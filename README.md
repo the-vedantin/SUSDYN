@@ -114,6 +114,8 @@ The team's OptimumK export uses inches with X=longitudinal, Y=lateral, Z=vertica
 
 ## Hardpoint Geometry
 
+![Hardpoint Editing and 3D View](screenshots/3d_view.png)
+
 ### The 14 Hardpoints
 
 Each suspension corner is defined by 14 points in 3D space (42 scalar coordinates):
@@ -176,6 +178,8 @@ Key geometry from Excel:
 ---
 
 ## Forward Kinematic Solver
+
+![Kinematic Sweep Results](screenshots/graphs.png)
 
 ### The Constraint System
 
@@ -407,6 +411,8 @@ C_alpha(Fz) = C_alpha_ref * (Fz / Fz_ref) ^ n
 
 ## Steady-State Dynamics Solver
 
+![Dynamics Panel](screenshots/dynamics_panel.png)
+
 ### Overview
 
 `vahan/dynamics.py` provides `SteadyStateSolver` — computes the vehicle's steady-state response to lateral and longitudinal acceleration. Uses iterative roll convergence with per-corner kinematic state updates.
@@ -450,6 +456,8 @@ Scalar outputs: `roll_angle_deg`, `pitch_angle_deg`, `understeer_gradient_deg`, 
 
 ### Sensitivity Analysis
 
+![Dynamics Optimization and Sensitivity](screenshots/dynamics_opt.png)
+
 `DynamicsSensitivity` uses central finite differences:
 
 ```
@@ -467,6 +475,8 @@ The recommendation engine finds which parameter changes produce a desired delta 
 ---
 
 ## Component Loads
+
+![Component Loads Results](screenshots/loads_popup.png)
 
 ### Overview
 
@@ -586,6 +596,8 @@ line_pressure = caliper_clamp / piston_area   (MPa = N/mm^2)
 ---
 
 ## GUI
+
+![Full Application Layout](screenshots/main_window.png)
 
 ### Layout
 
