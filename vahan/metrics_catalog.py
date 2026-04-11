@@ -180,12 +180,117 @@ def _steer_angle(m, **_):
     """
     return m.toe  # reuses toe computation — positive = toe-in = steer inward
 
-def _ackermann_pct(m, **_):
+def _ackermann_pct(m, ackermann_pct_value=None, **_):
     """
-    Ackermann percentage placeholder. Requires both FL+FR simultaneously.
-    Returns toe angle as a proxy until dual-corner data is available.
+    Ackermann percentage — populated by post-processing in compute_ackermann_post().
+
+    Per-step fn just reads the pre-computed value injected via extra kwargs.
+    Returns NaN if not yet computed (e.g. non-steer modes).
     """
-    return m.toe
+    if ackermann_pct_value is not None:
+        return float(ackermann_pct_value)
+    return float('nan')
+
+
+def compute_ackermann_post(toe_curve: np.ndarray,
+                           steer_input: np.ndarray,
+                           wheelbase_m: float = 1.530,
+                           front_track_m: float = 1.222) -> np.ndarray:
+    """
+    Post-process a steer-sweep toe curve into Ackermann percentage.
+
+    For a symmetric car, both corners share the same hardpoints (mirrored).
+    A steer sweep on the left corner at input angles [-A ... 0 ... +A] gives
+    the left-wheel steer angle at each step.  By mirror symmetry, the
+    right-wheel steer angle at input +d equals the left-wheel angle at -d
+    (with sign flip because toe-in is positive and the directions mirror).
+
+    At each steer input d:
+        delta_near  = |toe(+d)|   (this corner — nearer to turn centre)
+        delta_far   = |toe(-d)|   (opposite corner — farther from turn centre)
+
+    The ideal Ackermann relationship for turn radius R:
+        inner_ideal = atan(L / (R - t/2))
+        outer_ideal = atan(L / (R + t/2))
+    where R = L / tan(delta_bicycle), delta_bicycle = (delta_near + delta_far) / 2.
+
+    Ackermann % = (delta_near - delta_far) / (inner_ideal - outer_ideal) * 100
+
+    At zero steer, returns NaN (0/0 indeterminate).
+
+    Parameters
+    ----------
+    toe_curve : array, shape (n,)
+        Toe angle in degrees at each steer step. Positive = toe-in.
+        In steer mode, toe represents the wheel steer angle.
+    steer_input : array, shape (n,)
+        Steering input values (degrees) — the x-axis of the sweep.
+        Must be symmetric about zero (e.g. linspace(-20, 20, n)).
+    wheelbase_m : float
+        Vehicle wheelbase in metres.
+    front_track_m : float
+        Front track width in metres.
+
+    Returns
+    -------
+    ackermann : array, shape (n,)
+        Ackermann percentage at each steer step. NaN where undefined.
+    """
+    n = len(toe_curve)
+    ack = np.full(n, np.nan)
+    L = wheelbase_m
+    t = front_track_m
+
+    # Build a lookup: for each steer input, find the index of the
+    # mirror input (-steer).  The sweep is assumed to be a linspace
+    # symmetric about zero, so mirror index is simply (n-1-i).
+    for i in range(n):
+        steer_deg = steer_input[i]
+        # Skip near-zero steer (indeterminate)
+        if abs(steer_deg) < 0.05:
+            continue
+
+        toe_this = toe_curve[i]
+        # Mirror index: opposite end of the symmetric sweep
+        mirror_i = n - 1 - i
+        toe_mirror = toe_curve[mirror_i]
+
+        # Actual steer angles (degrees).
+        # In steer mode, positive steer input → positive toe on inner wheel.
+        # Toe sign: positive = toe-in.  For a left-turn (positive rack input),
+        # the left wheel (inner) toes-in more → positive toe.
+        # The mirrored value has the opposite sign convention, so negate.
+        delta_near = abs(toe_this)       # this corner
+        delta_far  = abs(toe_mirror)     # opposite corner (by symmetry)
+
+        # Identify inner (larger angle) vs outer (smaller angle)
+        delta_inner = max(delta_near, delta_far)
+        delta_outer = min(delta_near, delta_far)
+
+        # Actual toe-difference (steer angle spread)
+        actual_diff = delta_inner - delta_outer
+
+        # Average steer angle → bicycle-model turn radius
+        delta_avg_rad = np.radians((delta_inner + delta_outer) / 2.0)
+        if abs(delta_avg_rad) < 1e-6:
+            continue
+        R = L / np.tan(delta_avg_rad)
+
+        # Ideal Ackermann angles
+        denom_inner = R - t / 2.0
+        denom_outer = R + t / 2.0
+        if abs(denom_inner) < 1e-6 or denom_outer < 1e-6:
+            continue
+        ideal_inner = np.degrees(np.arctan(L / denom_inner))
+        ideal_outer = np.degrees(np.arctan(L / denom_outer))
+        ideal_diff = ideal_inner - ideal_outer
+
+        if abs(ideal_diff) < 1e-9:
+            continue
+
+        ack[i] = (actual_diff / ideal_diff) * 100.0
+
+    return ack
 
 # ── ARB metrics ───────────────────────────────────────────────────────────────
 # These are computed externally (passed via extra kwargs) because they require
@@ -241,7 +346,7 @@ CATALOG = [
 
     # ── Steering ──────────────────────────────────────────────────────────────
     dict(key='steer_angle',  label='Front Wheel Steer Angle',       unit='°',   category='Steering', fn=_steer_angle),
-    dict(key='ackermann',    label='Ackermann % (proxy: toe)',       unit='°',   category='Steering', fn=_ackermann_pct),
+    dict(key='ackermann',    label='Ackermann %',                    unit='%',   category='Steering', fn=_ackermann_pct),
 
     # ── ARB ───────────────────────────────────────────────────────────────────
     dict(key='arb_angle',       label='ARB Angle',                  unit='°',   category='ARB', fn=_arb_angle),

@@ -18,7 +18,25 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - **Widened search** explores solution space at increasing perturbation levels to find alternative geometries
 - Collision detection with configurable tube outer diameters — rejects solutions where suspension members intersect
 
-![Inverse Kinematics Panel](screenshots/ik_panel.png)
+### Steady-State Dynamics
+- Load transfer (elastic + geometric + unsprung) with iterative roll convergence
+- Degressive tire model with load sensitivity (`C_alpha ~ (Fz/Fz_ref)^n`, n < 1)
+- Understeer gradient from back-calculated slip angles
+- Friction circle tire utilization per corner
+- Roll angle, pitch angle, LLTD
+
+### Sensitivity & Optimization
+- Central finite-difference sensitivity of any dynamic output to any vehicle parameter
+- Practical step sizes (e.g. 1 mm spring preload, 1 N/mm spring rate)
+- Recommendation engine: which parameter changes achieve a target understeer/roll/pitch delta
+
+### Component Loads
+- 6x6 static equilibrium on upright free body for all member axial forces
+- Ball joint resultant forces decomposed into V (up+) and H (fwd+)
+- Bearing loads at inner/outer bearings (V and H) via moment equilibrium
+- Brake caliper mounting bolt forces (upper/lower, V and H) with direct shear + torque couple
+- Separate front/rear brake parameters (pad mu, piston area, pad radius, bolt spacing)
+- Brake system: torque, caliper clamp, line pressure
 
 ### 3D Visualization
 - Interactive OpenGL viewport (VisPy) with full-car wireframe rendering
@@ -26,13 +44,9 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Roll centre and roll axis overlays
 - Click-to-select hardpoint editing
 
-![3D View](screenshots/3d_view.png)
-
 ### Kinematic Curves
 - Live metric plots across wheel travel for all four corners
 - Configurable graph selection from the full metrics catalog
-
-![Kinematic Graphs](screenshots/graphs.png)
 
 ## Installation
 
@@ -63,20 +77,22 @@ The GUI opens with default FSAE hardpoints loaded. From there you can:
 
 ```
 vahan/                  Core computation library (no GUI dependencies)
-  hardpoints.py           Hardpoint data class
+  hardpoints.py           Hardpoint data class (14 points x 3 coords)
   solver.py               Forward kinematic constraint solver
   kinematics.py           Metric computation from solved states
   metrics_catalog.py      Registry of 30+ metrics with metadata
-  analysis.py             Sweep orchestration
+  analysis.py             Sweep orchestration (heave/roll/pitch/steer)
   optimizer.py            Inverse kinematics solver + collision detection
+  tire_model.py           Linear tire model with load sensitivity
+  dynamics.py             Steady-state vehicle dynamics solver
+  loads.py                Component force calculator (members, bearings, brakes)
 
 gui/                    PyQt6 desktop application
-  main_window.py          Main window, wiring, sweep logic
-  panels.py               All sidebar panels (motion, IK, hardpoints, etc.)
+  main_window.py          Main window, panel wiring, sweep + dynamics logic
+  panels.py               All sidebar panels (motion, IK, dynamics, loads, etc.)
   view3d.py               VisPy/OpenGL 3D viewport
 
 app.py                  Entry point
-examples/               Example configurations
 DOCUMENTATION.md        Full technical documentation
 ```
 
@@ -89,6 +105,10 @@ See [DOCUMENTATION.md](DOCUMENTATION.md) for detailed coverage of:
 - Inverse solver architecture (staged decomposition, orthogonal groups)
 - Collision detection algorithm
 - Vehicle data (2026 FSAE car parameters)
+
+## Collaborators
+
+<!-- Add collaborator names/handles here -->
 
 ## License
 

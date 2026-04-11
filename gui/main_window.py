@@ -40,9 +40,11 @@ from gui.view3d import View3D, HP_NAMES
 from gui.panels import (
     MotionPanel, CarParamsPanel, HardpointPanel,
     ValuesPanel, GraphPickerPanel, SteeringPanel, AlignmentPanel,
-    CollapsibleSection, InverseKinematicsPanel,
+    CollapsibleSection, InverseKinematicsPanel, DynamicsPanel, DynamicsOptPanel,
+    LoadsPanel,
 )
 from vahan.optimizer import InverseSolver, DesignVar
+from vahan.dynamics import VehicleParams, SteadyStateSolver, SteadyStateResult, DynamicsSensitivity
 
 # ==============================================================================
 #  DEFAULT HARDPOINTS  (X=lateral outboard+, Y=fwd+, Z=up+)
@@ -394,6 +396,214 @@ class CurvesCanvas(FigureCanvas):
         )
         self._blit_overlay()
 
+    def plot_dynamics(self, sweep: dict, graphs: list | None = None,
+                      corners: list | None = None,
+                      turn_radius_m: float = 0.0,
+                      wheelbase_m: float = 1.53,
+                      steer_ratio: float = 0.0):
+        """Plot dynamics sweep results with selectable graphs and corners."""
+        self._hover_ann = None
+        self.fig.clf()
+
+        # Determine x axis (lateral or longitudinal sweep)
+        is_longitudinal = 'longitudinal_g' in sweep and 'lateral_g' not in sweep
+        if is_longitudinal:
+            g_arr = sweep['longitudinal_g']
+            x_label = 'Longitudinal g'
+        else:
+            g_arr = sweep['lateral_g']
+            x_label = 'Lateral g'
+
+        if corners is None:
+            corners = ['FL', 'FR', 'RL', 'RR']
+        if graphs is None:
+            graphs = ['fz', 'roll', 'travel', 'lt', 'utilization']
+
+        _C = {'FL': '#e07b30', 'FR': '#EF5350', 'RL': '#66BB6A', 'RR': '#FFA726'}
+        _LS = {'FL': '-', 'FR': '--', 'RL': '-.', 'RR': ':'}
+
+        # Understeer data (needed for steer_correction / path_deviation)
+        us = sweep.get('understeer_gradient_deg')
+
+        # Build list of (title, ylabel, series) based on selected graphs
+        plots = []
+
+        if 'fz' in graphs:
+            series = [(c, sweep[f'Fz_{c}'], _C[c], _LS[c]) for c in corners]
+            plots.append(('Corner Loads', 'Fz (N)', series))
+
+        if 'roll' in graphs:
+            plots.append(('Roll Angle', 'Roll (deg)', [
+                ('Roll', sweep['roll_angle_deg'], '#4FC3F7', '-'),
+            ]))
+
+        if 'pitch' in graphs:
+            pa = sweep.get('pitch_angle_deg')
+            if pa is not None:
+                plots.append(('Pitch Angle', 'Pitch (deg)', [
+                    ('Pitch', pa, '#AB47BC', '-'),
+                ]))
+
+        if 'travel' in graphs:
+            series = [(c, sweep[f'travel_{c}'], _C[c], _LS[c]) for c in corners]
+            plots.append(('Suspension Travel', 'Travel (mm)', series))
+
+        if 'camber' in graphs:
+            series = [(c, sweep[f'camber_{c}'], _C[c], _LS[c]) for c in corners]
+            plots.append(('Camber', 'Camber (deg)', series))
+
+        if 'lt' in graphs:
+            plots.append(('Load Transfer', 'LT (N)', [
+                ('Elastic F', sweep['elastic_lt_front_N'], '#e07b30', '-'),
+                ('Elastic R', sweep['elastic_lt_rear_N'], '#66BB6A', '--'),
+                ('Geo F', sweep['geometric_lt_front_N'], '#EF5350', '-.'),
+                ('Geo R', sweep['geometric_lt_rear_N'], '#FFA726', ':'),
+            ]))
+
+        if 'rc' in graphs:
+            plots.append(('Roll Centre Height', 'RC (mm)', [
+                ('Front', sweep['rc_height_front_mm'], '#e07b30', '-'),
+                ('Rear', sweep['rc_height_rear_mm'], '#66BB6A', '--'),
+            ]))
+
+        if 'utilization' in graphs:
+            series = [(c, sweep.get(f'utilization_{c}', np.zeros_like(g_arr)),
+                        _C[c], _LS[c]) for c in corners]
+            plots.append(('Tire Utilization', 'Utilization', series))
+            # Add 1.0 reference line flag for this plot
+            self._util_plot_idx = len(plots) - 1
+
+        if 'understeer' in graphs:
+            if us is not None and np.any(us):
+                plots.append(('Understeer Gradient', 'SA_front − SA_rear (deg)', [
+                    ('US Gradient', us, '#FFCA28', '-'),
+                ]))
+
+        if 'steer_correction' in graphs:
+            if us is not None and np.any(us) and wheelbase_m > 0:
+                if turn_radius_m > 0:
+                    ack_deg = np.degrees(wheelbase_m / turn_radius_m)
+                    total_steer = ack_deg + us
+                    if steer_ratio > 0:
+                        # Show handwheel angle (what the driver actually turns)
+                        hw_ack = np.full_like(g_arr, ack_deg * steer_ratio)
+                        hw_req = total_steer * steer_ratio
+                        plots.append(('Handwheel Angle', 'Steering wheel (deg)', [
+                            ('Ackermann', hw_ack, '#555555', '--'),
+                            ('Required', hw_req, '#4FC3F7', '-'),
+                            ('Extra (US)', us * steer_ratio, '#EF5350', '-.'),
+                        ]))
+                    else:
+                        plots.append(('Steer Correction', 'Front wheel angle (deg)', [
+                            ('Ackermann', np.full_like(g_arr, ack_deg), '#555555', '--'),
+                            ('Required', total_steer, '#4FC3F7', '-'),
+                            ('Extra (US)', us, '#EF5350', '-.'),
+                        ]))
+                else:
+                    plots.append(('Steer Correction', 'Extra steer (deg)', [
+                        ('Extra (US)', us, '#EF5350', '-'),
+                    ]))
+
+        if 'path_deviation' in graphs:
+            if us is not None and np.any(us) and turn_radius_m > 0 and wheelbase_m > 0:
+                # If driver inputs only Ackermann steer:
+                # R_actual = R / (1 - R * Δα_rad / L)
+                us_rad = np.radians(us)
+                denom = 1.0 - turn_radius_m * us_rad / wheelbase_m
+                denom = np.where(np.abs(denom) < 0.01, 0.01, denom)  # avoid div-by-0
+                r_actual = turn_radius_m / denom
+                deviation = r_actual - turn_radius_m
+                # Clamp extreme values for readability
+                deviation = np.clip(deviation, -50, 50)
+                plots.append(('Path Deviation', f'Drift from {turn_radius_m:.0f}m radius (m)', [
+                    ('Deviation', deviation, '#FF7043', '-'),
+                ]))
+
+        if not plots:
+            self.draw()
+            return
+
+        n = len(plots)
+        cols = min(n, 3)
+        rows = (n + cols - 1) // cols
+
+        # Extra top margin for speed axis
+        show_speed = (not is_longitudinal and turn_radius_m > 0)
+        top_margin = 0.86 if show_speed else 0.90
+        self.fig.subplots_adjust(
+            hspace=0.72, wspace=0.40,
+            left=0.09, right=0.97, top=top_margin, bottom=0.10)
+
+        self._all_axes  = []
+        self._vlines    = []
+        self._plot_data = []
+
+        for idx, (title, ylabel, series) in enumerate(plots):
+            ax = self.fig.add_subplot(rows, cols, idx + 1)
+            ax.set_facecolor('#080808')
+            ax.tick_params(colors='#777777', labelsize=8)
+            for sp in ax.spines.values():
+                sp.set_edgecolor('#222222')
+            ax.set_ylabel(ylabel, color='#888888', fontsize=8, labelpad=2)
+            ax.set_xlabel(x_label, color='#888888', fontsize=8, labelpad=2)
+            ax.grid(True, color='#1a1a1a', lw=0.5)
+
+            for lbl, ydata, color, ls in series:
+                ax.plot(g_arr, ydata, color=color, lw=1.8, ls=ls, label=lbl)
+
+            # Reference lines
+            if title == 'Understeer Gradient':
+                ax.axhline(y=0, color='#555555', lw=0.8, ls='--', alpha=0.6)
+            if title == 'Tire Utilization':
+                ax.axhline(y=1.0, color='#EF5350', lw=1.0, ls='--', alpha=0.7,
+                            label='_grip limit')
+            if title == 'Path Deviation':
+                ax.axhline(y=0, color='#555555', lw=0.8, ls='--', alpha=0.6)
+
+            ax.legend(fontsize=7, facecolor='#06060e', labelcolor='white',
+                      framealpha=0.7, loc='best', handlelength=1.0, ncol=2)
+
+            # Speed secondary x-axis on top-row subplots only
+            if show_speed and idx < cols:
+                R = turn_radius_m
+                def _g_to_mph(g, R=R):
+                    return np.sqrt(np.maximum(g, 0) * 9.81 * R) * 2.23694
+                def _mph_to_g(mph, R=R):
+                    v = mph / 2.23694
+                    return v**2 / (9.81 * R) if R > 0 else 0.0
+                try:
+                    secax = ax.secondary_xaxis('top',
+                                               functions=(_g_to_mph, _mph_to_g))
+                    secax.set_xlabel('Speed (mph)', color='#4FC3F7',
+                                    fontsize=7, labelpad=2)
+                    secax.tick_params(colors='#4FC3F7', labelsize=7)
+                except Exception:
+                    pass  # older matplotlib may not support this
+
+            self._all_axes.append(ax)
+            vl = ax.axvline(x=float('nan'), color='#ffffff', lw=0.8,
+                            ls='--', alpha=0.5, zorder=10)
+            self._vlines.append(vl)
+            ax_series = []
+            for line in ax.get_lines():
+                lbl = line.get_label()
+                if lbl.startswith('_'):
+                    continue
+                ax_series.append((line.get_xdata(), line.get_ydata(),
+                                  lbl, line.get_color()))
+            self._plot_data.append((ax, ax_series))
+
+        fixed_lon = sweep.get('fixed_longitudinal_g')
+        if fixed_lon is not None:
+            sweep_type = f'Combined (lon={fixed_lon:+.1f}g)'
+        elif is_longitudinal:
+            sweep_type = 'Longitudinal'
+        else:
+            sweep_type = 'Lateral'
+        self.fig.suptitle(f'Dynamics Sweep ({sweep_type})',
+                          color='#cccccc', fontsize=9, y=0.98)
+        self.draw()
+
 
 # ==============================================================================
 #  IK SOLVER WORKER (runs in a background QThread)
@@ -465,6 +675,85 @@ class _IKExploreWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _DynamicsSolveWorker(QThread):
+    """Runs SteadyStateSolver.solve() off the main thread."""
+    finished = Signal(object)  # SteadyStateResult
+    failed   = Signal(str)
+
+    def __init__(self, solver: SteadyStateSolver, lateral_g: float,
+                 longitudinal_g: float = 0.0):
+        super().__init__()
+        self._solver = solver
+        self._lat_g = lateral_g
+        self._lon_g = longitudinal_g
+
+    def run(self):
+        try:
+            result = self._solver.solve(self._lat_g, self._lon_g)
+            self.finished.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _DynamicsSweepWorker(QThread):
+    """Runs lateral or longitudinal sweep off the main thread."""
+    finished = Signal(dict)   # sweep arrays
+    failed   = Signal(str)
+
+    def __init__(self, solver: SteadyStateSolver, g_min: float, g_max: float,
+                 n_points: int, longitudinal_g: float = 0.0,
+                 mode: str = 'lateral', lateral_g: float = 0.0):
+        super().__init__()
+        self._solver = solver
+        self._g_min = g_min
+        self._g_max = g_max
+        self._n = n_points
+        self._lon_g = longitudinal_g
+        self._lat_g = lateral_g
+        self._mode = mode
+
+    def run(self):
+        try:
+            if self._mode == 'combined':
+                result = self._solver.sweep_combined(
+                    lat_range=(self._g_min, self._g_max),
+                    lon_g=self._lon_g,
+                    n_points=self._n)
+            elif self._mode == 'longitudinal':
+                result = self._solver.sweep_longitudinal_g(
+                    g_range=(self._g_min, self._g_max),
+                    n_points=self._n,
+                    lateral_g=self._lat_g)
+            else:
+                result = self._solver.sweep_lateral_g(
+                    g_range=(self._g_min, self._g_max),
+                    n_points=self._n,
+                    longitudinal_g=self._lon_g)
+            self.finished.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _SensitivityWorker(QThread):
+    """Runs dynamics sensitivity analysis off the main thread."""
+    finished = Signal(dict)
+    failed   = Signal(str)
+
+    def __init__(self, sens: DynamicsSensitivity,
+                 lateral_g: float, longitudinal_g: float):
+        super().__init__()
+        self._sens = sens
+        self._lat_g = lateral_g
+        self._lon_g = longitudinal_g
+
+    def run(self):
+        try:
+            result = self._sens.analyze(self._lat_g, self._lon_g)
+            self.finished.emit(result)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 # ==============================================================================
 #  MAIN WINDOW
 # ==============================================================================
@@ -481,7 +770,9 @@ class MainWindow(QMainWindow):
         self._rear_hp   = {k: v.copy() for k, v in DEFAULT_REAR_HP.items()}
         self._front_arb = {k: v.copy() for k, v in DEFAULT_FRONT_ARB.items()}
         self._rear_arb  = {k: v.copy() for k, v in DEFAULT_REAR_ARB.items()}
-        self._car       = {'track_mm': 1118., 'wheelbase_mm': 1524.,
+        self._car       = {'axle_spacing_mm': 1537., 'wheelbase_mm': 1537.,
+                           'track_f_mm': 1222., 'track_r_mm': 1200.,
+                           'wheel_offset_f_mm': 25., 'wheel_offset_r_mm': 25.,
                            'tire_outer_dia_mm': 406., 'tire_rim_dia_mm': 330.,
                            'tire_width_mm': 200., 'show_ground': True,
                            'cg_x_mm': 0., 'cg_y_mm': 1100., 'cg_z_mm': 280.,
@@ -501,15 +792,20 @@ class MainWindow(QMainWindow):
         self._show_rc        = True
         self._show_roll_axis = True
         self._3d_pending     = False     # deferred 3D update flag
+        self._tire_model     = None      # TireModel or LinearTireModel
+        self._dyn_sweep_data = None      # last dynamics sweep dict
+        self._dyn_worker     = None      # active dynamics worker thread
 
         self._build_ui()
         self._apply_style()
         # Centre the camera orbit pivot at the car midpoint
-        wb_half = self._car['wheelbase_mm'] / 2000.   # half wheelbase in metres
+        wb_half = self._car['axle_spacing_mm'] / 2000.  # half axle spacing in metres
         self.view3d.set_camera_center((0., wb_half, 0.2))
         self._rebuild_solvers()
         self._run_sweep()
         self._update_3d()
+        self._try_autoload_tire()
+        self._update_min_turn_radius()
 
     # ==========================================================================
     #  BUILD UI
@@ -572,6 +868,11 @@ class MainWindow(QMainWindow):
                 car_data['cg_z_mm'] = car_data.pop('cg_height_mm')
                 car_data.setdefault('cg_x_mm', 0.)
                 car_data.setdefault('cg_y_mm', 1100.)
+            # backward compat: old files without axle_spacing / wheel_offset
+            if 'axle_spacing_mm' not in car_data:
+                car_data['axle_spacing_mm'] = car_data.get('wheelbase_mm', 1537.)
+            car_data.setdefault('wheel_offset_f_mm', 25.)
+            car_data.setdefault('wheel_offset_r_mm', 25.)
             self._car.update(car_data)
             self._steer.update(data.get('steer', {}))
             self._alignment.update(data.get('alignment', {}))
@@ -646,13 +947,19 @@ class MainWindow(QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setMinimumWidth(220)
 
-        # Right sidebar (IK panel)
+        # Right sidebar (IK + Dynamics panels)
         self._ik_panel = InverseKinematicsPanel()
+        self._dynamics_panel = DynamicsPanel()
+        self._dynamics_opt_panel = DynamicsOptPanel()
+        self._loads_panel = LoadsPanel()
         ik_inner = QWidget()
         ik_layout = QVBoxLayout(ik_inner)
         ik_layout.setContentsMargins(0, 0, 0, 0)
         ik_layout.setSpacing(4)
         ik_layout.addWidget(self._ik_panel)
+        ik_layout.addWidget(self._dynamics_panel)
+        ik_layout.addWidget(self._dynamics_opt_panel)
+        ik_layout.addWidget(self._loads_panel)
         ik_layout.addStretch()
 
         right_scroll = QScrollArea()
@@ -689,6 +996,13 @@ class MainWindow(QMainWindow):
         self._alignment_panel.alignment_changed.connect(self._on_alignment)
         self._ik_panel.solve_requested.connect(self._on_ik_solve)
         self._ik_panel.apply_requested.connect(self._on_ik_apply)
+        self._dynamics_panel.solve_requested.connect(self._on_dynamics_solve)
+        self._dynamics_panel.sweep_requested.connect(self._on_dynamics_sweep)
+        self._dynamics_panel.tire_file_changed.connect(self._on_tire_file)
+        self._dynamics_panel.graph_selection_changed.connect(self._on_dyn_graph_sel)
+        self._dynamics_panel.corners_changed.connect(self._on_dyn_corners_sel)
+        self._dynamics_opt_panel.analyze_requested.connect(self._on_sensitivity_analyze)
+        self._loads_panel.loads_requested.connect(self._on_compute_loads)
         self._motion_panel.damper_params_changed.connect(self._on_damper_limits)
         # Push initial damper limits to IK panel
         self._on_damper_limits({
@@ -1063,7 +1377,7 @@ class MainWindow(QMainWindow):
 
                 anti_kwargs = {
                     'cg_height_m':      self._car.get('cg_z_mm', 280.) / 1000.,
-                    'wheelbase_m':      self._car.get('wheelbase_mm', 1524.) / 1000.,
+                    'wheelbase_m':      self._car.get('wheelbase_mm', 1537.) / 1000.,
                     'front_brake_bias': self._car.get('front_brake_bias_pct', 65.) / 100.,
                     'rear_drive_bias':  1.0,   # RWD assumed
                     'front_drive_bias': 0.0,   # RWD = no front drive
@@ -1235,7 +1549,7 @@ class MainWindow(QMainWindow):
                 if label == 'FL':
                     values_fl = _all_metrics(st, 'left',
                         cg_height_m=self._car.get('cg_z_mm', 280.) / 1000.,
-                        wheelbase_m=self._car.get('wheelbase_mm', 1524.) / 1000.,
+                        wheelbase_m=self._car.get('wheelbase_mm', 1537.) / 1000.,
                         front_brake_bias=self._car.get('front_brake_bias_pct', 65.) / 100.,
                         rear_drive_bias=1.0, front_drive_bias=0.0,
                     )
@@ -1381,31 +1695,95 @@ class MainWindow(QMainWindow):
         self._rebuild_solvers(cur_angle)
         self._run_sweep()
         self._update_3d()
+        self._update_min_turn_radius()
+
+    def _update_min_turn_radius(self):
+        """Compute min turn radius from steering geometry and update readout."""
+        try:
+            steer_params = self._steer
+            total_mm = steer_params.get('total_rack_travel_mm', 120.0)
+            max_in   = steer_params.get('max_rack_travel_in', 2.5)
+            half_mm  = min(total_mm / 2.0, max_in * 25.4)
+            rack_m   = half_mm / 1000.0
+
+            hp_raw = {k: v.copy() for k, v in self._front_hp.items()}
+            hp_steered = self._steered_hp(hp_raw, rack_m, is_front=True)
+
+            # Design tie-rod length (before rack moves)
+            d = hp_raw['tie_rod_outer'] - hp_raw['tie_rod_inner']
+            design_tierod_len_sq = float(d @ d)
+
+            steered_solver = SuspensionConstraints(
+                _hp_obj(hp_steered),
+                tierod_len_sq=design_tierod_len_sq,
+                pushrod_body='uca')
+            state = steered_solver.solve(0.0)
+            m = KinematicMetrics(state, 'left')
+            max_steer_deg = abs(m.toe)
+            if max_steer_deg > 0.5:
+                wb = self._car['wheelbase_mm'] / 1000
+                r_min = wb / np.tan(np.radians(max_steer_deg))
+                self._dynamics_panel._cached_r_min = r_min
+                self._dynamics_panel._cached_max_steer = max_steer_deg
+                # Steering ratio: handwheel degrees / front wheel degrees
+                rack_per_rev = steer_params.get('rack_travel_per_rev_mm', 60.0)
+                if rack_per_rev > 0:
+                    hw_deg = (half_mm / rack_per_rev) * 360.0
+                    self._dynamics_panel._cached_steer_ratio = hw_deg / max_steer_deg
+                self._dynamics_panel._on_driving_changed()
+        except Exception:
+            pass
 
     def _on_car(self, params: dict):
         old = self._car
 
-        # ── wheelbase delta → shift ALL rear hardpoints in Y ──────────────
-        dw = (params['wheelbase_mm'] - old['wheelbase_mm']) / 1000.
-        if abs(dw) > 1e-9:
-            dy = np.array([0., dw, 0.])
+        # ── axle spacing delta → shift ALL rear hardpoints in Y ───────────
+        # Axle spacing = distance between front/rear hardpoint clusters.
+        das = (params.get('axle_spacing_mm', old.get('axle_spacing_mm', 1537.))
+               - old.get('axle_spacing_mm', old.get('wheelbase_mm', 1537.))) / 1000.
+        if abs(das) > 1e-9:
+            dy = np.array([0., das, 0.])
             for k in list(self._rear_hp):
                 self._rear_hp[k] = self._rear_hp[k] + dy
             for k in list(self._rear_arb):
                 self._rear_arb[k] = self._rear_arb[k] + dy
 
-        # ── track delta → shift outboard hardpoints in X (both axles) ─────
+        # ── wheelbase delta → dynamics only, NO hardpoint shift ───────────
+        # Wheelbase = contact-patch distance, used for load transfer,
+        # Ackermann, understeer gradient, etc.  Does not move geometry.
+
+        # ── track delta → shift outboard pickups + wheel_center in X ──────
         # "Outboard" = the upright pickup points and wheel centre.
-        # Inboard chassis mounts stay fixed (they're bolted to the frame).
+        # Inboard chassis mounts stay fixed (bolted to frame).
         _OUTBOARD = {'uca_outer', 'lca_outer', 'tie_rod_outer',
                      'wheel_center', 'pushrod_outer'}
-        dt = (params['track_mm'] - old['track_mm']) / 2000.  # half-track Δ (m)
-        if abs(dt) > 1e-9:
-            dx = np.array([dt, 0., 0.])
-            for hp_dict in (self._front_hp, self._rear_hp):
-                for k in _OUTBOARD:
-                    if k in hp_dict:
-                        hp_dict[k] = hp_dict[k] + dx
+        dt_f = (params['track_f_mm'] - old['track_f_mm']) / 2000.  # half-track Δ (m)
+        if abs(dt_f) > 1e-9:
+            dx = np.array([dt_f, 0., 0.])
+            for k in _OUTBOARD:
+                if k in self._front_hp:
+                    self._front_hp[k] = self._front_hp[k] + dx
+        dt_r = (params['track_r_mm'] - old['track_r_mm']) / 2000.
+        if abs(dt_r) > 1e-9:
+            dx = np.array([dt_r, 0., 0.])
+            for k in _OUTBOARD:
+                if k in self._rear_hp:
+                    self._rear_hp[k] = self._rear_hp[k] + dx
+
+        # ── wheel offset delta → shift ONLY wheel_center in X ────────────
+        # Wheel offset = how far the wheel sits beyond the outboard pickups.
+        dof = (params.get('wheel_offset_f_mm', old.get('wheel_offset_f_mm', 25.))
+               - old.get('wheel_offset_f_mm', 25.)) / 1000.
+        if abs(dof) > 1e-9:
+            dx = np.array([dof, 0., 0.])
+            if 'wheel_center' in self._front_hp:
+                self._front_hp['wheel_center'] = self._front_hp['wheel_center'] + dx
+        dor = (params.get('wheel_offset_r_mm', old.get('wheel_offset_r_mm', 25.))
+               - old.get('wheel_offset_r_mm', 25.)) / 1000.
+        if abs(dor) > 1e-9:
+            dx = np.array([dor, 0., 0.])
+            if 'wheel_center' in self._rear_hp:
+                self._rear_hp['wheel_center'] = self._rear_hp['wheel_center'] + dx
 
         self._car = params
 
@@ -1416,6 +1794,10 @@ class MainWindow(QMainWindow):
         self._rebuild_solvers()
         self._run_sweep()
         self._update_3d()
+        self._update_min_turn_radius()
+
+        # Update dynamics readout (weight distribution, etc.)
+        self._dynamics_panel._on_driving_changed()
 
     def _on_hp(self, hp_dict: dict, axle: str):
         # Split combined dict back into suspension HP and ARB HP
@@ -1464,7 +1846,7 @@ class MainWindow(QMainWindow):
 
         anti_kwargs = {
             'cg_height_m':      self._car.get('cg_z_mm', 280.) / 1000.,
-            'wheelbase_m':      self._car.get('wheelbase_mm', 1524.) / 1000.,
+            'wheelbase_m':      self._car.get('wheelbase_mm', 1537.) / 1000.,
             'front_brake_bias': self._car.get('front_brake_bias_pct', 65.) / 100.,
             'rear_drive_bias':  1.0,
             'front_drive_bias': 0.0,
@@ -1546,7 +1928,7 @@ class MainWindow(QMainWindow):
 
                 anti_kwargs = {
                     'cg_height_m':      self._car.get('cg_z_mm', 280.) / 1000.,
-                    'wheelbase_m':      self._car.get('wheelbase_mm', 1524.) / 1000.,
+                    'wheelbase_m':      self._car.get('wheelbase_mm', 1537.) / 1000.,
                     'front_brake_bias': self._car.get('front_brake_bias_pct', 65.) / 100.,
                     'rear_drive_bias':  1.0,
                     'front_drive_bias': 0.0,
@@ -1720,6 +2102,311 @@ class MainWindow(QMainWindow):
             f'{params["front_toe_deg"]:+.2f}° toe  |  '
             f'rear {params["rear_camber_deg"]:+.2f}° camber  '
             f'{params["rear_toe_deg"]:+.2f}° toe', 5000)
+
+    # ==========================================================================
+    #  DYNAMICS
+    # ==========================================================================
+
+    def _build_dynamics_solver(self) -> SteadyStateSolver:
+        """Build a SteadyStateSolver from current GUI state.
+
+        - Motion ratios are queried from the kinematic solver at design
+          position (travel=0), not manually entered.
+        - CG and track come from the Car Parameters panel.
+        - Unsprung CG height = wheel center Z at design (from geometry).
+        """
+        dyn_params = self._dynamics_panel.get_params()
+        car = self._car
+
+        # Geometry from Car Params panel
+        dyn_params['front_track_m'] = car['track_f_mm'] / 1000
+        dyn_params['rear_track_m'] = car['track_r_mm'] / 1000
+        dyn_params['wheelbase_m'] = car['wheelbase_mm'] / 1000
+        dyn_params['cg_height_m'] = car['cg_z_mm'] / 1000
+        dyn_params['cg_to_front_axle_m'] = car.get('cg_y_mm', 1100) / 1000
+        if 'front_brake_bias_pct' in car:
+            dyn_params['front_brake_bias'] = car['front_brake_bias_pct'] / 100
+
+        # Motion ratio from kinematic model: MR = d(spring_length)/d(travel)
+        # Computed via central difference at design position (±1mm)
+        dt = 0.001  # 1mm perturbation
+        for label, param_key in [('FL', 'motion_ratio_front'), ('RL', 'motion_ratio_rear')]:
+            solver = self._solvers.get(label)
+            if solver:
+                try:
+                    s_plus = solver.solve(+dt)
+                    s_minus = solver.solve(-dt)
+                    mr = abs(s_plus.spring_length - s_minus.spring_length) / (2 * dt)
+                    if 0.1 < mr < 3.0:  # sanity check
+                        dyn_params[param_key] = mr
+                except Exception:
+                    pass  # keep default if solver fails
+
+        # Unsprung CG height = wheel center Z at design position
+        for label in ('FL', 'RL'):
+            solver = self._solvers.get(label)
+            if solver:
+                try:
+                    state = solver.solve(0.0)
+                    dyn_params['unsprung_cg_height_m'] = float(state.wheel_center[2])
+                    break
+                except Exception:
+                    pass
+
+        # Max steer angle from geometry (cached by _update_min_turn_radius)
+        cached_steer = getattr(self._dynamics_panel, '_cached_max_steer', None)
+        if cached_steer and cached_steer > 1.0:
+            dyn_params['max_steer_angle_deg'] = cached_steer
+
+        veh = VehicleParams(**dyn_params)
+        # Update computed constants display
+        self._dynamics_panel.update_constants(veh)
+        tire = self._tire_model
+        if tire is None:
+            from vahan.tire_model import LinearTireModel
+            tire = LinearTireModel()
+        return SteadyStateSolver(veh, self._solvers, tire)
+
+    def _try_autoload_tire(self):
+        """Auto-load default tire data if tire_data/ directory exists."""
+        import os
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Prefer run5 (14 PSI operating pressure, 7" rim)
+        candidates = [
+            os.path.join(base, 'tire_data', 'B2356run5.mat'),
+            os.path.join(base, 'tire_data', 'B2356run5.csv'),
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                self._on_tire_file(path)
+                return
+
+    def _on_tire_file(self, path: str):
+        """Load tire data from .mat, .csv, or .xlsx."""
+        try:
+            from vahan.tire_model import TireModel
+            self._tire_model = TireModel.from_file(path)
+            name = path.split('/')[-1].split('\\')[-1]
+            self._dynamics_panel._tire_path = path
+            self._dynamics_panel._tire_label.setText(name)
+            self._dynamics_panel._tire_label.setStyleSheet(
+                'color: #e0e0e0; font-size: 11px;')
+            self._dynamics_panel.set_status(
+                f'Loaded: {self._tire_model.tire_id}  '
+                f'SA: {self._tire_model.sa_range[0]:.0f} to {self._tire_model.sa_range[1]:.0f} deg  '
+                f'Fz: {self._tire_model.fz_range[0]:.0f}-{self._tire_model.fz_range[1]:.0f} N')
+            self.statusBar().showMessage(f'Tire model loaded: {path}', 4000)
+        except Exception as e:
+            self._dynamics_panel.set_status(f'Error: {e}')
+            self.statusBar().showMessage(f'Tire load error: {e}', 6000)
+
+    def _on_dynamics_solve(self, spec: dict):
+        """Single-point steady-state solve."""
+        try:
+            ss = self._build_dynamics_solver()
+            self._dynamics_panel.set_solving(True)
+            self._dynamics_panel.set_status('Solving...')
+
+            worker = _DynamicsSolveWorker(
+                ss, spec['lateral_g'], spec.get('longitudinal_g', 0.0))
+            worker.finished.connect(self._on_dynamics_solve_done)
+            worker.failed.connect(self._on_dynamics_failed)
+            self._dyn_worker = worker
+            worker.start()
+        except Exception as e:
+            self._dynamics_panel.set_status(f'Error: {e}')
+
+    def _on_dynamics_solve_done(self, result):
+        self._dynamics_panel.set_solving(False)
+        self._dynamics_panel.show_result(result)
+        # Compute max g and min turn radius if power/steer is set
+        try:
+            ss = self._build_dynamics_solver()
+            veh = ss._veh
+            max_g_info = ss.max_accel_g(speed_kph=veh.speed_kph)
+            if max_g_info.get('traction_g', 0) > 0:
+                self._dynamics_panel.show_max_g(max_g_info)
+            if veh.min_turn_radius_m < 100:
+                max_g_info['min_turn_radius_m'] = veh.min_turn_radius_m
+                self._dynamics_panel.show_max_g(max_g_info)
+        except Exception:
+            pass
+        self._dynamics_panel.set_status('Done.')
+        self.statusBar().showMessage(
+            f'Dynamics: {result.roll_angle_deg:.3f} deg roll at '
+            f'{result.lateral_g:.2f}g', 4000)
+
+    def _on_dynamics_sweep(self, spec: dict):
+        """Lateral or longitudinal g sweep."""
+        try:
+            ss = self._build_dynamics_solver()
+            self._dynamics_panel.set_solving(True)
+            mode = spec.get('mode', 'lateral')
+            self._dynamics_panel.set_status(
+                f'Sweeping ({mode})...')
+
+            worker = _DynamicsSweepWorker(
+                ss, spec['g_min'], spec['g_max'],
+                spec.get('n_points', 41),
+                longitudinal_g=spec.get('longitudinal_g', 0.0),
+                mode=mode,
+                lateral_g=spec.get('lateral_g', 0.0))
+            worker.finished.connect(self._on_dynamics_sweep_done)
+            worker.failed.connect(self._on_dynamics_failed)
+            self._dyn_worker = worker
+            worker.start()
+        except Exception as e:
+            self._dynamics_panel.set_status(f'Error: {e}')
+
+    def _on_dynamics_sweep_done(self, sweep: dict):
+        self._dynamics_panel.set_solving(False)
+        self._dyn_sweep_data = sweep  # stash for re-plot on graph/corner change
+
+        # Determine mode from which x-axis key is present
+        is_longitudinal = 'longitudinal_g' in sweep and 'lateral_g' not in sweep
+        g_key = 'longitudinal_g' if is_longitudinal else 'lateral_g'
+        g_arr = sweep[g_key]
+
+        self._dynamics_panel.set_status(
+            f'Sweep complete: {len(g_arr)} points')
+
+        graphs = self._dynamics_panel.get_selected_graphs()
+        corners = self._dynamics_panel.get_selected_corners()
+        turn_r = self._dynamics_panel._turn_radius.value()
+        wb = self._car.get('wheelbase_mm', 1530) / 1000
+        sr = getattr(self._dynamics_panel, '_cached_steer_ratio', 0.0)
+        self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
+                                 turn_radius_m=turn_r, wheelbase_m=wb,
+                                 steer_ratio=sr)
+
+        # Show the 1g (lateral) or 0g (longitudinal) point in the table
+        ref_g = 0.0 if is_longitudinal else 1.0
+        idx_ref = np.argmin(np.abs(g_arr - ref_g))
+        if abs(g_arr[idx_ref] - ref_g) < 0.15:
+            result = SteadyStateResult(
+                lateral_g=g_arr[idx_ref] if not is_longitudinal else 0.0,
+                longitudinal_g=g_arr[idx_ref] if is_longitudinal else 0.0)
+            result.roll_angle_deg = sweep['roll_angle_deg'][idx_ref]
+            result.pitch_angle_deg = sweep.get('pitch_angle_deg', np.zeros(1))[min(idx_ref, len(sweep.get('pitch_angle_deg', [0]))-1)]
+            result.rc_height_front_m = sweep['rc_height_front_mm'][idx_ref] / 1000
+            result.rc_height_rear_m = sweep['rc_height_rear_mm'][idx_ref] / 1000
+            result.elastic_lt_front_N = sweep['elastic_lt_front_N'][idx_ref]
+            result.elastic_lt_rear_N = sweep['elastic_lt_rear_N'][idx_ref]
+            result.geometric_lt_front_N = sweep['geometric_lt_front_N'][idx_ref]
+            result.geometric_lt_rear_N = sweep['geometric_lt_rear_N'][idx_ref]
+            result.understeer_gradient_deg = sweep.get('understeer_gradient_deg', np.zeros(1))[min(idx_ref, len(sweep.get('understeer_gradient_deg', [0]))-1)]
+            result.iterations = 0
+            for lbl in ['FL', 'FR', 'RL', 'RR']:
+                result.Fz[lbl] = sweep[f'Fz_{lbl}'][idx_ref]
+                result.travel[lbl] = sweep[f'travel_{lbl}'][idx_ref]
+                result.camber[lbl] = sweep[f'camber_{lbl}'][idx_ref]
+                result.utilization[lbl] = sweep.get(f'utilization_{lbl}', np.zeros(1))[idx_ref]
+            self._dynamics_panel.show_result(result)
+
+    def _on_dynamics_failed(self, msg: str):
+        self._dynamics_panel.set_solving(False)
+        self._dynamics_panel.set_status(f'Error: {msg}')
+        self.statusBar().showMessage(f'Dynamics error: {msg}', 6000)
+
+    def _on_dyn_graph_sel(self, graphs: list):
+        """Re-plot dynamics with new graph selection."""
+        sweep = getattr(self, '_dyn_sweep_data', None)
+        if sweep is not None:
+            corners = self._dynamics_panel.get_selected_corners()
+            turn_r = self._dynamics_panel._turn_radius.value()
+            wb = self._car.get('wheelbase_mm', 1530) / 1000
+            self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
+                                     turn_radius_m=turn_r, wheelbase_m=wb)
+
+    def _on_dyn_corners_sel(self, corners: list):
+        """Re-plot dynamics with new corner selection."""
+        sweep = getattr(self, '_dyn_sweep_data', None)
+        if sweep is not None:
+            graphs = self._dynamics_panel.get_selected_graphs()
+            turn_r = self._dynamics_panel._turn_radius.value()
+            wb = self._car.get('wheelbase_mm', 1530) / 1000
+            self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
+                                     turn_radius_m=turn_r, wheelbase_m=wb)
+
+    # ── Dynamics Optimizer ───────────────────────────────────────────────
+
+    _sens_worker: _SensitivityWorker | None = None
+
+    def _on_sensitivity_analyze(self, spec: dict):
+        """Run sensitivity analysis in a background thread."""
+        try:
+            solver = self._build_dynamics_solver()
+            tire = self._tire_model
+            if tire is None:
+                from vahan.tire_model import LinearTireModel
+                tire = LinearTireModel()
+            sens = DynamicsSensitivity(solver._veh, self._solvers, tire)
+
+            self._sens_worker = _SensitivityWorker(
+                sens, spec['lateral_g'], spec['longitudinal_g'])
+            self._sens_worker.finished.connect(self._on_sensitivity_done)
+            self._sens_worker.failed.connect(self._on_sensitivity_failed)
+            self._sens_worker.start()
+        except Exception as e:
+            self._dynamics_opt_panel._opt_status.setText(f'Error: {e}')
+            self._dynamics_opt_panel._analyze_btn.setEnabled(True)
+
+    def _on_sensitivity_done(self, analysis: dict):
+        self._dynamics_opt_panel.show_analysis(analysis)
+        self.statusBar().showMessage('Sensitivity analysis complete', 4000)
+
+    def _on_sensitivity_failed(self, msg: str):
+        self._dynamics_opt_panel._opt_status.setText(f'Error: {msg}')
+        self._dynamics_opt_panel._analyze_btn.setEnabled(True)
+        self.statusBar().showMessage(f'Sensitivity error: {msg}', 6000)
+
+    # ==========================================================================
+    #  COMPONENT LOADS
+    # ==========================================================================
+
+    def _on_compute_loads(self):
+        """Compute component forces for all 4 corners at current dynamics state."""
+        try:
+            from vahan.loads import compute_all_corners
+
+            solver = self._build_dynamics_solver()
+            dyn_params = self._dynamics_panel.get_params()
+            lat_g = dyn_params.get('_lat_g', 1.2)
+            lon_g = dyn_params.get('_lon_g', 0.0)
+
+            # Get lat/lon g from the dynamics panel spinners
+            try:
+                lat_g = self._dynamics_panel._lat_g.value()
+                lon_g = self._dynamics_panel._lon_g.value()
+            except AttributeError:
+                pass
+
+            result = solver.solve(lat_g, lon_g)
+
+            # Separate front/rear brake params + shared upright params
+            bp_f = self._loads_panel.get_brake_params_front()
+            bp_r = self._loads_panel.get_brake_params_rear()
+            up = self._loads_panel.get_upright_params()
+
+            veh = solver._veh
+            wheel_r = veh.tire_radius_m
+
+            loads = compute_all_corners(
+                self._solvers, result,
+                brake_params_f=bp_f, brake_params_r=bp_r,
+                upright_params_f=up, upright_params_r=up,
+                wheel_radius_m=wheel_r,
+                motion_ratio_f=veh.motion_ratio_front,
+                motion_ratio_r=veh.motion_ratio_rear,
+            )
+
+            self._loads_panel.show_loads(loads, lat_g=lat_g, lon_g=lon_g)
+            self.statusBar().showMessage(
+                f'Component loads computed at {lat_g:.1f}g lat, {lon_g:.1f}g lon', 4000)
+
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._loads_panel._loads_status.setText(f'Error: {e}')
 
     # ==========================================================================
     #  STYLE

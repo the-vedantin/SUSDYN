@@ -2,7 +2,7 @@
 
 ## Technical Documentation
 
-**Version:** 1.0 (Kinematics Complete)
+**Version:** 2.0 (Kinematics + Dynamics + Loads)
 **Date:** April 2026
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
@@ -10,15 +10,19 @@
 
 ## 1. Project Overview
 
-Vahan is a ground-up suspension design tool covering the full pipeline from kinematic geometry through inverse optimization. It targets double-wishbone suspensions with pushrod/rocker spring actuation — the standard layout for FSAE and production performance cars.
+Vahan is a ground-up suspension design tool covering the full pipeline from kinematic geometry through dynamics and component load analysis. It targets double-wishbone suspensions with pushrod/rocker spring actuation — the standard layout for FSAE and production performance cars.
 
-### What It Does Today
+### What It Does
 
 1. **Forward Kinematics** — Given 14 hardpoint coordinates, solve the full suspension constraint system at any wheel travel position. Computes 30+ metrics (camber, toe, caster, roll centre, anti-dive, motion ratio, etc.).
 
 2. **Inverse Kinematics** — Given target metric curves (e.g., "I want camber to go from 0 deg at static to -2 deg at full bump"), find the hardpoint positions that produce them. Uses a priority-ordered staged solver that exploits geometric orthogonality between metrics.
 
-3. **Interactive GUI** — Real-time 3D visualization, live metric graphs, hardpoint editing, motion sweeps (heave/roll/pitch/steer), and full inverse solve integration with collision detection.
+3. **Steady-State Dynamics** — Load transfer, roll/pitch, tire utilization, understeer gradient with degressive tire model, sensitivity analysis, and parameter optimization.
+
+4. **Component Loads** — 6x6 static equilibrium for member forces, ball joint reactions in V/H, bearing loads, caliper bolt forces, and brake system forces with separate front/rear parameters.
+
+5. **Interactive GUI** — Real-time 3D visualization, live metric graphs, hardpoint editing, motion sweeps, dynamics solver, and component load calculator.
 
 ### Architecture
 
@@ -30,6 +34,9 @@ vahan/                         GUI (PyQt6)
   metrics_catalog.py
   analysis.py
   optimizer.py
+  tire_model.py
+  dynamics.py
+  loads.py
 ```
 
 The `vahan/` package is a pure computation library with zero GUI dependencies. The `gui/` layer wraps it in a desktop application. Either can be used independently.
@@ -510,31 +517,205 @@ All spinboxes and combo boxes ignore the scroll wheel unless they have keyboard 
 
 ---
 
-## 9. File Reference
+## 9. Tire Model
 
-| File | Lines | Purpose |
-|------|-------|---------|
-| `vahan/hardpoints.py` | ~80 | Hardpoint dataclass + mirror ops |
-| `vahan/solver.py` | ~350 | 12-DOF Newton-Raphson constraint solver |
-| `vahan/kinematics.py` | ~150 | Metric computation from solved state |
-| `vahan/analysis.py` | ~80 | High-level sweep interface |
-| `vahan/metrics_catalog.py` | ~260 | 30+ metric definitions |
-| `vahan/optimizer.py` | ~850 | IK solver, orthogonal groups, collision detection |
-| `gui/main_window.py` | ~1700 | Main window, steering model, all wiring |
-| `gui/panels.py` | ~1150 | 11 sidebar panels |
-| `gui/view3d.py` | ~500 | VisPy 3D rendering + NavCube |
-| `app.py` | ~10 | Entry point |
+### 9.1 Linear Tire with Load Sensitivity
+
+`vahan/tire_model.py` provides `LinearTireModel` — a tire with degressive load sensitivity:
+
+```
+C_alpha(Fz) = C_alpha_ref * (Fz / Fz_ref) ^ n
+```
+
+Where:
+- `C_alpha_ref` = reference cornering stiffness (N/deg, default 200)
+- `Fz_ref` = reference vertical load (N, default 700)
+- `n` = load sensitivity exponent (default 0.8)
+
+**Why n < 1 matters:** With n = 1 (linear), the slip angle ratio between front and rear is always 1.0, giving zero understeer gradient regardless of load transfer. Degressive tires (n < 1) produce higher slip angles on heavily loaded tires, creating understeer when the front is more loaded.
+
+### 9.2 Key Methods
+
+- `cornering_stiffness(Fz, camber)` — Returns C_alpha at given Fz
+- `slip_angle_for_Fy(Fy, Fz, camber)` — Back-calculates slip angle from lateral force
+- `peak_mu(Fz, camber)` — Returns peak friction coefficient
 
 ---
 
-## 10. What's Next: Dynamics
+## 10. Steady-State Dynamics Solver
 
-The kinematics engine computes how the suspension geometry changes with travel. The next phase adds **forces and accelerations** — how the car responds to road inputs, cornering loads, and driver inputs over time.
+### 10.1 Overview
 
-This requires coupling the kinematic model with:
-- Spring/damper force models (force as a function of displacement and velocity)
-- Tire force models (vertical load, lateral force, slip angle)
-- Rigid body dynamics (sprung mass pitch/roll/heave equations of motion)
-- Road surface inputs (bump profiles, random roughness)
+`vahan/dynamics.py` provides `SteadyStateSolver` — computes the vehicle's steady-state response to lateral and longitudinal acceleration.
 
-The kinematic solver becomes the "geometry engine" inside a larger time-stepping simulation loop.
+### 10.2 Solve Flow
+
+```
+Given: lateral_g, longitudinal_g
+  1. Static weight on each corner from CG position
+  2. Iterate until roll converges:
+     a. Wheel travel from roll angle × track geometry
+     b. Solve kinematics at each corner → RC height, camber
+     c. Load transfer (elastic + geometric + unsprung)
+     d. Per-corner Fz from static + load transfer
+     e. Update roll angle from moment balance
+  3. Per-corner Fy from cornering stiffness at dynamic Fz
+  4. Per-corner Fx from brake bias (braking) or drivetrain (accel)
+  5. Tire utilization = combined(Fy, Fx) / (mu × Fz)
+  6. Understeer gradient from front/rear avg slip angle difference
+  7. Brake torque per corner = |Fx| × tire_radius
+```
+
+### 10.3 Load Transfer Breakdown
+
+Total lateral load transfer per axle = elastic + geometric + unsprung:
+
+- **Elastic** — Through springs/ARBs, distributed by roll stiffness ratio (LLTD)
+- **Geometric** — Through roll centre, proportional to RC height
+- **Unsprung** — Direct, proportional to unsprung CG height
+
+### 10.4 SteadyStateResult
+
+Key outputs stored per corner:
+- `Fz` — Vertical load (N)
+- `Fy` — Lateral force (N)
+- `Fx` — Longitudinal force (N)
+- `brake_torque` — At wheel (Nm)
+- `travel` — Wheel travel (mm)
+- `camber` — Dynamic camber (deg)
+- `utilization` — Friction circle usage (0-1+)
+
+Scalars: `roll_angle_deg`, `pitch_angle_deg`, `understeer_gradient_deg`, `lltd_pct`
+
+### 10.5 Sensitivity Analysis
+
+`DynamicsSensitivity` uses central finite differences:
+
+```
+∂output/∂param ≈ (solve(param+δ) - solve(param-δ)) / (2δ)
+```
+
+Each parameter has a practical step size (e.g., 1 N/mm for spring rate, 1% for brake bias) representing a realistic shop adjustment.
+
+---
+
+## 11. Component Loads
+
+### 11.1 Overview
+
+`vahan/loads.py` computes forces in every suspension member at a given operating condition (lateral g, longitudinal g).
+
+### 11.2 Member Force Solver (6x6 Equilibrium)
+
+The upright is a free body connected to 6 two-force members:
+
+| Member | From | To |
+|--------|------|-----|
+| UCA front arm | `uca_front` (chassis) | `uca_outer` (BJ) |
+| UCA rear arm | `uca_rear` (chassis) | `uca_outer` (BJ) |
+| LCA front arm | `lca_front` (chassis) | `lca_outer` (BJ) |
+| LCA rear arm | `lca_rear` (chassis) | `lca_outer` (BJ) |
+| Tie rod | `tr_inner` (rack) | `tr_outer` (steer arm) |
+| Pushrod | `pushrod_inner` (rocker) | `pushrod_outer` (arm/upright) |
+
+Each member carries only axial force (tension or compression). This gives:
+- 3 force equilibrium equations (ΣFx=0, ΣFy=0, ΣFz=0)
+- 3 moment equations about LCA outer ball joint
+
+6 equations, 6 unknowns → exact solution via `np.linalg.solve`.
+
+Applied loads: contact patch forces (Fz, Fy, Fx) + brake torque about the spin axis.
+
+### 11.3 Ball Joint Reactions (V/H Decomposition)
+
+After solving the 6x6 system, the resultant force at each ball joint is computed:
+
+```
+F_UCA_bj = F_uca_front × u_front + F_uca_rear × u_rear  (vector sum)
+UCA_bj_V = F_UCA_bj[Z]   (vertical, up+)
+UCA_bj_H = F_UCA_bj[Y]   (longitudinal, fwd+)
+```
+
+This is the force the upright sees at the UCA ball joint — needed for BJ sizing and upright design.
+
+### 11.4 Bearing Loads
+
+Two bearings on the spindle (inner = vehicle side, outer = wheel side) spaced by `l1`. Contact patch forces act at lateral offset `d` from inner bearing. Brake pad friction on the disc adds additional load.
+
+**Moment equilibrium about inner bearing:**
+```
+total_V = Fz + F_friction × sin(θ)
+total_H = Fx - F_friction × cos(θ)
+
+bearing_outer_V = total_V × d / l1
+bearing_inner_V = total_V × (l1 - d) / l1
+bearing_outer_H = total_H × d / l1
+bearing_inner_H = total_H × (l1 - d) / l1
+```
+
+Where `F_friction = brake_torque / pad_radius` and `θ` = caliper angular position from top of disc.
+
+### 11.5 Caliper Mounting Bolt Forces
+
+Two bolts (upper/lower) react the brake friction force on the caliper:
+
+1. **Direct shear** — Friction force V/H components shared equally between bolts
+2. **Torque couple** — Brake torque reacted as a horizontal force pair: `H_couple = T / bolt_spacing`
+
+```
+upper_bolt_H = F_cal_H/2 + T/bolt_spacing   (shear + couple)
+lower_bolt_H = F_cal_H/2 - T/bolt_spacing   (shear - couple)
+upper_bolt_V = lower_bolt_V = F_cal_V/2      (equal vertical shear)
+```
+
+Friction direction on caliper (Newton's 3rd law, reaction to friction on disc):
+```
+F_cal_H = F_friction × cos(θ)
+F_cal_V = -F_friction × sin(θ)
+```
+
+### 11.6 Brake System
+
+From known brake torque at the wheel:
+```
+caliper_clamp = brake_torque / (pad_mu × pad_radius × 2)
+line_pressure = caliper_clamp / piston_area   (MPa = N/mm²)
+```
+
+### 11.7 Inputs
+
+**BrakeParams** (separate front/rear):
+| Parameter | Default | Unit |
+|-----------|---------|------|
+| `pad_mu` | 0.45 | — |
+| `piston_area_mm2` | 793.5 | mm² |
+| `pad_radius_mm` | 94.4 | mm |
+| `num_pistons` | 1 | — |
+| `caliper_bolt_spacing_mm` | 60 | mm |
+
+**UprightParams:**
+| Parameter | Default | Unit | Description |
+|-----------|---------|------|-------------|
+| `bearing_spacing_mm` | 50 | mm | Inner-to-outer bearing distance along spindle |
+| `cp_offset_mm` | 30 | mm | Contact patch plane offset from inner bearing |
+| `caliper_angle_deg` | 45 | deg | Caliper position from top of disc, CW from outboard |
+
+---
+
+## 12. File Reference
+
+| File | Purpose |
+|------|---------|
+| `vahan/hardpoints.py` | Hardpoint dataclass + mirror ops |
+| `vahan/solver.py` | 12-DOF Newton-Raphson constraint solver |
+| `vahan/kinematics.py` | Metric computation from solved state |
+| `vahan/analysis.py` | High-level sweep interface |
+| `vahan/metrics_catalog.py` | 30+ metric definitions + dynamics sensitivities |
+| `vahan/optimizer.py` | IK solver, orthogonal groups, collision detection |
+| `vahan/tire_model.py` | Linear tire model with load sensitivity |
+| `vahan/dynamics.py` | Steady-state dynamics solver + sensitivity analysis |
+| `vahan/loads.py` | Component force calculator (members, bearings, brakes) |
+| `gui/main_window.py` | Main window, steering model, dynamics/loads wiring |
+| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, loads, optimizer) |
+| `gui/view3d.py` | VisPy 3D rendering + NavCube |
+| `app.py` | Entry point |

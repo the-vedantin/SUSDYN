@@ -8,3 +8,10 @@ build/
 *.log
 .vscode/
 .idea/
+.claude/
+
+# Tire test data (TTC consortium — cannot redistribute)
+tire_data/
+
+# Reference spreadsheets (local only)
+sus_calc_ref/

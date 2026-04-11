@@ -17,7 +17,7 @@ from scipy.optimize import least_squares, differential_evolution
 from vahan import DoubleWishboneHardpoints
 from vahan.solver import SuspensionConstraints, SolvedState
 from vahan.kinematics import KinematicMetrics
-from vahan.metrics_catalog import CATALOG_MAP
+from vahan.metrics_catalog import CATALOG_MAP, compute_ackermann_post
 
 
 # ─── Design variable specification ───────────────────────────────────────────
@@ -58,6 +58,17 @@ ORTHO_GROUPS: dict[str, list[dict]] = {
         dict(point='tie_rod_inner', coord=2),
         dict(point='tie_rod_inner', coord=1),
         dict(point='tie_rod_outer', coord=1),
+    ],
+    # Group 2b — Ackermann %: tie rod geometry (controls inner/outer steer split).
+    # Same variables as toe — Ackermann is entirely determined by the steering
+    # linkage geometry (tie rod length, height, and fore-aft position).
+    'ackermann': [
+        dict(point='tie_rod_outer', coord=2),   # dominant: height rel to LCA arc
+        dict(point='tie_rod_inner', coord=2),
+        dict(point='tie_rod_inner', coord=1),
+        dict(point='tie_rod_outer', coord=1),
+        dict(point='tie_rod_inner', coord=0),   # lateral position also affects Ackermann
+        dict(point='tie_rod_outer', coord=0),
     ],
     # Group 3 — Anti-dive/squat/lift: side-view pivot axis TILT.
     # Only change the Z-difference between front & rear inboard mounts,
@@ -112,6 +123,7 @@ PRESETS = ORTHO_GROUPS
 SOLVE_ORDER = [
     'motion_ratio',   # completely independent
     'toe',            # near-zero cross-contamination
+    'ackermann',      # same variable group as toe (steer mode only)
     'anti_dive',      # side-view, minimal front-view effect
     'anti_squat',
     'anti_lift',
@@ -329,7 +341,11 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
     tierod_len_sq = float(d @ d)
 
     keys = metric_keys or list(CATALOG_MAP.keys())
-    out = {k: np.full(len(travel_arr), np.nan) for k in keys}
+    # Ackermann post-processing needs the toe curve — ensure it's computed
+    _need_toe_for_ackermann = ('ackermann' in keys and 'toe' not in keys
+                               and motion == 'steer')
+    compute_keys = list(keys) + (['toe'] if _need_toe_for_ackermann else [])
+    out = {k: np.full(len(travel_arr), np.nan) for k in compute_keys}
     extra = anti_kwargs or {}
 
     # For non-steer modes, build solver once (much faster)
@@ -370,7 +386,7 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
 
             st = solver.solve(t_solve)
             m = KinematicMetrics(st, side)
-            for k in keys:
+            for k in compute_keys:
                 entry = CATALOG_MAP.get(k)
                 if entry is None:
                     continue
@@ -384,6 +400,26 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
         except Exception:
             spring_prev = None
             travel_prev = None
+
+    # ── Ackermann % post-processing (steer mode only) ────────────────────
+    # Requires the full toe curve + vehicle params, so it runs after the loop.
+    if 'ackermann' in keys and motion == 'steer':
+        toe_curve = out.get('toe')
+        if toe_curve is not None and not np.all(np.isnan(toe_curve)):
+            wb = extra.get('wheelbase_m', 1.530)
+            # Track width: prefer explicit param; fall back to 2 * |wc_x|
+            ft = extra.get('front_track_m')
+            if ft is None:
+                wc_x = abs(float(hp_work.get('wheel_center',
+                                              np.array([0.6, 0, 0]))[0]))
+                ft = 2.0 * wc_x if wc_x > 0.1 else 1.222
+            out['ackermann'] = compute_ackermann_post(
+                toe_curve, travel_arr,
+                wheelbase_m=wb, front_track_m=ft)
+
+    # Remove auxiliary toe if it was only computed for ackermann
+    if _need_toe_for_ackermann:
+        out.pop('toe', None)
 
     return out
 
