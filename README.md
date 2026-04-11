@@ -786,6 +786,6 @@ The GUI opens with default FSAE hardpoints loaded.
 
 Personal project by [@the-vedantin](https://github.com/the-vedantin).
 
-## Disclaimer
 
-Vahan is provided "as is" without warranty. The user assumes all risk for component failures, incorrect calculations, or faulty data.
+
+Disclaimer : Vahan is provided "as is" without warranty. The user assumes all risk for component failures, incorrect calculations, or faulty data.
