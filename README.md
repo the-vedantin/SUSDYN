@@ -100,16 +100,6 @@ All directional force outputs use V/H:
 
 Member axial forces: positive = tension (pulled apart), negative = compression (pushed together).
 
-### Mapping from OptimumK Export
-
-The team's OptimumK export uses inches with X=longitudinal, Y=lateral, Z=vertical. Vahan swaps X/Y and converts to metres:
-
-| OptimumK (in) | Vahan (m) | Example |
-|---------------|-----------|---------|
-| X = 4.625 | Y = 4.625 * 0.0254 = 0.11748 m | lca_front Y |
-| Y = 8.5 | X = 8.5 * 0.0254 = 0.21590 m | lca_front X |
-| Z = 4.75 | Z = 4.75 * 0.0254 = 0.12065 m | lca_front Z |
-
 ---
 
 ## Hardpoint Geometry
