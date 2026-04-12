@@ -1051,6 +1051,7 @@ class DynamicsSensitivity:
             'baseline': baseline,
             'baseline_result': base_result,
             'sensitivities': sensitivities,
+            'vehicle_params': self._base_veh,
         }
 
     def recommend(self, analysis: dict, target_metric: str,
@@ -1062,6 +1063,10 @@ class DynamicsSensitivity:
         Each entry: {knob, unit, category, change_needed, current, new_value,
                      side_effects: {other_metric: delta}, implementations}
         """
+        # Ensure _base_veh is set (may be called via __new__ without __init__)
+        if not hasattr(self, '_base_veh') or self._base_veh is None:
+            self._base_veh = analysis.get('vehicle_params')
+
         recommendations = []
         for s in analysis['sensitivities']:
             effect = s['effects'].get(target_metric, 0)
@@ -1080,6 +1085,13 @@ class DynamicsSensitivity:
 
             new_val = s['current_value'] + change_needed
 
+            # Regenerate hints with actual change_needed for roll stiffness info
+            impls = self._implementation_hints(
+                s['key'], s['knob'], s['unit'], s['current_value'],
+                change_needed=change_needed)
+            if not impls:
+                impls = s.get('implementations', [])
+
             recommendations.append({
                 'knob': s['knob'],
                 'key': s['key'],
@@ -1089,7 +1101,7 @@ class DynamicsSensitivity:
                 'change_needed': change_needed,
                 'new_value': new_val,
                 'side_effects': side_effects,
-                'implementations': s['implementations'],
+                'implementations': impls,
                 'effectiveness': abs(effect),  # for sorting
             })
 
@@ -1169,18 +1181,46 @@ class DynamicsSensitivity:
 
         return effects
 
-    @staticmethod
-    def _implementation_hints(key, name, unit, current_val) -> list:
+    def _implementation_hints(self, key, name, unit, current_val,
+                              change_needed=0.0) -> list:
         """Return human-readable implementation suggestions for a knob."""
         hints = []
+        v = self._base_veh
         if 'spring_rate' in key:
             axle = 'front' if 'front' in key else 'rear'
-            hints.append(f'Swap {axle} spring (currently {current_val:.0f} {unit})')
+            t = v.front_track_m if 'front' in key else v.rear_track_m
+            mr = v.motion_ratio_front if 'front' in key else v.motion_ratio_rear
+            arb = v.arb_rate_front_Npm if 'front' in key else v.arb_rate_rear_Npm
+            # Current and new roll stiffness contribution from this spring
+            new_rate_lbf = current_val + change_needed
+            new_rate_Npm = new_rate_lbf * 175.127
+            old_wheel = current_val * 175.127 * mr ** 2
+            new_wheel = new_rate_Npm * mr ** 2
+            old_roll = (old_wheel + arb) * t ** 2 / 2
+            new_roll = (new_wheel + arb) * t ** 2 / 2
+            delta_roll = new_roll - old_roll
+            hints.append(f'Swap {axle} spring: {current_val:.0f} -> {new_rate_lbf:.0f} {unit}')
+            hints.append(f'Roll stiffness {axle}: {old_roll:.0f} -> {new_roll:.0f} N\u00b7m/rad '
+                         f'(\u0394{delta_roll:+.0f})')
         elif 'arb_rate' in key:
             axle = 'front' if 'front' in key else 'rear'
-            hints.append(f'Change {axle} ARB blade length')
-            hints.append(f'Adjust {axle} bellcrank/rocker geometry (changes ARB MR)')
-            hints.append(f'Currently {current_val:.0f} {unit}')
+            t = v.front_track_m if 'front' in key else v.rear_track_m
+            wheel_rate = v.wheel_rate_front_Npm if 'front' in key else v.wheel_rate_rear_Npm
+            # Current and new roll stiffness
+            new_rate_lbf = current_val + change_needed
+            new_rate_Npm = new_rate_lbf * 175.127
+            old_Npm = current_val * 175.127
+            old_roll = (wheel_rate + old_Npm) * t ** 2 / 2
+            new_roll = (wheel_rate + new_rate_Npm) * t ** 2 / 2
+            delta_roll = new_roll - old_roll
+            hints.append(f'{axle.title()} ARB rate: {current_val:.0f} -> {new_rate_lbf:.0f} {unit}')
+            hints.append(f'Roll stiffness {axle}: {old_roll:.0f} -> {new_roll:.0f} N\u00b7m/rad '
+                         f'(\u0394{delta_roll:+.0f})')
+            # Blade length guidance: ARB stiffness ~ 1/L^3
+            if old_Npm > 1 and new_rate_Npm > 1:
+                ratio = (old_Npm / new_rate_Npm) ** (1.0 / 3.0)
+                hints.append(f'Blade length ratio: \u00d7{ratio:.3f} '
+                             f'(stiffer = shorter blade)')
         elif 'motion_ratio' in key:
             axle = 'front' if 'front' in key else 'rear'
             hints.append(f'Adjust {axle} rocker geometry (pushrod/rocker points)')

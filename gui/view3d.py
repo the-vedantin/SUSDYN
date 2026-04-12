@@ -17,39 +17,39 @@ vispy_app.use_app('pyqt6')
 
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF
 from PyQt6.QtWidgets import QWidget
-from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF
+from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF, QTransform
 
 
 # ── NavCube widget ────────────────────────────────────────────────────────────
 
 class NavCube(QWidget):
-    """Orientation cube overlay — click faces/edges to snap the camera."""
-    view_requested = pyqtSignal(float, float)  # azimuth, elevation
+    """
+    Onshape-style solid orientation cube with perspective-warped face labels.
+
+    Convention: X = lateral / width, Y = longitudinal / length, Z = up.
+    VisPy TurntableCamera: az=0 → camera at -Y looking at +Y (front of car).
+    """
+    view_requested = pyqtSignal(float, float)
 
     _VERTS = np.array([
         [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],   # 0-3 bottom
         [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],   # 4-7 top
     ], dtype=float)
 
-    # (vertex_indices, outward_normal, label, snap_azimuth, snap_elevation)
-    # snap_az = None means keep current azimuth (for top/bottom)
+    # (fill_vi, outward_normal, label, snap_az, snap_el,
+    #  text_vi = [TL, TR, BR, BL] when viewed head-on)
     _FACES = [
-        ([0, 1, 2, 3], [0, 0, -1], 'BTM',   None,  -90),
-        ([4, 5, 6, 7], [0, 0,  1], 'TOP',   None,   90),
-        ([0, 1, 5, 4], [0, -1, 0], 'FRONT', 180,     0),
-        ([2, 3, 7, 6], [0,  1, 0], 'REAR',    0,     0),
-        ([0, 3, 7, 4], [-1, 0, 0], 'LEFT',  270,     0),
-        ([1, 2, 6, 5], [1,  0, 0], 'RIGHT',  90,     0),
+        ([0,1,2,3], [ 0, 0,-1], 'Bottom', None, -90, [0,1,2,3]),
+        ([4,5,6,7], [ 0, 0, 1], 'Top',    None,  90, [7,6,5,4]),
+        ([0,1,5,4], [ 0,-1, 0], 'Front',    0,   0,  [4,5,1,0]),
+        ([2,3,7,6], [ 0, 1, 0], 'Back',   180,   0,  [6,7,3,2]),
+        ([0,3,7,4], [-1, 0, 0], 'Left',   270,   0,  [7,4,0,3]),
+        ([1,2,6,5], [ 1, 0, 0], 'Right',   90,   0,  [5,6,2,1]),
     ]
 
-    _COLORS = {
-        'FRONT': QColor(224, 123, 48, 200),
-        'REAR':  QColor(224, 123, 48, 140),
-        'LEFT':  QColor(80, 130, 200, 180),
-        'RIGHT': QColor(80, 130, 200, 120),
-        'TOP':   QColor(100, 180, 100, 180),
-        'BTM':   QColor(100, 180, 100, 120),
-    }
+    # Fixed directional light for consistent face shading
+    _LIGHT = np.array([0.35, -0.25, 0.85])
+    _LIGHT = _LIGHT / np.linalg.norm(_LIGHT)
 
     def __init__(self, parent=None, size=110):
         super().__init__(parent)
@@ -65,72 +65,127 @@ class NavCube(QWidget):
             self._az, self._el = az, el
             self.update()
 
-    # ── projection helpers ────────────────────────────────────────────────
-
     def _cam_dir(self):
+        """Camera position direction — matches VisPy TurntableCamera."""
         az, el = np.radians(self._az), np.radians(self._el)
-        return np.array([np.sin(az)*np.cos(el), np.cos(az)*np.cos(el), np.sin(el)])
+        return np.array([np.sin(az)*np.cos(el),
+                         -np.cos(az)*np.cos(el),
+                         np.sin(el)])
 
-    def _project(self, verts=None):
-        """Orthographic project world 3D → widget 2D. Returns (N,2) in widget coords."""
-        if verts is None:
-            verts = self._VERTS
+    def _project(self, verts):
+        """Orthographic projection matching VisPy TurntableCamera."""
         az, el = np.radians(self._az), np.radians(self._el)
         ca, sa = np.cos(az), np.sin(az)
         ce, se = np.cos(el), np.sin(el)
-        R = np.array([[ca, -sa, 0], [sa * se, ca * se, ce]])
-        pts = (R @ verts.T).T          # (N, 2) in projection space
+        # Camera right = (ca, sa, 0), camera up = (-sa*se, ca*se, ce)
+        R = np.array([[ca, sa, 0],
+                      [-sa * se, ca * se, ce]])
+        pts = (R @ np.asarray(verts).T).T
         s = self._sz * 0.30
         c = self._sz / 2
         pts = pts * s + c
-        pts[:, 1] = self._sz - pts[:, 1]  # flip Y for widget coords
+        pts[:, 1] = self._sz - pts[:, 1]   # flip Y for screen coords
         return pts
 
-    # ── painting ──────────────────────────────────────────────────────────
-
     def paintEvent(self, _event):
-        pts = self._project()
+        pts = self._project(self._VERTS)
         cam = self._cam_dir()
 
-        # collect visible faces with depth
+        # Only front-facing faces (dot > 0), sorted back-to-front
         draws = []
-        for vi, nrm, label, *_ in self._FACES:
+        for vi, nrm, label, snap_az, snap_el, text_vi in self._FACES:
             n = np.asarray(nrm, float)
-            if np.dot(n, cam) <= 0.01:
+            dot = float(np.dot(n, cam))
+            if dot <= 0.0:
                 continue
             depth = float(np.mean(self._VERTS[vi] @ cam))
-            draws.append((depth, vi, label))
-        draws.sort(key=lambda x: x[0])  # painter's algorithm: back→front
+            shade = max(float(np.dot(n, self._LIGHT)), 0.08)
+            draws.append((depth, vi, label, dot, text_vi, shade))
+        draws.sort(key=lambda x: x[0])
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        font = QFont('Segoe UI', 9, QFont.Weight.Bold)
-        p.setFont(font)
 
-        for _, vi, label in draws:
-            poly = QPolygonF([QPointF(float(pts[i, 0]), float(pts[i, 1])) for i in vi])
-            p.setPen(QPen(QColor(180, 180, 180, 80), 1.0))
-            p.setBrush(self._COLORS[label])
+        edge_pen = QPen(QColor(25, 28, 38), 2.0)
+
+        # ── 1. Solid opaque faces ───────────────────────────────────────
+        for _, vi, label, dot, text_vi, shade in draws:
+            poly = QPolygonF([QPointF(float(pts[i, 0]), float(pts[i, 1]))
+                              for i in vi])
+            g = int(52 + 68 * shade)
+            col = QColor(g - 2, g, g + 6)
+            p.setPen(edge_pen)
+            p.setBrush(col)
             p.drawPolygon(poly)
-            cx = float(np.mean([pts[i, 0] for i in vi]))
-            cy = float(np.mean([pts[i, 1] for i in vi]))
-            p.setPen(QColor(255, 255, 255, 230))
-            p.drawText(int(cx) - 22, int(cy) - 7, 44, 14,
-                       int(Qt.AlignmentFlag.AlignCenter), label)
+
+        # ── 2. Perspective-warped text on each visible face ─────────────
+        for _, vi, label, dot, text_vi, shade in draws:
+            if dot < 0.15:
+                continue
+            tw, th = 100., 44.
+            src = QPolygonF([QPointF(0, 0), QPointF(tw, 0),
+                             QPointF(tw, th), QPointF(0, th)])
+            dst = QPolygonF([QPointF(float(pts[i, 0]), float(pts[i, 1]))
+                             for i in text_vi])
+            xform = QTransform()
+            ok = QTransform.quadToQuad(src, dst, xform)
+            if ok:
+                p.save()
+                p.setTransform(xform, True)
+                alpha = int(min(255, 120 + 135 * dot))
+                p.setFont(QFont('Segoe UI', 14, QFont.Weight.Bold))
+                p.setPen(QColor(195, 200, 212, alpha))
+                p.drawText(0, 0, int(tw), int(th),
+                           int(Qt.AlignmentFlag.AlignCenter), label)
+                p.restore()
+
+        # ── 3. XYZ axes from front-left-bottom corner (vertex 0) ───────
+        ax_pts_3d = np.array([
+            [-1, -1, -1],      # origin (vertex 0)
+            [ 1.25, -1, -1],   # X tip
+            [-1, 1.25, -1],    # Y tip
+            [-1, -1, 1.25],    # Z tip
+            [ 1.5, -1, -1],    # X label
+            [-1, 1.5, -1],     # Y label
+            [-1, -1, 1.5],     # Z label
+        ])
+        ap = self._project(ax_pts_3d)
+        axes = [('X', QColor(220, 75, 75), 1),
+                ('Y', QColor(75, 190, 75), 2),
+                ('Z', QColor(75, 140, 230), 3)]
+        for lbl, col, ti in axes:
+            ox, oy = float(ap[0, 0]), float(ap[0, 1])
+            ex, ey = float(ap[ti, 0]), float(ap[ti, 1])
+            p.setPen(QPen(col, 2.0))
+            p.drawLine(QPointF(ox, oy), QPointF(ex, ey))
+            # arrowhead
+            dx, dy = ex - ox, ey - oy
+            ln = max((dx * dx + dy * dy) ** 0.5, 1e-6)
+            ux, uy = dx / ln, dy / ln
+            p.drawLine(QPointF(ex, ey),
+                       QPointF(ex - ux * 5 + uy * 3, ey - uy * 5 - ux * 3))
+            p.drawLine(QPointF(ex, ey),
+                       QPointF(ex - ux * 5 - uy * 3, ey - uy * 5 + ux * 3))
+        # axis labels
+        p.setFont(QFont('Segoe UI', 8, QFont.Weight.Bold))
+        for lbl, col, ti in axes:
+            li = ti + 3   # label point index (4, 5, 6)
+            p.setPen(col)
+            p.drawText(int(ap[li, 0]) - 6, int(ap[li, 1]) - 6, 12, 12,
+                       int(Qt.AlignmentFlag.AlignCenter), lbl)
         p.end()
 
-    # ── click → snap ──────────────────────────────────────────────────────
-
     def mousePressEvent(self, event):
-        pts = self._project()
+        pts = self._project(self._VERTS)
         mx, my = event.position().x(), event.position().y()
         cam = self._cam_dir()
 
         best, best_d = None, -1e9
-        for vi, nrm, label, snap_az, snap_el in self._FACES:
-            if np.dot(np.asarray(nrm, float), cam) <= 0.01:
+        for vi, nrm, label, snap_az, snap_el, _tv in self._FACES:
+            if np.dot(np.asarray(nrm, float), cam) <= 0.0:
                 continue
-            if self._pt_in_poly(mx, my, [(float(pts[i, 0]), float(pts[i, 1])) for i in vi]):
+            if self._pt_in_poly(mx, my,
+                    [(float(pts[i, 0]), float(pts[i, 1])) for i in vi]):
                 d = float(np.mean(self._VERTS[vi] @ cam))
                 if d > best_d:
                     best_d = d
@@ -149,7 +204,8 @@ class NavCube(QWidget):
         for i in range(n):
             xi, yi = poly[i]
             xj, yj = poly[j]
-            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            if ((yi > py) != (yj > py)) and \
+               (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
                 inside = not inside
             j = i
         return inside
@@ -342,6 +398,15 @@ class View3D:
         )
         self._roll_axis_vis.visible = True
 
+        # ── CG sphere (translucent white) ────────────────────────────────
+        self._cg_marker = scene.Markers(parent=self._view.scene)
+        self._cg_marker.set_data(
+            pos=np.zeros((1, 3), np.float32),
+            face_color=(1.0, 1.0, 1.0, 0.35),
+            size=22, edge_width=0,
+        )
+        self._cg_marker.visible = False
+
         # ── camera state ──────────────────────────────────────────────────
         self._mouse_last = None
         self._mouse_btn  = None
@@ -414,6 +479,23 @@ class View3D:
                 pos=np.array([front_xyz, rear_xyz], np.float32),
                 color=(1.0, 1.0, 1.0, 0.25),
             )
+        self._canvas.update()
+
+    def update_cg(self, xyz):
+        """Update CG sphere position. xyz: (x, y, z) in metres."""
+        if xyz is not None:
+            self._cg_marker.set_data(
+                pos=np.array([xyz], np.float32),
+                face_color=(1.0, 1.0, 1.0, 0.35),
+                size=22, edge_width=0,
+            )
+            self._cg_marker.visible = True
+        else:
+            self._cg_marker.visible = False
+        self._canvas.update()
+
+    def set_cg_visible(self, visible: bool):
+        self._cg_marker.visible = visible
         self._canvas.update()
 
     def set_rc_visible(self, visible: bool):

@@ -351,7 +351,7 @@ CATALOG = [
     # ── ARB ───────────────────────────────────────────────────────────────────
     dict(key='arb_angle',       label='ARB Angle',                  unit='°',   category='ARB', fn=_arb_angle),
     dict(key='arb_drop_travel', label='ARB Drop Link Travel',       unit='mm',  category='ARB', fn=_arb_drop_travel),
-    dict(key='arb_mr',          label='ARB Motion Ratio',           unit='-',   category='ARB', fn=_arb_mr),
+    dict(key='arb_mr',          label='ARB Motion Ratio',           unit='\u00b0/mm', category='ARB', fn=_arb_mr),
 ]
 
 # Fast lookup by key

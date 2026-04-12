@@ -218,6 +218,12 @@ class TireModel:
             Number of initial warmup samples to discard (default 1500).
         """
         self.tire_id = ttc.tire_id
+        self.test_id = ttc.test_id
+
+        # Store pressure stats before filtering
+        p_raw = ttc.pressure_kPa
+        self.pressure_kPa_mean = float(np.median(p_raw[p_raw > 0])) if np.any(p_raw > 0) else 0.0
+        self.pressure_psi = self.pressure_kPa_mean * 0.145038
 
         # Discard warmup
         n = len(ttc.slip_angle_deg)

@@ -400,7 +400,9 @@ class CurvesCanvas(FigureCanvas):
                       corners: list | None = None,
                       turn_radius_m: float = 0.0,
                       wheelbase_m: float = 1.53,
-                      steer_ratio: float = 0.0):
+                      steer_ratio: float = 0.0,
+                      power_W: float = 0.0,
+                      mass_kg: float = 290.0):
         """Plot dynamics sweep results with selectable graphs and corners."""
         self._hover_ann = None
         self.fig.clf()
@@ -528,7 +530,7 @@ class CurvesCanvas(FigureCanvas):
         rows = (n + cols - 1) // cols
 
         # Extra top margin for speed axis
-        show_speed = (not is_longitudinal and turn_radius_m > 0)
+        show_speed = (not is_longitudinal and turn_radius_m > 0) or is_longitudinal
         top_margin = 0.86 if show_speed else 0.90
         self.fig.subplots_adjust(
             hspace=0.72, wspace=0.40,
@@ -563,20 +565,33 @@ class CurvesCanvas(FigureCanvas):
             ax.legend(fontsize=7, facecolor='#06060e', labelcolor='white',
                       framealpha=0.7, loc='best', handlelength=1.0, ncol=2)
 
-            # Speed secondary x-axis on top-row subplots only
-            if show_speed and idx < cols:
-                R = turn_radius_m
-                def _g_to_mph(g, R=R):
-                    return np.sqrt(np.maximum(g, 0) * 9.81 * R) * 2.23694
-                def _mph_to_g(mph, R=R):
-                    v = mph / 2.23694
-                    return v**2 / (9.81 * R) if R > 0 else 0.0
+            # Speed secondary x-axis on all subplots
+            if show_speed:
+                if not is_longitudinal and turn_radius_m > 0:
+                    R = turn_radius_m
+                    def _g_to_mph(g, R=R):
+                        return np.sqrt(np.maximum(g, 0) * 9.81 * R) * 2.23694
+                    def _mph_to_g(mph, R=R):
+                        v = mph / 2.23694
+                        return v**2 / (9.81 * R) if R > 0 else 0.0
+                elif is_longitudinal and power_W > 0 and mass_kg > 0:
+                    P, M = power_W, mass_kg
+                    def _g_to_mph(g, P=P, M=M):
+                        g = np.asarray(g, float)
+                        F = np.maximum(g, 0.01) * M * 9.81
+                        return np.where(F > 0, (P / F) * 2.23694, 0.0)
+                    def _mph_to_g(mph, P=P, M=M):
+                        v = max(mph / 2.23694, 0.01)
+                        return P / (M * 9.81 * v) if v > 0 else 0.0
+                else:
+                    _g_to_mph = _mph_to_g = None
                 try:
-                    secax = ax.secondary_xaxis('top',
-                                               functions=(_g_to_mph, _mph_to_g))
-                    secax.set_xlabel('Speed (mph)', color='#4FC3F7',
-                                    fontsize=7, labelpad=2)
-                    secax.tick_params(colors='#4FC3F7', labelsize=7)
+                    if _g_to_mph is not None:
+                        secax = ax.secondary_xaxis('top',
+                                                   functions=(_g_to_mph, _mph_to_g))
+                        secax.set_xlabel('Speed (mph)', color='#4FC3F7',
+                                        fontsize=7, labelpad=2)
+                        secax.tick_params(colors='#4FC3F7', labelsize=7)
                 except Exception:
                     pass  # older matplotlib may not support this
 
@@ -1152,6 +1167,7 @@ class MainWindow(QMainWindow):
             if abs(drdt) < 1e-14:
                 break
             theta -= res / drdt
+            theta = max(-np.pi / 2, min(np.pi / 2, theta))
 
         ae_world      = pv + _rodrigues(arm_vec, bc_axis, theta)
         drop_link_travel = float(np.linalg.norm(ae_world - arb_drop_top_world)
@@ -1164,8 +1180,12 @@ class MainWindow(QMainWindow):
         lo, hi = mp.min_val, mp.max_val
         n      = 81
         try:
+            _flip_x = np.array([-1., 1., 1.])
             def _arb(lbl):
-                return self._front_arb if lbl in ('FL', 'FR') else self._rear_arb
+                src = self._front_arb if lbl in ('FL', 'FR') else self._rear_arb
+                if lbl in ('FR', 'RR'):
+                    return {k: v * _flip_x for k, v in src.items()}
+                return src
 
             # Alignment offsets (applied post-solve as measurement shifts).
             a = self._alignment
@@ -1370,7 +1390,7 @@ class MainWindow(QMainWindow):
                         arb_kwargs = {
                             'arb_angle':       ang,
                             'arb_drop_travel': dl_t,
-                            'arb_mr': abs(dl_t / float(t)) if abs(float(t)) > 1e-6 else 0.,
+                            'arb_mr': min(abs(np.degrees(ang) / (float(t) * 1000)), 5.0) if abs(float(t)) > 1e-9 else float('nan'),
                         }
                     except Exception:
                         pass
@@ -1464,7 +1484,7 @@ class MainWindow(QMainWindow):
                            'RL': -pos/1000, 'RR': -pos/1000}
 
             corners_draw = []
-            values_fl    = {}
+            all_corner_values = {}
             hp_dicts     = self._all_corner_hp()
             flip_x       = np.array([-1., 1., 1.])
 
@@ -1546,18 +1566,57 @@ class MainWindow(QMainWindow):
 
                 corners_draw.append({
                     'pts': pts, 'spin_axis': spin_vis, 'label': label})
-                if label == 'FL':
-                    values_fl = _all_metrics(st, 'left',
-                        cg_height_m=self._car.get('cg_z_mm', 280.) / 1000.,
-                        wheelbase_m=self._car.get('wheelbase_mm', 1537.) / 1000.,
-                        front_brake_bias=self._car.get('front_brake_bias_pct', 65.) / 100.,
-                        rear_drive_bias=1.0, front_drive_bias=0.0,
-                    )
-                    # Add alignment offsets to displayed values
-                    values_fl['camber'] = (values_fl.get('camber', 0.)
-                                           + self._alignment.get('front_camber_deg', 0.))
-                    values_fl['toe']    = (values_fl.get('toe',    0.)
-                                           + self._alignment.get('front_toe_deg',    0.))
+
+                # Compute metrics for this corner
+                # Two-point solve for MR: solve at t - epsilon first
+                side = 'left' if label in ('FL', 'RL') else 'right'
+                _dt = 0.001  # 1mm perturbation
+                t_prev = float(t) - _dt
+                spring_prev = travel_prev = None
+                try:
+                    st_prev = solver.solve(t_prev)
+                    spring_prev = float(np.sqrt(
+                        (st_prev.rocker_spring_pt[0] - st_prev.spring_chassis_pt[0])**2 +
+                        (st_prev.rocker_spring_pt[1] - st_prev.spring_chassis_pt[1])**2 +
+                        (st_prev.rocker_spring_pt[2] - st_prev.spring_chassis_pt[2])**2))
+                    travel_prev = t_prev
+                except Exception:
+                    pass
+                corner_vals = _all_metrics(st, side,
+                    spring_prev=spring_prev, travel_prev=travel_prev,
+                    cg_height_m=self._car.get('cg_z_mm', 280.) / 1000.,
+                    wheelbase_m=self._car.get('wheelbase_mm', 1537.) / 1000.,
+                    front_brake_bias=self._car.get('front_brake_bias_pct', 65.) / 100.,
+                    rear_drive_bias=1.0, front_drive_bias=0.0,
+                )
+                # Add alignment offsets
+                cam_key = 'front_camber_deg' if is_front else 'rear_camber_deg'
+                toe_key = 'front_toe_deg' if is_front else 'rear_toe_deg'
+                corner_vals['camber'] = (corner_vals.get('camber', 0.)
+                                         + self._alignment.get(cam_key, 0.))
+                corner_vals['toe']    = (corner_vals.get('toe', 0.)
+                                         + self._alignment.get(toe_key, 0.))
+
+                # ARB metrics for this corner
+                try:
+                    pivot  = st.rocker_pivot
+                    ax_pt  = pivot + np.array([0., 0.0254, 0.])
+                    r_axis = _norm(ax_pt - pivot)
+                    arb_d  = arb_hp['arb_drop_top'].copy()
+                    if label in ('FR', 'RR'):
+                        arb_d = arb_d * flip_x
+                    arm_dt = arb_d - pivot
+                    dt_w   = pivot + _rodrigues(arm_dt, r_axis, st.rocker_angle)
+                    arb_vis = (arb_hp if label not in ('FR', 'RR')
+                               else {k: v * flip_x for k, v in arb_hp.items()})
+                    ang, _, dl_t = self._solve_arb_bellcrank(dt_w, arb_vis)
+                    corner_vals['arb_angle'] = float(np.degrees(ang))
+                    corner_vals['arb_drop_travel'] = float(dl_t * 1000)
+                    corner_vals['arb_mr'] = min(abs(np.degrees(ang) / (float(t) * 1000)), 5.0) if abs(float(t)) > 1e-9 else float('nan')
+                except Exception:
+                    pass
+
+                all_corner_values[label] = corner_vals
 
             # ── ARB visual ────────────────────────────────────────────────────
             # Topology: arb_drop_top (on rocker, moving)
@@ -1636,7 +1695,13 @@ class MainWindow(QMainWindow):
             self.view3d.set_rc_visible(self._show_rc)
             self.view3d.set_roll_axis_visible(self._show_roll_axis)
 
-            self._values_panel.update_values(values_fl)
+            # ── CG sphere ────────────────────────────────────────────────
+            cg_x = self._car.get('cg_x_mm', 0.) / 1000.
+            cg_y = self._car.get('cg_y_mm', 1100.) / 1000.
+            cg_z = self._car.get('cg_z_mm', 280.) / 1000.
+            self.view3d.update_cg((cg_x, cg_y, cg_z))
+
+            self._values_panel.update_values(all_corner_values)
 
             unit = 'deg' if motion in ('roll', 'steer') else ' mm'
             self.statusBar().showMessage(
@@ -1834,9 +1899,14 @@ class MainWindow(QMainWindow):
         from vahan.optimizer import _evaluate_sweep
 
         axle = spec['axle']
-        hp = self._front_hp if axle == 'front' else self._rear_hp
+        hp = dict(self._front_hp if axle == 'front' else self._rear_hp)
         side = 'left'
         pushrod_body = 'uca' if axle == 'front' else 'lca'
+
+        # Merge ARB points into hp dict so optimizer can adjust them
+        arb = self._front_arb if axle == 'front' else self._rear_arb
+        for k, v in arb.items():
+            hp[k] = v.copy()
 
         variables = []
         for hp_name in spec['hp_names']:
@@ -1918,7 +1988,10 @@ class MainWindow(QMainWindow):
 
                 warm_x_raw = np.array(last['x'])
                 axle = spec['axle']
-                hp = self._front_hp if axle == 'front' else self._rear_hp
+                hp = dict(self._front_hp if axle == 'front' else self._rear_hp)
+                arb = self._front_arb if axle == 'front' else self._rear_arb
+                for k, v in arb.items():
+                    hp[k] = v.copy()
                 side = 'left'
                 pushrod_body = 'uca' if axle == 'front' else 'lca'
                 lo_mm = spec.get('range_lo', -30)
@@ -2011,7 +2084,9 @@ class MainWindow(QMainWindow):
                 return
 
             # ── Normal single solve ──────────────────────────────────────
-            hp_check = self._front_hp if spec['axle'] == 'front' else self._rear_hp
+            hp_check = dict(self._front_hp if spec['axle'] == 'front' else self._rear_hp)
+            arb_check = self._front_arb if spec['axle'] == 'front' else self._rear_arb
+            hp_check.update(arb_check)
             has_vars = any(hp_name in hp_check
                           for hp_name in spec['hp_names']
                           for _ in spec['coords'])
@@ -2034,11 +2109,11 @@ class MainWindow(QMainWindow):
             import traceback; traceback.print_exc()
 
     def _on_damper_limits(self, params: dict):
-        """Forward damper stroke/sag to IK panel so sweep range is clamped."""
-        self._ik_panel.set_damper_limits(
-            params.get('stroke_mm', 60.0),
-            params.get('sag_pct', 30.0),
-        )
+        """Forward damper stroke/sag to IK panel and values panel."""
+        stroke = params.get('stroke_mm', 60.0)
+        sag = params.get('sag_pct', 30.0)
+        self._ik_panel.set_damper_limits(stroke, sag)
+        self._values_panel.update_damper_params(stroke, sag)
 
     def _on_ik_done(self, result: dict):
         self._ik_panel.show_result(result)
@@ -2064,11 +2139,20 @@ class MainWindow(QMainWindow):
         axle = data['axle']
         new_hp = data['hp']
 
+        # Separate ARB points from suspension hardpoints
+        _ARB_KEYS = {'arb_drop_top', 'arb_arm_end', 'arb_pivot'}
+        sus_hp = {k: v.copy() for k, v in new_hp.items() if k not in _ARB_KEYS}
+        arb_hp = {k: v.copy() for k, v in new_hp.items() if k in _ARB_KEYS}
+
         if axle == 'front':
-            self._front_hp = {k: v.copy() for k, v in new_hp.items()}
+            self._front_hp = sus_hp
+            if arb_hp:
+                self._front_arb = arb_hp
             self._front_hp_panel.refresh(self._front_hp, self._front_arb)
         else:
-            self._rear_hp = {k: v.copy() for k, v in new_hp.items()}
+            self._rear_hp = sus_hp
+            if arb_hp:
+                self._rear_arb = arb_hp
             self._rear_hp_panel.refresh(self._rear_hp, self._rear_arb)
 
         self._rebuild_solvers()
@@ -2191,10 +2275,12 @@ class MainWindow(QMainWindow):
             self._dynamics_panel._tire_label.setText(name)
             self._dynamics_panel._tire_label.setStyleSheet(
                 'color: #e0e0e0; font-size: 11px;')
+            psi_str = f'  P: {self._tire_model.pressure_psi:.1f} psi' if self._tire_model.pressure_psi > 0 else ''
             self._dynamics_panel.set_status(
                 f'Loaded: {self._tire_model.tire_id}  '
                 f'SA: {self._tire_model.sa_range[0]:.0f} to {self._tire_model.sa_range[1]:.0f} deg  '
-                f'Fz: {self._tire_model.fz_range[0]:.0f}-{self._tire_model.fz_range[1]:.0f} N')
+                f'Fz: {self._tire_model.fz_range[0]:.0f}-{self._tire_model.fz_range[1]:.0f} N'
+                f'{psi_str}')
             self.statusBar().showMessage(f'Tire model loaded: {path}', 4000)
         except Exception as e:
             self._dynamics_panel.set_status(f'Error: {e}')
@@ -2275,9 +2361,12 @@ class MainWindow(QMainWindow):
         turn_r = self._dynamics_panel._turn_radius.value()
         wb = self._car.get('wheelbase_mm', 1530) / 1000
         sr = getattr(self._dynamics_panel, '_cached_steer_ratio', 0.0)
+        hp_w = self._dynamics_panel._power_hp.value() * 745.7
+        mass = self._dynamics_panel._total_mass.value()
         self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
                                  turn_radius_m=turn_r, wheelbase_m=wb,
-                                 steer_ratio=sr)
+                                 steer_ratio=sr,
+                                 power_W=hp_w, mass_kg=mass)
 
         # Show the 1g (lateral) or 0g (longitudinal) point in the table
         ref_g = 0.0 if is_longitudinal else 1.0
@@ -2315,8 +2404,11 @@ class MainWindow(QMainWindow):
             corners = self._dynamics_panel.get_selected_corners()
             turn_r = self._dynamics_panel._turn_radius.value()
             wb = self._car.get('wheelbase_mm', 1530) / 1000
+            hp_w = self._dynamics_panel._power_hp.value() * 745.7
+            mass = self._dynamics_panel._total_mass.value()
             self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
-                                     turn_radius_m=turn_r, wheelbase_m=wb)
+                                     turn_radius_m=turn_r, wheelbase_m=wb,
+                                     power_W=hp_w, mass_kg=mass)
 
     def _on_dyn_corners_sel(self, corners: list):
         """Re-plot dynamics with new corner selection."""
@@ -2325,8 +2417,11 @@ class MainWindow(QMainWindow):
             graphs = self._dynamics_panel.get_selected_graphs()
             turn_r = self._dynamics_panel._turn_radius.value()
             wb = self._car.get('wheelbase_mm', 1530) / 1000
+            hp_w = self._dynamics_panel._power_hp.value() * 745.7
+            mass = self._dynamics_panel._total_mass.value()
             self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
-                                     turn_radius_m=turn_r, wheelbase_m=wb)
+                                     turn_radius_m=turn_r, wheelbase_m=wb,
+                                     power_W=hp_w, mass_kg=mass)
 
     # ── Dynamics Optimizer ───────────────────────────────────────────────
 

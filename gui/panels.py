@@ -485,39 +485,80 @@ class HardpointPanel(CollapsibleSection):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ValuesPanel(CollapsibleSection):
-    """Read-only live metric values for the FL corner."""
+    """Button that opens a popup showing live metric values for all 4 corners."""
+
+    _CORNERS = ('FL', 'FR', 'RL', 'RR')
+    _EXTRA_ROWS = [
+        ('max_bump_travel',  'Max Bump Travel',  'mm'),
+        ('max_droop_travel', 'Max Droop Travel', 'mm'),
+    ]
 
     def __init__(self):
-        super().__init__('Live Values — FL corner')
+        super().__init__('Live Values')
+        self._stroke_mm = 55.0
+        self._sag_pct = 35.0
+        self._last_data: dict = {}
+        self._dlg: QDialog | None = None
         self._build()
 
-    def update_values(self, values: dict):
-        self._updating = True
-        for row, entry in enumerate(CATALOG):
-            val = values.get(entry['key'], float('nan'))
-            item = self._table.item(row, 1)
-            if item:
-                item.setText(f'{val:.4f}' if not np.isnan(val) else '—')
-        self._updating = False
+    def update_values(self, all_corners: dict):
+        """Update stored data and refresh popup if open.
+
+        all_corners: {'FL': {metric: val, ...}, 'FR': {...}, ...}
+        """
+        self._last_data = all_corners
+        if self._dlg is not None and self._dlg.isVisible():
+            self._fill_table()
+
+    def update_damper_params(self, stroke_mm: float, sag_pct: float):
+        self._stroke_mm = stroke_mm
+        self._sag_pct = sag_pct
 
     def _build(self):
-        self._table = QTableWidget(len(CATALOG), 3)
-        self._table.setHorizontalHeaderLabels(['Metric', 'Value', 'Unit'])
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col, w in ((1, 82), (2, 44)):
-            self._table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-            self._table.setColumnWidth(col, w)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.setAlternatingRowColors(True)
-        self._updating = False
+        btn = QPushButton('Show Live Values')
+        btn.setStyleSheet(
+            'QPushButton { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #444; padding: 6px 16px; border-radius: 3px; '
+            'font-weight: bold; }'
+            'QPushButton:hover { background: #2a2a2a; }')
+        btn.clicked.connect(self._show_popup)
+        self.add_widget(btn)
 
-        # Slightly larger font for readability
-        tbl_font = QFont()
-        tbl_font.setPointSize(10)
-        self._table.setFont(tbl_font)
+    def _show_popup(self):
+        if self._dlg is not None and self._dlg.isVisible():
+            self._dlg.raise_()
+            return
 
-        # Category header color: light gray
+        self._dlg = QDialog(self)
+        self._dlg.setWindowTitle('Live Kinematic Values — All Corners')
+        self._dlg.resize(620, 700)
+        self._dlg.setStyleSheet(
+            'QDialog { background: #0a0a0a; }'
+            'QTableWidget { background: #0a0a0a; color: #e0e0e0; '
+            'gridline-color: #222; font-size: 11px; }'
+            'QHeaderView::section { background: #111; color: #aaa; '
+            'border: 1px solid #222; padding: 3px; font-weight: bold; }')
+
+        lay = QVBoxLayout(self._dlg)
+        n_rows = len(CATALOG) + len(self._EXTRA_ROWS)
+        n_cols = 1 + len(self._CORNERS) + 1
+        self._popup_table = QTableWidget(n_rows, n_cols)
+        headers = ['Metric'] + list(self._CORNERS) + ['Unit']
+        self._popup_table.setHorizontalHeaderLabels(headers)
+        self._popup_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch)
+        for ci in range(1, 1 + len(self._CORNERS)):
+            self._popup_table.horizontalHeader().setSectionResizeMode(
+                ci, QHeaderView.ResizeMode.Fixed)
+            self._popup_table.setColumnWidth(ci, 82)
+        self._popup_table.horizontalHeader().setSectionResizeMode(
+            n_cols - 1, QHeaderView.ResizeMode.Fixed)
+        self._popup_table.setColumnWidth(n_cols - 1, 40)
+        self._popup_table.verticalHeader().setVisible(False)
+        self._popup_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._popup_table.setAlternatingRowColors(True)
+
+        # Populate labels
         prev_cat = None
         for row, entry in enumerate(CATALOG):
             cat = entry['category']
@@ -526,19 +567,69 @@ class ValuesPanel(CollapsibleSection):
             if cat != prev_cat:
                 ni.setForeground(QColor('#aaaaaa'))
             prev_cat = cat
-            vi = QTableWidgetItem('—')
-            vi.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            vi.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self._popup_table.setItem(row, 0, ni)
+            for ci in range(len(self._CORNERS)):
+                vi = QTableWidgetItem('—')
+                vi.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                vi.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._popup_table.setItem(row, 1 + ci, vi)
             ui = QTableWidgetItem(entry['unit'])
             ui.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             ui.setFlags(Qt.ItemFlag.ItemIsEnabled)
             ui.setForeground(QColor(C_SUB))
-            self._table.setItem(row, 0, ni)
-            self._table.setItem(row, 1, vi)
-            self._table.setItem(row, 2, ui)
+            self._popup_table.setItem(row, n_cols - 1, ui)
 
-        self._table.resizeRowsToContents()
-        self.add_widget(self._table)
+        base = len(CATALOG)
+        for i, (key, label, unit) in enumerate(self._EXTRA_ROWS):
+            row = base + i
+            ni = QTableWidgetItem(label)
+            ni.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            ni.setForeground(QColor('#aaaaaa'))
+            self._popup_table.setItem(row, 0, ni)
+            for ci in range(len(self._CORNERS)):
+                vi = QTableWidgetItem('—')
+                vi.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                vi.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._popup_table.setItem(row, 1 + ci, vi)
+            ui = QTableWidgetItem(unit)
+            ui.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            ui.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            ui.setForeground(QColor(C_SUB))
+            self._popup_table.setItem(row, n_cols - 1, ui)
+
+        self._popup_table.resizeRowsToContents()
+        lay.addWidget(self._popup_table)
+
+        self._fill_table()
+        self._dlg.show()
+
+    def _fill_table(self):
+        if self._popup_table is None:
+            return
+        for row, entry in enumerate(CATALOG):
+            key = entry['key']
+            for ci, corner in enumerate(self._CORNERS):
+                vals = self._last_data.get(corner, {})
+                val = vals.get(key, float('nan'))
+                item = self._popup_table.item(row, 1 + ci)
+                if item:
+                    item.setText(f'{val:.4f}' if not np.isnan(val) else '—')
+
+        base = len(CATALOG)
+        for ci, corner in enumerate(self._CORNERS):
+            vals = self._last_data.get(corner, {})
+            mr = vals.get('motion_ratio', float('nan'))
+            if not np.isnan(mr) and mr > 1e-6:
+                sag_frac = max(0.0, min(1.0, self._sag_pct / 100.0))
+                bump  = self._stroke_mm * sag_frac / mr
+                droop = self._stroke_mm * (1.0 - sag_frac) / mr
+            else:
+                bump = droop = float('nan')
+            for ei, (ek, _, _) in enumerate(self._EXTRA_ROWS):
+                val = bump if 'bump' in ek else droop
+                item = self._popup_table.item(base + ei, 1 + ci)
+                if item:
+                    item.setText(f'{val:.1f}' if not np.isnan(val) else '—')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -730,6 +821,7 @@ IK_METRICS = [
     ('caster',       'Caster Angle',       '°',   0, 15),
     ('trail',        'Caster Trail',       'mm', -10, 60),
     ('motion_ratio', 'Motion Ratio',       '-',   0.3, 1.5),
+    ('arb_mr',       'ARB Motion Ratio',  '-',   0.1, 2.0),
 ]
 
 # Hardpoints the user can select (inboard chassis points that matter)
@@ -737,6 +829,9 @@ IK_HARDPOINTS = [
     'uca_front', 'uca_rear', 'uca_outer',
     'lca_front', 'lca_rear', 'lca_outer',
     'tie_rod_inner', 'tie_rod_outer',
+    'pushrod_outer', 'pushrod_inner',
+    'rocker_pivot', 'rocker_spring_pt',
+    'arb_drop_top', 'arb_arm_end', 'arb_pivot',
 ]
 
 
@@ -907,7 +1002,8 @@ class InverseKinematicsPanel(CollapsibleSection):
         lock_row = QGridLayout(); lock_row.setSpacing(2)
         # Default: lock everything except camber (the usual primary target)
         _default_locks = {'anti_dive', 'anti_squat', 'anti_lift', 'toe',
-                          'rc_height', 'caster', 'trail', 'motion_ratio'}
+                          'rc_height', 'caster', 'trail', 'motion_ratio',
+                          'arb_mr'}
         for i, (key, label, unit, *_) in enumerate(IK_METRICS):
             cb = QCheckBox(label)
             cb.setChecked(key in _default_locks)
@@ -1958,6 +2054,7 @@ class DynamicsPanel(CollapsibleSection):
         return [lbl for lbl, cb in self._corner_cbs.items() if cb.isChecked()]
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  COMPONENT LOADS PANEL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2486,29 +2583,8 @@ class DynamicsOptPanel(CollapsibleSection):
             # Show predicted target metric value
             change_str += f'\n{target_label}: {baseline_val:.2f} -> {predicted_val:.2f}{target_unit}'
 
-            # Flag infeasible values
-            feasible = True
-            key = rec['key']
-            if 'spring_rate' in key and new_val < 0:
-                change_str += '  [infeasible]'
-                feasible = False
-            elif 'arb_rate' in key and new_val < 0:
-                change_str += '  [infeasible]'
-                feasible = False
-            elif 'motion_ratio' in key and (new_val < 0.3 or new_val > 3.0):
-                change_str += '  [infeasible]'
-                feasible = False
-            elif 'brake_bias' in key and (new_val < 30 or new_val > 90):
-                change_str += '  [infeasible]'
-                feasible = False
-            elif 'cg_to_front' in key and (new_val < 500 or new_val > 2000):
-                change_str += '  [infeasible]'
-                feasible = False
-
             item = QTableWidgetItem(change_str)
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if not feasible:
-                item.setForeground(QColor('#555555'))
             self._sens_table.setItem(i, 1, item)
 
             # Side effects — show as absolute values (baseline -> predicted)
@@ -2533,7 +2609,7 @@ class DynamicsOptPanel(CollapsibleSection):
             self._sens_table.setItem(i, 3, item)
 
             # Implementation hints
-            item = QTableWidgetItem('\n'.join(rec['implementations'][:2]))
+            item = QTableWidgetItem('\n'.join(rec['implementations'][:3]))
             item.setForeground(QColor('#888888'))
             self._sens_table.setItem(i, 4, item)
 
