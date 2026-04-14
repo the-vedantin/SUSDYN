@@ -60,7 +60,6 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Interactive OpenGL viewport (VisPy) with full-car wireframe rendering
 - Colour-coded suspension members (UCA, LCA, tie rod, pushrod, rocker, spring/damper)
 - Roll centre and roll axis overlays
-- Click-to-select hardpoint editing
 
 ### Kinematic Curves
 - Live metric plots across wheel travel for all four corners
