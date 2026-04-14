@@ -683,25 +683,6 @@ line_pressure = caliper_clamp / piston_area   (MPa = N/mm^2)
 
 ![Full Application Layout](screenshots/main_window.png)
 
-### Layout
-
-```
-+-------------------+----------------------------+--------------------+
-|   Left Sidebar    |      Centre 3D View        |   Right Panel      |
-|                   |                            |                    |
-| Motion Control    |   VisPy/OpenGL rendering   | Matplotlib Graphs  |
-| Car Parameters    |   of suspension geometry   | (metric curves)    |
-| Front Hardpoints  |                            |                    |
-| Rear Hardpoints   |   + NavCube (orientation)  | Values Table       |
-| Metric Picker     |                            | (current metrics)  |
-| Steering          |                            |                    |
-| Inverse Kin.      |                            |                    |
-| Dynamics          |                            |                    |
-| Dyn. Optimizer    |                            |                    |
-| Aero Load Targets |                            |                    |
-| Component Loads   |                            |                    |
-+-------------------+----------------------------+--------------------+
-```
 
 ### Panels (Left Sidebar)
 
