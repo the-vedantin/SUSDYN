@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QListWidget,
     QListWidgetItem, QComboBox, QPushButton, QCheckBox,
     QSizePolicy, QScrollArea, QFrame, QToolButton, QAbstractItemView,
-    QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox, QFileDialog, QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -2488,12 +2488,80 @@ class LoadsPanel(CollapsibleSection):
         tbl.resizeRowsToContents()
         lay.addWidget(tbl)
 
+        # ── build plain-text for copy / export ───────────────────────
+        def _build_text():
+            lines = []
+            lines.append(f'Component Loads — {lat_g:.2f}g lateral{lon_desc}')
+            lines.append('=' * 72)
+            lines.append(f'{"":40s}  {"FL":>7s}  {"FR":>7s}  {"RL":>7s}  {"RR":>7s}')
+            lines.append('-' * 72)
+            for label, attr, unit, dec in rows:
+                if label == 'header':
+                    lines.append('')
+                    lines.append(attr)
+                    continue
+                if attr is None:
+                    continue
+                vals = []
+                for corner in ('FL', 'FR', 'RL', 'RR'):
+                    cl = loads.get(corner)
+                    v = getattr(cl, attr, 0) if cl else 0
+                    vals.append(f'{v + 0.0:.{dec}f}')
+                tag = f'{label} ({unit})'
+                lines.append(f'{tag:40s}  {vals[0]:>7s}  {vals[1]:>7s}  {vals[2]:>7s}  {vals[3]:>7s}')
+            return '\n'.join(lines)
+
+        def _build_csv():
+            csv_lines = [f'# Component Loads — {lat_g:.2f}g lateral{lon_desc}']
+            csv_lines.append('Parameter,Unit,FL,FR,RL,RR')
+            for label, attr, unit, dec in rows:
+                if label == 'header' or attr is None:
+                    continue
+                vals = []
+                for corner in ('FL', 'FR', 'RL', 'RR'):
+                    cl = loads.get(corner)
+                    v = getattr(cl, attr, 0) if cl else 0
+                    vals.append(f'{v + 0.0:.{dec}f}')
+                csv_lines.append(f'{label},{unit},{",".join(vals)}')
+            return '\n'.join(csv_lines)
+
+        # ── buttons ──────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
+                      'border-radius: 3px; } QPushButton:hover { background: #555; }')
+        _btn_green = ('QPushButton { background: #2E7D32; color: white; padding: 6px 16px; '
+                      'border-radius: 3px; font-weight: bold; } '
+                      'QPushButton:hover { background: #388E3C; }')
+
+        copy_btn = QPushButton('Copy to Clipboard')
+        copy_btn.setStyleSheet(_btn_green)
+        def _copy():
+            QApplication.clipboard().setText(_build_text())
+            copy_btn.setText('Copied!')
+            copy_btn.setStyleSheet(
+                'QPushButton { background: #1B5E20; color: #A5D6A7; padding: 6px 16px; '
+                'border-radius: 3px; font-weight: bold; }')
+        copy_btn.clicked.connect(_copy)
+        btn_row.addWidget(copy_btn)
+
+        export_btn = QPushButton('Export CSV')
+        export_btn.setStyleSheet(_btn_style)
+        def _export():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, 'Export Loads', 'component_loads.csv', 'CSV (*.csv)')
+            if path:
+                with open(path, 'w') as f:
+                    f.write(_build_csv())
+                export_btn.setText(f'Saved!')
+        export_btn.clicked.connect(_export)
+        btn_row.addWidget(export_btn)
+
+        btn_row.addStretch()
         close_btn = QPushButton('Close')
-        close_btn.setStyleSheet(
-            'QPushButton { background: #333; color: white; padding: 6px 20px; '
-            'border-radius: 3px; } QPushButton:hover { background: #555; }')
+        close_btn.setStyleSheet(_btn_style)
         close_btn.clicked.connect(dlg.accept)
-        lay.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
 
         dlg.exec()
 

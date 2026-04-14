@@ -23,8 +23,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QHBoxLayout, QVBoxLayout, QSplitter, QStatusBar, QSizePolicy, QScrollArea,
     QGroupBox, QCheckBox, QMenuBar, QFileDialog, QMessageBox,
+    QDialog, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QPushButton,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal as Signal
+from PyQt6.QtGui import QColor
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -924,13 +926,19 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         fm = mb.addMenu('File')
         save_act = fm.addAction('Save Project…')
+        save_act.setToolTip('Save all hardpoints (FL/FR/RL/RR), vehicle params, and settings to JSON')
         load_act = fm.addAction('Load Project…')
         save_act.triggered.connect(self._save_project)
         load_act.triggered.connect(self._load_project)
 
+        vm = mb.addMenu('View')
+        hp_act = vm.addAction('All Hardpoints…')
+        hp_act.triggered.connect(self._show_all_hardpoints)
+
     def _save_project(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, 'Save Vahan Project', '', 'Vahan Project (*.vahan);;JSON (*.json)')
+            self, 'Save Project (all hardpoints + vehicle params)',
+            '', 'Vahan Project (*.vahan);;JSON (*.json)')
         if not path:
             return
         mp = self._motion_panel
@@ -953,7 +961,8 @@ class MainWindow(QMainWindow):
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
-        self.statusBar().showMessage(f'Saved: {path}', 4000)
+        self.statusBar().showMessage(
+            f'Saved all hardpoints (FL/RL + ARB) + vehicle params: {path}', 5000)
 
     def _load_project(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -996,6 +1005,118 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f'Loaded: {path}', 4000)
         except Exception as e:
             QMessageBox.critical(self, 'Load Error', str(e))
+
+    def _show_all_hardpoints(self):
+        """Popup showing all 4 corners' hardpoints (FL input, FR mirrored, RL input, RR mirrored)."""
+        fl = self._front_hp
+        fr = _mirror_x(fl)
+        rl = self._rear_hp
+        rr = _mirror_x(rl)
+
+        corners = [('FL', fl), ('FR', fr), ('RL', rl), ('RR', rr)]
+        names = list(fl.keys())  # same keys for all corners
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('All Hardpoints (mm)')
+        dlg.setMinimumSize(920, 700)
+        dlg.setStyleSheet('''
+            QDialog { background: #000; color: #e0e0e0; }
+            QLabel  { color: #e0e0e0; }
+            QTableWidget { background: #0a0a0a; color: #e0e0e0;
+                           gridline-color: #2a2a2a; border: none; font-size: 11px; }
+            QHeaderView::section { background: #111; color: #ccc;
+                                   border: 1px solid #2a2a2a; padding: 3px;
+                                   font-weight: bold; font-size: 11px; }
+        ''')
+        lay = QVBoxLayout(dlg)
+
+        note = QLabel('FL and RL are input values.  FR and RR are X-mirrored.  '
+                       'Save Project exports all hardpoints + vehicle params to JSON.')
+        note.setStyleSheet('color: #FFA726; font-size: 11px; padding: 4px;')
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        # 4 columns per corner (X, Y, Z) = 12 data cols + 1 name col = 13
+        ncols = 1 + 4 * 3  # name + FL(x,y,z) + FR(x,y,z) + RL(x,y,z) + RR(x,y,z)
+        tbl = QTableWidget(len(names), ncols)
+
+        headers = ['Point']
+        for label, _ in corners:
+            headers += [f'{label} X', f'{label} Y', f'{label} Z']
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for c in range(1, ncols):
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
+            tbl.setColumnWidth(c, 62)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+
+        # Color the corner headers
+        corner_colors = {'FL': '#4FC3F7', 'FR': '#81C784', 'RL': '#FFB74D', 'RR': '#CE93D8'}
+
+        for ri, name in enumerate(names):
+            it = QTableWidgetItem(name)
+            it.setForeground(QColor('#cccccc'))
+            f = it.font(); f.setBold(True); it.setFont(f)
+            tbl.setItem(ri, 0, it)
+
+            for ci, (label, hp_dict) in enumerate(corners):
+                pt = hp_dict.get(name)
+                if pt is None:
+                    continue
+                mm = pt * 1000.0
+                color = corner_colors[label]
+                for ax in range(3):
+                    col = 1 + ci * 3 + ax
+                    cell = QTableWidgetItem(f'{mm[ax]:.2f}')
+                    cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    cell.setForeground(QColor(color))
+                    tbl.setItem(ri, col, cell)
+
+        tbl.resizeRowsToContents()
+        lay.addWidget(tbl)
+
+        # ── buttons ──────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
+                      'border-radius: 3px; } QPushButton:hover { background: #555; }')
+
+        copy_btn = QPushButton('Copy to Clipboard')
+        copy_btn.setStyleSheet(
+            'QPushButton { background: #2E7D32; color: white; padding: 6px 16px; '
+            'border-radius: 3px; font-weight: bold; } '
+            'QPushButton:hover { background: #388E3C; }')
+        def _copy():
+            lines = ['All Hardpoints (mm)', '=' * 90]
+            hdr = f'{"Point":22s}'
+            for label, _ in corners:
+                hdr += f'  {label + " X":>8s} {label + " Y":>8s} {label + " Z":>8s}'
+            lines.append(hdr)
+            lines.append('-' * 90)
+            for name in names:
+                row_txt = f'{name:22s}'
+                for label, hp_dict in corners:
+                    pt = hp_dict.get(name)
+                    if pt is not None:
+                        mm = pt * 1000.0
+                        row_txt += f'  {mm[0]:8.2f} {mm[1]:8.2f} {mm[2]:8.2f}'
+                    else:
+                        row_txt += f'  {"—":>8s} {"—":>8s} {"—":>8s}'
+                lines.append(row_txt)
+            QApplication.clipboard().setText('\n'.join(lines))
+            copy_btn.setText('Copied!')
+        copy_btn.clicked.connect(_copy)
+        btn_row.addWidget(copy_btn)
+
+        btn_row.addStretch()
+        close_btn = QPushButton('Close')
+        close_btn.setStyleSheet(_btn_style)
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        dlg.exec()
 
     def _build_ui(self):
         self._build_menu()
