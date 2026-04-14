@@ -2,7 +2,7 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.0 (Kinematics + Dynamics + Loads)
+**Version:** 2.1 (Kinematics + Dynamics + Loads + Aero)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
 ![Main Window](screenshots/main_window.png)
@@ -35,6 +35,19 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Practical step sizes (e.g. 1 mm spring preload, 1 N/mm spring rate)
 - Recommendation engine: which parameter changes achieve a target understeer/roll/pitch delta
 
+### Aero Load Targets
+- Computes per-corner Fz deficit to reach a target tire utilization at a given g level
+- Bisection solver finds the additional downforce needed per corner
+- Axle-level packaging: sizes to the worse (more loaded) corner per axle
+- Outputs: per-corner deficit, front/rear axle need, total downforce, rear aero bias %
+- Sweep mode plots deficit vs lateral g with velocity secondary axis
+
+### Apply Aero (V² Scaling)
+- Toggle in Dynamics panel applies solved aero downforce to dynamics solve/sweep
+- V²-scaled: downforce ∝ V², and at constant turn radius V² ∝ g, so aero load scales linearly with g
+- Solved deficit at g_ref is normalised to per-1g, then multiplied by g at each sweep point
+- Lets you compare dynamics curves with and without aero to verify aero targets
+
 ### Component Loads
 - 6x6 static equilibrium on upright free body for all member axial forces
 - Ball joint resultant forces decomposed into V (up+) and H (fwd+)
@@ -66,7 +79,7 @@ vahan/                         GUI (PyQt6)
   analysis.py
   optimizer.py
   tire_model.py
-  dynamics.py
+  dynamics.py      (SteadyStateSolver + AeroDownforceSolver)
   loads.py
 ```
 
@@ -454,6 +467,16 @@ Per-corner outputs: `Fz`, `Fy`, `Fx`, `brake_torque`, `travel`, `camber`, `utili
 
 Scalar outputs: `roll_angle_deg`, `pitch_angle_deg`, `understeer_gradient_deg`, `lltd_pct`
 
+### Velocity Axis on Sweep Plots
+
+All dynamics and aero sweep plots display a secondary x-axis showing speed in mph. For lateral sweeps at constant turn radius R:
+
+```
+V = sqrt(g * 9.81 * R)    (m/s)    ->    mph = V * 2.237
+```
+
+For longitudinal sweeps with known power: `V = P / (F)` where `F = g * m * 9.81`.
+
 ### Sensitivity Analysis
 
 ![Dynamics Optimization and Sensitivity](screenshots/dynamics_opt.png)
@@ -471,6 +494,67 @@ Each parameter has a practical step size representing a realistic shop adjustmen
 - CG height: 5 mm
 
 The recommendation engine finds which parameter changes produce a desired delta in the target metric (e.g., "reduce understeer gradient by 0.5 deg").
+
+---
+
+## Aero Load Targets Solver
+
+![Aero Load Targets Panel](screenshots/aero_panel.png)
+
+### Overview
+
+`AeroDownforceSolver` in `vahan/dynamics.py` answers: "How much additional vertical load does each corner need to bring tire utilization down to a target?" This is the aerodynamicist's starting point — it tells you how much downforce your aero package must produce, and where.
+
+### Solve Algorithm
+
+At a given lateral g (and optional longitudinal g):
+
+1. Run the steady-state dynamics solver to get per-corner Fz, Fy, Fx, camber
+2. Compute demand at each corner: `demand = sqrt(Fy^2 + Fx^2)`
+3. Compute grip at current Fz: `grip = mu(Fz, camber) * Fz`
+4. If `demand / grip > target_util`, bisection-search for additional Fz:
+   - Bracket: `[0, max_total / 4]`
+   - Target: `demand / grip(Fz + dFz) <= target_util`
+   - 60 iterations, 0.1 N precision
+5. Axle-level packaging: `front_need = max(FL, FR)`, `rear_need = max(RL, RR)`
+6. Total and rear bias: `total = front + rear`, `bias = rear / total * 100%`
+
+**Why bisection over analytical inversion:** The tire's peak mu is load-sensitive (degressive). As Fz increases, mu decreases, so grip is nonlinear in Fz. Bisection handles this robustly.
+
+### AeroResult
+
+```
+downforce:        {FL, FR, RL, RR}   per-corner deficit (N)
+utilization_aero: {FL, FR, RL, RR}   utilization after adding Fz
+front_axle_need_N                     axle-level front deficit
+rear_axle_need_N                      axle-level rear deficit
+total_downforce_N                     total deficit
+rear_aero_bias_pct                    % of total on rear axle
+capped                                corners that hit the per-corner cap
+```
+
+### Sweep Mode
+
+![Aero Sweep Results](screenshots/aero_sweep.png)
+
+`AeroDownforceSolver.sweep(g_range)` solves at each g point and returns arrays of front/rear/total deficit vs lateral g. The GUI plots these with a velocity secondary x-axis (mph) computed from the turn radius set in the Dynamics panel:
+
+```
+V = sqrt(g * 9.81 * R)    (m/s, converted to mph)
+```
+
+### Apply Aero (V² Scaling)
+
+The "Apply Aero" toggle in the Dynamics panel feeds the solved aero deficit back into dynamics. Since aerodynamic downforce scales with V², and at constant turn radius V² = g * R * 9.81, the aero force scales linearly with g:
+
+```
+aero_Fz_per_g = {corner: deficit / g_ref}     (normalised to 1g)
+aero_Fz(g)    = {corner: per_g * |g|}          (at any sweep point)
+```
+
+This is added to the static loads in the dynamics solver before the roll iteration begins. The total weight for renormalisation becomes `W_vehicle + sum(aero_Fz)`.
+
+When active, the dynamics sweep worker loops manually through each g point, computing V²-scaled aero at each step, rather than using the vectorised sweep.
 
 ---
 
@@ -614,6 +698,7 @@ line_pressure = caliper_clamp / piston_area   (MPa = N/mm^2)
 | Inverse Kin.      |                            |                    |
 | Dynamics          |                            |                    |
 | Dyn. Optimizer    |                            |                    |
+| Aero Load Targets |                            |                    |
 | Component Loads   |                            |                    |
 +-------------------+----------------------------+--------------------+
 ```
@@ -629,8 +714,9 @@ All panels are collapsible sections:
 - **SteeringPanel** — Rack ratio, travel limits, Ackermann
 - **AlignmentPanel** — Static camber, toe, caster display
 - **InverseKinematicsPanel** — Target metric, range, locks, method, tube ODs, solve/explore
-- **DynamicsPanel** — Lateral/longitudinal g inputs, vehicle params, solve/sweep
+- **DynamicsPanel** — Lateral/longitudinal g inputs, vehicle params, solve/sweep, Apply Aero toggle
 - **DynamicsOptPanel** — Target metric delta, sensitivity grid, recommendations
+- **AeroPanel** — Lateral/longitudinal g, target utilization, solve/sweep, deficit table + summary
 - **LoadsPanel** — Front/rear brake params, upright geometry, compute button, results popup
 
 ### 3D View
@@ -723,10 +809,10 @@ The entire UI uses a grayscale colour scheme (dark background, grey text/borders
 | `vahan/metrics_catalog.py` | 30+ metric definitions + dynamics sensitivities |
 | `vahan/optimizer.py` | IK solver, orthogonal groups, collision detection |
 | `vahan/tire_model.py` | Linear tire model with load sensitivity |
-| `vahan/dynamics.py` | Steady-state dynamics solver + sensitivity analysis |
+| `vahan/dynamics.py` | Steady-state dynamics solver + sensitivity + aero deficit solver |
 | `vahan/loads.py` | Component force calculator (members, bearings, brakes) |
-| `gui/main_window.py` | Main window, steering model, dynamics/loads wiring |
-| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, loads, optimizer) |
+| `gui/main_window.py` | Main window, steering model, dynamics/loads/aero wiring |
+| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, optimizer, aero, loads) |
 | `gui/view3d.py` | VisPy 3D rendering + NavCube |
 | `app.py` | Entry point |
 
@@ -772,8 +858,10 @@ The GUI opens with default FSAE hardpoints loaded.
 5. **Explore** — Run widened search to find alternative solutions across the design space
 6. **Dynamics** — Set lateral/longitudinal g, solve for load transfer, roll, utilization
 7. **Sensitivity** — Analyze which vehicle parameters most affect your target metric
-8. **Component loads** — Set brake params and upright geometry, compute forces at operating point
-9. **Save/Load** — File menu for JSON geometry files
+8. **Aero targets** — Set target utilization, solve for downforce deficit, sweep across g range
+9. **Apply Aero** — Toggle aero on in Dynamics panel to see dynamics curves with V²-scaled downforce
+10. **Component loads** — Set brake params and upright geometry, compute forces at operating point
+11. **Save/Load** — File menu for JSON geometry files
 
 ### Sign Convention Cheat Sheet
 

@@ -35,7 +35,7 @@ class VehicleParams:
     front_track_m: float = 1.2218
     rear_track_m: float = 1.200
     cg_height_m: float = 0.26063
-    cg_to_front_axle_m: float = 0.84118
+    cg_to_front_axle_m: float = 0.845
 
     # Unsprung CG height (approximation: wheel center height)
     unsprung_cg_height_m: float = 0.203
@@ -313,15 +313,22 @@ class SteadyStateSolver:
     def solve(self, lateral_g: float,
               longitudinal_g: float = 0.0,
               max_iter: int = 15,
-              tol_deg: float = 0.002) -> SteadyStateResult:
+              tol_deg: float = 0.002,
+              aero_Fz: dict = None) -> SteadyStateResult:
         """
         Solve steady-state equilibrium.
 
         Algorithm:
-        1. Compute static corner loads
+        1. Compute static corner loads (+ optional aero downforce)
         2. Initial roll estimate from total roll stiffness
         3. Iterate: roll → per-corner travel → kinematics → load transfer → new roll
         4. Converge when roll angle change < tol_deg
+
+        Parameters
+        ----------
+        aero_Fz : dict, optional
+            Per-corner additional vertical load from aerodynamics (N).
+            {'FL': N, 'FR': N, 'RL': N, 'RR': N}
         """
         v = self._veh
         ay = lateral_g * G  # m/s^2
@@ -341,6 +348,11 @@ class SteadyStateSolver:
             'RL': Fz_static_rear + delta_Fz_pitch / 2,
             'RR': Fz_static_rear + delta_Fz_pitch / 2,
         }
+
+        # Add aerodynamic downforce to static loads
+        if aero_Fz:
+            for lbl in ('FL', 'FR', 'RL', 'RR'):
+                Fz_static[lbl] += aero_Fz.get(lbl, 0.0)
 
         # ── Step 2: Initial roll estimate ────────────────────────────────
         # Get design-position RC heights
@@ -426,8 +438,10 @@ class SteadyStateSolver:
             fz_floor = spring_force + unspr_w
             Fz[label] = max(Fz[label], fz_floor)
 
-        # Renormalize so Σ Fz = vehicle weight (total vertical load is conserved)
+        # Renormalize so Σ Fz = vehicle weight + aero (total vertical load is conserved)
         W_total = v.total_mass_kg * G
+        if aero_Fz:
+            W_total += sum(aero_Fz.values())
         Fz_sum = sum(Fz.values())
         if Fz_sum > 0:
             scale = W_total / Fz_sum
@@ -587,7 +601,8 @@ class SteadyStateSolver:
     def sweep_lateral_g(self,
                         g_range: tuple = (0.0, 2.0),
                         n_points: int = 41,
-                        longitudinal_g: float = 0.0) -> dict:
+                        longitudinal_g: float = 0.0,
+                        aero_Fz: dict = None) -> dict:
         """
         Sweep lateral acceleration and return arrays of all outputs.
 
@@ -611,7 +626,7 @@ class SteadyStateSolver:
         self._warm = {}  # reset warm starts
 
         for i, lg in enumerate(g_arr):
-            r = self.solve(lg, longitudinal_g)
+            r = self.solve(lg, longitudinal_g, aero_Fz=aero_Fz)
             out['roll_angle_deg'][i] = r.roll_angle_deg
             out['pitch_angle_deg'][i] = r.pitch_angle_deg
             out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
@@ -641,7 +656,8 @@ class SteadyStateSolver:
     def sweep_longitudinal_g(self,
                              g_range: tuple = (-2.0, 2.0),
                              n_points: int = 41,
-                             lateral_g: float = 0.0) -> dict:
+                             lateral_g: float = 0.0,
+                             aero_Fz: dict = None) -> dict:
         """
         Sweep longitudinal acceleration and return arrays of all outputs.
 
@@ -666,7 +682,7 @@ class SteadyStateSolver:
         self._warm = {}
 
         for i, lg in enumerate(g_arr):
-            r = self.solve(lateral_g, lg)
+            r = self.solve(lateral_g, lg, aero_Fz=aero_Fz)
             out['roll_angle_deg'][i] = r.roll_angle_deg
             out['pitch_angle_deg'][i] = r.pitch_angle_deg
             out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
@@ -695,7 +711,8 @@ class SteadyStateSolver:
     def sweep_combined(self,
                        lat_range: tuple = (0.0, 2.0),
                        lon_g: float = -0.5,
-                       n_points: int = 41) -> dict:
+                       n_points: int = 41,
+                       aero_Fz: dict = None) -> dict:
         """
         Sweep lateral g while simultaneously applying longitudinal g.
 
@@ -724,7 +741,7 @@ class SteadyStateSolver:
         self._warm = {}
 
         for i, lat_g in enumerate(g_arr):
-            r = self.solve(lat_g, lon_g)
+            r = self.solve(lat_g, lon_g, aero_Fz=aero_Fz)
             out['roll_angle_deg'][i] = r.roll_angle_deg
             out['pitch_angle_deg'][i] = r.pitch_angle_deg
             out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
@@ -1345,55 +1362,29 @@ class DynamicsSensitivity:
 
 @dataclass
 class AeroResult:
-    """Per-corner aero downforce required to equalise tire utilization."""
+    """Per-corner additional Fz required to hit target utilization."""
     lateral_g: float
     longitudinal_g: float = 0.0
     target_util: float = 0.0
 
-    # Per-corner required downforce (N, positive = pushing tire into ground)
+    # Per-corner required additional Fz (N) — remaining deficit after aero
     downforce: dict = field(default_factory=dict)
-    # Per-corner Fz after downforce (N)
-    Fz_aero: dict = field(default_factory=dict)
-    # Per-corner utilization after downforce
+    # Per-corner utilization after adding Fz
     utilization_aero: dict = field(default_factory=dict)
-    # Per-corner lateral force demand (N)
-    Fy_demand: dict = field(default_factory=dict)
-    # Total downforce (N)
-    total_downforce_N: float = 0.0
-    # Front/rear split (% front)
-    front_downforce_pct: float = 0.0
     # Corners that hit the cap
     capped: list = field(default_factory=list)
 
-    # ── Axle-level needs ──
-    front_axle_need_N: float = 0.0   # max(FL, FR) additional Fz on front axle
-    rear_axle_need_N: float = 0.0    # max(RL, RR) additional Fz on rear axle
-
-    # ── Per-device allocation (populated when device positions supplied) ──
-    # Force each device must generate (N, at its own CoP)
-    device_force: dict = field(default_factory=dict)  # {'fw': N, 'rw': N, 'diff': N}
-    # Each device's CoP position from front axle (m)
-    device_cop_m: dict = field(default_factory=dict)   # {'fw': m, 'rw': m, 'diff': m}
-    # Combined aero CoP from front axle
-    cop_from_front_m: float = 0.0
-    cop_pct_wheelbase: float = 0.0
-    # Rear aero bias (% of axle load on rear)
+    # Axle-level: max(left, right) per axle — remaining deficit
+    front_axle_need_N: float = 0.0
+    rear_axle_need_N: float = 0.0
+    # Total remaining deficit
+    total_downforce_N: float = 0.0
+    # Rear bias (% of total on rear axle)
     rear_aero_bias_pct: float = 50.0
 
 
 class AeroDownforceSolver:
-    """
-    Given a steady-state operating point, estimate **total** aerodynamic
-    downforce needed so that the **worst** tire utilization does not exceed a
-    target.
-
-    Model (single coupled degree of freedom):
-        Total added downforce D (N) is split front / rear by ``front_aero_fraction``
-        (0–1). Each front wheel gets ``f·D/2``, each rear wheel gets ``(1−f)·D/2``.
-        This matches how wings / diffusers load axles rather than independent
-        per-wheel shims (the old per-corner bisection hit arbitrary caps and
-        produced step-function “solutions”).
-    """
+    """Per-corner Fz deficit solver with axle-level summary."""
 
     def __init__(self, steady_solver: SteadyStateSolver):
         self._ss = steady_solver
@@ -1401,26 +1392,14 @@ class AeroDownforceSolver:
     def solve(self, lateral_g: float,
               longitudinal_g: float = 0.0,
               target_util: float = 0.80,
-              front_aero_fraction: float = 0.50,
               max_total_downforce_N: float = 12000.0,
-              max_iter: int = 60,
-              device_positions: dict | None = None) -> AeroResult:
-        """
-        Per-corner minimum downforce to bring each corner's utilization
-        to *target_util*.  Corners already below target get 0.
+              max_iter: int = 60) -> AeroResult:
 
-        If *device_positions* is provided (dict with keys
-        ``fw_y``, ``rw_y``, ``diff_y`` in metres from front axle),
-        the solver also computes how much force each physical aero device
-        must generate based on lever-arm moment balance, maximising the
-        diffuser contribution so the wings are as small as possible.
-        """
         tire = self._ss._tire
         if tire is None:
             raise ValueError('Tire model required for aero solver')
 
-        D_cap = float(max(max_total_downforce_N, 100.0)) / 4.0  # per-corner cap
-
+        D_cap = float(max(max_total_downforce_N, 100.0)) / 4.0
         base = self._ss.solve(lateral_g, longitudinal_g)
         fz_data_min = float(tire.fz_range[0])
 
@@ -1460,195 +1439,51 @@ class AeroDownforceSolver:
                 dFz = hi
 
             result.downforce[lbl] = dFz
-            result.Fy_demand[lbl] = fy_d
             fz_new = max(fz0 + dFz, 0.01)
-            result.Fz_aero[lbl] = fz_new
             g_after = _grip(fz_new, cam)
             result.utilization_aero[lbl] = demand / g_after if g_after > 0 else 1e9
             if result.utilization_aero[lbl] > target_util + 0.02:
                 result.capped.append(lbl)
 
-        # ── Axle-level needs (per side — size to worse corner) ──
+        # Axle-level: size to the worse corner per axle
         front_need = max(result.downforce.get('FL', 0),
                          result.downforce.get('FR', 0))
         rear_need  = max(result.downforce.get('RL', 0),
                          result.downforce.get('RR', 0))
-        total_on_car = front_need + rear_need
+        total = front_need + rear_need
 
         result.front_axle_need_N = front_need
         result.rear_axle_need_N  = rear_need
-
-        total_d = sum(result.downforce.values())
-        front_d = result.downforce.get('FL', 0) + result.downforce.get('FR', 0)
-        result.total_downforce_N = total_d
-        result.front_downforce_pct = (front_d / total_d * 100) if total_d > 0 else 50.0
-
-        wb = self._ss._veh.wheelbase_m
-
-        # ── Per-device allocation via moment balance ──
-        if device_positions and total_on_car > 0:
-            self._allocate_devices(result, device_positions,
-                                   front_need, rear_need, wb)
-        else:
-            # No device positions — report axle-level only
-            result.rear_aero_bias_pct = (
-                rear_need / total_on_car * 100.0) if total_on_car > 0 else 50.0
-            if total_on_car > 0:
-                result.cop_from_front_m = (rear_need / total_on_car) * wb
-                result.cop_pct_wheelbase = (rear_need / total_on_car) * 100.0
-            else:
-                cg = self._ss._veh.cg_to_front_axle_m
-                result.cop_from_front_m = cg
-                result.cop_pct_wheelbase = (cg / wb * 100) if wb > 0 else 50.0
+        result.total_downforce_N = total
+        result.rear_aero_bias_pct = (
+            rear_need / total * 100.0) if total > 0 else 50.0
 
         return result
-
-    # ------------------------------------------------------------------
-    def _allocate_devices(self, result: 'AeroResult', pos: dict,
-                          F_front: float, F_rear: float, wb: float):
-        """
-        Distribute the axle-load requirement among three physical devices
-        (front wing, rear wing, diffuser) placed at given Y positions.
-
-        Physics:  a device generating force *F* at position *y* from the
-        front axle produces axle reactions:
-            front-axle load  = F * (wb - y) / wb
-            rear-axle  load  = F *  y       / wb
-
-        Strategy: maximise diffuser usage (it's the most drag-efficient
-        device) so the two wings are as small as possible.
-        """
-        y_fw = float(pos.get('fw_y', 0.0))
-        y_rw = float(pos.get('rw_y', wb))
-        y_d  = float(pos.get('diff_y', wb * 0.5))
-
-        result.device_cop_m = {'fw': y_fw, 'rw': y_rw, 'diff': y_d}
-
-        # Lever-arm fractions (fraction of device force reaching each axle)
-        a_fw = (wb - y_fw) / wb     # front-axle fraction
-        b_fw = y_fw / wb            # rear-axle fraction
-        a_rw = (wb - y_rw) / wb
-        b_rw = y_rw / wb
-        a_d  = (wb - y_d)  / wb
-        b_d  = y_d  / wb
-
-        # 2-eqn / 3-unknown linear system, parametric in F_d:
-        #   a_fw*F_fw + a_rw*F_rw + a_d*F_d = F_front
-        #   b_fw*F_fw + b_rw*F_rw + b_d*F_d = F_rear
-        det = a_fw * b_rw - a_rw * b_fw
-        if abs(det) < 1e-12:
-            # Degenerate (fw and rw at same position) — split 50/50
-            result.device_force = {
-                'fw': F_front, 'rw': F_rear, 'diff': 0.0}
-            self._finish_cop(result, wb)
-            return
-
-        # F_fw(F_d) = c_fw + d_fw * F_d
-        # F_rw(F_d) = c_rw + d_rw * F_d
-        c_fw = (b_rw * F_front - a_rw * F_rear) / det
-        d_fw = (a_rw * b_d - b_rw * a_d) / det
-        c_rw = (a_fw * F_rear  - b_fw * F_front) / det
-        d_rw = (b_fw * a_d - a_fw * b_d) / det
-
-        # Find feasible F_d range: all three forces >= 0
-        lo, hi = 0.0, 1e9
-
-        if d_fw < -1e-12:
-            hi = min(hi, -c_fw / d_fw)
-        elif d_fw > 1e-12:
-            bound = -c_fw / d_fw
-            if bound > 0:
-                lo = max(lo, bound)
-        else:
-            if c_fw < -1e-6:
-                hi = -1       # infeasible
-
-        if d_rw < -1e-12:
-            hi = min(hi, -c_rw / d_rw)
-        elif d_rw > 1e-12:
-            bound = -c_rw / d_rw
-            if bound > 0:
-                lo = max(lo, bound)
-        else:
-            if c_rw < -1e-6:
-                hi = -1
-
-        if lo > hi:
-            # Infeasible with all 3 — fall back to 2-device (no diffuser)
-            Fd = 0.0
-        else:
-            # Maximise diffuser (= pick hi) to minimise wing sizes
-            Fd = min(hi, 1e6)
-
-        Ffw = max(c_fw + d_fw * Fd, 0.0)
-        Frw = max(c_rw + d_rw * Fd, 0.0)
-        Fd  = max(Fd, 0.0)
-
-        result.device_force = {'fw': Ffw, 'rw': Frw, 'diff': Fd}
-        self._finish_cop(result, wb)
-
-    @staticmethod
-    def _finish_cop(result: 'AeroResult', wb: float):
-        """Compute combined CoP and rear bias from device allocation."""
-        forces = result.device_force
-        cops   = result.device_cop_m
-        total_f = sum(forces.values())
-        if total_f > 1e-6:
-            cop = sum(forces[k] * cops[k] for k in forces) / total_f
-            result.cop_from_front_m  = cop
-            result.cop_pct_wheelbase = (cop / wb * 100.0) if wb > 0 else 50.0
-        else:
-            result.cop_from_front_m  = wb * 0.5
-            result.cop_pct_wheelbase = 50.0
-
-        # Rear bias = fraction of total *axle load* on the rear
-        F_front = result.front_axle_need_N
-        F_rear  = result.rear_axle_need_N
-        total_axle = F_front + F_rear
-        result.rear_aero_bias_pct = (
-            F_rear / total_axle * 100.0) if total_axle > 0 else 50.0
 
     def sweep(self, g_range: np.ndarray,
               longitudinal_g: float = 0.0,
               target_util: float = 0.80,
-              front_aero_fraction: float = 0.50,
-              max_total_downforce_N: float = 12000.0,
-              device_positions: dict | None = None) -> dict:
-        """
-        Sweep lateral g and return arrays of required downforce per corner,
-        plus device forces, CoP, and diffuser rear-bias at each g level.
-        """
+              max_total_downforce_N: float = 12000.0) -> dict:
+        """Sweep lateral g — deficit vs g."""
         gs = np.asarray(g_range, float)
         out = {
             'lateral_g': gs,
-            'total_downforce_N': np.zeros(len(gs)),
-            'front_pct': np.zeros(len(gs)),
-            'cop_from_front_m': np.zeros(len(gs)),
-            'cop_pct_wheelbase': np.zeros(len(gs)),
-            'rear_aero_bias_pct': np.full(len(gs), 50.0),
-            'F_fw': np.zeros(len(gs)),
-            'F_rw': np.zeros(len(gs)),
-            'F_diff': np.zeros(len(gs)),
+            'front_need': np.zeros(len(gs)),
+            'rear_need': np.zeros(len(gs)),
+            'total': np.zeros(len(gs)),
+            'rear_bias_pct': np.full(len(gs), 50.0),
         }
         for lbl in ('FL', 'FR', 'RL', 'RR'):
             out[f'dF_{lbl}'] = np.zeros(len(gs))
 
         for i, g in enumerate(gs):
             try:
-                r = self.solve(
-                    g, longitudinal_g, target_util,
-                    front_aero_fraction=front_aero_fraction,
-                    max_total_downforce_N=max_total_downforce_N,
-                    device_positions=device_positions,
-                )
-                out['total_downforce_N'][i] = r.total_downforce_N
-                out['front_pct'][i] = r.front_downforce_pct
-                out['cop_from_front_m'][i] = r.cop_from_front_m
-                out['cop_pct_wheelbase'][i] = r.cop_pct_wheelbase
-                out['rear_aero_bias_pct'][i] = r.rear_aero_bias_pct
-                out['F_fw'][i]   = r.device_force.get('fw', 0.0)
-                out['F_rw'][i]   = r.device_force.get('rw', 0.0)
-                out['F_diff'][i] = r.device_force.get('diff', 0.0)
+                r = self.solve(g, longitudinal_g, target_util,
+                               max_total_downforce_N=max_total_downforce_N)
+                out['front_need'][i] = r.front_axle_need_N
+                out['rear_need'][i]  = r.rear_axle_need_N
+                out['total'][i]      = r.total_downforce_N
+                out['rear_bias_pct'][i] = r.rear_aero_bias_pct
                 for lbl in ('FL', 'FR', 'RL', 'RR'):
                     out[f'dF_{lbl}'][i] = r.downforce.get(lbl, 0.0)
             except Exception:

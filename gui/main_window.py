@@ -41,7 +41,7 @@ from gui.panels import (
     MotionPanel, CarParamsPanel, HardpointPanel,
     ValuesPanel, GraphPickerPanel, SteeringPanel, AlignmentPanel,
     CollapsibleSection, InverseKinematicsPanel, DynamicsPanel, DynamicsOptPanel,
-    LoadsPanel, AeroPanel, AeroGeomPanel,
+    LoadsPanel, AeroPanel,
 )
 from vahan.optimizer import InverseSolver, DesignVar
 from vahan.dynamics import (VehicleParams, SteadyStateSolver, SteadyStateResult,
@@ -705,28 +705,36 @@ class _DynamicsSolveWorker(QThread):
     failed   = Signal(str)
 
     def __init__(self, solver: SteadyStateSolver, lateral_g: float,
-                 longitudinal_g: float = 0.0):
+                 longitudinal_g: float = 0.0, aero_Fz: dict = None):
         super().__init__()
         self._solver = solver
         self._lat_g = lateral_g
         self._lon_g = longitudinal_g
+        self._aero_Fz = aero_Fz
 
     def run(self):
         try:
-            result = self._solver.solve(self._lat_g, self._lon_g)
+            result = self._solver.solve(self._lat_g, self._lon_g,
+                                        aero_Fz=self._aero_Fz)
             self.finished.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
 
 
 class _DynamicsSweepWorker(QThread):
-    """Runs lateral or longitudinal sweep off the main thread."""
+    """Runs lateral or longitudinal sweep off the main thread.
+
+    When aero_Fz_per_g is provided, aero downforce scales with V^2
+    (i.e. linearly with g at constant turn radius):
+        aero_Fz(g) = {k: v * |g| for k, v in aero_Fz_per_g.items()}
+    """
     finished = Signal(dict)   # sweep arrays
     failed   = Signal(str)
 
-    def __init__(self, solver: SteadyStateSolver, g_min: float, g_max: float,
+    def __init__(self, solver, g_min: float, g_max: float,
                  n_points: int, longitudinal_g: float = 0.0,
-                 mode: str = 'lateral', lateral_g: float = 0.0):
+                 mode: str = 'lateral', lateral_g: float = 0.0,
+                 aero_Fz_per_g: dict = None):
         super().__init__()
         self._solver = solver
         self._g_min = g_min
@@ -735,10 +743,21 @@ class _DynamicsSweepWorker(QThread):
         self._lon_g = longitudinal_g
         self._lat_g = lateral_g
         self._mode = mode
+        self._aero_per_g = aero_Fz_per_g
+
+    def _aero_at_g(self, g_val: float) -> dict | None:
+        if self._aero_per_g is None:
+            return None
+        g = abs(g_val)
+        return {k: v * g for k, v in self._aero_per_g.items()}
 
     def run(self):
         try:
-            if self._mode == 'combined':
+            # For V^2-scaled aero we must call solve() per-point ourselves
+            # so each g gets its own scaled aero_Fz.
+            if self._aero_per_g is not None:
+                result = self._sweep_with_aero()
+            elif self._mode == 'combined':
                 result = self._solver.sweep_combined(
                     lat_range=(self._g_min, self._g_max),
                     lon_g=self._lon_g,
@@ -756,6 +775,71 @@ class _DynamicsSweepWorker(QThread):
             self.finished.emit(result)
         except Exception as e:
             self.failed.emit(str(e))
+
+    def _sweep_with_aero(self) -> dict:
+        """Manual sweep loop: each g-point gets V^2-scaled aero_Fz."""
+        import numpy as _np
+        from scipy.ndimage import uniform_filter1d as _uf
+        from vahan.kinematics import KinematicMetrics
+
+        if self._mode == 'longitudinal':
+            g_arr = _np.linspace(self._g_min, self._g_max, self._n)
+            x_key = 'longitudinal_g'
+        else:
+            g_arr = _np.linspace(self._g_min, self._g_max, self._n)
+            x_key = 'lateral_g'
+
+        keys = ['roll_angle_deg', 'pitch_angle_deg',
+                'rc_height_front_mm', 'rc_height_rear_mm',
+                'elastic_lt_front_N', 'elastic_lt_rear_N',
+                'geometric_lt_front_N', 'geometric_lt_rear_N',
+                'understeer_gradient_deg']
+        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+
+        out = {x_key: g_arr}
+        for k in keys:
+            out[k] = _np.zeros(self._n)
+        for ck in corner_keys:
+            for lbl in ['FL', 'FR', 'RL', 'RR']:
+                out[f'{ck}_{lbl}'] = _np.zeros(self._n)
+
+        self._solver._warm = {}
+        for i, gv in enumerate(g_arr):
+            if self._mode == 'longitudinal':
+                lat_g, lon_g = self._lat_g, gv
+            elif self._mode == 'combined':
+                lat_g, lon_g = gv, self._lon_g
+            else:
+                lat_g, lon_g = gv, self._lon_g
+
+            # V^2-scaled aero: scale by the g magnitude being swept
+            aero = self._aero_at_g(lat_g if self._mode != 'longitudinal' else self._lat_g)
+            r = self._solver.solve(lat_g, lon_g, aero_Fz=aero)
+
+            out['roll_angle_deg'][i] = r.roll_angle_deg
+            out['pitch_angle_deg'][i] = r.pitch_angle_deg
+            out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
+            out['rc_height_rear_mm'][i] = r.rc_height_rear_m * 1000
+            out['elastic_lt_front_N'][i] = r.elastic_lt_front_N
+            out['elastic_lt_rear_N'][i] = r.elastic_lt_rear_N
+            out['geometric_lt_front_N'][i] = r.geometric_lt_front_N
+            out['geometric_lt_rear_N'][i] = r.geometric_lt_rear_N
+            out['understeer_gradient_deg'][i] = r.understeer_gradient_deg
+            for lbl in ['FL', 'FR', 'RL', 'RR']:
+                out[f'Fz_{lbl}'][i] = r.Fz.get(lbl, 0)
+                out[f'travel_{lbl}'][i] = r.travel.get(lbl, 0)
+                out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
+                out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
+
+        # Smooth
+        for k in ['understeer_gradient_deg']:
+            if len(out[k]) >= 5:
+                out[k] = _uf(out[k], size=5, mode='nearest')
+        for lbl in ['FL', 'FR', 'RL', 'RR']:
+            uk = f'utilization_{lbl}'
+            if len(out[uk]) >= 3:
+                out[uk] = _uf(out[uk], size=3, mode='nearest')
+        return out
 
 
 class _SensitivityWorker(QThread):
@@ -799,7 +883,7 @@ class MainWindow(QMainWindow):
                            'wheel_offset_f_mm': 25., 'wheel_offset_r_mm': 25.,
                            'tire_outer_dia_mm': 406., 'tire_rim_dia_mm': 330.,
                            'tire_width_mm': 200., 'show_ground': True,
-                           'cg_x_mm': 0., 'cg_y_mm': 1100., 'cg_z_mm': 280.,
+                           'cg_x_mm': 0., 'cg_y_mm': 845., 'cg_z_mm': 280.,
                            'front_brake_bias_pct': 65.}
         self._steer     = {'rack_travel_per_rev_mm': 60.,
                            'total_rack_travel_mm': 100.,
@@ -830,8 +914,7 @@ class MainWindow(QMainWindow):
         self._update_3d()
         self._try_autoload_tire()
         self._update_min_turn_radius()
-        # Push initial aero geometry to 3D viewer
-        self._on_aero_geom(self._aero_geom_panel.params())
+        # (aero geom feeds solver only, no 3D visuals to push)
 
     # ==========================================================================
     #  BUILD UI
@@ -893,7 +976,7 @@ class MainWindow(QMainWindow):
             if 'cg_height_mm' in car_data and 'cg_z_mm' not in car_data:
                 car_data['cg_z_mm'] = car_data.pop('cg_height_mm')
                 car_data.setdefault('cg_x_mm', 0.)
-                car_data.setdefault('cg_y_mm', 1100.)
+                car_data.setdefault('cg_y_mm', 845.)
             # backward compat: old files without axle_spacing / wheel_offset
             if 'axle_spacing_mm' not in car_data:
                 car_data['axle_spacing_mm'] = car_data.get('wheelbase_mm', 1537.)
@@ -978,7 +1061,6 @@ class MainWindow(QMainWindow):
         self._dynamics_panel = DynamicsPanel()
         self._dynamics_opt_panel = DynamicsOptPanel()
         self._aero_panel = AeroPanel()
-        self._aero_geom_panel = AeroGeomPanel()
         self._loads_panel = LoadsPanel()
         ik_inner = QWidget()
         ik_layout = QVBoxLayout(ik_inner)
@@ -988,7 +1070,6 @@ class MainWindow(QMainWindow):
         ik_layout.addWidget(self._dynamics_panel)
         ik_layout.addWidget(self._dynamics_opt_panel)
         ik_layout.addWidget(self._aero_panel)
-        ik_layout.addWidget(self._aero_geom_panel)
         ik_layout.addWidget(self._loads_panel)
         ik_layout.addStretch()
 
@@ -1034,7 +1115,7 @@ class MainWindow(QMainWindow):
         self._dynamics_opt_panel.analyze_requested.connect(self._on_sensitivity_analyze)
         self._aero_panel.solve_requested.connect(self._on_aero_solve)
         self._aero_panel.sweep_requested.connect(self._on_aero_sweep)
-        self._aero_geom_panel.aero_geom_changed.connect(self._on_aero_geom)
+        self._dynamics_panel.apply_aero_toggled.connect(self._on_apply_aero_toggle)
         self._loads_panel.loads_requested.connect(self._on_compute_loads)
         self._motion_panel.damper_params_changed.connect(self._on_damper_limits)
         # Push initial damper limits to IK panel
@@ -1715,7 +1796,7 @@ class MainWindow(QMainWindow):
 
             # ── CG sphere ────────────────────────────────────────────────
             cg_x = self._car.get('cg_x_mm', 0.) / 1000.
-            cg_y = self._car.get('cg_y_mm', 1100.) / 1000.
+            cg_y = self._car.get('cg_y_mm', 845.) / 1000.
             cg_z = self._car.get('cg_z_mm', 280.) / 1000.
             self.view3d.update_cg((cg_x, cg_y, cg_z))
 
@@ -2309,10 +2390,15 @@ class MainWindow(QMainWindow):
         try:
             ss = self._build_dynamics_solver()
             self._dynamics_panel.set_solving(True)
-            self._dynamics_panel.set_status('Solving...')
+            aero_fz = self._get_active_aero_Fz(at_g=spec['lateral_g'])
+            msg = 'Solving...'
+            if aero_fz:
+                msg += f' (aero: {sum(aero_fz.values()):.0f} N)'
+            self._dynamics_panel.set_status(msg)
 
             worker = _DynamicsSolveWorker(
-                ss, spec['lateral_g'], spec.get('longitudinal_g', 0.0))
+                ss, spec['lateral_g'], spec.get('longitudinal_g', 0.0),
+                aero_Fz=aero_fz)
             worker.finished.connect(self._on_dynamics_solve_done)
             worker.failed.connect(self._on_dynamics_failed)
             self._dyn_worker = worker
@@ -2346,15 +2432,19 @@ class MainWindow(QMainWindow):
             ss = self._build_dynamics_solver()
             self._dynamics_panel.set_solving(True)
             mode = spec.get('mode', 'lateral')
-            self._dynamics_panel.set_status(
-                f'Sweeping ({mode})...')
+            aero_per_g = self._get_aero_Fz_per_g()
+            msg = f'Sweeping ({mode})...'
+            if aero_per_g:
+                msg += ' + aero (V\u00b2)'
+            self._dynamics_panel.set_status(msg)
 
             worker = _DynamicsSweepWorker(
                 ss, spec['g_min'], spec['g_max'],
                 spec.get('n_points', 41),
                 longitudinal_g=spec.get('longitudinal_g', 0.0),
                 mode=mode,
-                lateral_g=spec.get('lateral_g', 0.0))
+                lateral_g=spec.get('lateral_g', 0.0),
+                aero_Fz_per_g=aero_per_g)
             worker.finished.connect(self._on_dynamics_sweep_done)
             worker.failed.connect(self._on_dynamics_failed)
             self._dyn_worker = worker
@@ -2525,14 +2615,52 @@ class MainWindow(QMainWindow):
     #  AERO DOWNFORCE
     # ==========================================================================
 
-    def _get_device_positions(self) -> dict:
-        """Extract device CoP positions from the aero geometry panel."""
-        gp = self._aero_geom_panel.params()
+    _last_aero_result = None  # most recent AeroResult (stores deficit per corner + g_ref)
+    _aero_active = False      # True when "Apply Aero" is toggled on
+
+    def _get_aero_Fz_per_g(self) -> dict | None:
+        """Per-corner aero Fz normalised to 1g (V^2-scaled).
+
+        Aero solve gives deficit at g_ref.  Since downforce ~ V^2 ~ g
+        (constant turn radius), at any g the applied Fz scales linearly:
+            Fz_corner(g) = Fz_per_g[corner] * g
+
+        Returns dict with per-corner Fz at 1g, or None if no aero data.
+        """
+        r = self._last_aero_result
+        if r is None or not self._aero_active:
+            return None
+        g_ref = r.lateral_g
+        if g_ref < 0.01:
+            return None
+        # Use axle-level need (symmetric: max of left/right per axle)
+        fn = r.front_axle_need_N
+        rn = r.rear_axle_need_N
+        if fn + rn < 0.1:
+            return None
         return {
-            'fw_y':   gp['fw_y'],                                   # m from front axle
-            'rw_y':   gp['rw_y'],                                   # m from front axle
-            'diff_y': (gp['diff_y_start'] + gp['diff_y_end']) / 2,  # diffuser centroid
+            'FL': fn / g_ref, 'FR': fn / g_ref,
+            'RL': rn / g_ref, 'RR': rn / g_ref,
         }
+
+    def _get_active_aero_Fz(self, at_g: float = None) -> dict | None:
+        """Return per-corner aero Fz at a specific g (V^2-scaled), or None."""
+        per_g = self._get_aero_Fz_per_g()
+        if per_g is None:
+            return None
+        if at_g is None:
+            at_g = self._dynamics_panel._lat_g.value()
+        g = abs(at_g)
+        return {k: v * g for k, v in per_g.items()}
+
+    def _on_apply_aero_toggle(self, checked: bool):
+        self._aero_active = checked
+        r = self._last_aero_result
+        if checked and r is not None:
+            total = r.front_axle_need_N + r.rear_axle_need_N
+            self._dynamics_panel.update_aero_label(total)
+        else:
+            self._dynamics_panel.update_aero_label(0)
 
     def _on_aero_solve(self, params: dict):
         try:
@@ -2542,10 +2670,12 @@ class MainWindow(QMainWindow):
             result = aero.solve(
                 params['lateral_g'], params['longitudinal_g'],
                 params['target_util'],
-                front_aero_fraction=params.get('front_aero_fraction', 0.5),
-                device_positions=self._get_device_positions(),
             )
+            self._last_aero_result = result
             self._aero_panel.show_result(result)
+            if self._aero_active:
+                total = result.front_axle_need_N + result.rear_axle_need_N
+                self._dynamics_panel.update_aero_label(total)
         except Exception as e:
             import traceback; traceback.print_exc()
             self._aero_panel._status.setText(f'Error: {e}')
@@ -2555,20 +2685,18 @@ class MainWindow(QMainWindow):
             self._aero_panel._status.setText('Sweeping...')
             ss = self._build_dynamics_solver()
             aero = AeroDownforceSolver(ss)
+            turn_r = self._dynamics_panel._turn_radius.value()
+
             g_range = np.linspace(0.1, params['lateral_g'], 21)
             sweep = aero.sweep(
-                g_range, params['longitudinal_g'], params['target_util'],
-                front_aero_fraction=params.get('front_aero_fraction', 0.5),
-                device_positions=self._get_device_positions(),
-            )
+                g_range, params['longitudinal_g'], params['target_util'])
 
             # ── Plot in dynamics figure ──
-            # Consistent per-corner styles (matches dynamics sweep exactly)
             _styles = {
-                'FL': (CORNER_PLOT_COLORS['FL'], '-'),   # yellow solid
-                'FR': (CORNER_PLOT_COLORS['FR'], '--'),  # red dashed
-                'RL': (CORNER_PLOT_COLORS['RL'], '-.'),  # white dash-dot
-                'RR': (CORNER_PLOT_COLORS['RR'], ':'),   # blue dotted
+                'FL': (CORNER_PLOT_COLORS['FL'], '-'),
+                'FR': (CORNER_PLOT_COLORS['FR'], '--'),
+                'RL': (CORNER_PLOT_COLORS['RL'], '-.'),
+                'RR': (CORNER_PLOT_COLORS['RR'], ':'),
             }
             _leg_kw = dict(fontsize=7, facecolor='#06060e',
                            labelcolor='white', framealpha=0.7,
@@ -2577,6 +2705,12 @@ class MainWindow(QMainWindow):
             fig = self.curves.fig
             fig.clear()
             gs = sweep['lateral_g']
+
+            show_speed = turn_r > 0
+            top_margin = 0.86 if show_speed else 0.92
+            fig.subplots_adjust(
+                hspace=0.55, wspace=0.40,
+                left=0.09, right=0.97, top=top_margin, bottom=0.12)
 
             # ── Subplot 1: per-corner Fz deficit ──
             ax1 = fig.add_subplot(1, 2, 1)
@@ -2591,66 +2725,65 @@ class MainWindow(QMainWindow):
             ax1.legend(**_leg_kw)
             ax1.grid(True, alpha=0.2)
 
-            # ── Subplot 2: per-device force allocation ──
+            # ── Subplot 2: axle-level needs + total ──
             ax2 = fig.add_subplot(1, 2, 2)
-            F_fw   = sweep['F_fw']
-            F_rw   = sweep['F_rw']
-            F_diff = sweep['F_diff']
-            F_total = F_fw + F_rw + F_diff
-
-            ax2.plot(gs, F_fw, color='#FFD600', linewidth=2.2,
+            ax2.plot(gs, sweep['front_need'], color='#FFD600', linewidth=2.2,
                      linestyle='-', marker='v', markersize=4,
-                     markevery=3, label='Front wing')
-            ax2.plot(gs, F_rw, color='#42A5F5', linewidth=2.2,
+                     markevery=3, label='Front axle')
+            ax2.plot(gs, sweep['rear_need'], color='#E53935', linewidth=2.2,
                      linestyle='-', marker='^', markersize=4,
-                     markevery=3, label='Rear wing')
-            ax2.plot(gs, F_diff, color='#E53935', linewidth=2.2,
-                     linestyle='-', marker='s', markersize=3,
-                     markevery=3, label='Diffuser')
-            ax2.plot(gs, F_total, color='#FFFFFF', linewidth=2.0,
+                     markevery=3, label='Rear axle')
+            ax2.plot(gs, sweep['total'], color='#FFFFFF', linewidth=2.0,
                      linestyle=':', marker='o', markersize=2,
                      markevery=3, label='Total', alpha=0.7)
             ax2.set_xlabel('Lateral g')
-            ax2.set_ylabel('Device force (N)')
-            ax2.set_title(f'Device allocation (util\u2264{params["target_util"]:.0%})',
+            ax2.set_ylabel('Downforce needed (N)')
+            ax2.set_title(f'Aero targets (util\u2264{params["target_util"]:.0%})',
                           color='white', fontsize=10)
             ax2.legend(**{**_leg_kw, 'ncol': 1, 'loc': 'upper left'})
             ax2.grid(True, alpha=0.2)
 
             # Annotate rear bias at final g
-            bias_final = sweep['rear_aero_bias_pct'][-1]
-            if F_total[-1] > 0:
+            bias_final = sweep['rear_bias_pct'][-1]
+            total_final = sweep['total'][-1]
+            if total_final > 0:
                 ax2.annotate(
                     f'Rear bias: {bias_final:.0f}%',
-                    xy=(gs[-1], F_total[-1]),
+                    xy=(gs[-1], total_final),
                     xytext=(-60, 12), textcoords='offset points',
                     color='#aaa', fontsize=8,
                     arrowprops=dict(arrowstyle='->', color='#666'))
 
-            for ax in fig.get_axes():
+            # Style + velocity secondary x-axis (same as dynamics plots)
+            for ax in [ax1, ax2]:
                 ax.set_facecolor('#000000')
                 ax.tick_params(colors='#888')
                 ax.xaxis.label.set_color('#aaa')
                 ax.yaxis.label.set_color('#aaa')
 
-            fig.tight_layout()
+                if show_speed:
+                    try:
+                        R = turn_r
+                        def _g_to_mph(g, R=R):
+                            return np.sqrt(np.maximum(g, 0) * 9.81 * R) * 2.23694
+                        def _mph_to_g(mph, R=R):
+                            v = mph / 2.23694
+                            return v**2 / (9.81 * R) if R > 0 else 0.0
+                        secax = ax.secondary_xaxis('top',
+                                                   functions=(_g_to_mph, _mph_to_g))
+                        secax.set_xlabel('Speed (mph)', color='#4FC3F7',
+                                        fontsize=7, labelpad=2)
+                        secax.tick_params(colors='#4FC3F7', labelsize=7)
+                    except Exception:
+                        pass
+
+            fig.tight_layout(rect=[0, 0, 1, top_margin + 0.04])
             self.curves.draw()
             self._aero_panel._status.setText(
                 f'Sweep done: 0.1\u2013{params["lateral_g"]:.1f}g, {len(g_range)} pts')
         except Exception as e:
             import traceback; traceback.print_exc()
             self._aero_panel._status.setText(f'Error: {e}')
-
-    # ==========================================================================
-    #  AERO GEOMETRY (3D overlay)
-    # ==========================================================================
-
-    def _on_aero_geom(self, params: dict):
-        """Push aero package geometry to the 3D viewer."""
-        try:
-            self.view3d.update_aero(params)
-        except Exception as e:
-            import traceback; traceback.print_exc()
 
     # ==========================================================================
     #  STYLE

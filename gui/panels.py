@@ -1475,6 +1475,7 @@ class DynamicsPanel(CollapsibleSection):
     params_changed         = pyqtSignal(dict)
     graph_selection_changed = pyqtSignal(list)   # selected graph keys
     corners_changed        = pyqtSignal(list)    # selected corners
+    apply_aero_toggled     = pyqtSignal(bool)    # True = aero on
 
     def __init__(self):
         super().__init__('Dynamics', header_color='#4FC3F7')
@@ -1622,6 +1623,26 @@ class DynamicsPanel(CollapsibleSection):
             'QPushButton:hover { background: #1f6da0; }')
         btn_row.addWidget(self._sweep_btn)
         self.add_layout(btn_row)
+
+        # ── Apply Aero toggle ────────────────────────────────────────────
+        aero_row = QHBoxLayout()
+        self._apply_aero_btn = QPushButton('Apply Aero')
+        self._apply_aero_btn.setCheckable(True)
+        self._apply_aero_btn.setChecked(False)
+        self._apply_aero_btn.setStyleSheet(
+            'QPushButton { background: #1a1a1a; color: #888; padding: 5px 14px; '
+            'border: 1px solid #333; border-radius: 3px; font-weight: bold; }'
+            'QPushButton:checked { background: #6A1B9A; color: white; border-color: #CE93D8; }'
+            'QPushButton:hover { background: #2a2a2a; }')
+        self._apply_aero_btn.setToolTip(
+            'Include aero downforce (from Aero Load Targets panel) in dynamics solve/sweep')
+        self._apply_aero_btn.toggled.connect(self._on_aero_toggle)
+        aero_row.addWidget(self._apply_aero_btn)
+        self._aero_label = QLabel('OFF')
+        self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
+        aero_row.addWidget(self._aero_label)
+        aero_row.addStretch()
+        self.add_layout(aero_row)
 
         # ── Sweep axes (checkboxes) + range ──────────────────────────────
         mode_row = QHBoxLayout()
@@ -1948,6 +1969,31 @@ class DynamicsPanel(CollapsibleSection):
             'turn_radius_m': self._turn_radius.value(),
         })
 
+    def _on_aero_toggle(self, checked: bool):
+        self.apply_aero_toggled.emit(checked)
+        if checked:
+            self._apply_aero_btn.setStyleSheet(
+                'QPushButton { background: #6A1B9A; color: white; padding: 5px 14px; '
+                'border: 1px solid #CE93D8; border-radius: 3px; font-weight: bold; }'
+                'QPushButton:hover { background: #8E24AA; }')
+        else:
+            self._apply_aero_btn.setStyleSheet(
+                'QPushButton { background: #1a1a1a; color: #888; padding: 5px 14px; '
+                'border: 1px solid #333; border-radius: 3px; font-weight: bold; }'
+                'QPushButton:checked { background: #6A1B9A; color: white; border-color: #CE93D8; }'
+                'QPushButton:hover { background: #2a2a2a; }')
+            self._aero_label.setText('OFF')
+            self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
+
+    def update_aero_label(self, total_N: float):
+        """Called by main_window when aero state changes."""
+        if self._apply_aero_btn.isChecked() and total_N > 0:
+            self._aero_label.setText(f'+{total_N:.0f} N applied')
+            self._aero_label.setStyleSheet('color: #CE93D8; font-size: 10px; font-weight: bold;')
+        else:
+            self._aero_label.setText('OFF')
+            self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
+
     def _on_graph_changed(self):
         self.graph_selection_changed.emit(self.get_selected_graphs())
 
@@ -2061,7 +2107,7 @@ class DynamicsPanel(CollapsibleSection):
 
 class AeroPanel(CollapsibleSection):
     """Per-corner additional Fz needed for target utilization."""
-    solve_requested = pyqtSignal(dict)   # lateral_g, longitudinal_g, target_util, front_aero_fraction
+    solve_requested = pyqtSignal(dict)   # lateral_g, longitudinal_g, target_util
     sweep_requested = pyqtSignal(dict)
 
     def __init__(self):
@@ -2076,12 +2122,6 @@ class AeroPanel(CollapsibleSection):
         self._lon_g = _spin(-3, 3, 0, ' g', dec=2, step=0.1); g.addWidget(self._lon_g, r, 1); r += 1
         g.addWidget(QLabel('Target util:'), r, 0)
         self._tgt = _spin(0.1, 1.0, 0.80, '', dec=2, step=0.05); g.addWidget(self._tgt, r, 1); r += 1
-        g.addWidget(QLabel('Front aero %:'), r, 0)
-        self._front_pct = _spin(5, 95, 50, ' %', dec=0, step=5.0)
-        self._front_pct.setToolTip(
-            'Fraction of total added downforce on the front axle (rest on rear). '
-            'Each axle splits 50/50 left/right.')
-        g.addWidget(self._front_pct, r, 1); r += 1
         self.add_layout(g)
 
         btn_row = QHBoxLayout()
@@ -2106,12 +2146,12 @@ class AeroPanel(CollapsibleSection):
         self._status.setWordWrap(True)
         self.add_widget(self._status)
 
-        # Results table: 4 corners + total
+        # Results table
         self._tbl = QTableWidget(5, 3)
-        self._tbl.setHorizontalHeaderLabels(['Corner', 'Addl Fz (N)', 'Util after'])
+        self._tbl.setHorizontalHeaderLabels(['', 'Addl Fz (N)', 'Util after'])
         self._tbl.verticalHeader().setVisible(False)
         self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self._tbl.setMaximumHeight(280)
+        self._tbl.setMaximumHeight(320)
         self._tbl.setStyleSheet(
             'QTableWidget { background: #0d0d0d; color: #e0e0e0; gridline-color: #222; '
             'font-size: 11px; } QHeaderView::section { background: #1a1a1a; color: #aaa; '
@@ -2128,7 +2168,6 @@ class AeroPanel(CollapsibleSection):
             'lateral_g': self._lat_g.value(),
             'longitudinal_g': self._lon_g.value(),
             'target_util': self._tgt.value(),
-            'front_aero_fraction': self._front_pct.value() / 100.0,
         })
 
     def _on_sweep(self):
@@ -2136,55 +2175,29 @@ class AeroPanel(CollapsibleSection):
             'lateral_g': self._lat_g.value(),
             'longitudinal_g': self._lon_g.value(),
             'target_util': self._tgt.value(),
-            'front_aero_fraction': self._front_pct.value() / 100.0,
         })
 
     def show_result(self, r):
-        """r: AeroResult"""
+        """r: AeroResult — per-corner deficit, axle needs, total, rear bias."""
         df = r.downforce
         ut = r.utilization_aero
-        dev = r.device_force     # {'fw': N, 'rw': N, 'diff': N} or {}
-        cop = r.device_cop_m     # {'fw': m, 'rw': m, 'diff': m} or {}
 
-        # ── Column header (3rd col switches meaning) ──
-        self._tbl.setHorizontalHeaderLabels(
-            ['', 'Addl Fz (N)', 'Util after'])
+        self._tbl.setHorizontalHeaderLabels(['', 'Deficit (N)', 'Util after'])
 
         rows = [('FL', df.get('FL', 0), ut.get('FL', 0)),
                 ('FR', df.get('FR', 0), ut.get('FR', 0)),
                 ('RL', df.get('RL', 0), ut.get('RL', 0)),
                 ('RR', df.get('RR', 0), ut.get('RR', 0))]
 
-        # Axle-level summary
         front_need = r.front_axle_need_N
         rear_need  = r.rear_axle_need_N
-        total_axle = front_need + rear_need
+        total      = r.total_downforce_N
 
         rows.append(('', '', None))
-        rows.append(('Front axle need /side', f'{front_need:.0f}', None))
-        rows.append(('Rear axle need /side',  f'{rear_need:.0f}', None))
-        rows.append(('Total axle need',       f'{total_axle:.0f}', None))
-
-        # ── Per-device allocation (if device positions were given) ──
-        if dev:
-            rows.append(('', '', None))
-            # Header-ish row
-            rows.append(('DEVICE', 'Force (N)', 'CoP (mm)'))
-            for key, label in [('fw', 'Front wing'),
-                               ('rw', 'Rear wing'),
-                               ('diff', 'Diffuser')]:
-                f_val = dev.get(key, 0)
-                y_mm  = cop.get(key, 0) * 1000
-                rows.append((label, f'{f_val:.0f}', f'{y_mm:.0f}'))
-            total_dev = sum(dev.values())
-            rows.append(('Total device force', f'{total_dev:.0f}', ''))
-
-            rows.append(('', '', None))
-            rows.append(('Combined CoP',
-                          f'{r.cop_from_front_m * 1000:.0f} mm',
-                          f'{r.cop_pct_wheelbase:.1f}% wb'))
-            rows.append(('Rear aero bias',
-                          f'{r.rear_aero_bias_pct:.1f}%', ''))
+        rows.append(('Front axle need',  f'{front_need:.0f}', None))
+        rows.append(('Rear axle need',   f'{rear_need:.0f}', None))
+        rows.append(('Total deficit',    f'{total:.0f}', None))
+        rows.append(('Rear aero bias',   f'{r.rear_aero_bias_pct:.1f}%', None))
 
         self._tbl.setRowCount(len(rows))
         for i, (lbl, val, u) in enumerate(rows):
@@ -2198,152 +2211,13 @@ class AeroPanel(CollapsibleSection):
         if r.capped:
             cap = f'  |  Capped: {", ".join(r.capped)}'
 
-        if dev:
-            self._summary.setText(
-                f'FW: {dev.get("fw", 0):.0f} N @ {cop.get("fw", 0)*1000:.0f}mm  |  '
-                f'RW: {dev.get("rw", 0):.0f} N @ {cop.get("rw", 0)*1000:.0f}mm  |  '
-                f'Diff: {dev.get("diff", 0):.0f} N @ {cop.get("diff", 0)*1000:.0f}mm\n'
-                f'Combined CoP: {r.cop_from_front_m*1000:.0f} mm  |  '
-                f'Rear bias: {r.rear_aero_bias_pct:.1f}%{cap}')
-        else:
-            self._summary.setText(
-                f'Front: {front_need:.0f} N/side  |  '
-                f'Rear: {rear_need:.0f} N/side  |  '
-                f'Total: {total_axle:.0f} N{cap}')
-        self._status.setText(f'Solved @ {r.lateral_g:.2f}g lat, {r.longitudinal_g:.2f}g lon')
+        self._summary.setText(
+            f'Deficit F:{front_need:.0f}  R:{rear_need:.0f}  '
+            f'Tot:{total:.0f} N  |  '
+            f'Bias: {r.rear_aero_bias_pct:.0f}%{cap}')
+        self._status.setText(
+            f'Solved @ {r.lateral_g:.2f}g lat, {r.longitudinal_g:.2f}g lon')
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  AERO GEOMETRY PANEL  (3-D packaging overlay)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AeroGeomPanel(CollapsibleSection):
-    """
-    Inputs for front wing, rear wing, and diffuser geometry.
-    Drives the translucent 3D overlays in View3D so the user can
-    check packaging feasibility.
-    """
-    aero_geom_changed = pyqtSignal(dict)   # emits full param dict on any change
-
-    # Default values — sensible FSAE starting point (mm in UI, metres internal)
-    _DEFAULTS = {
-        'fw_visible': True,
-        'fw_y_mm':    -250,     # 250 mm ahead of front axle
-        'fw_z_mm':     55,      # 55 mm above ground
-        'fw_span_mm': 1400,
-        'fw_chord_mm': 300,
-
-        'rw_visible': True,
-        'rw_y_mm':    1900,     # 1900 mm from front axle (≈ 360 mm behind rear axle)
-        'rw_z_mm':     850,
-        'rw_span_mm':  780,
-        'rw_chord_mm': 250,
-
-        'diff_visible': True,
-        'diff_y_start_mm': 650,
-        'diff_y_end_mm':  1700,
-        'diff_z_entry_mm': 25,
-        'diff_z_exit_mm': 175,
-        'diff_width_mm':  850,
-    }
-
-    def __init__(self):
-        super().__init__('Aero Package (3D)', header_color='#4DD0E1')
-        self._spins = {}
-        self._checks = {}
-        self._build()
-
-    # ── build UI ──────────────────────────────────────────────────────
-
-    def _build(self):
-        d = self._DEFAULTS
-
-        # ── Front wing ──
-        self._add_section('Front Wing', '#FFD600', [
-            ('fw_visible', None),
-            ('fw_y_mm',     'Y offset (mm)',  -800, 200,  d['fw_y_mm']),
-            ('fw_z_mm',     'Z height (mm)',     0, 300,  d['fw_z_mm']),
-            ('fw_span_mm',  'Span (mm)',       400, 2000, d['fw_span_mm']),
-            ('fw_chord_mm', 'Chord (mm)',      100, 600,  d['fw_chord_mm']),
-        ])
-
-        # ── Rear wing ──
-        self._add_section('Rear Wing', '#42A5F5', [
-            ('rw_visible', None),
-            ('rw_y_mm',     'Y position (mm)', 1200, 2500, d['rw_y_mm']),
-            ('rw_z_mm',     'Z height (mm)',     300, 1200, d['rw_z_mm']),
-            ('rw_span_mm',  'Span (mm)',         300, 1200, d['rw_span_mm']),
-            ('rw_chord_mm', 'Chord (mm)',        100, 500,  d['rw_chord_mm']),
-        ])
-
-        # ── Diffuser ──
-        self._add_section('Diffuser', '#E53935', [
-            ('diff_visible', None),
-            ('diff_y_start_mm', 'Y start (mm)',    200, 1200, d['diff_y_start_mm']),
-            ('diff_y_end_mm',   'Y end (mm)',      1000, 2200, d['diff_y_end_mm']),
-            ('diff_z_entry_mm', 'Entry height (mm)',  5, 80,  d['diff_z_entry_mm']),
-            ('diff_z_exit_mm',  'Exit height (mm)',  50, 400, d['diff_z_exit_mm']),
-            ('diff_width_mm',   'Width (mm)',       400, 1400, d['diff_width_mm']),
-        ])
-
-    def _add_section(self, title, color, fields):
-        lbl = QLabel(title)
-        lbl.setStyleSheet(f'font-weight: bold; color: {color}; font-size: 11px;')
-        self.add_widget(lbl)
-
-        g = QGridLayout()
-        g.setSpacing(3)
-        row = 0
-
-        for spec in fields:
-            key = spec[0]
-            if spec[1] is None:
-                # visibility checkbox
-                cb = QCheckBox('Show')
-                cb.setChecked(self._DEFAULTS.get(key, True))
-                cb.stateChanged.connect(self._emit)
-                self._checks[key] = cb
-                g.addWidget(cb, row, 0, 1, 2)
-                row += 1
-            else:
-                label, lo, hi, val = spec[1], spec[2], spec[3], spec[4]
-                g.addWidget(QLabel(label), row, 0)
-                sb = _spin(lo, hi, val, ' mm', dec=0, step=10.0)
-                sb.valueChanged.connect(self._emit)
-                self._spins[key] = sb
-                g.addWidget(sb, row, 1)
-                row += 1
-
-        self.add_layout(g)
-
-    # ── public ────────────────────────────────────────────────────────
-
-    def params(self) -> dict:
-        """Return current params in METRES (ready for View3D.update_aero)."""
-        mm = 0.001
-        return {
-            'fw_visible':    self._checks['fw_visible'].isChecked(),
-            'fw_y':          self._spins['fw_y_mm'].value() * mm,
-            'fw_z':          self._spins['fw_z_mm'].value() * mm,
-            'fw_span':       self._spins['fw_span_mm'].value() * mm,
-            'fw_chord':      self._spins['fw_chord_mm'].value() * mm,
-
-            'rw_visible':    self._checks['rw_visible'].isChecked(),
-            'rw_y':          self._spins['rw_y_mm'].value() * mm,
-            'rw_z':          self._spins['rw_z_mm'].value() * mm,
-            'rw_span':       self._spins['rw_span_mm'].value() * mm,
-            'rw_chord':      self._spins['rw_chord_mm'].value() * mm,
-
-            'diff_visible':  self._checks['diff_visible'].isChecked(),
-            'diff_y_start':  self._spins['diff_y_start_mm'].value() * mm,
-            'diff_y_end':    self._spins['diff_y_end_mm'].value() * mm,
-            'diff_z_entry':  self._spins['diff_z_entry_mm'].value() * mm,
-            'diff_z_exit':   self._spins['diff_z_exit_mm'].value() * mm,
-            'diff_width':    self._spins['diff_width_mm'].value() * mm,
-        }
-
-    def _emit(self, *_args):
-        self.aero_geom_changed.emit(self.params())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
