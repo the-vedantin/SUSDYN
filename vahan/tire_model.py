@@ -373,10 +373,20 @@ class TireModel:
         return (fy_pos - fy_neg) / (2 * da)
 
     def peak_mu(self, Fz_N, camber_deg=0.0):
-        """Peak friction coefficient: mu = peak_Fy / Fz."""
+        """Peak friction coefficient: mu = peak_Fy / Fz.
+
+        Above the data range, peak_Fy is clipped (constant), which makes
+        mu drop as 1/Fz and grip plateau.  Fix: hold mu constant at the
+        boundary value so grip extrapolates linearly.
+        """
         fz = np.atleast_1d(np.asarray(Fz_N, float))
+        fz_max = float(self._fz_axis[-1])
         peak = self.peak_Fy(fz, camber_deg)
-        return np.where(fz > 1.0, peak / fz, 0.0).squeeze()
+        mu = np.where(fz > 1.0, peak / np.maximum(fz, 1.0), 0.0)
+        # Above data range: use mu at boundary so grip = mu_max * Fz
+        mu_at_max = self.peak_Fy(fz_max, camber_deg) / fz_max
+        mu = np.where(fz > fz_max, mu_at_max, mu)
+        return mu.squeeze()
 
     def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0):
         """

@@ -6,5 +6,5 @@ from .solver import SuspensionConstraints, SolvedState
 from .kinematics import KinematicMetrics
 from .analysis import SuspensionAnalysis
 from .tire_model import TireModel, LinearTireModel, load_ttc_mat, load_tire_data
-from .dynamics import VehicleParams, SteadyStateSolver, SteadyStateResult
+from .dynamics import VehicleParams, SteadyStateSolver, SteadyStateResult, AeroDownforceSolver, AeroResult
 from .loads import BrakeParams, UprightParams, ComponentLoads, compute_all_corners

@@ -41,10 +41,11 @@ from gui.panels import (
     MotionPanel, CarParamsPanel, HardpointPanel,
     ValuesPanel, GraphPickerPanel, SteeringPanel, AlignmentPanel,
     CollapsibleSection, InverseKinematicsPanel, DynamicsPanel, DynamicsOptPanel,
-    LoadsPanel,
+    LoadsPanel, AeroPanel, AeroGeomPanel,
 )
 from vahan.optimizer import InverseSolver, DesignVar
-from vahan.dynamics import VehicleParams, SteadyStateSolver, SteadyStateResult, DynamicsSensitivity
+from vahan.dynamics import (VehicleParams, SteadyStateSolver, SteadyStateResult,
+                            DynamicsSensitivity, AeroDownforceSolver, AeroResult)
 
 # ==============================================================================
 #  DEFAULT HARDPOINTS  (X=lateral outboard+, Y=fwd+, Z=up+)
@@ -107,6 +108,14 @@ DEFAULT_REAR_ARB = {
     'arb_drop_top':  np.array([ 0.27518,  1.54623,  0.35118]),
     'arb_arm_end':   np.array([ 0.27518,  1.54623,  0.23178]),
     'arb_pivot':     np.array([ 0.27518,  1.65100,  0.23178]),
+}
+
+# Per-corner plot colors — yellow/red/white/blue (user preference).
+CORNER_PLOT_COLORS = {
+    'FL': '#FFD600',   # yellow
+    'FR': '#E53935',   # red
+    'RL': '#FFFFFF',   # white
+    'RR': '#42A5F5',   # blue
 }
 
 
@@ -235,10 +244,10 @@ class CurvesCanvas(FigureCanvas):
             left=0.09, right=0.97, top=0.90, bottom=0.10)
 
         styles = {
-            'FL': ('#e07b30', '-'),
-            'FR': ('#EF5350', '--'),
-            'RL': ('#66BB6A', '-.'),
-            'RR': ('#FFA726', ':'),
+            'FL': (CORNER_PLOT_COLORS['FL'], '-'),
+            'FR': (CORNER_PLOT_COLORS['FR'], '--'),
+            'RL': (CORNER_PLOT_COLORS['RL'], '-.'),
+            'RR': (CORNER_PLOT_COLORS['RR'], ':'),
         }
 
         for idx, key in enumerate(selected_keys):
@@ -421,7 +430,7 @@ class CurvesCanvas(FigureCanvas):
         if graphs is None:
             graphs = ['fz', 'roll', 'travel', 'lt', 'utilization']
 
-        _C = {'FL': '#e07b30', 'FR': '#EF5350', 'RL': '#66BB6A', 'RR': '#FFA726'}
+        _C = dict(CORNER_PLOT_COLORS)
         _LS = {'FL': '-', 'FR': '--', 'RL': '-.', 'RR': ':'}
 
         # Understeer data (needed for steer_correction / path_deviation)
@@ -456,16 +465,16 @@ class CurvesCanvas(FigureCanvas):
 
         if 'lt' in graphs:
             plots.append(('Load Transfer', 'LT (N)', [
-                ('Elastic F', sweep['elastic_lt_front_N'], '#e07b30', '-'),
-                ('Elastic R', sweep['elastic_lt_rear_N'], '#66BB6A', '--'),
-                ('Geo F', sweep['geometric_lt_front_N'], '#EF5350', '-.'),
-                ('Geo R', sweep['geometric_lt_rear_N'], '#FFA726', ':'),
+                ('Elastic F', sweep['elastic_lt_front_N'], '#64B5F6', '-'),
+                ('Elastic R', sweep['elastic_lt_rear_N'], '#0D47A1', '--'),
+                ('Geo F', sweep['geometric_lt_front_N'], '#E53935', '-.'),
+                ('Geo R', sweep['geometric_lt_rear_N'], '#AD1457', ':'),
             ]))
 
         if 'rc' in graphs:
             plots.append(('Roll Centre Height', 'RC (mm)', [
-                ('Front', sweep['rc_height_front_mm'], '#e07b30', '-'),
-                ('Rear', sweep['rc_height_rear_mm'], '#66BB6A', '--'),
+                ('Front', sweep['rc_height_front_mm'], '#42A5F5', '-'),
+                ('Rear', sweep['rc_height_rear_mm'], '#4527A0', '--'),
             ]))
 
         if 'utilization' in graphs:
@@ -478,7 +487,7 @@ class CurvesCanvas(FigureCanvas):
         if 'understeer' in graphs:
             if us is not None and np.any(us):
                 plots.append(('Understeer Gradient', 'SA_front − SA_rear (deg)', [
-                    ('US Gradient', us, '#FFCA28', '-'),
+                    ('US Gradient', us, '#9575CD', '-'),
                 ]))
 
         if 'steer_correction' in graphs:
@@ -493,17 +502,17 @@ class CurvesCanvas(FigureCanvas):
                         plots.append(('Handwheel Angle', 'Steering wheel (deg)', [
                             ('Ackermann', hw_ack, '#555555', '--'),
                             ('Required', hw_req, '#4FC3F7', '-'),
-                            ('Extra (US)', us * steer_ratio, '#EF5350', '-.'),
+                            ('Extra (US)', us * steer_ratio, '#BA68C8', '-.'),
                         ]))
                     else:
                         plots.append(('Steer Correction', 'Front wheel angle (deg)', [
                             ('Ackermann', np.full_like(g_arr, ack_deg), '#555555', '--'),
                             ('Required', total_steer, '#4FC3F7', '-'),
-                            ('Extra (US)', us, '#EF5350', '-.'),
+                            ('Extra (US)', us, '#BA68C8', '-.'),
                         ]))
                 else:
                     plots.append(('Steer Correction', 'Extra steer (deg)', [
-                        ('Extra (US)', us, '#EF5350', '-'),
+                        ('Extra (US)', us, '#BA68C8', '-'),
                     ]))
 
         if 'path_deviation' in graphs:
@@ -518,7 +527,7 @@ class CurvesCanvas(FigureCanvas):
                 # Clamp extreme values for readability
                 deviation = np.clip(deviation, -50, 50)
                 plots.append(('Path Deviation', f'Drift from {turn_radius_m:.0f}m radius (m)', [
-                    ('Deviation', deviation, '#FF7043', '-'),
+                    ('Deviation', deviation, '#90CAF9', '-'),
                 ]))
 
         if not plots:
@@ -557,7 +566,7 @@ class CurvesCanvas(FigureCanvas):
             if title == 'Understeer Gradient':
                 ax.axhline(y=0, color='#555555', lw=0.8, ls='--', alpha=0.6)
             if title == 'Tire Utilization':
-                ax.axhline(y=1.0, color='#EF5350', lw=1.0, ls='--', alpha=0.7,
+                ax.axhline(y=1.0, color='#B0BEC5', lw=1.0, ls='--', alpha=0.7,
                             label='_grip limit')
             if title == 'Path Deviation':
                 ax.axhline(y=0, color='#555555', lw=0.8, ls='--', alpha=0.6)
@@ -821,6 +830,8 @@ class MainWindow(QMainWindow):
         self._update_3d()
         self._try_autoload_tire()
         self._update_min_turn_radius()
+        # Push initial aero geometry to 3D viewer
+        self._on_aero_geom(self._aero_geom_panel.params())
 
     # ==========================================================================
     #  BUILD UI
@@ -966,6 +977,8 @@ class MainWindow(QMainWindow):
         self._ik_panel = InverseKinematicsPanel()
         self._dynamics_panel = DynamicsPanel()
         self._dynamics_opt_panel = DynamicsOptPanel()
+        self._aero_panel = AeroPanel()
+        self._aero_geom_panel = AeroGeomPanel()
         self._loads_panel = LoadsPanel()
         ik_inner = QWidget()
         ik_layout = QVBoxLayout(ik_inner)
@@ -974,6 +987,8 @@ class MainWindow(QMainWindow):
         ik_layout.addWidget(self._ik_panel)
         ik_layout.addWidget(self._dynamics_panel)
         ik_layout.addWidget(self._dynamics_opt_panel)
+        ik_layout.addWidget(self._aero_panel)
+        ik_layout.addWidget(self._aero_geom_panel)
         ik_layout.addWidget(self._loads_panel)
         ik_layout.addStretch()
 
@@ -1017,6 +1032,9 @@ class MainWindow(QMainWindow):
         self._dynamics_panel.graph_selection_changed.connect(self._on_dyn_graph_sel)
         self._dynamics_panel.corners_changed.connect(self._on_dyn_corners_sel)
         self._dynamics_opt_panel.analyze_requested.connect(self._on_sensitivity_analyze)
+        self._aero_panel.solve_requested.connect(self._on_aero_solve)
+        self._aero_panel.sweep_requested.connect(self._on_aero_sweep)
+        self._aero_geom_panel.aero_geom_changed.connect(self._on_aero_geom)
         self._loads_panel.loads_requested.connect(self._on_compute_loads)
         self._motion_panel.damper_params_changed.connect(self._on_damper_limits)
         # Push initial damper limits to IK panel
@@ -2502,6 +2520,137 @@ class MainWindow(QMainWindow):
         except Exception as e:
             import traceback; traceback.print_exc()
             self._loads_panel._loads_status.setText(f'Error: {e}')
+
+    # ==========================================================================
+    #  AERO DOWNFORCE
+    # ==========================================================================
+
+    def _get_device_positions(self) -> dict:
+        """Extract device CoP positions from the aero geometry panel."""
+        gp = self._aero_geom_panel.params()
+        return {
+            'fw_y':   gp['fw_y'],                                   # m from front axle
+            'rw_y':   gp['rw_y'],                                   # m from front axle
+            'diff_y': (gp['diff_y_start'] + gp['diff_y_end']) / 2,  # diffuser centroid
+        }
+
+    def _on_aero_solve(self, params: dict):
+        try:
+            self._aero_panel._status.setText('Solving...')
+            ss = self._build_dynamics_solver()
+            aero = AeroDownforceSolver(ss)
+            result = aero.solve(
+                params['lateral_g'], params['longitudinal_g'],
+                params['target_util'],
+                front_aero_fraction=params.get('front_aero_fraction', 0.5),
+                device_positions=self._get_device_positions(),
+            )
+            self._aero_panel.show_result(result)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._aero_panel._status.setText(f'Error: {e}')
+
+    def _on_aero_sweep(self, params: dict):
+        try:
+            self._aero_panel._status.setText('Sweeping...')
+            ss = self._build_dynamics_solver()
+            aero = AeroDownforceSolver(ss)
+            g_range = np.linspace(0.1, params['lateral_g'], 21)
+            sweep = aero.sweep(
+                g_range, params['longitudinal_g'], params['target_util'],
+                front_aero_fraction=params.get('front_aero_fraction', 0.5),
+                device_positions=self._get_device_positions(),
+            )
+
+            # ── Plot in dynamics figure ──
+            # Consistent per-corner styles (matches dynamics sweep exactly)
+            _styles = {
+                'FL': (CORNER_PLOT_COLORS['FL'], '-'),   # yellow solid
+                'FR': (CORNER_PLOT_COLORS['FR'], '--'),  # red dashed
+                'RL': (CORNER_PLOT_COLORS['RL'], '-.'),  # white dash-dot
+                'RR': (CORNER_PLOT_COLORS['RR'], ':'),   # blue dotted
+            }
+            _leg_kw = dict(fontsize=7, facecolor='#06060e',
+                           labelcolor='white', framealpha=0.7,
+                           loc='best', handlelength=1.5, ncol=2)
+
+            fig = self.curves.fig
+            fig.clear()
+            gs = sweep['lateral_g']
+
+            # ── Subplot 1: per-corner Fz deficit ──
+            ax1 = fig.add_subplot(1, 2, 1)
+            for lbl in ('FL', 'FR', 'RL', 'RR'):
+                col, ls = _styles[lbl]
+                ax1.plot(gs, sweep[f'dF_{lbl}'], label=lbl,
+                         color=col, ls=ls, lw=1.8)
+            ax1.set_xlabel('Lateral g')
+            ax1.set_ylabel('Additional Fz required (N)')
+            ax1.set_title('Per-corner load deficit',
+                          color='white', fontsize=10)
+            ax1.legend(**_leg_kw)
+            ax1.grid(True, alpha=0.2)
+
+            # ── Subplot 2: per-device force allocation ──
+            ax2 = fig.add_subplot(1, 2, 2)
+            F_fw   = sweep['F_fw']
+            F_rw   = sweep['F_rw']
+            F_diff = sweep['F_diff']
+            F_total = F_fw + F_rw + F_diff
+
+            ax2.plot(gs, F_fw, color='#FFD600', linewidth=2.2,
+                     linestyle='-', marker='v', markersize=4,
+                     markevery=3, label='Front wing')
+            ax2.plot(gs, F_rw, color='#42A5F5', linewidth=2.2,
+                     linestyle='-', marker='^', markersize=4,
+                     markevery=3, label='Rear wing')
+            ax2.plot(gs, F_diff, color='#E53935', linewidth=2.2,
+                     linestyle='-', marker='s', markersize=3,
+                     markevery=3, label='Diffuser')
+            ax2.plot(gs, F_total, color='#FFFFFF', linewidth=2.0,
+                     linestyle=':', marker='o', markersize=2,
+                     markevery=3, label='Total', alpha=0.7)
+            ax2.set_xlabel('Lateral g')
+            ax2.set_ylabel('Device force (N)')
+            ax2.set_title(f'Device allocation (util\u2264{params["target_util"]:.0%})',
+                          color='white', fontsize=10)
+            ax2.legend(**{**_leg_kw, 'ncol': 1, 'loc': 'upper left'})
+            ax2.grid(True, alpha=0.2)
+
+            # Annotate rear bias at final g
+            bias_final = sweep['rear_aero_bias_pct'][-1]
+            if F_total[-1] > 0:
+                ax2.annotate(
+                    f'Rear bias: {bias_final:.0f}%',
+                    xy=(gs[-1], F_total[-1]),
+                    xytext=(-60, 12), textcoords='offset points',
+                    color='#aaa', fontsize=8,
+                    arrowprops=dict(arrowstyle='->', color='#666'))
+
+            for ax in fig.get_axes():
+                ax.set_facecolor('#000000')
+                ax.tick_params(colors='#888')
+                ax.xaxis.label.set_color('#aaa')
+                ax.yaxis.label.set_color('#aaa')
+
+            fig.tight_layout()
+            self.curves.draw()
+            self._aero_panel._status.setText(
+                f'Sweep done: 0.1\u2013{params["lateral_g"]:.1f}g, {len(g_range)} pts')
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._aero_panel._status.setText(f'Error: {e}')
+
+    # ==========================================================================
+    #  AERO GEOMETRY (3D overlay)
+    # ==========================================================================
+
+    def _on_aero_geom(self, params: dict):
+        """Push aero package geometry to the 3D viewer."""
+        try:
+            self.view3d.update_aero(params)
+        except Exception as e:
+            import traceback; traceback.print_exc()
 
     # ==========================================================================
     #  STYLE

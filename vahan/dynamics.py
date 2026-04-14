@@ -252,7 +252,7 @@ class SteadyStateResult:
     unsprung_lt_front_N: float = 0.0
     unsprung_lt_rear_N: float = 0.0
 
-    # Tire utilization (0-1 or higher if beyond grip)
+    # Tire utilization (0–1 at grip limit; >1 if demand exceeds μ·Fz)
     utilization: dict = field(default_factory=dict)
 
     # Per-corner lateral force (N, positive = outboard)
@@ -276,6 +276,10 @@ class SteadyStateResult:
 # ─────────────────────────────────────────────────────────────────────────────
 
 G = 9.81  # m/s^2
+
+# Minimum grip (N) for utilization ratio — avoids div-by-zero; keeps values
+# order-1 when Fz is tiny (unlike a 1e-9 floor, which blows up to 1e12).
+_UTIL_GRIP_FLOOR_N = 1.0
 
 
 class SteadyStateSolver:
@@ -405,6 +409,30 @@ class SteadyStateSolver:
             roll_prev = roll_rad
             roll_rad = roll_rad_new
 
+        # Physical Fz floor from spring forces: the analytical LT formula
+        # can predict Fz < 0 while the spring is still compressed.  The real
+        # minimum Fz at each corner = spring_force_at_travel + unsprung_weight.
+        # Spring force = wheel_rate × max(static_sag + travel, 0).
+        for label in ['FL', 'FR', 'RL', 'RR']:
+            if label[0] == 'F':
+                wr = v.wheel_rate_front_Npm
+                unspr_w = v.unsprung_mass_front_kg / 2 * G
+            else:
+                wr = v.wheel_rate_rear_Npm
+                unspr_w = v.unsprung_mass_rear_kg / 2 * G
+            static_sag_m = Fz_static[label] / wr if wr > 0 else 0.0
+            spring_defl = static_sag_m + travels[label]  # +travel = bump
+            spring_force = wr * max(spring_defl, 0.0)
+            fz_floor = spring_force + unspr_w
+            Fz[label] = max(Fz[label], fz_floor)
+
+        # Renormalize so Σ Fz = vehicle weight (total vertical load is conserved)
+        W_total = v.total_mass_kg * G
+        Fz_sum = sum(Fz.values())
+        if Fz_sum > 0:
+            scale = W_total / Fz_sum
+            Fz = {k: v * scale for k, v in Fz.items()}
+
         # ── Step 4: Build result ─────────────────────────────────────────
         result.roll_angle_deg = np.degrees(roll_rad)
 
@@ -446,27 +474,37 @@ class SteadyStateSolver:
             fy_front_axle = total_fy * v.front_weight_fraction  # total for axle
             fy_rear_axle  = total_fy * v.rear_weight_fraction
 
-            # Get cornering stiffness at each corner's dynamic Fz
-            # Use abs() — TTC sign convention gives negative C_alpha
+            # Get cornering stiffness at each corner's dynamic Fz.
+            # Below the tire data range, scale C_a linearly → 0 so that
+            # both demand (∝ C_a) and grip (∝ Fz) vanish together,
+            # keeping utilization = demand/grip smooth through wheel lift.
+            fz_data_min = float(self._tire.fz_range[0])  # lowest TTC test load
             C_a = {}
             for label in ['FL', 'FR', 'RL', 'RR']:
-                fz_c = max(Fz[label], 1.0)
-                C_a[label] = abs(float(self._tire.cornering_stiffness(
+                fz_raw = max(Fz[label], 0.0)
+                fz_c = max(fz_raw, fz_data_min)
+                ca = abs(float(self._tire.cornering_stiffness(
                     fz_c, abs(cambers.get(label, 0)))))
+                # Linear ramp below data range: C_a(Fz) → 0 as Fz → 0
+                if fz_raw < fz_data_min:
+                    ca *= fz_raw / fz_data_min
+                C_a[label] = ca
 
-            # Distribute Fy within each axle by cornering stiffness
+            # Distribute Fy within each axle by cornering stiffness alone.
+            # Both tires on an axle share the same slip angle α, so each
+            # produces Fy = Cα(Fz)·α  →  left/right split ∝ Cα.
             fy_per_corner = {}
-            C_front = C_a['FL'] + C_a['FR']
-            C_rear  = C_a['RL'] + C_a['RR']
-            if C_front > 0:
-                fy_per_corner['FL'] = fy_front_axle * C_a['FL'] / C_front
-                fy_per_corner['FR'] = fy_front_axle * C_a['FR'] / C_front
+            Wf = C_a['FL'] + C_a['FR']
+            Wr = C_a['RL'] + C_a['RR']
+            if Wf > 0:
+                fy_per_corner['FL'] = fy_front_axle * C_a['FL'] / Wf
+                fy_per_corner['FR'] = fy_front_axle * C_a['FR'] / Wf
             else:
                 fy_per_corner['FL'] = fy_front_axle / 2
                 fy_per_corner['FR'] = fy_front_axle / 2
-            if C_rear > 0:
-                fy_per_corner['RL'] = fy_rear_axle * C_a['RL'] / C_rear
-                fy_per_corner['RR'] = fy_rear_axle * C_a['RR'] / C_rear
+            if Wr > 0:
+                fy_per_corner['RL'] = fy_rear_axle * C_a['RL'] / Wr
+                fy_per_corner['RR'] = fy_rear_axle * C_a['RR'] / Wr
             else:
                 fy_per_corner['RL'] = fy_rear_axle / 2
                 fy_per_corner['RR'] = fy_rear_axle / 2
@@ -493,17 +531,15 @@ class SteadyStateSolver:
                     fx_per_corner[lbl] = total_fx * (1 - bb_f) / 2
 
             for label in ['FL', 'FR', 'RL', 'RR']:
-                fz_corner = Fz[label]
-                if fz_corner <= 0:
-                    # Wheel lifted — cap at 1.0 (fully saturated)
-                    result.utilization[label] = 1.0
-                    continue
-                mu = float(self._tire.peak_mu(fz_corner, abs(cambers.get(label, 0))))
-                grip_budget = mu * fz_corner
+                fz_raw = max(Fz[label], 0.0)
+                fz_for_mu = max(fz_raw, fz_data_min)  # stable mu eval
+                mu = float(self._tire.peak_mu(
+                    fz_for_mu, abs(cambers.get(label, 0.0))))
+                grip_budget = mu * max(fz_raw, 0.01)  # → 0 smoothly
                 fy_req = fy_per_corner.get(label, 0.0)
                 fx_req = fx_per_corner.get(label, 0.0)
                 combined = np.sqrt(fy_req ** 2 + fx_req ** 2)
-                result.utilization[label] = combined / grip_budget if grip_budget > 0 else 0.0
+                result.utilization[label] = combined / grip_budget
 
             # Store per-corner forces for component load analysis
             result.Fy = dict(fy_per_corner)
@@ -591,10 +627,14 @@ class SteadyStateSolver:
                 out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
-        # Smooth understeer gradient — inverse tire lookup is noisy at grid edges
-        us = out['understeer_gradient_deg']
-        if len(us) >= 5:
-            out['understeer_gradient_deg'] = uniform_filter1d(us, size=5, mode='nearest')
+        # Smooth noisy signals — tire inverse lookup + kinematic solver edges
+        for k in ['understeer_gradient_deg']:
+            if len(out[k]) >= 5:
+                out[k] = uniform_filter1d(out[k], size=5, mode='nearest')
+        for lbl in ['FL', 'FR', 'RL', 'RR']:
+            uk = f'utilization_{lbl}'
+            if len(out[uk]) >= 3:
+                out[uk] = uniform_filter1d(out[uk], size=3, mode='nearest')
 
         return out
 
@@ -642,10 +682,13 @@ class SteadyStateSolver:
                 out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
-        # Smooth understeer gradient
-        us = out['understeer_gradient_deg']
-        if len(us) >= 5:
-            out['understeer_gradient_deg'] = uniform_filter1d(us, size=5, mode='nearest')
+        for k in ['understeer_gradient_deg']:
+            if len(out[k]) >= 5:
+                out[k] = uniform_filter1d(out[k], size=5, mode='nearest')
+        for lbl in ['FL', 'FR', 'RL', 'RR']:
+            uk = f'utilization_{lbl}'
+            if len(out[uk]) >= 3:
+                out[uk] = uniform_filter1d(out[uk], size=3, mode='nearest')
 
         return out
 
@@ -701,6 +744,10 @@ class SteadyStateSolver:
         us = out['understeer_gradient_deg']
         if len(us) >= 5:
             out['understeer_gradient_deg'] = uniform_filter1d(us, size=5, mode='nearest')
+        for lbl in ['FL', 'FR', 'RL', 'RR']:
+            uk = f'utilization_{lbl}'
+            if len(out[uk]) >= 3:
+                out[uk] = uniform_filter1d(out[uk], size=3, mode='nearest')
 
         return out
 
@@ -768,6 +815,23 @@ class SteadyStateSolver:
         }
 
     # ── Internals ────────────────────────────────────────────────────────
+
+    def _clamp_and_renormalize_fz(self, Fz: dict, W_total: float) -> dict:
+        """
+        Enforce physically plausible normal loads (no tension on the ground).
+
+        The linear load-transfer model can predict inside Fz < 0 at high lateral
+        g (wheel lift). Clamp each corner to ≥ 0, then scale so the four corners
+        still sum to total vehicle weight.
+        """
+        labels = ('FL', 'FR', 'RL', 'RR')
+        pos = np.array([max(0.0, float(Fz[l])) for l in labels])
+        s = float(pos.sum())
+        if s <= 1e-9:
+            v = W_total / 4.0
+            return {l: v for l in labels}
+        scale = W_total / s
+        return {l: float(pos[i] * scale) for i, l in enumerate(labels)}
 
     def _solve_corner(self, label: str, travel_m: float):
         """Solve kinematics for one corner with warm-start caching."""
@@ -944,14 +1008,31 @@ class DynamicsSensitivity:
     def analyze(self, lateral_g: float = 1.2,
                 longitudinal_g: float = 0.0) -> dict:
         """
-        Run sensitivity analysis at the given operating point.
+        Run sensitivity analysis averaged over a g range (±0.3g around
+        the operating point, 5 samples).  Averaging eliminates artifacts
+        from single-point noise in the tire model / kinematic solver.
 
         Returns dict with 'baseline' outputs and 'sensitivities' list.
         """
-        # ── Baseline solve ───────────────────────────────────────────
+        # Sample at multiple g points around the operating point
+        g_spread = 0.3
+        n_samples = 5
+        g_samples = np.linspace(
+            max(0.1, lateral_g - g_spread),
+            lateral_g + g_spread,
+            n_samples)
+
+        # ── Baseline: average over samples ──────────────────────────
         base_solver = SteadyStateSolver(self._base_veh, self._solvers, self._tire)
+        baselines = [_extract_outputs(base_solver.solve(g, longitudinal_g))
+                     for g in g_samples]
+        baseline = {k: float(np.mean([b[k] for b in baselines]))
+                    for k in baselines[0]}
+        # Also keep the center-point result for display
         base_result = base_solver.solve(lateral_g, longitudinal_g)
-        baseline = _extract_outputs(base_result)
+        baseline_center = _extract_outputs(base_result)
+        # Use center point for display values, averaged for sensitivities
+        baseline.update({f'_display_{k}': v for k, v in baseline_center.items()})
 
         sensitivities = []
 
@@ -959,17 +1040,20 @@ class DynamicsSensitivity:
         for key, name, unit, delta, category, practical_step in SENSITIVITY_KNOBS:
             base_val = getattr(self._base_veh, key)
 
-            # Perturb up
+            # Average perturbed outputs over the same g samples
             veh_up = self._perturb_veh(key, base_val + delta)
             solver_up = SteadyStateSolver(veh_up, self._solvers, self._tire)
-            result_up = solver_up.solve(lateral_g, longitudinal_g)
-            out_up = _extract_outputs(result_up)
+            outs_up = [_extract_outputs(solver_up.solve(g, longitudinal_g))
+                       for g in g_samples]
+            out_up = {k: float(np.mean([o[k] for o in outs_up]))
+                      for k in outs_up[0]}
 
-            # Perturb down (central difference)
             veh_dn = self._perturb_veh(key, base_val - delta)
             solver_dn = SteadyStateSolver(veh_dn, self._solvers, self._tire)
-            result_dn = solver_dn.solve(lateral_g, longitudinal_g)
-            out_dn = _extract_outputs(result_dn)
+            outs_dn = [_extract_outputs(solver_dn.solve(g, longitudinal_g))
+                       for g in g_samples]
+            out_dn = {k: float(np.mean([o[k] for o in outs_dn]))
+                      for k in outs_dn[0]}
 
             # Convert delta to display units
             if unit == 'lbf/in':
@@ -1067,6 +1151,18 @@ class DynamicsSensitivity:
         if not hasattr(self, '_base_veh') or self._base_veh is None:
             self._base_veh = analysis.get('vehicle_params')
 
+        # Physical bounds: (key → (min_value, max_value)) in SI units
+        _BOUNDS = {
+            'spring_rate_front_Npm': (1750, 175000),    # 10–1000 lbf/in
+            'spring_rate_rear_Npm':  (1750, 175000),
+            'arb_rate_front_Npm':    (0, 87500),         # 0–500 lbf/in
+            'arb_rate_rear_Npm':     (0, 87500),
+            'motion_ratio_front':    (0.3, 2.0),
+            'motion_ratio_rear':     (0.3, 2.0),
+            'cg_to_front_axle_m':    (0.3, 2.5),
+            'front_brake_bias':      (0.4, 0.85),
+        }
+
         recommendations = []
         for s in analysis['sensitivities']:
             effect = s['effects'].get(target_metric, 0)
@@ -1074,6 +1170,15 @@ class DynamicsSensitivity:
                 continue
 
             change_needed = target_delta / effect  # how much to change this knob
+
+            # Clamp to physical bounds
+            key = s['key']
+            if key in _BOUNDS:
+                lo, hi = _BOUNDS[key]
+                new_clamped = max(lo, min(hi, s['current_value'] + change_needed))
+                change_needed = new_clamped - s['current_value']
+                if abs(change_needed) < 1e-9:
+                    continue  # already at bound, skip
 
             # Compute side effects on other metrics
             side_effects = {}
@@ -1232,3 +1337,320 @@ class DynamicsSensitivity:
             hints.append(f'Adjust brake bias bar / proportioning valve')
             hints.append(f'Currently {current_val:.0f}% front')
         return hints
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Aero downforce solver
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AeroResult:
+    """Per-corner aero downforce required to equalise tire utilization."""
+    lateral_g: float
+    longitudinal_g: float = 0.0
+    target_util: float = 0.0
+
+    # Per-corner required downforce (N, positive = pushing tire into ground)
+    downforce: dict = field(default_factory=dict)
+    # Per-corner Fz after downforce (N)
+    Fz_aero: dict = field(default_factory=dict)
+    # Per-corner utilization after downforce
+    utilization_aero: dict = field(default_factory=dict)
+    # Per-corner lateral force demand (N)
+    Fy_demand: dict = field(default_factory=dict)
+    # Total downforce (N)
+    total_downforce_N: float = 0.0
+    # Front/rear split (% front)
+    front_downforce_pct: float = 0.0
+    # Corners that hit the cap
+    capped: list = field(default_factory=list)
+
+    # ── Axle-level needs ──
+    front_axle_need_N: float = 0.0   # max(FL, FR) additional Fz on front axle
+    rear_axle_need_N: float = 0.0    # max(RL, RR) additional Fz on rear axle
+
+    # ── Per-device allocation (populated when device positions supplied) ──
+    # Force each device must generate (N, at its own CoP)
+    device_force: dict = field(default_factory=dict)  # {'fw': N, 'rw': N, 'diff': N}
+    # Each device's CoP position from front axle (m)
+    device_cop_m: dict = field(default_factory=dict)   # {'fw': m, 'rw': m, 'diff': m}
+    # Combined aero CoP from front axle
+    cop_from_front_m: float = 0.0
+    cop_pct_wheelbase: float = 0.0
+    # Rear aero bias (% of axle load on rear)
+    rear_aero_bias_pct: float = 50.0
+
+
+class AeroDownforceSolver:
+    """
+    Given a steady-state operating point, estimate **total** aerodynamic
+    downforce needed so that the **worst** tire utilization does not exceed a
+    target.
+
+    Model (single coupled degree of freedom):
+        Total added downforce D (N) is split front / rear by ``front_aero_fraction``
+        (0–1). Each front wheel gets ``f·D/2``, each rear wheel gets ``(1−f)·D/2``.
+        This matches how wings / diffusers load axles rather than independent
+        per-wheel shims (the old per-corner bisection hit arbitrary caps and
+        produced step-function “solutions”).
+    """
+
+    def __init__(self, steady_solver: SteadyStateSolver):
+        self._ss = steady_solver
+
+    def solve(self, lateral_g: float,
+              longitudinal_g: float = 0.0,
+              target_util: float = 0.80,
+              front_aero_fraction: float = 0.50,
+              max_total_downforce_N: float = 12000.0,
+              max_iter: int = 60,
+              device_positions: dict | None = None) -> AeroResult:
+        """
+        Per-corner minimum downforce to bring each corner's utilization
+        to *target_util*.  Corners already below target get 0.
+
+        If *device_positions* is provided (dict with keys
+        ``fw_y``, ``rw_y``, ``diff_y`` in metres from front axle),
+        the solver also computes how much force each physical aero device
+        must generate based on lever-arm moment balance, maximising the
+        diffuser contribution so the wings are as small as possible.
+        """
+        tire = self._ss._tire
+        if tire is None:
+            raise ValueError('Tire model required for aero solver')
+
+        D_cap = float(max(max_total_downforce_N, 100.0)) / 4.0  # per-corner cap
+
+        base = self._ss.solve(lateral_g, longitudinal_g)
+        fz_data_min = float(tire.fz_range[0])
+
+        def _grip(fz_n, cam):
+            fz_n = max(float(fz_n), 0.01)
+            mu = float(tire.peak_mu(max(fz_n, fz_data_min), cam))
+            return mu * fz_n
+
+        result = AeroResult(lateral_g=lateral_g,
+                            longitudinal_g=longitudinal_g,
+                            target_util=target_util)
+
+        for lbl in ('FL', 'FR', 'RL', 'RR'):
+            fz0 = base.Fz.get(lbl, 0.0)
+            cam = abs(base.camber.get(lbl, 0.0))
+            fy_d = abs(base.Fy.get(lbl, 0.0))
+            fx_d = abs(base.Fx.get(lbl, 0.0))
+            demand = np.sqrt(fy_d ** 2 + fx_d ** 2)
+
+            base_grip = _grip(fz0, cam)
+            base_util = demand / base_grip if base_grip > 0 else 1e9
+
+            if base_util <= target_util + 1e-9:
+                dFz = 0.0
+            else:
+                lo, hi = 0.0, D_cap
+                for _ in range(max_iter):
+                    mid = 0.5 * (lo + hi)
+                    g = _grip(fz0 + mid, cam)
+                    u = demand / g if g > 0 else 1e9
+                    if u <= target_util:
+                        hi = mid
+                    else:
+                        lo = mid
+                    if hi - lo < 0.1:
+                        break
+                dFz = hi
+
+            result.downforce[lbl] = dFz
+            result.Fy_demand[lbl] = fy_d
+            fz_new = max(fz0 + dFz, 0.01)
+            result.Fz_aero[lbl] = fz_new
+            g_after = _grip(fz_new, cam)
+            result.utilization_aero[lbl] = demand / g_after if g_after > 0 else 1e9
+            if result.utilization_aero[lbl] > target_util + 0.02:
+                result.capped.append(lbl)
+
+        # ── Axle-level needs (per side — size to worse corner) ──
+        front_need = max(result.downforce.get('FL', 0),
+                         result.downforce.get('FR', 0))
+        rear_need  = max(result.downforce.get('RL', 0),
+                         result.downforce.get('RR', 0))
+        total_on_car = front_need + rear_need
+
+        result.front_axle_need_N = front_need
+        result.rear_axle_need_N  = rear_need
+
+        total_d = sum(result.downforce.values())
+        front_d = result.downforce.get('FL', 0) + result.downforce.get('FR', 0)
+        result.total_downforce_N = total_d
+        result.front_downforce_pct = (front_d / total_d * 100) if total_d > 0 else 50.0
+
+        wb = self._ss._veh.wheelbase_m
+
+        # ── Per-device allocation via moment balance ──
+        if device_positions and total_on_car > 0:
+            self._allocate_devices(result, device_positions,
+                                   front_need, rear_need, wb)
+        else:
+            # No device positions — report axle-level only
+            result.rear_aero_bias_pct = (
+                rear_need / total_on_car * 100.0) if total_on_car > 0 else 50.0
+            if total_on_car > 0:
+                result.cop_from_front_m = (rear_need / total_on_car) * wb
+                result.cop_pct_wheelbase = (rear_need / total_on_car) * 100.0
+            else:
+                cg = self._ss._veh.cg_to_front_axle_m
+                result.cop_from_front_m = cg
+                result.cop_pct_wheelbase = (cg / wb * 100) if wb > 0 else 50.0
+
+        return result
+
+    # ------------------------------------------------------------------
+    def _allocate_devices(self, result: 'AeroResult', pos: dict,
+                          F_front: float, F_rear: float, wb: float):
+        """
+        Distribute the axle-load requirement among three physical devices
+        (front wing, rear wing, diffuser) placed at given Y positions.
+
+        Physics:  a device generating force *F* at position *y* from the
+        front axle produces axle reactions:
+            front-axle load  = F * (wb - y) / wb
+            rear-axle  load  = F *  y       / wb
+
+        Strategy: maximise diffuser usage (it's the most drag-efficient
+        device) so the two wings are as small as possible.
+        """
+        y_fw = float(pos.get('fw_y', 0.0))
+        y_rw = float(pos.get('rw_y', wb))
+        y_d  = float(pos.get('diff_y', wb * 0.5))
+
+        result.device_cop_m = {'fw': y_fw, 'rw': y_rw, 'diff': y_d}
+
+        # Lever-arm fractions (fraction of device force reaching each axle)
+        a_fw = (wb - y_fw) / wb     # front-axle fraction
+        b_fw = y_fw / wb            # rear-axle fraction
+        a_rw = (wb - y_rw) / wb
+        b_rw = y_rw / wb
+        a_d  = (wb - y_d)  / wb
+        b_d  = y_d  / wb
+
+        # 2-eqn / 3-unknown linear system, parametric in F_d:
+        #   a_fw*F_fw + a_rw*F_rw + a_d*F_d = F_front
+        #   b_fw*F_fw + b_rw*F_rw + b_d*F_d = F_rear
+        det = a_fw * b_rw - a_rw * b_fw
+        if abs(det) < 1e-12:
+            # Degenerate (fw and rw at same position) — split 50/50
+            result.device_force = {
+                'fw': F_front, 'rw': F_rear, 'diff': 0.0}
+            self._finish_cop(result, wb)
+            return
+
+        # F_fw(F_d) = c_fw + d_fw * F_d
+        # F_rw(F_d) = c_rw + d_rw * F_d
+        c_fw = (b_rw * F_front - a_rw * F_rear) / det
+        d_fw = (a_rw * b_d - b_rw * a_d) / det
+        c_rw = (a_fw * F_rear  - b_fw * F_front) / det
+        d_rw = (b_fw * a_d - a_fw * b_d) / det
+
+        # Find feasible F_d range: all three forces >= 0
+        lo, hi = 0.0, 1e9
+
+        if d_fw < -1e-12:
+            hi = min(hi, -c_fw / d_fw)
+        elif d_fw > 1e-12:
+            bound = -c_fw / d_fw
+            if bound > 0:
+                lo = max(lo, bound)
+        else:
+            if c_fw < -1e-6:
+                hi = -1       # infeasible
+
+        if d_rw < -1e-12:
+            hi = min(hi, -c_rw / d_rw)
+        elif d_rw > 1e-12:
+            bound = -c_rw / d_rw
+            if bound > 0:
+                lo = max(lo, bound)
+        else:
+            if c_rw < -1e-6:
+                hi = -1
+
+        if lo > hi:
+            # Infeasible with all 3 — fall back to 2-device (no diffuser)
+            Fd = 0.0
+        else:
+            # Maximise diffuser (= pick hi) to minimise wing sizes
+            Fd = min(hi, 1e6)
+
+        Ffw = max(c_fw + d_fw * Fd, 0.0)
+        Frw = max(c_rw + d_rw * Fd, 0.0)
+        Fd  = max(Fd, 0.0)
+
+        result.device_force = {'fw': Ffw, 'rw': Frw, 'diff': Fd}
+        self._finish_cop(result, wb)
+
+    @staticmethod
+    def _finish_cop(result: 'AeroResult', wb: float):
+        """Compute combined CoP and rear bias from device allocation."""
+        forces = result.device_force
+        cops   = result.device_cop_m
+        total_f = sum(forces.values())
+        if total_f > 1e-6:
+            cop = sum(forces[k] * cops[k] for k in forces) / total_f
+            result.cop_from_front_m  = cop
+            result.cop_pct_wheelbase = (cop / wb * 100.0) if wb > 0 else 50.0
+        else:
+            result.cop_from_front_m  = wb * 0.5
+            result.cop_pct_wheelbase = 50.0
+
+        # Rear bias = fraction of total *axle load* on the rear
+        F_front = result.front_axle_need_N
+        F_rear  = result.rear_axle_need_N
+        total_axle = F_front + F_rear
+        result.rear_aero_bias_pct = (
+            F_rear / total_axle * 100.0) if total_axle > 0 else 50.0
+
+    def sweep(self, g_range: np.ndarray,
+              longitudinal_g: float = 0.0,
+              target_util: float = 0.80,
+              front_aero_fraction: float = 0.50,
+              max_total_downforce_N: float = 12000.0,
+              device_positions: dict | None = None) -> dict:
+        """
+        Sweep lateral g and return arrays of required downforce per corner,
+        plus device forces, CoP, and diffuser rear-bias at each g level.
+        """
+        gs = np.asarray(g_range, float)
+        out = {
+            'lateral_g': gs,
+            'total_downforce_N': np.zeros(len(gs)),
+            'front_pct': np.zeros(len(gs)),
+            'cop_from_front_m': np.zeros(len(gs)),
+            'cop_pct_wheelbase': np.zeros(len(gs)),
+            'rear_aero_bias_pct': np.full(len(gs), 50.0),
+            'F_fw': np.zeros(len(gs)),
+            'F_rw': np.zeros(len(gs)),
+            'F_diff': np.zeros(len(gs)),
+        }
+        for lbl in ('FL', 'FR', 'RL', 'RR'):
+            out[f'dF_{lbl}'] = np.zeros(len(gs))
+
+        for i, g in enumerate(gs):
+            try:
+                r = self.solve(
+                    g, longitudinal_g, target_util,
+                    front_aero_fraction=front_aero_fraction,
+                    max_total_downforce_N=max_total_downforce_N,
+                    device_positions=device_positions,
+                )
+                out['total_downforce_N'][i] = r.total_downforce_N
+                out['front_pct'][i] = r.front_downforce_pct
+                out['cop_from_front_m'][i] = r.cop_from_front_m
+                out['cop_pct_wheelbase'][i] = r.cop_pct_wheelbase
+                out['rear_aero_bias_pct'][i] = r.rear_aero_bias_pct
+                out['F_fw'][i]   = r.device_force.get('fw', 0.0)
+                out['F_rw'][i]   = r.device_force.get('rw', 0.0)
+                out['F_diff'][i] = r.device_force.get('diff', 0.0)
+                for lbl in ('FL', 'FR', 'RL', 'RR'):
+                    out[f'dF_{lbl}'][i] = r.downforce.get(lbl, 0.0)
+            except Exception:
+                pass
+        return out
