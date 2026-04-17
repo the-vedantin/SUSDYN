@@ -548,8 +548,6 @@ capped                                corners that hit the per-corner cap
 
 ### Sweep Mode
 
-![Aero Sweep Results](screenshots/aero_sweep.png)
-
 `AeroDownforceSolver.sweep(g_range)` solves at each g point and returns arrays of front/rear/total deficit vs lateral g. The GUI plots these with a velocity secondary x-axis (mph) computed from the turn radius set in the Dynamics panel:
 
 ```
@@ -772,7 +770,13 @@ FL and RL are the input (left-side) values. FR and RR are automatically X-mirror
 
 ### VahanHardpoints.fs — FeatureScript Custom Feature
 
-`VahanHardpoints.fs` is a self-contained Onshape FeatureScript with no external library dependencies. Copy its contents into a Feature Studio in your Onshape document.
+`VahanHardpoints.fs` is a self-contained Onshape FeatureScript with no external library dependencies.
+
+**Quickest way to use it:** open the Feature Studio directly in Onshape, copy the feature, and paste it into your own document's Feature Studio:
+
+> [Open VahanHardpoints Feature Studio on Onshape](https://cad.onshape.com/documents/0fd1ba4fa3000364cc5e975c/w/c68fedaa2bfec6c13cd02fce/e/19856db1245e96443584ccac)
+
+Alternatively, copy the contents of `VahanHardpoints.fs` from this repo into a new Feature Studio in your Onshape document.
 
 **How it works:**
 
