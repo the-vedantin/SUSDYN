@@ -2,7 +2,7 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.1 (Kinematics + Dynamics + Loads + Aero)
+**Version:** 2.2 (Kinematics + Dynamics + Loads + Aero + Onshape)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
 ![Main Window](screenshots/main_window.png)
@@ -60,6 +60,12 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Interactive OpenGL viewport (VisPy) with full-car wireframe rendering
 - Colour-coded suspension members (UCA, LCA, tie rod, pushrod, rocker, spring/damper)
 - Roll centre and roll axis overlays
+
+### Onshape FeatureScript Export
+- **View → All Hardpoints** popup shows all 18 hardpoints × 4 corners in a single table (including ARB bellcrank)
+- **Copy for Onshape** produces a single-line pipe-delimited string ready to paste into the `VahanHardpoints` custom feature
+- `VahanHardpoints.fs` FeatureScript custom feature: paste data → up to 72 labelled 3D construction points appear in the Part Studio
+- Points are labelled by corner and name (e.g. `FL uca_front`, `RR arb_pivot`) in the feature tree
 
 ### Kinematic Curves
 - Live metric plots across wheel travel for all four corners
@@ -128,9 +134,9 @@ The team's OptimumK export uses inches with X=longitudinal, Y=lateral, Z=vertica
 
 ![Hardpoint Editing and 3D View](screenshots/3d_view.png)
 
-### The 14 Hardpoints
+### The 18 Hardpoints
 
-Each suspension corner is defined by 14 points in 3D space (42 scalar coordinates):
+Each suspension corner is defined by 15 suspension points + 3 ARB bellcrank points = 18 points total (54 scalar coordinates):
 
 **Control Arms (6 points)**
 | Point | Description | Role |
@@ -153,7 +159,7 @@ Each suspension corner is defined by 14 points in 3D space (42 scalar coordinate
 |-------|-------------|------|
 | `wheel_center` | Hub centre | Moves with wheel (driven by travel) |
 
-**Pushrod/Rocker (5 points)**
+**Pushrod/Rocker (6 points)**
 | Point | Description | Role |
 |-------|-------------|------|
 | `pushrod_outer` | Pushrod attachment on arm/upright | Moves with arm |
@@ -161,6 +167,14 @@ Each suspension corner is defined by 14 points in 3D space (42 scalar coordinate
 | `rocker_pivot` | Rocker chassis pivot | Fixed to chassis |
 | `rocker_spring_pt` | Rocker end touching spring/damper | Moves with rocker |
 | `spring_chassis_pt` | Chassis spring/damper mount | Fixed to chassis |
+| `rocker_axis_pt` | Second point defining rocker rotation axis | Fixed to chassis |
+
+**ARB Bellcrank (3 points per axle, shared L/R)**
+| Point | Description | Role |
+|-------|-------------|------|
+| `arb_drop_top` | Drop link attachment on rocker | Moves with rocker |
+| `arb_arm_end` | ARB blade tip | Rotates about torsion bar axis |
+| `arb_pivot` | Torsion bar rotation axis | Fixed to chassis |
 
 ### Default Values (Front Left Corner, metres)
 
@@ -715,6 +729,81 @@ The entire UI uses a grayscale colour scheme (dark background, grey text/borders
 
 ---
 
+## Onshape Integration
+
+![All Hardpoints Popup](screenshots/all_hardpoints.png)
+
+### Overview
+
+Vahan can export all suspension hardpoints directly into an Onshape Part Studio as 3D construction points via a custom FeatureScript feature. This bridges the kinematic design loop in Vahan with the CAD model in Onshape — no manual coordinate entry.
+
+![Onshape Part Studio with Suspension Points](screenshots/onshape_points.png)
+
+### Hardpoints Exported
+
+The export covers all 18 hardpoints × 4 corners (FL, FR, RL, RR) = up to 72 points:
+
+**Suspension (15 per corner)**
+| Point | Description |
+|-------|-------------|
+| `uca_front` / `uca_rear` / `uca_outer` | Upper control arm chassis pickups + ball joint |
+| `lca_front` / `lca_rear` / `lca_outer` | Lower control arm chassis pickups + ball joint |
+| `tie_rod_inner` / `tie_rod_outer` | Rack end and steer arm pickup |
+| `wheel_center` | Hub centre |
+| `pushrod_outer` / `pushrod_inner` | Pushrod endpoints |
+| `rocker_pivot` / `rocker_spring_pt` / `spring_chassis_pt` / `rocker_axis_pt` | Rocker and spring geometry |
+
+**ARB Bellcrank (3 per corner)**
+| Point | Description |
+|-------|-------------|
+| `arb_drop_top` | Drop link attachment point on rocker (moves with rocker) |
+| `arb_arm_end` | ARB blade tip (rotates about torsion bar axis) |
+| `arb_pivot` | Torsion bar rotation axis, fixed to chassis |
+
+FL and RL are the input (left-side) values. FR and RR are automatically X-mirrored.
+
+### Export Workflow
+
+1. In Vahan: **View → All Hardpoints**
+2. Click **Copy for Onshape**
+3. In Onshape: open your Part Studio → insert the **Vahan Hardpoints** custom feature
+4. Paste the clipboard contents into the **Paste Data** field
+5. Click the green checkmark — up to 72 labelled construction points appear
+
+### VahanHardpoints.fs — FeatureScript Custom Feature
+
+`VahanHardpoints.fs` is a self-contained Onshape FeatureScript with no external library dependencies. Copy its contents into a Feature Studio in your Onshape document.
+
+**How it works:**
+
+- The **Paste Data** field accepts a single-line string (pipe `|` separated records, comma-separated fields per record)
+- Format per record: `name,FL_X,FL_Y,FL_Z,FR_X,FR_Y,FR_Z,RL_X,RL_Y,RL_Z,RR_X,RR_Y,RR_Z` (coordinates in mm)
+- The feature body parses this string directly and calls `opPoint` for each non-zero coordinate set — no editing logic dependency
+- Each point body is labelled with `setProperty / PropertyType.NAME` (e.g. `FL uca_front`)
+- **Show FL / FR / RL / RR** toggles hide/show each corner's points without deleting them
+- Coordinate groups (FL / FR / RL / RR) in the feature dialog show the parsed values and allow manual per-point overrides when Paste Data is cleared
+
+**Paste Data format (single line):**
+```
+uca_front,263.53,-127.00,263.53,-263.53,-127.00,263.53,...|uca_rear,...|...
+```
+
+**Manual override mode:** Clear the Paste Data field. Edit individual X/Y/Z params in the corner groups directly. Points are created from the parameter values instead of the paste string.
+
+### Coordinate System
+
+Vahan and Onshape share the same coordinate convention in the exported data:
+
+| Axis | Direction | Origin |
+|------|-----------|--------|
+| X | Lateral (outboard positive for left corner) | Vehicle centreline |
+| Y | Longitudinal (forward positive) | Front axle |
+| Z | Vertical (up positive) | Ground |
+
+All exported values are in **millimetres**.
+
+---
+
 ## Vehicle Data (2026 Car)
 
 ### Vehicle Parameters
@@ -795,6 +884,7 @@ The entire UI uses a grayscale colour scheme (dark background, grey text/borders
 | `gui/panels.py` | All sidebar panels (motion, IK, dynamics, optimizer, aero, loads) |
 | `gui/view3d.py` | VisPy 3D rendering + NavCube |
 | `app.py` | Entry point |
+| `VahanHardpoints.fs` | Onshape FeatureScript: paste hardpoints → 3D construction points in Part Studio |
 
 ---
 
@@ -841,7 +931,8 @@ The GUI opens with default FSAE hardpoints loaded.
 8. **Aero targets** — Set target utilization, solve for downforce deficit, sweep across g range
 9. **Apply Aero** — Toggle aero on in Dynamics panel to see dynamics curves with V²-scaled downforce
 10. **Component loads** — Set brake params and upright geometry, compute forces at operating point
-11. **Save/Load** — File menu for JSON geometry files
+11. **Export to Onshape** — View → All Hardpoints → Copy for Onshape → paste into `VahanHardpoints` FeatureScript feature in Part Studio
+12. **Save/Load** — File menu for JSON geometry files
 
 ### Sign Convention Cheat Sheet
 

@@ -1013,8 +1013,14 @@ class MainWindow(QMainWindow):
         rl = self._rear_hp
         rr = _mirror_x(rl)
 
-        corners = [('FL', fl), ('FR', fr), ('RL', rl), ('RR', rr)]
-        names = list(fl.keys())  # same keys for all corners
+        # Merge ARB points into each corner's dict (right side = X-mirrored)
+        fl_full = {**fl, **self._front_arb}
+        fr_full = {**fr, **_mirror_x(self._front_arb)}
+        rl_full = {**rl, **self._rear_arb}
+        rr_full = {**rr, **_mirror_x(self._rear_arb)}
+
+        corners = [('FL', fl_full), ('FR', fr_full), ('RL', rl_full), ('RR', rr_full)]
+        names = list(fl.keys()) + list(self._front_arb.keys())
 
         dlg = QDialog(self)
         dlg.setWindowTitle('All Hardpoints (mm)')
@@ -1082,11 +1088,15 @@ class MainWindow(QMainWindow):
         _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
                       'border-radius: 3px; } QPushButton:hover { background: #555; }')
 
+        _btn_green = ('QPushButton { background: #2E7D32; color: white; padding: 6px 16px; '
+                      'border-radius: 3px; font-weight: bold; } '
+                      'QPushButton:hover { background: #388E3C; }')
+        _btn_purple = ('QPushButton { background: #6A1B9A; color: white; padding: 6px 16px; '
+                       'border-radius: 3px; font-weight: bold; } '
+                       'QPushButton:hover { background: #8E24AA; }')
+
         copy_btn = QPushButton('Copy to Clipboard')
-        copy_btn.setStyleSheet(
-            'QPushButton { background: #2E7D32; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; } '
-            'QPushButton:hover { background: #388E3C; }')
+        copy_btn.setStyleSheet(_btn_green)
         def _copy():
             lines = ['All Hardpoints (mm)', '=' * 90]
             hdr = f'{"Point":22s}'
@@ -1108,6 +1118,51 @@ class MainWindow(QMainWindow):
             copy_btn.setText('Copied!')
         copy_btn.clicked.connect(_copy)
         btn_row.addWidget(copy_btn)
+
+        # Copy CSV for FeatureScript paste
+        onshape_btn = QPushButton('Copy for Onshape')
+        onshape_btn.setStyleSheet(_btn_purple)
+        onshape_btn.setToolTip('Copy as CSV for pasting into the Vahan Hardpoints FeatureScript')
+        def _copy_onshape():
+            csv_lines = []
+            for name in names:
+                vals = []
+                for label, hp_dict in corners:
+                    pt = hp_dict.get(name)
+                    if pt is not None:
+                        mm = pt * 1000.0
+                        vals.extend([f'{mm[0]:.2f}', f'{mm[1]:.2f}', f'{mm[2]:.2f}'])
+                    else:
+                        vals.extend(['0', '0', '0'])
+                csv_lines.append(f'{name},{",".join(vals)}')
+            QApplication.clipboard().setText('|'.join(csv_lines))
+            onshape_btn.setText('Copied!')
+        onshape_btn.clicked.connect(_copy_onshape)
+        btn_row.addWidget(onshape_btn)
+
+        # Export JSON for Onshape upload
+        json_btn = QPushButton('Export JSON')
+        json_btn.setStyleSheet(_btn_style)
+        json_btn.setToolTip('Save JSON file for Onshape tab import')
+        def _export_json():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, 'Export Hardpoints for Onshape',
+                'hardpoints.json', 'JSON (*.json)')
+            if path:
+                data = {}
+                for label, hp_dict in corners:
+                    data[label] = {}
+                    for name in names:
+                        pt = hp_dict.get(name)
+                        if pt is not None:
+                            mm = pt * 1000.0
+                            data[label][name] = [round(mm[0], 2), round(mm[1], 2), round(mm[2], 2)]
+                import json as _json
+                with open(path, 'w') as f:
+                    _json.dump(data, f, indent=2)
+                json_btn.setText('Saved!')
+        json_btn.clicked.connect(_export_json)
+        btn_row.addWidget(json_btn)
 
         btn_row.addStretch()
         close_btn = QPushButton('Close')
