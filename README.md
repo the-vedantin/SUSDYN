@@ -2,7 +2,7 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.2 (Kinematics + Dynamics + Loads + Aero + Onshape)
+**Version:** 2.3 (Kinematics + Steady & Transient Dynamics + Loads + Aero + Onshape)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
 ![Main Window](screenshots/main_window.png)
@@ -29,6 +29,16 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Understeer gradient from back-calculated slip angles
 - Friction circle tire utilization per corner
 - Roll angle, pitch angle, LLTD
+- Anti-roll bar wheel rate **derived from bar geometry** (G·J/L² for torsion + 3·E·I/A³ for arm bending in series), with hollow bars supported via separate OD and ID inputs per axle. Arm length, half-length and ARB motion ratio auto-computed from the kinematic hardpoints — no redundant geometric inputs.
+
+### Transient Dynamics (Skidpad / Step / Ramp / Sine)
+- Time-domain bicycle + roll model integrated with RK4 (`vahan/transient.py`)
+- Test types: FSAE skidpad (single circle or full figure-8), step steer, ramp steer, sine-frequency sweep
+- Solve modes: **target speed** (read off the lateral-g) or **target lateral-g** (derive speed from `v = √(a_y · g · R)`)
+- Per-corner kinematic effects (camber change, RC migration) precomputed at init as travel→metric lookup tables; cheap interpolation inside the integration loop
+- Damper bump/rebound rates (per axle) reflected through the motion ratio + track to derive body-roll damping `c_phi`
+- Closed-loop path tracking via Stanley controller with first-order steer-actuator lag
+- Outputs: peak/steady lateral-g, peak/steady roll, yaw-rate rise/settling, peak understeer, full time-history of any signal
 
 ### Sensitivity & Optimization
 - Central finite-difference sensitivity of any dynamic output to any vehicle parameter
@@ -84,7 +94,9 @@ vahan/                         GUI (PyQt6)
   analysis.py
   optimizer.py
   tire_model.py
-  dynamics.py      (SteadyStateSolver + AeroDownforceSolver)
+  steering.py      (rack ↔ road-wheel angle chain)
+  dynamics.py      (SteadyStateSolver + AeroDownforceSolver + sensitivity)
+  transient.py     (RK4 bicycle+roll model — skidpad / step / ramp / sine)
   loads.py
 ```
 
@@ -439,6 +451,7 @@ C_alpha(Fz) = C_alpha_ref * (Fz / Fz_ref) ^ n
 
 ![Dynamics Panel](screenshots/dynamics_panel.png)
 
+
 ### Overview
 
 `vahan/dynamics.py` provides `SteadyStateSolver` — computes the vehicle's steady-state response to lateral and longitudinal acceleration. Uses iterative roll convergence with per-corner kinematic state updates.
@@ -510,6 +523,71 @@ The recommendation engine finds which parameter changes produce a desired delta 
 
 ---
 
+## Transient Dynamics Solver
+
+![Skidpad / Transient Panel](screenshots/skidpad_panel.png)
+
+### Overview
+
+`vahan/transient.py` provides `TransientSolver` — a time-domain solver for skidpad, step-steer, ramp-steer, and sine-sweep tests. Where the steady-state solver answers "what does the car do at constant lateral g?", the transient solver answers "how does the car *get there* — how fast does yaw rate rise, how much does it overshoot, how long until roll settles?"
+
+### State Vector (7 states)
+
+```
+[ Y, X, ψ, vx, vy, r, φ ]
+   Y, X       inertial-frame position (m)
+   ψ          yaw angle (rad)
+   vx, vy     body-frame velocities (m/s)
+   r          yaw rate (rad/s)
+   φ          body roll (rad)
+```
+
+Steer angle is a separate first-order state with time constant `steer_tau_s` so a step input doesn't excite an infinite-derivative spike.
+
+### Kinematic Lookup Tables
+
+Camber change and roll-centre migration depend on suspension travel, but solving the 12-DOF Newton-Raphson constraint solver inside an RK4 step would be prohibitively slow. Instead, at solver init each corner is swept across ~20 travel points, the relevant metrics (camber, RC height, motion ratio) are stored, and the integration loop interpolates. Per-step cost drops to a few `np.interp` calls instead of a Newton solve.
+
+### Body Roll Damping
+
+Damper bump/rebound rates (per axle, at the shock) are reflected to the wheel via the kinematic motion ratio, then to roll via the track:
+
+```
+c_phi = Σ_axle  (c_bump + c_rebound) · MR² · t² / 4         (N·m·s/rad)
+```
+
+Nothing in the panel asks for `c_phi` directly any more — it's derived from the four damper coefficient inputs and the auto-derived motion ratios.
+
+### Test Types
+
+| Mode | Steer profile | Solve target |
+|------|---------------|--------------|
+| `skidpad`      | Closed-loop Stanley path follower on a fixed-radius circle | Target speed OR target lat-g (`v = √(a_y · g · R)`) |
+| `skidpad_full` | Same, full FSAE figure-8 (R = 9.125 m, fixed) | Same |
+| `step`         | Open-loop instantaneous step (smoothed by `steer_tau_s`) | Target speed |
+| `ramp`         | Open-loop linear ramp from 0 to peak over `ramp_duration_s` | Target speed |
+| `sine`         | Open-loop frequency sweep — peak amplitude × sin(2π·f·t) | Target speed |
+
+### Outputs
+
+Every state and intermediate force is recorded at every dt. Reported metrics include:
+
+- **Peak / steady lateral-g** (steady = mean of last 25%)
+- **Peak / steady roll angle**
+- **Yaw rate rise time** (10–90% of steady)
+- **Yaw rate overshoot %**
+- **Yaw rate settling time** (within ±5% of steady)
+- **Peak understeer** (`α_F − α_R` from per-tire slip angles)
+- Per-corner Fz, Fy, utilization, camber, travel — full time history
+
+The GUI exposes a multi-select plot picker so any signal can be added to the time-history graph.
+
+![Transient Simulation Time History](screenshots/transient_sim.png)
+
+The plot above is a 10° road-wheel step at 12 m/s on the default vehicle — yaw inertia, roll inertia, and roll damping are all derived from `VehicleParams` and the SkidpadPanel damper bump/rebound coefficients via the formulas given above (Izz ≈ 202 kg·m², Ixx ≈ 40 kg·m², c_φ ≈ 2660 N·m·s/rad).
+
+---
+
 ## Aero Load Targets Solver
 
 ![Aero Load Targets Panel](screenshots/aero_panel.png)
@@ -547,6 +625,8 @@ capped                                corners that hit the per-corner cap
 ```
 
 ### Sweep Mode
+
+![Aero Sweep Across Lateral g](screenshots/aero_sweep.png)
 
 `AeroDownforceSolver.sweep(g_range)` solves at each g point and returns arrays of front/rear/total deficit vs lateral g. The GUI plots these with a velocity secondary x-axis (mph) computed from the turn radius set in the Dynamics panel:
 
@@ -706,7 +786,8 @@ All panels are collapsible sections:
 - **SteeringPanel** — Rack ratio, travel limits, Ackermann
 - **AlignmentPanel** — Static camber, toe, caster display
 - **InverseKinematicsPanel** — Target metric, range, locks, method, tube ODs, solve/explore
-- **DynamicsPanel** — Lateral/longitudinal g inputs, vehicle params, solve/sweep, Apply Aero toggle
+- **DynamicsPanel** — Vehicle masses, springs, ARB OD/ID + G/E, powertrain, lat/lon g inputs, solve/sweep, Apply Aero toggle. Auto-derived ARB arm length / half-length / MR shown in green readout.
+- **SkidpadPanel** — Test type (skidpad / step / ramp / sine), solve mode (target speed or target lat-g), per-axle damper bump/rebound rates, steer lag, time step, multi-select plot signal picker
 - **DynamicsOptPanel** — Target metric delta, sensitivity grid, recommendations
 - **AeroPanel** — Lateral/longitudinal g, target utilization, solve/sweep, deficit table + summary
 - **LoadsPanel** — Front/rear brake params, upright geometry, compute button, results popup
@@ -839,11 +920,24 @@ All exported values are in **millimetres**.
 
 ### Anti-Roll Bars
 
+ARB wheel rate is derived from bar geometry (G, E, OD, ID) and the kinematic linkage. The arm length, half-length (active twist span), and bar→wheel motion ratio are auto-computed from the kinematic hardpoints (`arb_pivot`, `arb_arm_end`, `arb_drop_top`) and the rocker chain — the user only owns OD, ID and the material constants.
+
+```
+J = π·(OD⁴ − ID⁴) / 32                 polar 2nd moment  (hollow general form)
+I = π·(OD⁴ − ID⁴) / 64                 area  2nd moment  (hollow general form)
+K_torsion  = G·J / (A²·L_half)         half-bar twist stiffness at the arm tip
+K_armBend  = 3·E·I / A³                cantilever bending of the arm
+K_arb      = (K_t · K_a) / (K_t + K_a) two springs in series
+K_wheel    = K_arb / MR²               wheel-rate contribution
+```
+
+Setting ID = 0 reproduces the solid-bar formula exactly.
+
 | Parameter | Front | Rear | Unit |
 |-----------|-------|------|------|
 | ARB OD / ID | 12.7 / 9.75 | 12.7 / 9.75 | mm |
-| Arm length | 84.3-90 | 104.8 | mm |
-| ARB motion ratio | 2.4-2.5 | 2.92-3.0 | -- |
+| Arm length (auto-derived) | 84.3-90 | 104.8 | mm |
+| ARB motion ratio (auto-derived) | 2.4-2.5 | 2.92-3.0 | -- |
 | ARB wheel rate per wheel | 16.8-20.9 | 6.5-10.5 | N/mm |
 
 ### Roll & Pitch Stiffness
@@ -882,13 +976,16 @@ All exported values are in **millimetres**.
 | `vahan/metrics_catalog.py` | 30+ metric definitions + dynamics sensitivities |
 | `vahan/optimizer.py` | IK solver, orthogonal groups, collision detection |
 | `vahan/tire_model.py` | Linear tire model with load sensitivity |
+| `vahan/steering.py` | Steering-wheel ↔ rack ↔ road-wheel angle chain |
 | `vahan/dynamics.py` | Steady-state dynamics solver + sensitivity + aero deficit solver |
+| `vahan/transient.py` | Time-domain transient solver (skidpad / step / ramp / sine), RK4 bicycle + roll model |
 | `vahan/loads.py` | Component force calculator (members, bearings, brakes) |
-| `gui/main_window.py` | Main window, steering model, dynamics/loads/aero wiring |
-| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, optimizer, aero, loads) |
+| `gui/main_window.py` | Main window, steering model, dynamics/transient/loads/aero wiring, JSON save/load |
+| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, skidpad, optimizer, aero, loads) |
 | `gui/view3d.py` | VisPy 3D rendering + NavCube |
 | `app.py` | Entry point |
 | `VahanHardpoints.fs` | Onshape FeatureScript: paste hardpoints → 3D construction points in Part Studio |
+| `VahanLayout.fs` | Onshape FeatureScript: companion to `VahanHardpoints.fs` for layout/sketch wiring |
 
 ---
 
@@ -931,12 +1028,13 @@ The GUI opens with default FSAE hardpoints loaded.
 4. **Inverse solve** — Set target curves, select which hardpoints to adjust, and hit Solve
 5. **Explore** — Run widened search to find alternative solutions across the design space
 6. **Dynamics** — Set lateral/longitudinal g, solve for load transfer, roll, utilization
-7. **Sensitivity** — Analyze which vehicle parameters most affect your target metric
-8. **Aero targets** — Set target utilization, solve for downforce deficit, sweep across g range
-9. **Apply Aero** — Toggle aero on in Dynamics panel to see dynamics curves with V²-scaled downforce
-10. **Component loads** — Set brake params and upright geometry, compute forces at operating point
-11. **Export to Onshape** — View → All Hardpoints → Copy for Onshape → paste into `VahanHardpoints` FeatureScript feature in Part Studio
-12. **Save/Load** — File menu for JSON geometry files
+7. **Transient** — Pick a test (skidpad / step / ramp / sine), choose target speed or target lat-g, set damper rates, simulate
+8. **Sensitivity** — Analyze which vehicle parameters most affect your target metric
+9. **Aero targets** — Set target utilization, solve for downforce deficit, sweep across g range
+10. **Apply Aero** — Toggle aero on in Dynamics panel to see dynamics curves with V²-scaled downforce
+11. **Component loads** — Set brake params and upright geometry, compute forces at operating point
+12. **Export to Onshape** — View → All Hardpoints → Copy for Onshape → paste into `VahanHardpoints` FeatureScript feature in Part Studio
+13. **Save/Load** — File menu writes a v2 `.vahan` JSON file capturing all hardpoints, ARB geometry, vehicle params, motion settings, and **every input** on the Dynamics, Skidpad, Loads, and Aero panels. Older v1 files (geometry only) still load.
 
 ### Sign Convention Cheat Sheet
 
