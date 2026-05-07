@@ -43,6 +43,17 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 ### Save / Load
 - **Project format v2.** Every input on Dynamics, Skidpad, Loads and Aero panels round-trips through `Save Project` / `Load Project`. Old v1 files (geometry only) still load — `panels` block falls back to defaults when missing.
 
+### Report Export (File → Export Report…)
+- **[Example report (Google Docs)](https://docs.google.com/document/d/1onLCdDAopES1Kb3C31Rbo0flc9Yq8WNX/edit)**
+- **One-click `.docx` generation** — exports the current state of the solver (whatever you see is what you get). Opens and edits in Google Docs without formatting issues.
+- Uses your **live panel settings**: g range, lon-g, start speed, aero toggle, loads — not hardcoded defaults.
+- Sections: cover (3D screenshot), vehicle params table, heave kinematics (camber, toe, RC height, anti-dive/squat, MR), roll kinematics, steady-state cornering (roll, Fz, utilization, LLTD, pitch), acceleration trajectory, braking trajectory, **component loads** (member axial, BJ reactions, bearing + caliper bolt forces).
+- Aero V²-scaled per-g-point if Apply Aero is on.
+- **Auto-generated analysis box** per graph — summarizes what the curve says (e.g. "FL camber gains −0.021 deg/mm in bump", "First tire saturates at 1.32 g — FR leads").
+- **Editable design-rationale placeholder** (dashed box) under each analysis — type your engineering justification directly in Google Docs.
+- Runs all sweeps fresh from current state in a background thread with progress dialog — UI stays responsive.
+- Matplotlib Agg backend renders to embedded PNG at 150 DPI. Arial font only, no Word-specific features — clean Google Docs import guaranteed.
+
 ### Known gaps
 - **Tire pressure / temperature**: TTC `P` column is read and stored as `pressure_kPa_mean`/`pressure_psi`, but not surfaced in the panel. **Temperature columns (`TSTI/TSTC/TSTO`) are NOT read at all** — the loader silently drops them. Operating P/T inputs (with delta-warning vs. test conditions) are queued for v2.5.
 
@@ -145,6 +156,15 @@ For default geometry (h_cg ≈ 300 mm, L = 1530 mm, μ = 1.5): the dynamic limit
 - Separate front/rear brake parameters (pad mu, piston area, pad radius, bolt spacing)
 - Brake system: torque, caliper clamp, line pressure
 
+### Report Export
+- **File → Export Report…** generates a full Vehicle Dynamics `.docx` (editable in Google Docs)
+- Exports the **current solver state** — your g range, lon-g, start speed, aero, loads
+- Content: 3D screenshot, vehicle params, heave kinematics (camber, toe, RC, anti-dive/squat, MR), roll kinematics, cornering sweep, accel trajectory, braking trajectory, component loads
+- Aero V²-scaled if Apply Aero is toggled on
+- Each graph has an **auto-analysis callout** and an **editable design-rationale box**
+- Background thread with progress dialog — UI stays responsive
+- Requirements: `python-docx`, `Pillow` (in `requirements.txt`)
+
 ### 3D Visualization
 - Interactive OpenGL viewport (VisPy) with full-car wireframe rendering
 - Colour-coded suspension members (UCA, LCA, tie rod, pushrod, rocker, spring/damper)
@@ -176,6 +196,7 @@ vahan/                         GUI (PyQt6)
   steering.py      (rack ↔ road-wheel angle chain)
   dynamics.py      (SteadyStateSolver + AeroDownforceSolver + sensitivity)
   transient.py     (RK4 bicycle+roll model — skidpad / step / ramp / sine)
+  report_gen.py    (DOCX report generator — matplotlib + python-docx, no Qt)
   loads.py
 ```
 
