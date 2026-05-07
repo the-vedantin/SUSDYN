@@ -43,13 +43,6 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 ### Save / Load
 - **Project format v2.** Every input on Dynamics, Skidpad, Loads and Aero panels round-trips through `Save Project` / `Load Project`. Old v1 files (geometry only) still load — `panels` block falls back to defaults when missing.
 
-### Defaults updated
-- Damper fully-extended length: 210 mm
-- Rack travel/rev: 120 mm/rev, total rack travel: 64 mm
-- ARB ID (front + rear): 9.65 mm; OD: 12.70 mm
-- Power / RPM / sprockets: 75 hp / 10 000 rpm / 11 T drive / 39 T driven
-- Turn radius (used for lateral-sweep speed axis): 10 m
-
 ### Known gaps
 - **Tire pressure / temperature**: TTC `P` column is read and stored as `pressure_kPa_mean`/`pressure_psi`, but not surfaced in the panel. **Temperature columns (`TSTI/TSTC/TSTO`) are NOT read at all** — the loader silently drops them. Operating P/T inputs (with delta-warning vs. test conditions) are queued for v2.5.
 
