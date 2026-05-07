@@ -2,10 +2,56 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.3 (Kinematics + Steady & Transient Dynamics + Loads + Aero + Onshape)
+**Version:** 2.5 (Kinematics + Steady & Transient Dynamics + Loads + Aero + Onshape)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
 ![Main Window](screenshots/main_window.png)
+
+---
+
+## Recent Patch Notes (v2.5)
+
+### Dynamics UI — Two-mode redesign (Poka Yoke)
+- **Two top-level test modes: Cornering and Straights.**  Inputs are physically gated by the active mode — user cannot enter values that don't apply.
+- **Cornering:** Lateral g + Longitudinal g (signed: 0 = pure lateral, - = braking, + = accel). Steady-state sweep with friction-circle clamp.
+- **Straights:** Start speed (mph) + Longitudinal g (signed). Time-domain trajectory where the sign of lon-g drives direction — no separate dropdown, no redundant inputs.
+- **target_lon_g is always literal.** 0g = coast (drag only), +0.5g = moderate throttle, +3g = traction-limited. No hidden "0 means full throttle" fallback. Every distinct input produces a distinct graph.
+- Removed: end_speed, CdA, air density, trajectory direction dropdown from the panel (they remain on VehicleParams internally).
+
+### Dynamics solver (v2.4 continued)
+- **Longitudinal sweep is now a real time-domain acceleration trajectory.** Integrates `v(t)` from `start_speed_mph` using `F_engine = P/v` minus `F_drag = ½·ρ·CdA·v²`. Run terminates naturally when `a → 0` (terminal speed). X-axis = **time (s)**, speed grows monotonically, longitudinal-g traces the traction-then-power-then-drag envelope, pitch follows g.
+- **Drag is parametric, not hardcoded.** New `cda_m2` and `air_density_kg_m3` fields on `VehicleParams`, exposed in the DynamicsPanel. Terminal speed `v_term = ∛(2P/(ρ·CdA))` falls out of the math — no magic numbers, no hardcoded duration.
+- **Friction circle is drivetrain-aware.** Combined cornering + accel/braking sweeps now correctly clamp achievable longitudinal-g as lat-g grows. RWD accel: `a_x_max = rear_frac · √(μ²−a_y²)`. Braking: `a_x_max = (front_frac/brake_bias) · √(μ²−a_y²)` (front tires saturate first when bias > weight share). Pitch curve drops with lat-g instead of sitting flat.
+- **Roll moment arm fix.** Was using whole-vehicle `cg_height_m`, should be sprung-CG height. New `VehicleParams.sprung_cg_height_m` property = `(m·h_cg − m_u·h_u)/m_s`. ~7 % systematic under-prediction of roll moment fixed in 4 callsites (transient + steady-state).
+- **Pitch moment formula fix.** `m_s · ax · (h_cg − h_us)` had no physical meaning — replaced with `m_s · ax · h_s`.
+- **Tire-model fallback unified.** `SteadyStateSolver.__init__` now installs a `LinearTireModel` when no tire data is loaded, killing the hardcoded `mu = 1.5` literal that was buried in `_effective_mu` and `max_accel_g`.
+- **Steering Wheel Angle / Steer Correction plots fixed.** Were using a fixed `turn_radius_m` (constant Ackermann at all lat-g); now derive R from `v²/(a_y·g_e)` so SWA = 0 at lat = 0 and grows with corner sharpness.
+
+### Live Values panel
+- **Metric scope respected.** Catalog entries now carry a `scope` field (`corner` / `axle` / `front` / `rear` / `vehicle`). Anti-dive shows once on the front axle (was: 4 different per-corner values that drifted by ~10 %). Anti-squat / anti-lift on the rear. Roll-centre height shown per-axle. Vehicle-level metrics (turn radius, roll-axis inclination) shown once.
+- **Roll Axis Inclination** added as a new kinematic metric — angle the front-RC-to-rear-RC line makes with horizontal in side view (`atan2(RC_R − RC_F, wheelbase)`).
+- **Instant Centre Y/Z** now uses **kinematic finite-difference** (Aronhold rigid-body construction) instead of intersecting static YZ-arm projections. Smooth across the full sweep, no asymptotic spikes when projected arm slopes match.
+- **Rocker angle** wraps to `[−180°, +180°)` (was reporting 706°, −1092° due to solver branch winding).
+
+### ARBs
+- **Hollow bars supported.** OD + ID inputs per axle (was: single Ø); cross-section moments scale with `OD⁴ − ID⁴`. ID = 0 reproduces the solid-bar formula.
+- **Geometry auto-derived.** Arm length, half-length and motion ratio come from the kinematic hardpoints (`arb_pivot`, `arb_arm_end`, `arb_drop_top`) and the rocker chain. No redundant geometric inputs in the panel.
+
+### Aero
+- **Custom (CFD validation) source.** Apply Aero now has two sources via a combobox: `Solved` (inverse from the Aero panel) and `Custom`. Custom takes user-typed `F_ref / V_ref / CoP%` and back-calculates `CL·A = 2·F_ref/(ρ·V_ref²)`, applied via the same V²-scaled pipeline. Lets you validate handling against CFD numbers directly without inverting the solver.
+
+### Save / Load
+- **Project format v2.** Every input on Dynamics, Skidpad, Loads and Aero panels round-trips through `Save Project` / `Load Project`. Old v1 files (geometry only) still load — `panels` block falls back to defaults when missing.
+
+### Defaults updated
+- Damper fully-extended length: 210 mm
+- Rack travel/rev: 120 mm/rev, total rack travel: 64 mm
+- ARB ID (front + rear): 9.65 mm; OD: 12.70 mm
+- Power / RPM / sprockets: 75 hp / 10 000 rpm / 11 T drive / 39 T driven
+- Turn radius (used for lateral-sweep speed axis): 10 m
+
+### Known gaps
+- **Tire pressure / temperature**: TTC `P` column is read and stored as `pressure_kPa_mean`/`pressure_psi`, but not surfaced in the panel. **Temperature columns (`TSTI/TSTC/TSTO`) are NOT read at all** — the loader silently drops them. Operating P/T inputs (with delta-warning vs. test conditions) are queued for v2.5.
 
 ---
 
@@ -28,8 +74,47 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Degressive tire model with load sensitivity (`C_alpha ~ (Fz/Fz_ref)^n`, n < 1)
 - Understeer gradient from back-calculated slip angles
 - Friction circle tire utilization per corner
-- Roll angle, pitch angle, LLTD
+- Roll angle (uses **sprung-CG height** for the moment arm, not whole-vehicle CG), pitch angle (`m_s · ax · h_s` formulation), LLTD
+- **Drivetrain-aware friction-circle clamp** on combined sweeps — RWD accel saturates the rear axle at `a_x_max = rear_frac · √(μ²−a_y²)`; braking saturates the front when bias exceeds front weight share. Pitch curves drop with lat-g instead of sitting flat.
 - Anti-roll bar wheel rate **derived from bar geometry** (G·J/L² for torsion + 3·E·I/A³ for arm bending in series), with hollow bars supported via separate OD and ID inputs per axle. Arm length, half-length and ARB motion ratio auto-computed from the kinematic hardpoints — no redundant geometric inputs.
+
+### Longitudinal Acceleration Trajectory (Straights mode)
+- **Inputs: Start speed (mph) + Longitudinal g (signed).** Sign drives direction: positive = throttle, negative = brake, zero = coast. No separate dropdown.
+- Time-domain integration: `v(t+dt) = v(t) + [F_engine(v) − F_drag(v)] / m · dt`
+- `F_engine = P/v` capped by traction at low v; `F_drag = ½·ρ·CdA·v²`
+- **User target always literal:** 0.5g = 0.5g applied (clamped by traction/power when over). 0g = coast. No hidden "full throttle" fallback.
+- **No hardcoded duration** — terminates naturally when `a → 0` at terminal speed `v_term = ∛(2P/(ρ·CdA))`
+- Plot X = time (monotonic); Y = speed, longitudinal-g, pitch, roll, etc. — all evolve together along the real trajectory
+
+#### Why does max accel land at ~0.83g?
+
+Pure Coulomb friction at the driven axle. For RWD the rear tires are the only ones pushing the car forward, so only the weight on the rear (~55% for default geometry) contributes to forward grip:
+
+```
+Max forward force = μ · Fz_rear
+Max accel         = μ · (W_rear / W_total)
+                  = μ · rear_weight_fraction
+                  = 1.50 · 0.552
+                  = 0.828 g
+```
+
+What pushes that limit higher:
+
+| Change | Effect |
+|--------|--------|
+| AWD | All 4 tires drive → traction_g = μ |
+| Move CG rearward | More Fz on driven axle |
+| Stickier tire (higher μ) — load TTC data | Linear scale-up |
+| Aerodynamic downforce | Adds Fz without adding mass |
+| Longitudinal weight transfer (dynamic) | Accel itself shifts weight rearward → feedback boost (not yet modelled) |
+
+**Static vs dynamic weight transfer.** The current trajectory uses *static* weight distribution for the traction-g calc. In reality, accelerating at `a` shifts `m·a·h_cg/L` of weight onto the rear, making the real limit implicit:
+
+```
+a/g = μ · rear_static / (1 − μ · h_cg / L)
+```
+
+For default geometry (h_cg ≈ 300 mm, L = 1530 mm, μ = 1.5): the dynamic limit is `0.55 · 1.5 / (1 − 1.5 · 0.196) = 1.16g`, not 0.83g. A dynamic-weight-transfer iteration is queued for v2.6 — small per-step fixed-point in `sweep_acceleration_trajectory`.
 
 ### Transient Dynamics (Skidpad / Step / Ramp / Sine)
 - Time-domain bicycle + roll model integrated with RK4 (`vahan/transient.py`)
@@ -53,10 +138,11 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Sweep mode plots deficit vs lateral g with velocity secondary axis
 
 ### Apply Aero (V² Scaling)
-- Toggle in Dynamics panel applies solved aero downforce to dynamics solve/sweep
+- Toggle in Dynamics panel applies aero downforce to dynamics solve/sweep
 - V²-scaled: downforce ∝ V², and at constant turn radius V² ∝ g, so aero load scales linearly with g
-- Solved deficit at g_ref is normalised to per-1g, then multiplied by g at each sweep point
-- Lets you compare dynamics curves with and without aero to verify aero targets
+- **Two sources** controlled by the "Aero source" combobox:
+  - **Solved** — uses the inverse-solved deficit from the Aero Load Targets panel ("what aero do I *need* to hit a target?"). Normalised to per-1g, multiplied by g at each sweep point.
+  - **Custom (CFD validation)** — user types in measured/CFD numbers: total downforce at a reference speed, CoP location (% rear), and air density. CL·A is back-calculated as `2·F_ref / (ρ·V_ref²)` and applied via the same V²-scaled pipeline. Lets you validate handling against CFD without inverting the solve.
 
 ### Component Loads
 - 6x6 static equilibrium on upright free body for all member axial forces
@@ -935,10 +1021,27 @@ Setting ID = 0 reproduces the solid-bar formula exactly.
 
 | Parameter | Front | Rear | Unit |
 |-----------|-------|------|------|
-| ARB OD / ID | 12.7 / 9.75 | 12.7 / 9.75 | mm |
+| ARB OD / ID | 12.70 / 9.65 | 12.70 / 9.65 | mm |
 | Arm length (auto-derived) | 84.3-90 | 104.8 | mm |
 | ARB motion ratio (auto-derived) | 2.4-2.5 | 2.92-3.0 | -- |
 | ARB wheel rate per wheel | 16.8-20.9 | 6.5-10.5 | N/mm |
+
+### Powertrain & Aero (longitudinal trajectory inputs)
+
+| Parameter | Value | Unit |
+|-----------|-------|------|
+| Wheel power | 75 | hp |
+| Engine RPM | 10 000 | rpm |
+| Primary ratio | 3.55 : 1 | -- |
+| Drive sprocket | 11 | T |
+| Driven sprocket | 39 | T |
+| Drivetrain | RWD | -- |
+| Tire radius | 203 | mm |
+| **CdA** | 1.0 | m² |
+| **Air density (ρ)** | 1.225 | kg/m³ |
+| Terminal speed *(derived)* | ≈ 100 | mph |
+
+`v_term = ∛(2 · P / (ρ · CdA))` is what bounds the longitudinal trajectory — at 75 hp / CdA=1.0 / ρ=1.225 ⇒ ~100 mph. Tune CdA per car: bare FSAE chassis ≈ 1.0, FSAE with aero kit ≈ 1.5–2.0, F1 ≈ 1.3–1.5.
 
 ### Roll & Pitch Stiffness
 
