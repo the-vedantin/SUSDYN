@@ -166,6 +166,17 @@ class SuspensionConstraints:
             self._rocker_axis = _norm(np.cross(arm_push, arm_spring))
         self._L_pushrod   = float(np.sqrt(_d2(hp.pushrod_inner, hp.pushrod_outer)))
 
+        # ── static-sag geometric offset (advanced / scripting) ────────────
+        # Shifts the interpretation of `travel` in solve(): an external caller
+        # requesting travel=T actually solves the kinematics at T + sag_offset_m.
+        # Normal GUI use leaves this at 0.  The "Apply Sag to Hardpoints"
+        # button in the MotionPanel does NOT use this — it rewrites the
+        # hardpoint dict permanently instead, so there's no hidden offset
+        # sitting on the solver.  The attribute is kept for scripting /
+        # testing use cases where you want to probe the sagged state
+        # without committing to new hardpoints.
+        self.sag_offset_m = 0.0
+
     # ── residual vector ──────────────────────────────────────────────────────
 
     def _residuals(self, x: np.ndarray, travel: float) -> np.ndarray:
@@ -338,13 +349,19 @@ class SuspensionConstraints:
         """
         hp = self.hp
 
+        # Shift the drive constraint by the sag offset so that "display" travel
+        # (what the caller passes in and what we return on SolvedState.travel)
+        # is referenced to the physics-consistent static ride height instead of
+        # the raw hardpoint position.  When sag_offset_m == 0 this is a no-op.
+        effective_travel = travel + self.sag_offset_m
+
         if x0 is None:
             x0 = np.concatenate([hp.uca_outer, hp.lca_outer,
                                   hp.tie_rod_outer, hp.wheel_center])
 
         x = x0.copy()
         for i in range(max_iter):
-            r = self._residuals(x, travel)
+            r = self._residuals(x, effective_travel)
             if np.max(np.abs(r)) < tol:
                 break
             J  = self._jacobian(x)
@@ -353,7 +370,8 @@ class SuspensionConstraints:
         else:
             raise RuntimeError(
                 f"Main solver did not converge at travel={travel*1000:.2f} mm "
-                f"(max residual={np.max(np.abs(r)):.2e})."
+                f"(effective {effective_travel*1000:.2f} mm, "
+                f"max residual={np.max(np.abs(r)):.2e})."
             )
 
         uca_out = x[0:3]

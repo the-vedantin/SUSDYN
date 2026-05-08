@@ -2,14 +2,35 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.5 (Kinematics + Steady & Transient Dynamics + Loads + Aero + Onshape)
+**Version:** 2.6 (Kinematics + Steady & Transient Dynamics + Loads + Aero + Brakes + Onshape)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
 ![Main Window](screenshots/main_window.png)
 
 ---
 
-## Recent Patch Notes (v2.5)
+## Recent Patch Notes (v2.6)
+
+### Dynamic Ideal Ackermann (Sensitivity Analyzer)
+- **New output metric: `ideal_ackermann_pct`** — computes the Ackermann % the tires *want* at a given operating point using tire-model inversion. Not self-referential: Fy comes from equilibrium (Newton's 2nd law at a known g), then the tire model is inverted in one direction only (Fy,Fz → slip angle).
+- **Turn radius input** added to the Dynamics Optimizer panel (default 7.5 m). Required for the ideal Ackermann computation — without it the metric shows N/A.
+- Sensitivity of ideal Ackermann to every existing knob (spring rates, ARB, CG, MR, RC height) is computed and displayed. Shows how parameter changes affect what the tires want — e.g. stiffer front springs → more front load transfer asymmetry → tires want more Ackermann.
+- Formula: `geo_diff = atan(L/(R-t/2)) - atan(L/(R+t/2))`, then `required_diff = geo_diff + (SA_inner - SA_outer)`, `ideal_ack% = required_diff / geo_diff × 100`. Values >100% mean the tires want more inner steer than pure geometry gives (typical at high g where the inner tire is unloaded).
+
+### Ackermann Optimizer (IK Solver)
+- **`Ackermann %` added to the IK target metric dropdown.** Selecting it auto-switches to steer mode and auto-selects only `tie_rod_inner` (rack position) as design variables.
+- **New `rack_position` variable group** in `ORTHO_GROUPS` — moves the inboard tie-rod pickup (rack end) in X/Y/Z without touching `tie_rod_outer`. Changes Ackermann geometry by repositioning the rack while keeping the outer ball joint on the knuckle fixed — preserves steering ratio and rack length.
+- Workflow: run the sensitivity analyzer to get the ideal Ackermann % target → punch that into the IK solver → optimizer moves the rack to match.
+
+### Brake Calculator (new panel)
+- **New collapsible panel** in the right sidebar with its own lateral/longitudinal g spinners.
+- **Inputs:** Pedal ratio, front/rear master cylinder bore, brake bias %. Caliper parameters (pad μ, piston area, pad radius, pistons/caliper) are read from the existing Component Loads panel. Tire μ is pulled automatically from TTC data per corner (load-sensitive via `peak_mu(Fz, camber)`), tire radius from VehicleParams.
+- **Lockup analysis:** Per-corner lockup Fx, brake torque, caliper clamp force, line pressure, and pedal force. Summary shows which corner locks first and whether fronts or rears lock first.
+- **Rotor thermal:** Single braking event adiabatic temperature rise. Inputs: front/rear rotor mass, specific heat (Cp), ambient temp, brake-from/to speed. Outputs per corner: energy absorbed (kJ), ΔT, peak rotor temp. Color-coded: green <400°C, orange 400–600°C, red >600°C.
+
+---
+
+## Previous Patch Notes (v2.5)
 
 ### Dynamics UI — Two-mode redesign (Poka Yoke)
 - **Two top-level test modes: Cornering and Straights.**  Inputs are physically gated by the active mode — user cannot enter values that don't apply.
@@ -133,6 +154,7 @@ For default geometry (h_cg ≈ 300 mm, L = 1530 mm, μ = 1.5): the dynamic limit
 - Central finite-difference sensitivity of any dynamic output to any vehicle parameter
 - Practical step sizes (e.g. 1 mm spring preload, 1 N/mm spring rate)
 - Recommendation engine: which parameter changes achieve a target understeer/roll/pitch delta
+- **Dynamic ideal Ackermann %** — tire-model inversion at a given turn radius and Fz distribution. Shows what Ackermann the tires want, and how every knob affects it
 
 ### Aero Load Targets
 - Computes per-corner Fz deficit to reach a target tire utilization at a given g level
@@ -155,6 +177,12 @@ For default geometry (h_cg ≈ 300 mm, L = 1530 mm, μ = 1.5): the dynamic limit
 - Brake caliper mounting bolt forces (upper/lower, V and H) with direct shear + torque couple
 - Separate front/rear brake parameters (pad mu, piston area, pad radius, bolt spacing)
 - Brake system: torque, caliper clamp, line pressure
+
+### Brake Calculator
+- **Lockup analysis:** Per-corner lockup force, torque, clamp, line pressure, pedal force at any lateral/longitudinal g
+- **Tire μ from TTC data** — load-sensitive per corner via `peak_mu(Fz, camber)`, no manual entry
+- **Rotor thermal:** Adiabatic single-event temperature rise from KE dump into rotor thermal mass
+- Master cylinder sizing: front/rear bore, pedal ratio, bias bar %
 
 ### Report Export
 - **File → Export Report…** generates a full Vehicle Dynamics `.docx` (editable in Google Docs)
@@ -197,7 +225,7 @@ vahan/                         GUI (PyQt6)
   dynamics.py      (SteadyStateSolver + AeroDownforceSolver + sensitivity)
   transient.py     (RK4 bicycle+roll model — skidpad / step / ramp / sine)
   report_gen.py    (DOCX report generator — matplotlib + python-docx, no Qt)
-  loads.py
+  loads.py         (component forces + brake calculator + rotor thermal)
 ```
 
 The `vahan/` package is a pure computation library with zero GUI dependencies. The `gui/` layer wraps it in a desktop application. Either can be used independently.

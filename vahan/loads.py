@@ -358,6 +358,213 @@ def _compute_brake_forces(result: ComponentLoads, bp: BrakeParams):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  BRAKE SYSTEM CALCULATOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class BrakeSystemParams:
+    """System-level brake parameters (pedal + master cylinders)."""
+    pedal_ratio: float = 5.0            # mechanical advantage of pedal lever
+    mc_bore_front_mm: float = 15.87     # front master cylinder bore (5/8")
+    mc_bore_rear_mm: float = 15.87      # rear master cylinder bore (5/8")
+    bias_pct_front: float = 65.0        # brake bias % to front (from bias bar)
+    tire_radius_m: float = 0.203        # loaded tire radius
+
+    @property
+    def mc_area_front_mm2(self) -> float:
+        return np.pi * (self.mc_bore_front_mm / 2) ** 2
+
+    @property
+    def mc_area_rear_mm2(self) -> float:
+        return np.pi * (self.mc_bore_rear_mm / 2) ** 2
+
+
+@dataclass
+class BrakeCornerResult:
+    """Brake calculator output for one corner."""
+    # Current operating point
+    Fz_N: float = 0.0
+    tire_mu: float = 0.0               # peak μ used (from tire model or fallback)
+    brake_torque_Nm: float = 0.0
+    line_pressure_MPa: float = 0.0
+    clamp_force_N: float = 0.0
+    # At lockup
+    lockup_Fx_N: float = 0.0               # Fx that locks this tire
+    lockup_torque_Nm: float = 0.0           # brake torque at lockup
+    lockup_clamp_N: float = 0.0             # caliper clamp at lockup
+    lockup_line_pressure_MPa: float = 0.0   # line pressure at lockup
+    lockup_pedal_force_N: float = 0.0       # pedal force that locks this corner
+    # Margins
+    lockup_margin_pct: float = 0.0          # how far from lockup (100% = at limit)
+
+
+def compute_brake_system(
+    Fz: dict,
+    brake_params_f: BrakeParams,
+    brake_params_r: BrakeParams,
+    system: BrakeSystemParams,
+    tire_model=None,
+    cambers: dict = None,
+) -> dict:
+    """
+    Compute brake pressures, torques, and lockup limits for all 4 corners.
+
+    Parameters
+    ----------
+    Fz : dict
+        Per-corner vertical loads {'FL': N, 'FR': N, 'RL': N, 'RR': N}.
+    brake_params_f, brake_params_r : BrakeParams
+        Per-caliper parameters (front / rear).
+    system : BrakeSystemParams
+        System-level params (pedal, master cylinders, bias).
+    tire_model : optional
+        Tire model with ``peak_mu(Fz_N, camber_deg)`` — pulls μ per corner
+        from TTC data (load-sensitive).  Falls back to 1.5 if None.
+    cambers : dict, optional
+        Per-corner camber {'FL': deg, ...} for peak_mu lookup.
+
+    Returns
+    -------
+    dict of {corner_label: BrakeCornerResult}
+    """
+    results = {}
+    bias_f = system.bias_pct_front / 100.0
+    bias_r = 1.0 - bias_f
+    r_tire = system.tire_radius_m
+    if cambers is None:
+        cambers = {}
+
+    for label in ['FL', 'FR', 'RL', 'RR']:
+        is_front = label[0] == 'F'
+        bp = brake_params_f if is_front else brake_params_r
+        fz = max(Fz.get(label, 0), 0.0)
+
+        r_pad = bp.pad_radius_mm / 1000.0
+        A_piston = bp.piston_area_mm2
+        mu_pad = bp.pad_mu
+        n_pistons = bp.num_pistons
+
+        # Peak tire μ from tire model (load-sensitive) or fallback
+        if tire_model is not None and hasattr(tire_model, 'peak_mu'):
+            cam = abs(cambers.get(label, 0.0))
+            mu_tire = float(tire_model.peak_mu(max(fz, 1.0), cam))
+        else:
+            mu_tire = 1.5
+
+        cr = BrakeCornerResult(Fz_N=fz)
+        cr.tire_mu = mu_tire
+
+        # ── Lockup threshold ─────────────────────────────────────
+        # The tire locks when Fx > mu_tire × Fz
+        lockup_Fx = mu_tire * fz                            # N
+        lockup_torque = lockup_Fx * r_tire                  # Nm
+
+        # Caliper clamp to produce that torque
+        # T = clamp × mu_pad × r_pad × 2 (both pads)
+        if mu_pad > 0 and r_pad > 0:
+            lockup_clamp = lockup_torque / (mu_pad * r_pad * 2)
+        else:
+            lockup_clamp = 0.0
+
+        # Line pressure to produce that clamp
+        # clamp = P × A_piston × n_pistons (floating caliper: ×2 for both sides)
+        # For floating caliper with n_pistons on one side:
+        #   clamp = P × A_piston × n_pistons
+        # (the floating side mirrors the force → both pads grip equally)
+        effective_piston_area = A_piston * n_pistons
+        if effective_piston_area > 0:
+            lockup_pressure = lockup_clamp / effective_piston_area  # N/mm² = MPa
+        else:
+            lockup_pressure = 0.0
+
+        # Pedal force to generate that line pressure
+        # P_line = F_pedal × pedal_ratio / A_mc
+        # → F_pedal = P_line × A_mc / pedal_ratio
+        mc_area = system.mc_area_front_mm2 if is_front else system.mc_area_rear_mm2
+        if system.pedal_ratio > 0:
+            lockup_pedal = lockup_pressure * mc_area / system.pedal_ratio
+        else:
+            lockup_pedal = 0.0
+
+        cr.lockup_Fx_N = lockup_Fx
+        cr.lockup_torque_Nm = lockup_torque
+        cr.lockup_clamp_N = lockup_clamp
+        cr.lockup_line_pressure_MPa = lockup_pressure
+        cr.lockup_pedal_force_N = lockup_pedal
+
+        results[label] = cr
+
+    return results
+
+
+def compute_brake_thermal(
+    vehicle_mass_kg: float,
+    bias_pct_front: float,
+    speed_start_mph: float,
+    speed_end_mph: float,
+    rotor_mass_f_kg: float,
+    rotor_mass_r_kg: float,
+    rotor_cp: float = 460.0,
+    ambient_C: float = 25.0,
+) -> dict:
+    """
+    Single braking event adiabatic rotor temperature rise.
+
+    Assumes 100% of kinetic energy goes into the rotors (worst case —
+    no convective cooling during the stop).  Energy is split by brake
+    bias, then divided equally between left/right per axle.
+
+    Parameters
+    ----------
+    vehicle_mass_kg : float
+        Total vehicle mass (driver included).
+    bias_pct_front : float
+        Brake bias % to front axle.
+    speed_start_mph, speed_end_mph : float
+        Braking from → to (mph).
+    rotor_mass_f_kg, rotor_mass_r_kg : float
+        Mass of ONE front / rear rotor.
+    rotor_cp : float
+        Specific heat of rotor material (J/kg·K).
+    ambient_C : float
+        Ambient / initial rotor temperature (°C).
+
+    Returns
+    -------
+    dict of {corner_label: {'energy_kJ': float, 'delta_T_C': float, 'peak_T_C': float}}
+    """
+    mph_to_ms = 0.44704
+    v1 = speed_start_mph * mph_to_ms
+    v2 = speed_end_mph * mph_to_ms
+    KE = 0.5 * vehicle_mass_kg * (v1 ** 2 - v2 ** 2)  # joules
+    if KE < 0:
+        KE = 0.0
+
+    bias_f = bias_pct_front / 100.0
+    energy_front_axle = KE * bias_f
+    energy_rear_axle = KE * (1.0 - bias_f)
+
+    results = {}
+    for label in ['FL', 'FR', 'RL', 'RR']:
+        is_front = label[0] == 'F'
+        energy_per_rotor = (energy_front_axle if is_front else energy_rear_axle) / 2.0
+        m_rotor = rotor_mass_f_kg if is_front else rotor_mass_r_kg
+
+        if m_rotor > 0 and rotor_cp > 0:
+            delta_T = energy_per_rotor / (m_rotor * rotor_cp)
+        else:
+            delta_T = 0.0
+
+        results[label] = {
+            'energy_kJ': energy_per_rotor / 1000.0,
+            'delta_T_C': delta_T,
+            'peak_T_C': ambient_C + delta_T,
+        }
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  CONVENIENCE: COMPUTE ALL 4 CORNERS
 # ═══════════════════════════════════════════════════════════════════════════
 

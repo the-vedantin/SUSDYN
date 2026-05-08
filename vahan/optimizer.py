@@ -70,6 +70,17 @@ ORTHO_GROUPS: dict[str, list[dict]] = {
         dict(point='tie_rod_inner', coord=0),   # lateral position also affects Ackermann
         dict(point='tie_rod_outer', coord=0),
     ],
+    # Group 2c — Rack position only: moves the inboard tie-rod pickup
+    # (= rack end) in X/Y/Z WITHOUT touching tie_rod_outer.  This changes
+    # Ackermann geometry by repositioning the rack while keeping the outer
+    # ball joint (on the upright/knuckle) fixed — preserving steering ratio
+    # and rack length.  Use when the dynamic ideal Ackermann target differs
+    # from the current Ackermann curve.
+    'rack_position': [
+        dict(point='tie_rod_inner', coord=0),   # lateral (X) — rack offset
+        dict(point='tie_rod_inner', coord=1),   # fore-aft (Y) — rack fore/aft
+        dict(point='tie_rod_inner', coord=2),   # vertical (Z) — rack height
+    ],
     # Group 3 — Anti-dive/squat/lift: side-view pivot axis TILT.
     # Only change the Z-difference between front & rear inboard mounts,
     # NOT their average Z (which would shift front-view geometry).

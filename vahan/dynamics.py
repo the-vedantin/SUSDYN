@@ -62,11 +62,60 @@ class VehicleParams:
     max_steer_angle_deg: float = 28.0  # max front wheel steer angle
     front_brake_bias: float = 0.65  # fraction of brake force on front axle (0-1)
 
+    # Aerodynamic drag — bounds terminal speed during longitudinal
+    # acceleration trajectories.  CdA is the lumped drag coefficient ×
+    # frontal area (m²).  Without these, the steady-state power-limit
+    # speed v = P/(m·g·g_e) goes to infinity at low g.
+    cda_m2:                float = 1.0      # Cd · A (m²)  — FSAE no-aero ≈ 1.0
+    air_density_kg_m3:     float = 1.225    # ρ at ISA sea level / 15 °C
+
+    # Steering rack geometry — drives the mapping between the driver's
+    # steering-wheel rotation and the tie-rod translation at the front axle.
+    # Used by `vahan.steering.SteeringGeometry` to convert commanded
+    # road-wheel angle ↔ steering-wheel angle, and to derive the physical
+    # max road-wheel angle imposed by the rack travel limit.
+    rack_travel_per_rev_mm: float = 60.0    # rack translation per 360° of wheel
+    total_rack_travel_mm:   float = 120.0   # full stroke bump-to-bump
+
+    # Auto-inertia coefficients — used by the GUI when Ixx/Izz aren't
+    # measured directly.  Documented so they show up in from_car_dict.
+    yaw_inertia_factor:        float = 1.2   # Izz ≈ k · m · a · b
+    roll_gyradius_track_frac:  float = 0.35  # k_roll ≈ frac · track_avg
+
+    # Speed-hold PI controller (normalised by mass so the same gains give
+    # similar response on 200 kg and 800 kg cars).  Actual gain =
+    # per_kg × total_mass_kg inside TransientSolver.
+    speed_hold_kp_per_kg: float = 0.69   # → 200 N/(m/s) on a 290 kg FSAE
+    speed_hold_ki_per_kg: float = 0.17
+
     # ── Computed properties ──────────────────────────────────────────────
 
     @property
     def cg_to_rear_axle_m(self):
         return self.wheelbase_m - self.cg_to_front_axle_m
+
+    @property
+    def sprung_cg_height_m(self):
+        """Height of the *sprung-mass* CG above ground (m).
+
+        The user-supplied ``cg_height_m`` is the WHOLE-vehicle CG.  Most
+        chassis-roll / pitch moment expressions need the sprung-mass CG
+        instead — the unsprung mass sits at the wheel-centre height and
+        pulls the whole-vehicle CG down.  Conservation of mass-times-
+        height gives:
+
+            m · h_cg = m_s · h_s + m_u · h_u
+            ⇒  h_s = (m · h_cg − m_u · h_u) / m_s
+
+        Falls back to ``cg_height_m`` if sprung mass is degenerate
+        (ill-posed inputs) so callers never crash on missing data.
+        """
+        m_u = self.total_mass_kg - self.sprung_mass_kg
+        if self.sprung_mass_kg <= 1e-3:
+            return self.cg_height_m
+        return ((self.total_mass_kg * self.cg_height_m
+                 - m_u * self.unsprung_cg_height_m)
+                / self.sprung_mass_kg)
 
     @property
     def front_weight_fraction(self):
@@ -115,6 +164,100 @@ class VehicleParams:
     def roll_stiffness_total_Npm_rad(self):
         return self.roll_stiffness_front_Npm_rad + self.roll_stiffness_rear_Npm_rad
 
+    # ── Static sag computation ───────────────────────────────────────
+    #
+    # Sag = how far the damper has compressed from its fully-extended
+    # position when the car is sitting at rest.  Depends on corner
+    # load, spring rate, motion ratio, and any collar preload.
+    #
+    # Force balance at the shock (virtual work: F_wheel·δ_w = F_shock·δ_s):
+    #     F_shock_static = F_wheel_static / MR      (MR = δ_shock/δ_wheel)
+    #     F_shock_static = k_spring × (preload_mm + sag_shock_mm)
+    # → sag_shock_mm = F_wheel/(MR·k_spring) − preload_mm
+    #   (clamped to [0, stroke]; if negative, preload alone holds the car up
+    #    and the damper rests at full extension with sag = 0.)
+
+    def static_sag(self,
+                   preload_front_mm: float = 0.0,
+                   preload_rear_mm:  float = 0.0,
+                   stroke_mm:        float = 55.0,
+                   mr_front:         float = None,
+                   mr_rear:          float = None) -> dict:
+        """
+        Compute per-corner static sag (damper compression from full droop).
+
+        Parameters
+        ----------
+        preload_front_mm, preload_rear_mm : float
+            Collar preload in mm of spring compression.
+        stroke_mm : float
+            Total damper stroke (shock-frame travel available).
+        mr_front, mr_rear : float or None
+            Override motion ratios (e.g. from live kinematics). If None,
+            uses self.motion_ratio_front/rear.
+
+        Returns
+        -------
+        dict with keys:
+            'sag_shock_front_mm', 'sag_shock_rear_mm'     — shock frame
+            'sag_wheel_front_mm', 'sag_wheel_rear_mm'     — wheel frame
+            'sag_front_pct', 'sag_rear_pct'               — % of stroke
+            'topped_out_front', 'topped_out_rear'         — preload so high
+                                                            damper sits at
+                                                            full extension
+            'bottomed_out_front', 'bottomed_out_rear'     — spring too soft
+                                                            for the load
+        """
+        g = 9.81
+        mr_f = mr_front if mr_front is not None else self.motion_ratio_front
+        mr_r = mr_rear  if mr_rear  is not None else self.motion_ratio_rear
+
+        # Static corner wheel loads (including unsprung weight at wheel).
+        # Weight fractions come from CG, then split left/right 50/50.
+        w_f = self.front_weight_fraction
+        Fz_sprung_f = self.sprung_mass_kg * w_f * g / 2.0
+        Fz_sprung_r = self.sprung_mass_kg * (1 - w_f) * g / 2.0
+        Fz_us_f     = self.unsprung_mass_front_kg * g / 2.0
+        Fz_us_r     = self.unsprung_mass_rear_kg  * g / 2.0
+        Fz_f        = Fz_sprung_f + Fz_us_f
+        Fz_r        = Fz_sprung_r + Fz_us_r
+
+        # Spring compression required at static (shock frame, mm)
+        # k_spring is in N/m; convert to N/mm and use mm throughout.
+        k_f = self.spring_rate_front_Npm / 1000.0  # N/mm
+        k_r = self.spring_rate_rear_Npm  / 1000.0
+        if k_f <= 0 or mr_f <= 0:
+            required_f = 0.0
+        else:
+            required_f = Fz_f / (mr_f * k_f)  # mm of shock compression
+        if k_r <= 0 or mr_r <= 0:
+            required_r = 0.0
+        else:
+            required_r = Fz_r / (mr_r * k_r)
+
+        # Sag = spring compression minus preload (clamped to [0, stroke])
+        raw_f = required_f - preload_front_mm
+        raw_r = required_r - preload_rear_mm
+        sag_f = max(0.0, min(stroke_mm, raw_f))
+        sag_r = max(0.0, min(stroke_mm, raw_r))
+
+        return {
+            'sag_shock_front_mm': sag_f,
+            'sag_shock_rear_mm':  sag_r,
+            'sag_wheel_front_mm': sag_f / mr_f if mr_f > 0 else 0.0,
+            'sag_wheel_rear_mm':  sag_r / mr_r if mr_r > 0 else 0.0,
+            'sag_front_pct':      (sag_f / stroke_mm * 100.0) if stroke_mm > 0 else 0.0,
+            'sag_rear_pct':       (sag_r / stroke_mm * 100.0) if stroke_mm > 0 else 0.0,
+            'topped_out_front':   raw_f < 0,
+            'topped_out_rear':    raw_r < 0,
+            'bottomed_out_front': raw_f > stroke_mm,
+            'bottomed_out_rear':  raw_r > stroke_mm,
+            'required_spring_compression_front_mm': required_f,
+            'required_spring_compression_rear_mm':  required_r,
+            'mr_front_used': mr_f,
+            'mr_rear_used':  mr_r,
+        }
+
     # ── Powertrain computed properties ───────────────────────────────
 
     @property
@@ -155,6 +298,14 @@ class VehicleParams:
         if self.max_steer_angle_deg <= 0:
             return float('inf')
         return self.wheelbase_m / np.tan(np.radians(self.max_steer_angle_deg))
+
+    @property
+    def max_rack_half_travel_m(self) -> float:
+        """
+        Physical half-stroke of the rack in metres (symmetric about centre).
+        Simply ``total_rack_travel_mm / 2`` converted to metres.
+        """
+        return float(self.total_rack_travel_mm) / 2.0 / 1000.0
 
     def lateral_g_at_radius(self, turn_radius_m: float) -> float:
         """Lateral g = v² / (R × g) at current speed."""
@@ -199,6 +350,14 @@ class VehicleParams:
             'drivetrain':             'drivetrain',
             'max_steer_angle_deg':    'max_steer_angle_deg',
             'front_brake_bias':       'front_brake_bias',
+            # Rack / steering geometry
+            'rack_travel_per_rev_mm': 'rack_travel_per_rev_mm',
+            'total_rack_travel_mm':   'total_rack_travel_mm',
+            # Auto-inertia & speed-hold overrides (optional)
+            'yaw_inertia_factor':       'yaw_inertia_factor',
+            'roll_gyradius_track_frac': 'roll_gyradius_track_frac',
+            'speed_hold_kp_per_kg':     'speed_hold_kp_per_kg',
+            'speed_hold_ki_per_kg':     'speed_hold_ki_per_kg',
         }
         for src, dst in _map.items():
             if src in car:
@@ -307,6 +466,16 @@ class SteadyStateSolver:
         """
         self._veh = vehicle
         self._solvers = solvers
+        # Always have a tire model so peak_mu / cornering_stiffness /
+        # slip_angle_for_Fy never fall through to a hardcoded literal.
+        # The user's loaded TTC data is preferred when available; if
+        # nothing's loaded we use the parametric LinearTireModel —
+        # whose own defaults (mu, C_alpha, Fz_ref) live as named
+        # arguments on its __init__, not magic numbers buried in the
+        # dynamics solver.
+        if tire_model is None:
+            from vahan.tire_model import LinearTireModel
+            tire_model = LinearTireModel()
         self._tire = tire_model
         self._warm = {}  # per-corner warm start cache
 
@@ -450,13 +619,16 @@ class SteadyStateSolver:
         # ── Step 4: Build result ─────────────────────────────────────────
         result.roll_angle_deg = np.degrees(roll_rad)
 
-        # Pitch angle from longitudinal load transfer
-        # Pitch stiffness = 2 * (K_wheel_front * a^2 + K_wheel_rear * b^2)
-        # where a,b = CG distance to front/rear axle
+        # Pitch angle from longitudinal load transfer.  The pitch couple
+        # the suspension reacts is m_s · ax · h_s where h_s is the
+        # sprung-mass CG height (NOT (h_cg − h_us), which has no clean
+        # physical interpretation — see VehicleParams.sprung_cg_height_m).
+        # Pitch stiffness = 2 · (K_wheel_front · a² + K_wheel_rear · b²)
+        # with a, b = CG distance to each axle.
         a = v.cg_to_front_axle_m
         b = v.cg_to_rear_axle_m
         K_pitch = 2 * (v.wheel_rate_front_Npm * a**2 + v.wheel_rate_rear_Npm * b**2)
-        pitch_moment = v.sprung_mass_kg * ax * (v.cg_height_m - v.unsprung_cg_height_m)
+        pitch_moment = v.sprung_mass_kg * ax * v.sprung_cg_height_m
         result.pitch_angle_deg = np.degrees(pitch_moment / K_pitch) if K_pitch > 0 else 0.0
         result.Fz = Fz
         result.travel = {k: v * 1000 for k, v in travels.items()}  # mm
@@ -492,7 +664,11 @@ class SteadyStateSolver:
             # Below the tire data range, scale C_a linearly → 0 so that
             # both demand (∝ C_a) and grip (∝ Fz) vanish together,
             # keeping utilization = demand/grip smooth through wheel lift.
-            fz_data_min = float(self._tire.fz_range[0])  # lowest TTC test load
+            # `fz_range` is a TTC-specific attribute (lowest test load
+            # for cornering-stiffness extrapolation).  LinearTireModel
+            # is parametric and doesn't have a "test range" — treat its
+            # min as 0 so we never bypass any data.
+            fz_data_min = float(getattr(self._tire, 'fz_range', (0.0,))[0])
             C_a = {}
             for label in ['FL', 'FR', 'RL', 'RR']:
                 fz_raw = max(Fz[label], 0.0)
@@ -597,6 +773,395 @@ class SteadyStateSolver:
                 result.brake_torque[label] = abs(result.Fx.get(label, 0)) * tire_r
 
         return result
+
+    def sweep_by_speed(self,
+                       v_min_mph: float,
+                       v_max_mph: float,
+                       turn_radius_m: float,
+                       n_points: int = 41,
+                       longitudinal_g: float = 0.0,
+                       aero_Fz: dict = None) -> dict:
+        """Sweep speed (X-axis) at fixed turn radius — derive lat-g.
+
+        Companion to ``sweep_lateral_g`` for the "Sweep by: Speed"
+        option.  At constant R, lat-g and v are linked by
+            v² = a_y · g_e · R
+            ⇒  a_y = v² / (g_e · R)
+        Each sweep step picks v on a uniform grid, computes the
+        implied lat-g, and runs the same steady-state dynamics solve.
+        Returns a dict keyed like ``sweep_lateral_g`` but with
+        ``speed_mph`` and ``speed_kph`` as the primary X array and
+        ``lateral_g`` as the **derived** values.
+
+        ``longitudinal_g`` is held fixed (just like sweep_combined) —
+        if non-zero, it shows up in pitch / load transfer / utilization
+        but doesn't change the centripetal speed.
+        """
+        v_arr_mph = np.linspace(v_min_mph, v_max_mph, n_points)
+        v_arr_ms  = v_arr_mph / 2.23694
+        if turn_radius_m > 1e-6:
+            lat_arr = (v_arr_ms ** 2) / (9.81 * turn_radius_m)
+        else:
+            lat_arr = np.zeros(n_points)
+
+        keys = ['roll_angle_deg', 'pitch_angle_deg',
+                'rc_height_front_mm', 'rc_height_rear_mm',
+                'elastic_lt_front_N', 'elastic_lt_rear_N',
+                'geometric_lt_front_N', 'geometric_lt_rear_N',
+                'understeer_gradient_deg']
+        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+
+        out = {
+            'speed_mph':       v_arr_mph,
+            'speed_kph':       v_arr_mph * 1.609344,
+            'lateral_g':       lat_arr,        # derived from v + R
+            'turn_radius_m':   turn_radius_m,
+        }
+        for k in keys:
+            out[k] = np.zeros(n_points)
+        for ck in corner_keys:
+            for lbl in ('FL', 'FR', 'RL', 'RR'):
+                out[f'{ck}_{lbl}'] = np.zeros(n_points)
+
+        self._warm = {}
+        mu = self._effective_mu()
+        # Track friction-clamp like sweep_combined does so the user can
+        # see when the implied lat-g exceeds the circle.
+        out['lat_g_applied']  = np.zeros(n_points)
+        out['lon_g_applied']  = np.zeros(n_points)
+        out['friction_clamp'] = np.zeros(n_points, dtype=bool)
+
+        for i, lat_g in enumerate(lat_arr):
+            lat_c, lon_c, clamped = self._clamp_to_friction_circle(
+                float(lat_g), float(longitudinal_g), mu)
+            r = self.solve(lat_c, lon_c, aero_Fz=aero_Fz)
+            out['lat_g_applied'][i]   = lat_c
+            out['lon_g_applied'][i]   = lon_c
+            out['friction_clamp'][i]  = clamped
+            out['roll_angle_deg'][i]       = r.roll_angle_deg
+            out['pitch_angle_deg'][i]      = r.pitch_angle_deg
+            out['rc_height_front_mm'][i]   = r.rc_height_front_m * 1000
+            out['rc_height_rear_mm'][i]    = r.rc_height_rear_m  * 1000
+            out['elastic_lt_front_N'][i]   = r.elastic_lt_front_N
+            out['elastic_lt_rear_N'][i]    = r.elastic_lt_rear_N
+            out['geometric_lt_front_N'][i] = r.geometric_lt_front_N
+            out['geometric_lt_rear_N'][i]  = r.geometric_lt_rear_N
+            out['understeer_gradient_deg'][i] = r.understeer_gradient_deg
+            for lbl in ('FL', 'FR', 'RL', 'RR'):
+                out[f'Fz_{lbl}'][i]          = r.Fz.get(lbl, 0)
+                out[f'travel_{lbl}'][i]      = r.travel.get(lbl, 0)
+                out[f'camber_{lbl}'][i]      = r.camber.get(lbl, 0)
+                out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
+
+        for k in ['understeer_gradient_deg']:
+            if len(out[k]) >= 5:
+                out[k] = uniform_filter1d(out[k], size=5, mode='nearest')
+        for lbl in ('FL', 'FR', 'RL', 'RR'):
+            uk = f'utilization_{lbl}'
+            if len(out[uk]) >= 3:
+                out[uk] = uniform_filter1d(out[uk], size=3, mode='nearest')
+
+        return out
+
+    def sweep_acceleration_trajectory(self,
+                                       start_speed_mph: float = 0.0,
+                                       lateral_g: float = 0.0,
+                                       a_threshold_g: float = 0.01,
+                                       max_steps: int = 5000,
+                                       direction: str = 'accel',
+                                       end_speed_mph: float = 0.0,
+                                       target_lon_g: float = 0.0) -> dict:
+        """Time-domain longitudinal trajectory.
+
+        ``target_lon_g`` (signed): the longitudinal-g the driver is
+        applying.  Sign drives direction — no separate toggle:
+            > 0  → acceleration; per-step g = min(target, traction, P/(m·v))
+            < 0  → braking;       per-step |g| = min(|target|, μ-circle)
+            = 0  → coast (drag only; from rest → stationary).
+        Per-step physics still clamps to what the tires + engine can
+        actually deliver.  Drag (CdA, ρ) is always subtracted from the
+        achievable accel.
+
+        End conditions:
+            • Accel: terminate when achievable g decays below
+              ``a_threshold_g · traction_g`` (≈ at terminal speed).
+            • Brake: terminate when v reaches 0 (or end_speed_mph).
+        """
+        v = self._veh
+        P  = v.power_hp * 745.7                      # hp → W
+        M  = v.total_mass_kg
+        rho = v.air_density_kg_m3
+        CdA = v.cda_m2
+        gE  = G                                      # 9.80665
+
+        # Drivetrain-aware traction limit (driven axle saturation).
+        mu = self._effective_mu()
+        dt_kind = v.drivetrain.upper()
+        if dt_kind == 'RWD':
+            traction_g = mu * v.rear_weight_fraction
+        elif dt_kind == 'FWD':
+            traction_g = mu * v.front_weight_fraction
+        else:
+            traction_g = mu
+
+        # Terminal speed: drag balances engine power.
+        if rho > 0 and CdA > 0 and P > 0:
+            v_terminal_ms = (2 * P / (rho * CdA)) ** (1.0 / 3.0)
+        else:
+            # Without drag the trajectory is unbounded — fall back to
+            # the user's start_speed plus the traction-accel scale, so
+            # the loop terminates after a sensible distance.  Same code
+            # path is fine; just won't asymptote naturally.
+            v_terminal_ms = max(start_speed_mph / 2.23694, 1.0) * 10.0
+
+        # Time step from physics: 1 % of (terminal / max accel).
+        if traction_g > 1e-6:
+            dt = 0.01 * v_terminal_ms / (traction_g * gE)
+        else:
+            dt = 0.05
+        dt = max(dt, 1e-3)                           # numerical floor
+
+        # Integration loop
+        v_start_ms = max(start_speed_mph / 2.23694, 0.0)
+        times   = [0.0]
+        speeds  = [v_start_ms]
+        g_appl  = []
+        a_term_threshold_si = a_threshold_g * traction_g * gE   # m/s²
+
+        # Direction is ALWAYS derived from the sign of target_lon_g.
+        # The UI exposes a single signed lon-g spinner — positive means
+        # the driver is on the throttle, negative means brakes, zero
+        # means coasting (drag only).  There is no separate "direction"
+        # dropdown; the sign IS the input.
+        target_lon = float(target_lon_g)
+        is_braking = target_lon < -1e-9
+        target_mag = abs(target_lon)          # 0 = coast (not full throttle)
+
+        # Optional speed cap.  When end_speed_mph > 0, terminate the run
+        # once v crosses it (in either direction depending on accel/brake).
+        # Default 0 = "no cap, run to natural endpoint".
+        end_v_ms = float(end_speed_mph) / 2.23694 if end_speed_mph > 0 else None
+
+        # For braking, the friction circle uses full 4-tire μ (not the
+        # drivetrain-derived traction_g, which is only relevant for
+        # acceleration).  Lateral demand eats into the available
+        # longitudinal grip via √(μ² − a_y²).
+        brake_mu = mu
+        if is_braking:
+            ay_g = abs(float(lateral_g))
+            if ay_g >= brake_mu:
+                brake_g = 0.0                         # no grip left for brakes
+            else:
+                brake_g = float(np.sqrt(brake_mu * brake_mu - ay_g * ay_g))
+
+        for _ in range(max_steps):
+            v_now = speeds[-1]
+
+            if is_braking:
+                # Constant max-grip deceleration; no power/drag terms
+                # — the brakes are dissipating, not the engine doing
+                # work.  Drag still helps slow the car but is small
+                # compared to brake force at typical FSAE speeds.
+                F_drag = 0.5 * rho * CdA * v_now * v_now
+                # Cap brake-g by user target.  brake_g is the full
+                # circle-limited maximum; user can ask for less (e.g.
+                # 0.5g brake when 1.5g is available).  target_mag = 0
+                # → no braking force (coast / drag only).
+                brake_eff = min(brake_g, target_mag)
+                a_brake_si = brake_eff * gE
+                a_drag_si  = F_drag / M
+                a_signed   = -(a_brake_si + a_drag_si)   # m/s², negative
+                g_appl.append(a_signed / gE)             # signed (-)
+
+                # Terminate when v reaches 0 (or the user-set floor).
+                stop_v = end_v_ms if end_v_ms is not None else 0.0
+                if v_now <= max(stop_v, 1e-3) and len(times) > 5:
+                    break
+                v_next = max(stop_v, v_now + a_signed * dt)
+                times.append(times[-1] + dt)
+                speeds.append(v_next)
+            else:
+                # Acceleration: engine vs drag, traction-limited at low v.
+                if v_now > 0.5:                       # 0.5 m/s ≈ 1 mph
+                    F_pwr = P / v_now
+                else:
+                    F_pwr = traction_g * M * gE       # very low v → traction
+                F_drag = 0.5 * rho * CdA * v_now * v_now
+                F_net  = F_pwr - F_drag
+                a_pwr  = F_net / M
+                a_trac = traction_g * gE
+                a      = max(0.0, min(a_pwr, a_trac))
+                # Cap by user target (in m/s²).  User can ask for less
+                # than the achievable max (e.g. 0.3g instead of full-
+                # throttle 0.83g), but not more — physics already
+                # capped above.  target_mag = 0 → zero throttle (coast).
+                a = min(a, target_mag * gE)
+                g_appl.append(a / gE)
+
+                # Terminate when achievable accel decays toward terminal,
+                # or when v hits the user-set ceiling.
+                if a < a_term_threshold_si and len(times) > 5:
+                    break
+                if end_v_ms is not None and v_now >= end_v_ms and len(times) > 1:
+                    break
+                v_next = v_now + a * dt
+                times.append(times[-1] + dt)
+                speeds.append(v_next)
+
+        # The last sample missed g; copy the final value.
+        if len(g_appl) < len(times):
+            g_appl.append(g_appl[-1] if g_appl else 0.0)
+
+        t_arr  = np.asarray(times, float)
+        v_ms   = np.asarray(speeds, float)
+        g_arr  = np.asarray(g_appl, float)
+        n      = len(t_arr)
+
+        out = {
+            'time_s':         t_arr,
+            'speed_mph':      v_ms * 2.23694,
+            'speed_kph':      v_ms * 3.6,
+            'longitudinal_g': g_arr,
+        }
+        keys = ['roll_angle_deg', 'pitch_angle_deg',
+                'rc_height_front_mm', 'rc_height_rear_mm',
+                'elastic_lt_front_N', 'elastic_lt_rear_N',
+                'geometric_lt_front_N', 'geometric_lt_rear_N',
+                'understeer_gradient_deg']
+        for k in keys:
+            out[k] = np.zeros(n)
+        for ck in ('Fz', 'travel', 'camber', 'utilization'):
+            for lbl in ('FL', 'FR', 'RL', 'RR'):
+                out[f'{ck}_{lbl}'] = np.zeros(n)
+
+        # Run the steady-state dynamics solver at each (lat, lon) point.
+        self._warm = {}
+        for i in range(n):
+            r = self.solve(lateral_g, float(g_arr[i]))
+            out['roll_angle_deg'][i]       = r.roll_angle_deg
+            out['pitch_angle_deg'][i]      = r.pitch_angle_deg
+            out['rc_height_front_mm'][i]   = r.rc_height_front_m * 1000
+            out['rc_height_rear_mm'][i]    = r.rc_height_rear_m  * 1000
+            out['elastic_lt_front_N'][i]   = r.elastic_lt_front_N
+            out['elastic_lt_rear_N'][i]    = r.elastic_lt_rear_N
+            out['geometric_lt_front_N'][i] = r.geometric_lt_front_N
+            out['geometric_lt_rear_N'][i]  = r.geometric_lt_rear_N
+            out['understeer_gradient_deg'][i] = r.understeer_gradient_deg
+            for lbl in ('FL', 'FR', 'RL', 'RR'):
+                out[f'Fz_{lbl}'][i]          = r.Fz.get(lbl, 0)
+                out[f'travel_{lbl}'][i]      = r.travel.get(lbl, 0)
+                out[f'camber_{lbl}'][i]      = r.camber.get(lbl, 0)
+                out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
+        return out
+
+    def _effective_mu(self) -> float:
+        """Vehicle-level peak μ used by the friction-circle clamp.
+
+        Always pulled from the tire model — TTC data when loaded, or
+        the LinearTireModel parametric fallback installed by __init__
+        when none.  Average front + rear at the static-Fz operating
+        point (zero camber).  Used as the radius of the friction circle
+        √(a_x² + a_y²) ≤ μ for clamping impossible (lat, lon)
+        operating points in the combined sweep.
+        """
+        v = self._veh
+        W = v.total_mass_kg * G
+        Fz_f = W * v.front_weight_fraction / 2
+        Fz_r = W * v.rear_weight_fraction / 2
+        mu_f = float(self._tire.peak_mu(Fz_f, 0.0))
+        mu_r = float(self._tire.peak_mu(Fz_r, 0.0))
+        # Conservative: use the lower of the two so we don't pretend the
+        # rear can save the front when the front saturates first.
+        return min(mu_f, mu_r)
+
+    def _clamp_to_friction_circle(self, lat_g: float,
+                                   lon_g: float,
+                                   mu: float) -> tuple:
+        """Drivetrain-aware friction-circle clamp on (lat, lon).
+
+        Lateral force comes from all 4 tires; longitudinal force comes
+        from whatever subset is doing the work.  Per-tire saturation:
+            (F_y/F_z)² + (F_x/F_z)²  ≤  μ²
+        Re-arranged in g-units with each tire taking its weight share:
+            a_x ≤ k_drive · √(μ² − a_y²)
+        where k_drive is the **fraction of vehicle weight on the
+        force-applying axle/tires** — drivetrain-dependent for accel,
+        always 1.0 for braking (all 4 tires brake).
+
+            RWD accel : k_drive = rear_weight_fraction
+            FWD accel : k_drive = front_weight_fraction
+            AWD accel : k_drive = 1.0
+            Braking   : k_drive = 1.0
+
+        For the user's "1g lat + 1g lon RWD-accel" case at μ=1.5:
+            k_drive = 0.55  (rear weight fraction)
+            a_x_max = 0.55 · √(1.5² − 1²) = 0.615 g
+        The requested 1g of acceleration gets clamped to 0.615g, and
+        pitch drops with it — visible in the combined sweep instead of
+        sitting flat past the lat-g where the rear tires actually
+        saturate.
+
+        Returns (lat_clamped, lon_clamped, was_clamped: bool).
+        """
+        mu = max(float(mu), 1e-3)
+        lat = float(lat_g)
+        lon = float(lon_g)
+        lat_abs = abs(lat)
+
+        # Pure-cornering limit — all 4 tires can contribute laterally,
+        # so this uses the full μ.
+        if lat_abs >= mu:
+            return (np.sign(lat) * mu, 0.0, True)
+
+        # Drivetrain- and brake-bias-aware longitudinal capacity.
+        # k_drive accounts for the per-tire friction circle on the
+        # axle that bites first.  Derivation:
+        #   per-tire saturation : (F_y/F_z)² + (F_x/F_z)² ≤ μ²
+        # which in g-units gives, for the limiting tire:
+        #   a_x_max = (axle_weight_frac / axle_force_frac) · √(μ² − a_y²)
+        # k_drive = (axle_weight_frac / axle_force_frac) is the ratio of
+        # weight on that axle to its share of the longitudinal force.
+        # Smaller k_drive ⇒ tire is over-loaded laterally vs. it's
+        # carrying the same lon share ⇒ clamp bites earlier.
+        v = self._veh
+        if lon >= 0:
+            # Acceleration: driven tires take the lon force.  Their
+            # axle's force share = 1.0 (full Fx on driven), weight
+            # share = drivetrain weight fraction.
+            dt = v.drivetrain.upper()
+            if dt == 'RWD':
+                k_drive = v.rear_weight_fraction      # 0.55 / 1.0
+            elif dt == 'FWD':
+                k_drive = v.front_weight_fraction
+            else:                                     # AWD
+                k_drive = 1.0
+        else:
+            # Braking: all 4 tires brake, but brake-bias usually puts
+            # MORE longitudinal share on the front (e.g. 65 %) than
+            # the front carries by static weight (e.g. 45 %).  Front
+            # tires saturate first.  k_drive = front_frac / brake_bias
+            # measures that lopsidedness.
+            #   45 % weight + 65 % brake bias  →  k = 0.45/0.65 = 0.692
+            #   So clamp bites well before the naive μ-circle.
+            bb = float(v.front_brake_bias)
+            if bb >= 1e-3:
+                k_drive_front = v.front_weight_fraction / bb
+            else:
+                k_drive_front = float('inf')          # no front brakes
+            # Rear-tire side, for completeness:
+            rb = 1.0 - bb
+            if rb >= 1e-3:
+                k_drive_rear = v.rear_weight_fraction / rb
+            else:
+                k_drive_rear = float('inf')           # no rear brakes
+            # Whichever axle saturates first sets the limit.
+            k_drive = min(k_drive_front, k_drive_rear)
+
+        circle_remaining = np.sqrt(mu * mu - lat_abs * lat_abs)
+        max_lon = k_drive * circle_remaining
+        if abs(lon) <= max_lon:
+            return (lat, lon, False)
+        return (lat, np.sign(lon) * max_lon, True)
 
     def sweep_lateral_g(self,
                         g_range: tuple = (0.0, 2.0),
@@ -737,11 +1302,25 @@ class SteadyStateSolver:
         for ck in corner_keys:
             for lbl in ['FL', 'FR', 'RL', 'RR']:
                 out[f'{ck}_{lbl}'] = np.zeros(n_points)
+        # Track the actually-applied (lat, lon) after the friction
+        # clamp so plots can show the *real* operating point, not the
+        # one the user typed.  This is what makes pitch drop with lat-g
+        # in a combined cornering+braking sweep — past the circle, the
+        # car can no longer hold the requested lon-g and the actual
+        # value (and therefore pitch) decays.
+        out['lon_g_applied']  = np.zeros(n_points)
+        out['lat_g_applied']  = np.zeros(n_points)
+        out['friction_clamp'] = np.zeros(n_points, dtype=bool)
 
         self._warm = {}
+        mu = self._effective_mu()
 
         for i, lat_g in enumerate(g_arr):
-            r = self.solve(lat_g, lon_g, aero_Fz=aero_Fz)
+            lat_c, lon_c, clamped = self._clamp_to_friction_circle(lat_g, lon_g, mu)
+            r = self.solve(lat_c, lon_c, aero_Fz=aero_Fz)
+            out['lat_g_applied'][i]  = lat_c
+            out['lon_g_applied'][i]  = lon_c
+            out['friction_clamp'][i] = clamped
             out['roll_angle_deg'][i] = r.roll_angle_deg
             out['pitch_angle_deg'][i] = r.pitch_angle_deg
             out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
@@ -768,6 +1347,93 @@ class SteadyStateSolver:
 
         return out
 
+    def sweep_acceleration(self,
+                           v_min_kph: float = 0.0,
+                           v_max_kph: float = 200.0,
+                           n_points: int = 41,
+                           lateral_g: float = 0.0,
+                           aero_Fz: dict = None) -> dict:
+        """
+        Trajectory sweep: accelerate from rest along a real driving curve.
+
+        At each sample speed v, the longitudinal-g is whatever the car can
+        actually deliver:
+            g(v) = min(traction_limit, P/(m·g·v))           — accel
+            g(v) = min(braking_limit, ...)                  — would be if
+                   v_max < v_min (i.e. decel sweep)
+        Speed grows monotonically from v_min to v_max on the X-axis, and
+        the longitudinal-g traces the traction-then-power-limited envelope
+        that an actual driver would experience under full throttle.
+
+        This replaces the old "sweep g from g_min to g_max" semantics for
+        longitudinal — that one was an envelope of operating-point steady-
+        states, not a trajectory, and confused everyone because the
+        speed–g relationship is inverse (high-g only at low-speed in the
+        power-limited regime).
+
+        Returns a dict identical in shape to ``sweep_longitudinal_g`` but
+        with the X-axis as **speed**:
+            'speed_kph'      — primary X array (kph)
+            'speed_mph'      — same in mph for plot convenience
+            'longitudinal_g' — g actually achieved at each speed (the
+                               traction/power envelope)
+        """
+        v_arr_kph = np.linspace(v_min_kph, v_max_kph, n_points)
+
+        keys = ['roll_angle_deg', 'pitch_angle_deg',
+                'rc_height_front_mm', 'rc_height_rear_mm',
+                'elastic_lt_front_N', 'elastic_lt_rear_N',
+                'geometric_lt_front_N', 'geometric_lt_rear_N',
+                'understeer_gradient_deg']
+        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+
+        out = {
+            'speed_kph':      v_arr_kph,
+            'speed_mph':      v_arr_kph / 1.609344,
+            'longitudinal_g': np.zeros(n_points),
+        }
+        for k in keys:
+            out[k] = np.zeros(n_points)
+        for ck in corner_keys:
+            for lbl in ['FL', 'FR', 'RL', 'RR']:
+                out[f'{ck}_{lbl}'] = np.zeros(n_points)
+
+        self._warm = {}
+
+        for i, vk in enumerate(v_arr_kph):
+            # Achievable g at this speed (min of traction and power)
+            accel = self.max_accel_g(speed_kph=vk, lateral_g=lateral_g)
+            g_eff = accel['effective_g']
+            out['longitudinal_g'][i] = g_eff
+
+            # Steady-state dynamics at that g
+            r = self.solve(lateral_g, g_eff, aero_Fz=aero_Fz)
+            out['roll_angle_deg'][i]       = r.roll_angle_deg
+            out['pitch_angle_deg'][i]      = r.pitch_angle_deg
+            out['rc_height_front_mm'][i]   = r.rc_height_front_m * 1000
+            out['rc_height_rear_mm'][i]    = r.rc_height_rear_m * 1000
+            out['elastic_lt_front_N'][i]   = r.elastic_lt_front_N
+            out['elastic_lt_rear_N'][i]    = r.elastic_lt_rear_N
+            out['geometric_lt_front_N'][i] = r.geometric_lt_front_N
+            out['geometric_lt_rear_N'][i]  = r.geometric_lt_rear_N
+            out['understeer_gradient_deg'][i] = r.understeer_gradient_deg
+            for lbl in ['FL', 'FR', 'RL', 'RR']:
+                out[f'Fz_{lbl}'][i]          = r.Fz.get(lbl, 0)
+                out[f'travel_{lbl}'][i]      = r.travel.get(lbl, 0)
+                out[f'camber_{lbl}'][i]      = r.camber.get(lbl, 0)
+                out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
+
+        # Smoothing — same convention as sweep_longitudinal_g
+        for k in ['understeer_gradient_deg']:
+            if len(out[k]) >= 5:
+                out[k] = uniform_filter1d(out[k], size=5, mode='nearest')
+        for lbl in ['FL', 'FR', 'RL', 'RR']:
+            uk = f'utilization_{lbl}'
+            if len(out[uk]) >= 3:
+                out[uk] = uniform_filter1d(out[uk], size=3, mode='nearest')
+
+        return out
+
     def max_accel_g(self, speed_kph: float = 0.0, lateral_g: float = 0.0) -> dict:
         """
         Compute maximum longitudinal acceleration at a given speed.
@@ -783,14 +1449,13 @@ class SteadyStateSolver:
         r_tire = v.tire_radius_m
 
         # Get tire mu from tire model, or use default
-        if self._tire is not None and hasattr(self._tire, 'peak_mu'):
-            # Use average Fz per corner for mu estimate
-            Fz_front = W * v.front_weight_fraction / 2
-            Fz_rear = W * v.rear_weight_fraction / 2
-            mu_f = float(self._tire.peak_mu(Fz_front, 0.0))
-            mu_r = float(self._tire.peak_mu(Fz_rear, 0.0))
-        else:
-            mu_f = mu_r = 1.5  # conservative default
+        # Tire model is guaranteed by SteadyStateSolver.__init__ —
+        # either the user's loaded TTC data or the parametric
+        # LinearTireModel fallback.  No hardcoded mu literal here.
+        Fz_front = W * v.front_weight_fraction / 2
+        Fz_rear  = W * v.rear_weight_fraction / 2
+        mu_f = float(self._tire.peak_mu(Fz_front, 0.0))
+        mu_r = float(self._tire.peak_mu(Fz_rear,  0.0))
 
         # Traction limit (depends on driven axle)
         dt = v.drivetrain.upper()
@@ -884,8 +1549,10 @@ class SteadyStateSolver:
         b = v.cg_to_front_axle_m / v.wheelbase_m  # fraction from front
         h_roll_axis = rc_f * (1 - b) + rc_r * b
 
-        # Sprung mass roll moment
-        h_arm = v.cg_height_m - h_roll_axis
+        # Sprung-mass roll moment.  h_arm is the lever from the roll
+        # axis up to the SPRUNG-mass CG — see VehicleParams.sprung_cg_height_m
+        # for why this differs from the whole-vehicle CG.
+        h_arm = v.sprung_cg_height_m - h_roll_axis
         roll_moment = v.sprung_mass_kg * ay * h_arm  # N·m
 
         # Roll stiffness resists
@@ -914,7 +1581,7 @@ class SteadyStateSolver:
         geo_rear = v.sprung_mass_kg * v.rear_weight_fraction * ay * rc_r / v.rear_track_m
 
         # Elastic (through springs + ARB, proportional to roll stiffness dist)
-        h_arm = v.cg_height_m - h_roll_axis
+        h_arm = v.sprung_cg_height_m - h_roll_axis
         roll_moment = v.sprung_mass_kg * ay * h_arm
 
         if K_total > 0:
@@ -952,6 +1619,7 @@ SENSITIVITY_OUTPUTS = [
     'lltd_pct',            # elastic LT front / total elastic LT × 100
     'utilization_max',     # max of all 4 corners
     'utilization_spread',  # max - min across corners (balance)
+    'ideal_ackermann_pct', # dynamic ideal Ackermann from tire-model inversion
 ]
 
 # Tunable parameters:
@@ -975,14 +1643,23 @@ SENSITIVITY_KNOBS = [
 ]
 
 
-def _extract_outputs(result: SteadyStateResult) -> dict:
-    """Pull the tracked output metrics from a SteadyStateResult."""
+def _extract_outputs(result: SteadyStateResult,
+                     tire=None, vehicle: VehicleParams = None,
+                     turn_radius_m: float = None) -> dict:
+    """Pull the tracked output metrics from a SteadyStateResult.
+
+    Optional tire / vehicle / turn_radius_m enable ideal Ackermann
+    computation.  Without them the metric defaults to NaN.
+    """
     el_f = result.elastic_lt_front_N
     el_r = result.elastic_lt_rear_N
     el_tot = el_f + el_r
     lltd = (el_f / el_tot * 100) if el_tot > 0 else 50.0
 
     utils = [result.utilization.get(c, 0) for c in ('FL', 'FR', 'RL', 'RR')]
+
+    ack = _ideal_ackermann_pct(result, tire, vehicle, turn_radius_m)
+
     return {
         'understeer_gradient_deg': result.understeer_gradient_deg,
         'roll_angle_deg': result.roll_angle_deg,
@@ -990,7 +1667,86 @@ def _extract_outputs(result: SteadyStateResult) -> dict:
         'lltd_pct': lltd,
         'utilization_max': max(utils) if utils else 0,
         'utilization_spread': (max(utils) - min(utils)) if utils else 0,
+        'ideal_ackermann_pct': ack,
     }
+
+
+def _ideal_ackermann_pct(result: SteadyStateResult,
+                         tire=None, vehicle: VehicleParams = None,
+                         turn_radius_m: float = None) -> float:
+    """Compute the Ackermann % the tires WANT at a given operating point.
+
+    The idea: at a specific turn radius and Fz distribution, each front
+    tire needs a different slip angle to produce its share of lateral
+    force.  The difference between those slip angles — on top of the
+    geometric Ackermann split — defines what the tires "want".
+
+    Returns
+    -------
+    ideal_ackermann_pct : float
+        100 = pure Ackermann (inner steers more by exactly the geometric
+        amount).  >100 = tires want MORE inner steer than geometry gives
+        (common at high-g where the inner tire is unloaded).  <100 = the
+        tires want less.  NaN if we can't compute (no tire model, etc.).
+
+    Formula
+    -------
+        geo_inner = atan(L / (R − t/2))
+        geo_outer = atan(L / (R + t/2))
+        geo_diff  = geo_inner − geo_outer          (always positive)
+
+        SA_inner = tire.slip_angle_for_Fy(Fy_inner, Fz_inner, camber_inner)
+        SA_outer = tire.slip_angle_for_Fy(Fy_outer, Fz_outer, camber_outer)
+
+        required_steer_diff = geo_diff + (SA_inner − SA_outer)
+        ideal_ack%  = required_steer_diff / geo_diff × 100
+    """
+    if tire is None or vehicle is None or turn_radius_m is None:
+        return float('nan')
+    if not hasattr(tire, 'slip_angle_for_Fy'):
+        return float('nan')
+    if turn_radius_m < 1.0:
+        return float('nan')
+
+    L = vehicle.wheelbase_m
+    t = vehicle.front_track_m
+    R = turn_radius_m
+
+    # Geometric steer angles for inner / outer front wheels
+    geo_inner = np.arctan(L / (R - t / 2))
+    geo_outer = np.arctan(L / (R + t / 2))
+    geo_diff = geo_inner - geo_outer      # always > 0
+    if geo_diff < 1e-9:
+        return float('nan')
+
+    # We assume a left turn → FL = outer, FR = inner.
+    # (The math is symmetric; the sign convention doesn't change the
+    # Ackermann % because we use magnitudes.)
+    Fy = getattr(result, 'Fy', {})
+    Fz = getattr(result, 'Fz', {})
+    camber = getattr(result, 'camber', {})
+
+    Fy_outer = abs(Fy.get('FL', 0))
+    Fy_inner = abs(Fy.get('FR', 0))
+    Fz_outer = max(Fz.get('FL', 1.0), 1.0)
+    Fz_inner = max(Fz.get('FR', 1.0), 1.0)
+    cam_outer = abs(camber.get('FL', 0))
+    cam_inner = abs(camber.get('FR', 0))
+
+    try:
+        SA_outer = tire.slip_angle_for_Fy(Fy_outer, Fz_outer, cam_outer)
+        SA_inner = tire.slip_angle_for_Fy(Fy_inner, Fz_inner, cam_inner)
+    except Exception:
+        return float('nan')
+
+    # Convert slip angles to radians for consistent units with geo_diff
+    SA_outer_rad = np.radians(SA_outer)
+    SA_inner_rad = np.radians(SA_inner)
+
+    # The tires require this steer-angle difference (inner − outer)
+    required_diff = geo_diff + (SA_inner_rad - SA_outer_rad)
+
+    return float(required_diff / geo_diff * 100)
 
 
 class DynamicsSensitivity:
@@ -1023,11 +1779,18 @@ class DynamicsSensitivity:
         self._tire = tire_model
 
     def analyze(self, lateral_g: float = 1.2,
-                longitudinal_g: float = 0.0) -> dict:
+                longitudinal_g: float = 0.0,
+                turn_radius_m: float = None) -> dict:
         """
         Run sensitivity analysis averaged over a g range (±0.3g around
         the operating point, 5 samples).  Averaging eliminates artifacts
         from single-point noise in the tire model / kinematic solver.
+
+        Parameters
+        ----------
+        turn_radius_m : float, optional
+            Turn radius for dynamic ideal Ackermann computation.
+            If None, ideal_ackermann_pct will be NaN in outputs.
 
         Returns dict with 'baseline' outputs and 'sensitivities' list.
         """
@@ -1039,15 +1802,19 @@ class DynamicsSensitivity:
             lateral_g + g_spread,
             n_samples)
 
+        # Shared kwargs for _extract_outputs (enables ideal Ackermann)
+        _eo_kw = dict(tire=self._tire, vehicle=self._base_veh,
+                      turn_radius_m=turn_radius_m)
+
         # ── Baseline: average over samples ──────────────────────────
         base_solver = SteadyStateSolver(self._base_veh, self._solvers, self._tire)
-        baselines = [_extract_outputs(base_solver.solve(g, longitudinal_g))
+        baselines = [_extract_outputs(base_solver.solve(g, longitudinal_g), **_eo_kw)
                      for g in g_samples]
-        baseline = {k: float(np.mean([b[k] for b in baselines]))
+        baseline = {k: float(np.nanmean([b[k] for b in baselines]))
                     for k in baselines[0]}
         # Also keep the center-point result for display
         base_result = base_solver.solve(lateral_g, longitudinal_g)
-        baseline_center = _extract_outputs(base_result)
+        baseline_center = _extract_outputs(base_result, **_eo_kw)
         # Use center point for display values, averaged for sensitivities
         baseline.update({f'_display_{k}': v for k, v in baseline_center.items()})
 
@@ -1060,16 +1827,20 @@ class DynamicsSensitivity:
             # Average perturbed outputs over the same g samples
             veh_up = self._perturb_veh(key, base_val + delta)
             solver_up = SteadyStateSolver(veh_up, self._solvers, self._tire)
-            outs_up = [_extract_outputs(solver_up.solve(g, longitudinal_g))
+            _eo_up = dict(tire=self._tire, vehicle=veh_up,
+                          turn_radius_m=turn_radius_m)
+            outs_up = [_extract_outputs(solver_up.solve(g, longitudinal_g), **_eo_up)
                        for g in g_samples]
-            out_up = {k: float(np.mean([o[k] for o in outs_up]))
+            out_up = {k: float(np.nanmean([o[k] for o in outs_up]))
                       for k in outs_up[0]}
 
             veh_dn = self._perturb_veh(key, base_val - delta)
             solver_dn = SteadyStateSolver(veh_dn, self._solvers, self._tire)
-            outs_dn = [_extract_outputs(solver_dn.solve(g, longitudinal_g))
+            _eo_dn = dict(tire=self._tire, vehicle=veh_dn,
+                          turn_radius_m=turn_radius_m)
+            outs_dn = [_extract_outputs(solver_dn.solve(g, longitudinal_g), **_eo_dn)
                        for g in g_samples]
-            out_dn = {k: float(np.mean([o[k] for o in outs_dn]))
+            out_dn = {k: float(np.nanmean([o[k] for o in outs_dn]))
                       for k in outs_dn[0]}
 
             # Convert delta to display units
@@ -1085,7 +1856,12 @@ class DynamicsSensitivity:
             # ∂output/∂input (per display unit)
             effects = {}
             for metric in SENSITIVITY_OUTPUTS:
-                d_out = out_up[metric] - out_dn[metric]
+                val_up = out_up[metric]
+                val_dn = out_dn[metric]
+                if np.isnan(val_up) or np.isnan(val_dn):
+                    effects[metric] = float('nan')
+                    continue
+                d_out = val_up - val_dn
                 d_in = 2 * delta_display  # central difference
                 effects[metric] = d_out / d_in if abs(d_in) > 1e-12 else 0.0
 
@@ -1183,7 +1959,7 @@ class DynamicsSensitivity:
         recommendations = []
         for s in analysis['sensitivities']:
             effect = s['effects'].get(target_metric, 0)
-            if abs(effect) < 1e-6:
+            if np.isnan(effect) or abs(effect) < 1e-6:
                 continue
 
             change_needed = target_delta / effect  # how much to change this knob
@@ -1203,6 +1979,8 @@ class DynamicsSensitivity:
                 if metric == target_metric:
                     continue
                 other_effect = s['effects'].get(metric, 0)
+                if np.isnan(other_effect):
+                    continue
                 side_effects[metric] = other_effect * change_needed
 
             new_val = s['current_value'] + change_needed
@@ -1263,7 +2041,7 @@ class DynamicsSensitivity:
             # Recompute roll with perturbed RC
             b = v.cg_to_front_axle_m / v.wheelbase_m
             h_roll = rc_f_p * (1 - b) + rc_r_p * b
-            h_arm = v.cg_height_m - h_roll
+            h_arm = v.sprung_cg_height_m - h_roll
             roll_moment = v.sprung_mass_kg * ay * h_arm
             K_total = v.roll_stiffness_total_Npm_rad
             roll_rad = roll_moment / K_total if K_total > 0 else 0
@@ -1289,6 +2067,7 @@ class DynamicsSensitivity:
                 'understeer_gradient_deg': baseline['understeer_gradient_deg'],  # approx
                 'utilization_max': baseline['utilization_max'],
                 'utilization_spread': baseline['utilization_spread'],
+                'ideal_ackermann_pct': baseline.get('ideal_ackermann_pct', float('nan')),  # RC doesn't directly change Ackermann
             }
 
             if sign == +1:
@@ -1298,7 +2077,12 @@ class DynamicsSensitivity:
 
         delta_display = rc_delta_m * 1000  # mm
         for metric in SENSITIVITY_OUTPUTS:
-            d_out = out_up[metric] - out_dn[metric]
+            val_up = out_up[metric]
+            val_dn = out_dn[metric]
+            if np.isnan(val_up) or np.isnan(val_dn):
+                effects[metric] = float('nan')
+                continue
+            d_out = val_up - val_dn
             effects[metric] = d_out / (2 * delta_display)
 
         return effects

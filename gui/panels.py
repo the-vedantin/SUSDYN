@@ -105,12 +105,37 @@ class MotionPanel(CollapsibleSection):
         motion_changed(str)           — 'heave'/'roll'/'pitch'
         range_changed(float, float)   — (min, max) in mm or deg
         position_changed(float)       — current position in mm or deg
-        damper_params_changed(dict)   — {'stroke_mm', 'sag_pct'}
+        damper_params_changed(dict)   — {'stroke_mm',
+                                         'preload_front_mm',
+                                         'preload_rear_mm',
+                                         'fully_extended_mm'}
+        apply_sag_requested()         — user clicked "Apply to HPs":
+                                        rewrite moving hardpoints so the
+                                        physics-consistent static sag is
+                                        baked into the CAD geometry.
+
+    Sag is COMPUTED from stroke + preload + vehicle params (spring,
+    mass, MR), not entered as an input.  Call update_sag_display()
+    with a dict from VehicleParams.static_sag() to refresh the
+    read-only sag labels on this panel.
+
+    The `fully_extended_mm` field is the damper's eye-to-eye length
+    at zero compression (from the damper spec).  The main window uses
+    it to decide how much the kinematic geometry *would* shift from
+    the CAD position to reach physics-consistent static ride height:
+        comp_cad   = L_full − damper_length_at_CAD
+        comp_need  = sag_shock (from spring physics)
+        shift      = comp_need − comp_cad  (shock mm, in WHEEL via /MR)
+    Changing damper params NEVER auto-shifts the geometry.  The shift
+    is only applied to hardpoints when the user clicks "Apply to HPs",
+    which emits apply_sag_requested.  If `fully_extended_mm` is 0
+    (default) no shift is computed (CAD is treated as static).
     """
     motion_changed        = pyqtSignal(str)
     range_changed         = pyqtSignal(float, float)
     position_changed      = pyqtSignal(float)
     damper_params_changed = pyqtSignal(dict)
+    apply_sag_requested   = pyqtSignal()
 
     def __init__(self):
         super().__init__('Motion')
@@ -146,22 +171,71 @@ class MotionPanel(CollapsibleSection):
         # Asymmetric range
         grid = QGridLayout(); grid.setSpacing(4)
         grid.addWidget(QLabel('Min:'), 0, 0)
-        self._min_spin = _spin(-300, 0, -50, ' mm'); self._min_spin.valueChanged.connect(self._on_range)
+        self._min_spin = _spin(-1e6, 0, -50, ' mm'); self._min_spin.valueChanged.connect(self._on_range)
         grid.addWidget(self._min_spin, 0, 1)
         grid.addWidget(QLabel('Max:'), 0, 2)
-        self._max_spin = _spin(0, 300, 50, ' mm');   self._max_spin.valueChanged.connect(self._on_range)
+        self._max_spin = _spin(0, 1e6, 50, ' mm');   self._max_spin.valueChanged.connect(self._on_range)
         grid.addWidget(self._max_spin, 0, 3)
         self.add_layout(grid)
 
-        # Damper limits
+        # Damper limits — stroke + per-axle preload + fully-extended length.
+        # Sag is COMPUTED (not entered) from spring/mass/MR + preload.
         dlim = QGridLayout(); dlim.setSpacing(4)
         dlim.addWidget(QLabel('Stroke:'), 0, 0)
-        self._stroke = _spin(10, 300, 55, ' mm'); self._stroke.valueChanged.connect(self._on_damper)
+        self._stroke = _spin(0.1, 1e6, 55, ' mm'); self._stroke.valueChanged.connect(self._on_damper)
+        self._stroke.setToolTip('Total damper stroke (shock-frame mm)')
         dlim.addWidget(self._stroke, 0, 1)
-        dlim.addWidget(QLabel('Static sag:'), 0, 2)
-        self._sag = _spin(0, 80, 35, ' %'); self._sag.valueChanged.connect(self._on_damper)
-        dlim.addWidget(self._sag, 0, 3)
+        dlim.addWidget(QLabel('Preload F:'), 0, 2)
+        self._preload_f = _spin(0, 1e6, 0, ' mm', dec=1, step=0.5)
+        self._preload_f.valueChanged.connect(self._on_damper)
+        dlim.addWidget(self._preload_f, 0, 3)
+        dlim.addWidget(QLabel('Preload R:'), 1, 2)
+        self._preload_r = _spin(0, 1e6, 0, ' mm', dec=1, step=0.5)
+        self._preload_r.valueChanged.connect(self._on_damper)
+        dlim.addWidget(self._preload_r, 1, 3)
+
+        # Fully-extended eye-to-eye length (0 = disable shift diagnostic).
+        # When nonzero, the main window computes how much the CAD damper
+        # is already compressed relative to L_full; the "Apply to HPs"
+        # button below lets the user commit the physics-static shift
+        # to the actual hardpoints (the pushrod / rocker / wheel points
+        # are NEVER moved just because damper params changed).
+        dlim.addWidget(QLabel('Fully ext.:'), 1, 0)
+        self._fully_extended = _spin(0, 1e6, 210.0, ' mm', dec=1, step=0.5)
+        self._fully_extended.valueChanged.connect(self._on_damper)
+        self._fully_extended.setToolTip(
+            'Damper length at ZERO compression (from damper spec). '
+            'Leave 0 to skip the shift diagnostic. When set, the model '
+            'computes how much of the stroke is already used at CAD. '
+            'Changing this value does NOT move any hardpoints — click '
+            '"Apply to HPs" to commit the sag shift.')
+        dlim.addWidget(self._fully_extended, 1, 1)
         self.add_layout(dlim)
+
+        # "Apply" button — commits the computed sag shift into the
+        # actual moving hardpoints (wheel, UCA/LCA/tie-rod outers,
+        # pushrod endpoints, rocker spring point).  Everything in
+        # the 3D view stays put until the user presses this.
+        from PyQt6.QtWidgets import QPushButton
+        btn_row = QHBoxLayout()
+        self._apply_sag_btn = QPushButton('Apply Sag to Hardpoints')
+        self._apply_sag_btn.setToolTip(
+            'Rewrite the moving hardpoints so that travel=0 IS the physics-'
+            'consistent static ride height.  Chassis-side points stay put; '
+            'wheel, upright and rocker outboard points move to the sagged '
+            'positions.  Use this when you want the 3D view to reflect '
+            'where the car actually sits at rest.')
+        self._apply_sag_btn.clicked.connect(self.apply_sag_requested.emit)
+        btn_row.addWidget(self._apply_sag_btn)
+        btn_row.addStretch(1)
+        self.add_layout(btn_row)
+
+        # Computed-sag display (read-only)
+        self._sag_lbl = QLabel('Static sag: F — / R —')
+        self._sag_lbl.setStyleSheet(
+            'color: #b0b0b0; font-family: Consolas, monospace; '
+            'font-size: 11px; padding: 2px 0;')
+        self.add_widget(self._sag_lbl)
 
         # Slider
         self.add_widget(QLabel('Position (live 3D):'))
@@ -204,9 +278,93 @@ class MotionPanel(CollapsibleSection):
 
     def _on_damper(self):
         self.damper_params_changed.emit({
-            'stroke_mm': self._stroke.value(),
-            'sag_pct':   self._sag.value(),
+            'stroke_mm':         self._stroke.value(),
+            'preload_front_mm':  self._preload_f.value(),
+            'preload_rear_mm':   self._preload_r.value(),
+            'fully_extended_mm': self._fully_extended.value(),
         })
+
+    # Public getters (used by save/load + main window queries)
+    @property
+    def stroke_mm(self) -> float:
+        return self._stroke.value()
+
+    @property
+    def preload_front_mm(self) -> float:
+        return self._preload_f.value()
+
+    @property
+    def preload_rear_mm(self) -> float:
+        return self._preload_r.value()
+
+    @property
+    def fully_extended_mm(self) -> float:
+        return self._fully_extended.value()
+
+    def set_fully_extended_mm(self, val: float):
+        """Silently set the fully-extended length (used by project load)."""
+        blocked = self._fully_extended.blockSignals(True)
+        self._fully_extended.setValue(float(val))
+        self._fully_extended.blockSignals(blocked)
+
+    def update_sag_display(self, sag_info: dict):
+        """Refresh the read-only sag readout from a VehicleParams.static_sag() dict.
+
+        The dict may include extra diagnostic keys set by the main window:
+            cad_damper_len_front_mm / cad_damper_len_rear_mm
+            cad_compression_front_mm / cad_compression_rear_mm
+            shift_shock_front_mm     / shift_shock_rear_mm
+        to show how much the CAD damper is already compressed and how far
+        the geometry is shifting to reach physics-consistent static sag.
+        """
+        if not sag_info:
+            self._sag_lbl.setText('Static sag: F — / R —')
+            return
+        f_mm  = sag_info.get('sag_shock_front_mm', 0.0)
+        r_mm  = sag_info.get('sag_shock_rear_mm',  0.0)
+        f_pct = sag_info.get('sag_front_pct', 0.0)
+        r_pct = sag_info.get('sag_rear_pct',  0.0)
+        warn_list = []
+        if sag_info.get('topped_out_front') or sag_info.get('topped_out_rear'):
+            warn_list.append('TOP-OUT')
+        if sag_info.get('bottomed_out_front') or sag_info.get('bottomed_out_rear'):
+            warn_list.append('BOTTOM-OUT')
+        if sag_info.get('cad_over_extended_front') or sag_info.get('cad_over_extended_rear'):
+            warn_list.append('CAD > L_full')
+        if sag_info.get('cad_over_compressed_front') or sag_info.get('cad_over_compressed_rear'):
+            warn_list.append('CAD > stroke')
+        warn = ('  ' + ' / '.join(warn_list)) if warn_list else ''
+
+        lines = [
+            f'Static sag:  F {f_mm:5.2f} mm ({f_pct:4.1f}%)   '
+            f'R {r_mm:5.2f} mm ({r_pct:4.1f}%){warn}'
+        ]
+
+        # If the main window supplied CAD-compression diagnostics, show them
+        # so the user can see how their CAD maps onto the physical damper.
+        shift_f = sag_info.get('shift_shock_front_mm')
+        shift_r = sag_info.get('shift_shock_rear_mm')
+        cad_f   = sag_info.get('cad_compression_front_mm')
+        cad_r   = sag_info.get('cad_compression_rear_mm')
+        if shift_f is not None and shift_r is not None:
+            cad_f_str = f'{cad_f:+5.2f}' if cad_f is not None else '  —  '
+            cad_r_str = f'{cad_r:+5.2f}' if cad_r is not None else '  —  '
+            # Label as "would-shift" so it's obvious the geometry hasn't
+            # moved yet — clicking "Apply Sag to Hardpoints" is what
+            # actually commits these numbers into the moving hardpoints.
+            lines.append(
+                f'CAD compr.:  F {cad_f_str} mm   R {cad_r_str} mm   '
+                f'would-shift F {shift_f:+5.2f} / R {shift_r:+5.2f} mm'
+            )
+        self._sag_lbl.setText('\n'.join(lines))
+        if warn_list:
+            self._sag_lbl.setStyleSheet(
+                'color: #ffaa33; font-family: Consolas, monospace; '
+                'font-size: 11px; padding: 2px 0; font-weight: bold;')
+        else:
+            self._sag_lbl.setStyleSheet(
+                'color: #b0b0b0; font-family: Consolas, monospace; '
+                'font-size: 11px; padding: 2px 0;')
 
     def _sync(self):
         pct = self._slider.value() / 400.0
@@ -238,35 +396,63 @@ class SteeringPanel(CollapsibleSection):
         return {
             'rack_travel_per_rev_mm': self._rack_ratio.value(),
             'total_rack_travel_mm':   self._rack_total.value(),
-            'max_rack_travel_in':     self._rack_max_in.value(),
         }
 
     def _build(self):
         grid = QGridLayout(); grid.setSpacing(4)
 
         grid.addWidget(QLabel('Rack travel/rev:'), 0, 0)
-        self._rack_ratio = _spin(10, 200, 60, ' mm/rev')
-        self._rack_ratio.valueChanged.connect(
-            lambda _: self.steering_changed.emit(self.get_params()))
+        self._rack_ratio = _spin(0.1, 100000, 120.0, ' mm/rev')
+        self._rack_ratio.valueChanged.connect(self._on_rack_changed)
         grid.addWidget(self._rack_ratio, 0, 1)
 
         grid.addWidget(QLabel('Total rack travel:'), 1, 0)
-        self._rack_total = _spin(20, 300, 100, ' mm')
-        self._rack_total.valueChanged.connect(
-            lambda _: self.steering_changed.emit(self.get_params()))
+        self._rack_total = _spin(0.1, 100000, 64.0, ' mm')
+        self._rack_total.valueChanged.connect(self._on_rack_changed)
         grid.addWidget(self._rack_total, 1, 1)
-
-        grid.addWidget(QLabel('Max rack travel:'), 2, 0)
-        self._rack_max_in = _spin(0.1, 10.0, 2.0, ' in', dec=2, step=0.1)
-        self._rack_max_in.valueChanged.connect(
-            lambda _: self.steering_changed.emit(self.get_params()))
-        grid.addWidget(self._rack_max_in, 2, 1)
         self.add_layout(grid)
+
+        # ── Readout: max steering-wheel angle achievable ────────────────────
+        # max_hw_deg (one-way) = (total_rack_travel / 2) / rack_per_rev × 360
+        # lock-to-lock = 2 × max_hw_deg
+        self._max_hw_lbl = QLabel()
+        self._max_hw_lbl.setStyleSheet(
+            'color: #4FC3F7; font-size: 11px; font-weight: bold;'
+            ' padding: 2px 4px;')
+        self._max_hw_lbl.setWordWrap(True)
+        self.add_widget(self._max_hw_lbl)
+        self._refresh_max_hw()
 
         info = QLabel('Use Motion > Steer mode to simulate steering.')
         info.setWordWrap(True)
         info.setStyleSheet('color: #888888; font-size: 11px;')
         self.add_widget(info)
+
+    def _on_rack_changed(self, *_):
+        self._refresh_max_hw()
+        self.steering_changed.emit(self.get_params())
+
+    def _refresh_max_hw(self):
+        """Recompute and display max steering-wheel angle from rack params."""
+        rack_per_rev = float(self._rack_ratio.value())
+        total_mm     = float(self._rack_total.value())
+        if rack_per_rev <= 0 or total_mm <= 0:
+            self._max_hw_lbl.setText('Max steering-wheel angle: —')
+            return
+        max_hw = (total_mm / 2.0) / rack_per_rev * 360.0
+        turns  = max_hw / 360.0
+        self._max_hw_lbl.setText(
+            f'Max steering-wheel angle: ±{max_hw:.0f}°  '
+            f'({turns:.2f} turns from centre)\n'
+            f'Lock-to-lock: {2*max_hw:.0f}° ({2*turns:.2f} turns)')
+
+    def max_handwheel_deg(self) -> float:
+        """One-way max hand-wheel angle (deg) from the two rack params."""
+        rack_per_rev = float(self._rack_ratio.value())
+        total_mm     = float(self._rack_total.value())
+        if rack_per_rev <= 0 or total_mm <= 0:
+            return 0.0
+        return (total_mm / 2.0) / rack_per_rev * 360.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -309,21 +495,21 @@ class CarParamsPanel(CollapsibleSection):
             return sb
         r = 0
         # Geometry: axle spacing vs wheelbase (separated)
-        self._axle_sp    = row('Axle spacing:',          800, 3000, 1537, ' mm', r); r += 1
-        self._wb         = row('Wheelbase:',             800, 3000, 1537, ' mm', r); r += 1
-        self._track_f    = row('Track width F:',         800, 2000, 1222, ' mm', r); r += 1
-        self._track_r    = row('Track width R:',         800, 2000, 1200, ' mm', r); r += 1
-        self._woff_f     = row('Wheel offset F:',       -50,  100,   25, ' mm', r, dec=1, step=1); r += 1
-        self._woff_r     = row('Wheel offset R:',       -50,  100,   25, ' mm', r, dec=1, step=1); r += 1
+        self._axle_sp    = row('Axle spacing:',          0.1, 1e6, 1537, ' mm', r); r += 1
+        self._wb         = row('Wheelbase:',             0.1, 1e6, 1537, ' mm', r); r += 1
+        self._track_f    = row('Track width F:',         0.1, 1e6, 1222, ' mm', r); r += 1
+        self._track_r    = row('Track width R:',         0.1, 1e6, 1200, ' mm', r); r += 1
+        self._woff_f     = row('Wheel offset F:',       -1e6, 1e6,   25, ' mm', r, dec=1, step=1); r += 1
+        self._woff_r     = row('Wheel offset R:',       -1e6, 1e6,   25, ' mm', r, dec=1, step=1); r += 1
         # Tire dimensions
-        self._t_outer    = row('Tyre OD:',               300,  700,  406, ' mm', r); r += 1
-        self._t_rim      = row('Rim dia:',               200,  600,  330, ' mm', r); r += 1
-        self._t_width    = row('Tyre width:',            100,  400,  200, ' mm', r); r += 1
+        self._t_outer    = row('Tyre OD:',               0.1, 1e6,  406, ' mm', r); r += 1
+        self._t_rim      = row('Rim dia:',               0.1, 1e6,  330, ' mm', r); r += 1
+        self._t_width    = row('Tyre width:',            0.1, 1e6,  200, ' mm', r); r += 1
         # CG position
-        self._cg_x       = row('CG X (lateral):',       -300, 300,    0, ' mm', r, dec=1, step=1); r += 1
-        self._cg_y       = row('CG Y (longitudinal):', 500, 3000, 1100, ' mm', r, dec=1, step=5); r += 1
-        self._cg_z       = row('CG Z (height):',         100, 600,  280, ' mm', r, dec=1, step=1); r += 1
-        self._brake_bias = row('Front Brake Bias:',      30,   90,   65, ' %',  r,
+        self._cg_x       = row('CG X (lateral):',       -1e6, 1e6,    0, ' mm', r, dec=1, step=1); r += 1
+        self._cg_y       = row('CG Y (longitudinal):',   0,   1e6, 1100, ' mm', r, dec=1, step=5); r += 1
+        self._cg_z       = row('CG Z (height):',         0,   1e6,  280, ' mm', r, dec=1, step=1); r += 1
+        self._brake_bias = row('Front Brake Bias:',      0,   100,   65, ' %',  r,
                                dec=0, step=1); r += 1
         self.add_layout(g)
 
@@ -396,15 +582,15 @@ class HardpointPanel(CollapsibleSection):
 
     def __init__(self, title: str, hp_dict: dict, arb_dict: dict | None = None):
         super().__init__(title)
-        self._hp    = {k: v.copy() for k, v in hp_dict.items()}
-        self._arb   = {k: v.copy() for k, v in (arb_dict or {}).items()}
+        self._hp      = {k: v.copy() for k, v in hp_dict.items()}
+        self._arb     = {k: v.copy() for k, v in (arb_dict or {}).items()}
         self._names = list(hp_dict.keys())
         self._all_names = self._names + list(self._arb.keys())
         self._updating = False
         self._build()
 
     def refresh(self, hp_dict: dict, arb_dict: dict | None = None):
-        self._hp  = {k: v.copy() for k, v in hp_dict.items()}
+        self._hp = {k: v.copy() for k, v in hp_dict.items()}
         if arb_dict:
             self._arb = {k: v.copy() for k, v in arb_dict.items()}
         self._fill()
@@ -496,7 +682,10 @@ class ValuesPanel(CollapsibleSection):
     def __init__(self):
         super().__init__('Live Values')
         self._stroke_mm = 55.0
-        self._sag_pct = 35.0
+        # Per-axle sag in shock frame, mm (computed from preload + dynamics).
+        # NOT a user input anymore.
+        self._sag_shock_front_mm = 0.0
+        self._sag_shock_rear_mm  = 0.0
         self._last_data: dict = {}
         self._dlg: QDialog | None = None
         self._build()
@@ -510,9 +699,26 @@ class ValuesPanel(CollapsibleSection):
         if self._dlg is not None and self._dlg.isVisible():
             self._fill_table()
 
-    def update_damper_params(self, stroke_mm: float, sag_pct: float):
+    def update_damper_params(self,
+                             stroke_mm: float,
+                             sag_shock_front_mm: float,
+                             sag_shock_rear_mm: float):
+        """
+        stroke_mm           : total damper stroke in shock frame (mm)
+        sag_shock_front_mm  : computed static sag (front axle, shock frame, mm)
+        sag_shock_rear_mm   : computed static sag (rear axle, shock frame, mm)
+
+        Max bump travel (compression remaining) at wheel:
+            = (stroke − sag) / MR
+        Max droop travel (extension remaining) at wheel:
+            = sag / MR
+        """
         self._stroke_mm = stroke_mm
-        self._sag_pct = sag_pct
+        self._sag_shock_front_mm = sag_shock_front_mm
+        self._sag_shock_rear_mm  = sag_shock_rear_mm
+        # Repaint the popup if open so numbers reflect the new sag.
+        if self._dlg is not None and self._dlg.isVisible():
+            self._fill_table()
 
     def _build(self):
         btn = QPushButton('Show Live Values')
@@ -603,26 +809,92 @@ class ValuesPanel(CollapsibleSection):
         self._fill_table()
         self._dlg.show()
 
+    @staticmethod
+    def _avg_finite(values):
+        """Mean of the finite entries in `values`; NaN if none are finite.
+        Used for axle/vehicle scope reduction so per-corner numerical
+        drift in fns like anti-dive doesn't show up as 4 "almost equal"
+        cells."""
+        finite = [v for v in values if not np.isnan(v)]
+        if not finite:
+            return float('nan')
+        return float(sum(finite) / len(finite))
+
     def _fill_table(self):
+        """Render the live-values table.  Each catalog entry has a
+        ``scope`` controlling how its single value is laid out across
+        the four corner columns:
+
+            'corner'  → four independent values, one per cell.
+            'axle'    → two values (one per axle); FL=FR=front, RL=RR=rear.
+                        Per-corner L/R drift is averaged out.
+            'front'   → one value at the front axle; FL=FR=value, RL/RR blank.
+            'rear'    → one value at the rear axle; RL=RR=value, FL/FR blank.
+            'vehicle' → one value across all four cells.
+        """
         if self._popup_table is None:
             return
+
         for row, entry in enumerate(CATALOG):
             key = entry['key']
+            scope = entry.get('scope', 'corner')
+
+            # Pull the per-corner samples once.
+            samples = {c: self._last_data.get(c, {}).get(key, float('nan'))
+                       for c in self._CORNERS}
+
+            # Decide what to write into each cell based on scope.
+            if scope == 'corner':
+                cell_vals = samples
+
+            elif scope == 'axle':
+                # One value per axle, averaged across L/R to cancel
+                # numerical drift in the per-corner fn.
+                front = self._avg_finite([samples['FL'], samples['FR']])
+                rear  = self._avg_finite([samples['RL'], samples['RR']])
+                cell_vals = {'FL': front, 'FR': front,
+                             'RL': rear,  'RR': rear}
+
+            elif scope == 'front':
+                # Front-axle property — single number.  Rear cells blank.
+                front = self._avg_finite([samples['FL'], samples['FR']])
+                cell_vals = {'FL': front, 'FR': front,
+                             'RL': float('nan'), 'RR': float('nan')}
+
+            elif scope == 'rear':
+                # Rear-axle property — single number.  Front cells blank.
+                rear  = self._avg_finite([samples['RL'], samples['RR']])
+                cell_vals = {'FL': float('nan'), 'FR': float('nan'),
+                             'RL': rear,  'RR': rear}
+
+            elif scope == 'vehicle':
+                # Single car-level number.  Same in every cell.
+                avg = self._avg_finite(list(samples.values()))
+                cell_vals = {c: avg for c in self._CORNERS}
+
+            else:   # unknown scope → fall back to per-corner
+                cell_vals = samples
+
             for ci, corner in enumerate(self._CORNERS):
-                vals = self._last_data.get(corner, {})
-                val = vals.get(key, float('nan'))
+                v = cell_vals[corner]
                 item = self._popup_table.item(row, 1 + ci)
                 if item:
-                    item.setText(f'{val:.4f}' if not np.isnan(val) else '—')
+                    item.setText(f'{v:.4f}' if not np.isnan(v) else '—')
 
+        # ── Extra rows (bump/droop travel) are always per-corner ────────
         base = len(CATALOG)
         for ci, corner in enumerate(self._CORNERS):
             vals = self._last_data.get(corner, {})
             mr = vals.get('motion_ratio', float('nan'))
+            sag_shock = (self._sag_shock_front_mm if corner in ('FL', 'FR')
+                         else self._sag_shock_rear_mm)
             if not np.isnan(mr) and mr > 1e-6:
-                sag_frac = max(0.0, min(1.0, self._sag_pct / 100.0))
-                bump  = self._stroke_mm * sag_frac / mr
-                droop = self._stroke_mm * (1.0 - sag_frac) / mr
+                # Physical: at static, damper is compressed by sag_shock from
+                # full droop.  Remaining bump room = stroke − sag, remaining
+                # droop room = sag.  Convert to wheel frame: / MR.
+                sag_clamped = max(0.0, min(self._stroke_mm, sag_shock))
+                bump  = (self._stroke_mm - sag_clamped) / mr
+                droop = sag_clamped / mr
             else:
                 bump = droop = float('nan')
             for ei, (ek, _, _) in enumerate(self._EXTRA_ROWS):
@@ -747,19 +1019,19 @@ class AlignmentPanel(CollapsibleSection):
         grid = QGridLayout(); grid.setSpacing(4)
 
         grid.addWidget(QLabel('Front toe:'),    0, 0)
-        self._ft = _spin(-5.0, 5.0, 0.0, ' deg', dec=2, step=0.1)
+        self._ft = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
         grid.addWidget(self._ft, 0, 1)
 
         grid.addWidget(QLabel('Front camber:'), 1, 0)
-        self._fc = _spin(-10.0, 5.0, 0.0, ' deg', dec=2, step=0.1)
+        self._fc = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
         grid.addWidget(self._fc, 1, 1)
 
         grid.addWidget(QLabel('Rear toe:'),     2, 0)
-        self._rt = _spin(-5.0, 5.0, 0.0, ' deg', dec=2, step=0.1)
+        self._rt = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
         grid.addWidget(self._rt, 2, 1)
 
         grid.addWidget(QLabel('Rear camber:'),  3, 0)
-        self._rc = _spin(-10.0, 5.0, 0.0, ' deg', dec=2, step=0.1)
+        self._rc = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
         grid.addWidget(self._rc, 3, 1)
 
         self.add_layout(grid)
@@ -797,10 +1069,14 @@ class _NoScrollCombo(QComboBox):
 
 def _spin(lo, hi, val, suffix='', dec=1, step=5.0) -> QDoubleSpinBox:
     sb = _NoScrollSpin()
+    # NOTE: setDecimals() must come BEFORE setValue() — otherwise the
+    # value is silently rounded to the default 2-decimal precision before
+    # the higher-precision setting takes effect (e.g. 1.225 → 1.23 with
+    # dec=3).  Same with setRange when extreme values are involved.
+    sb.setDecimals(dec)
     sb.setRange(lo, hi)
     sb.setValue(val)
     sb.setSuffix(suffix)
-    sb.setDecimals(dec)
     sb.setSingleStep(step)
     sb.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     return sb
@@ -817,6 +1093,7 @@ IK_METRICS = [
     ('anti_lift',    'Anti-Lift',          '%',   0, 100),
     ('camber',       'Camber Angle',       '°',  -5, 2),
     ('toe',          'Bump Steer (Toe)',   '°',  -2, 2),
+    ('ackermann',    'Ackermann %',        '%',  50, 150),
     ('rc_height',    'Roll Centre Height', 'mm', -20, 80),
     ('caster',       'Caster Angle',       '°',   0, 15),
     ('trail',        'Caster Trail',       'mm', -10, 60),
@@ -946,10 +1223,10 @@ class InverseKinematicsPanel(CollapsibleSection):
 
         # Range — auto-clamps to damper limits when set_damper_limits() called
         grid.addWidget(QLabel('Min:'), r, 0)
-        self._range_lo = _spin(-120, 120, -18, ' mm', dec=0, step=5)
+        self._range_lo = _spin(-1e6, 1e6, -18, ' mm', dec=0, step=5)
         grid.addWidget(self._range_lo, r, 1); r += 1
         grid.addWidget(QLabel('Max:'), r, 0)
-        self._range_hi = _spin(-120, 120, 42, ' mm', dec=0, step=5)
+        self._range_hi = _spin(-1e6, 1e6, 42, ' mm', dec=0, step=5)
         grid.addWidget(self._range_hi, r, 1); r += 1
 
         # Metric selector
@@ -971,7 +1248,7 @@ class InverseKinematicsPanel(CollapsibleSection):
 
         # Bound (how far points can move)
         grid.addWidget(QLabel('Max Movement:'), r, 0)
-        self._bound = _spin(1, 100, 10, ' mm', dec=1, step=1)
+        self._bound = _spin(0.01, 1e6, 10, ' mm', dec=1, step=1)
         grid.addWidget(self._bound, r, 1); r += 1
 
         # Method
@@ -989,7 +1266,7 @@ class InverseKinematicsPanel(CollapsibleSection):
         lock_hdr.addWidget(lock_label)
         lock_hdr.addStretch()
         lock_hdr.addWidget(QLabel('Tol:'))
-        self._lock_tol = _spin(0.1, 100, 5.0, '', dec=1, step=1.0)
+        self._lock_tol = _spin(0.001, 1e6, 5.0, '', dec=1, step=1.0)
         self._lock_tol.setMaximumWidth(55)
         self._lock_tol.setToolTip(
             'Tolerance band for locked metrics.\n'
@@ -1059,7 +1336,7 @@ class InverseKinematicsPanel(CollapsibleSection):
         ]
         for i, (label, keys, default_mm) in enumerate(_tube_defaults):
             tube_grid.addWidget(QLabel(label), i, 0)
-            sp = _spin(0, 150, default_mm, ' mm', dec=1, step=1.0)
+            sp = _spin(0, 1e6, default_mm, ' mm', dec=1, step=1.0)
             sp.setMaximumWidth(80)
             tube_grid.addWidget(sp, i, 1)
             for k in keys:
@@ -1128,12 +1405,18 @@ class InverseKinematicsPanel(CollapsibleSection):
                 self._target_lo.setValue(default)
                 self._target_hi.setValue(default)
                 break
+        # Ackermann only works in steer mode — auto-switch
+        if key == 'ackermann':
+            self._motion.setCurrentText('Steer')
 
     def _auto_select(self):
         """Auto-select hardpoints based on the chosen metric."""
         from vahan.optimizer import PRESETS
         key = self._metric.currentData()
-        preset = PRESETS.get(key, [])
+        # For Ackermann, default to rack_position (tie_rod_inner only)
+        # so the optimizer moves the rack without changing tie_rod_outer.
+        preset_key = 'rack_position' if key == 'ackermann' else key
+        preset = PRESETS.get(preset_key, [])
         # Uncheck all first
         for cb in self._hp_checks.values():
             cb.setChecked(False)
@@ -1184,19 +1467,31 @@ class InverseKinematicsPanel(CollapsibleSection):
             'tube_od':      tube_od,
         }
 
-    def set_damper_limits(self, stroke_mm: float, sag_pct: float):
+    def set_damper_limits(self,
+                          stroke_mm: float,
+                          sag_shock_mm: float,
+                          mr: float = 1.0):
         """Clamp the IK sweep range to physical damper travel.
 
-        stroke_mm : total damper stroke length in mm
-        sag_pct   : percentage of stroke used as static sag (0-100)
+        stroke_mm    : total damper stroke length (shock frame, mm)
+        sag_shock_mm : static sag (shock frame, mm).  At ride height,
+                       the damper is compressed by this much from full
+                       extension (full droop).
+        mr           : motion ratio (d_spring/d_wheel) at static.
 
-        Effective range:
-            min travel = -(stroke_mm * sag_pct / 100)   (bump / compression)
-            max travel = stroke_mm * (1 - sag_pct/100)  (droop / extension)
+        Sign convention in this codebase:
+            positive travel = bump   (wheel up, spring compresses)
+            negative travel = droop  (wheel down, spring extends)
+
+        Available travel from ride height:
+            droop (extend) room : sag / MR   (wheel moves down by this)
+            bump  (compress)    : (stroke − sag) / MR
+        So sweep range:  lo = −sag/MR   .. hi = +(stroke−sag)/MR
         """
-        sag_frac = max(0.0, min(1.0, sag_pct / 100.0))
-        lo = -stroke_mm * sag_frac
-        hi = stroke_mm * (1 - sag_frac)
+        sag = max(0.0, min(stroke_mm, sag_shock_mm))
+        mr_safe = max(mr, 1e-6)
+        lo = -sag / mr_safe                   # max droop (wheel can drop this much)
+        hi = (stroke_mm - sag) / mr_safe      # max bump  (wheel can rise this much)
         self._range_lo.setRange(lo - 5, hi + 5)
         self._range_hi.setRange(lo - 5, hi + 5)
         self._range_lo.setValue(lo)
@@ -1528,16 +1823,66 @@ class DynamicsPanel(CollapsibleSection):
             return sb
 
         r = 0
-        self._total_mass      = row('Total mass:',        100, 1500, 290.35, ' kg',   r, dec=2, step=1); r += 1
-        self._sprung_mass     = row('Sprung mass:',        50, 1200, 223.8,  ' kg',   r, dec=1, step=1); r += 1
-        self._us_front        = row('Unsprung F (axle):',   5,  200,  26.5,  ' kg',   r, dec=1, step=0.5); r += 1
-        self._us_rear         = row('Unsprung R (axle):',   5,  200,  40.05, ' kg',   r, dec=2, step=0.5); r += 1
-        self._spring_f        = row('Spring rate F:',      10, 9999, 200,   ' lbf/in', r, dec=0, step=10); r += 1
-        self._spring_r        = row('Spring rate R:',      10, 9999, 200,   ' lbf/in', r, dec=0, step=10); r += 1
-        self._tire_rate       = row('Tire rate:',          50, 9999, 909,   ' lbf/in', r, dec=0, step=25); r += 1
-        self._arb_f           = row('ARB rate F:',          0, 9999, 108,   ' lbf/in', r, dec=0, step=10); r += 1
-        self._arb_r           = row('ARB rate R:',          0, 9999,  49,   ' lbf/in', r, dec=0, step=10); r += 1
+        self._total_mass      = row('Total mass:',        0.1, 1e6, 290.35, ' kg',   r, dec=2, step=1); r += 1
+        self._sprung_mass     = row('Sprung mass:',        0.1, 1e6, 223.8,  ' kg',   r, dec=1, step=1); r += 1
+        self._us_front        = row('Unsprung F (axle):',  0.01, 1e6,  26.5,  ' kg',   r, dec=1, step=0.5); r += 1
+        self._us_rear         = row('Unsprung R (axle):',  0.01, 1e6,  40.05, ' kg',   r, dec=2, step=0.5); r += 1
+        self._spring_f        = row('Spring rate F:',      0.1, 1e6, 200,   ' lbf/in', r, dec=0, step=10); r += 1
+        self._spring_r        = row('Spring rate R:',      0.1, 1e6, 200,   ' lbf/in', r, dec=0, step=10); r += 1
+        self._tire_rate       = row('Tire rate:',          0.1, 1e6, 909,   ' lbf/in', r, dec=0, step=25); r += 1
+        # ── ARB geometry (per axle) ─────────────────────────────────────
+        # The wheel-rate contribution of each anti-roll bar is DERIVED
+        # from the bar geometry rather than typed in directly:
+        #     J = π·D⁴/32                  polar second moment   (mm⁴)
+        #     I = π·D⁴/64                  area second moment    (mm⁴)
+        #     K_torsion = G·J / (A²·L)     end-of-arm torsion    (N/mm)
+        #     K_armBend = 3·E·I / A³       cantilever arm bend   (N/mm)
+        #     K_arb     = (K_t·K_a)/(K_t+K_a)   series combination
+        #     K_wheel   = K_arb / MR_arb²        wheel reduction
+        # See workbook ‘Springs, Dampers, Anti-roll’: rows 49–64.
+        #
+        # Of the geometry inputs, ONLY the bar OD/ID and material
+        # constants are owned by the panel.  The arm length, half-length
+        # (active twist span) and MR are all redundant — they are
+        # determined by the kinematic hardpoints (`arb_pivot`,
+        # `arb_arm_end`, `arb_drop_top`) and the rocker chain, so
+        # main_window pulls them from the kinematic model and pushes
+        # them in through :meth:`set_derived_arb_geometry` before any
+        # call to :meth:`get_params`.
+        #
+        # Hollow bars: ID > 0 switches the cross-section to a tube.
+        # Default ID = 0 (solid) preserves the workbook reference rates.
+        self._arb_OD_f = row('ARB F bar OD:', 0.1, 1e6,  12.70,   ' mm',    r, dec=2, step=0.1);  r += 1
+        self._arb_ID_f = row('ARB F bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=2, step=0.1);  r += 1
+        self._arb_OD_r = row('ARB R bar OD:', 0.1, 1e6,  12.70,   ' mm',    r, dec=2, step=0.1);  r += 1
+        self._arb_ID_r = row('ARB R bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=2, step=0.1);  r += 1
+        self._arb_G    = row('Bar G (shear):', 1, 1e9, 79300.0, ' N/mm²', r, dec=0, step=500);  r += 1
+        self._arb_E    = row('Bar E (Young):', 1, 1e9, 207000.0,' N/mm²', r, dec=0, step=500);  r += 1
+        # ID = 0 ⇒ solid bar.  Any ID ≥ OD collapses the cross-section
+        # to a zero-wall tube → wheel rate = 0 (caught in get_params).
+        self._arb_ID_f.setToolTip(
+            'Inner diameter of front anti-roll bar.\n'
+            '0 = solid bar.  Must be < OD; otherwise the bar contributes 0 stiffness.\n'
+            'Hollow bars cut mass dramatically with only modest stiffness loss '
+            '(stiffness scales with OD⁴−ID⁴ — the outer fibres carry almost all the load).')
+        self._arb_ID_r.setToolTip(self._arb_ID_f.toolTip().replace('front', 'rear'))
         self.add_layout(g)
+
+        # Cached derived geometry (populated by set_derived_arb_geometry).
+        # Defaults match the workbook so the panel behaves sensibly on
+        # first launch before the kinematic model has been queried.
+        self._derived_arb_geom = {
+            'F': {'arm_length_mm':  84.33, 'half_length_mm': 249.43, 'mr': 2.500},
+            'R': {'arm_length_mm': 104.78, 'half_length_mm': 286.26, 'mr': 3.000},
+        }
+        # Read-only readout for derived ARB geometry — same styling as the
+        # other auto-info labels in the panel.
+        self._arb_geom_label = QLabel('')
+        self._arb_geom_label.setStyleSheet(
+            f'color: #66BB6A; font-size: 10px; font-style: italic;')
+        self._arb_geom_label.setWordWrap(True)
+        self._refresh_arb_geom_label()
+        self.add_widget(self._arb_geom_label)
 
         # ── Powertrain ───────────────────────────────────────────────────
         pw = QGridLayout(); pw.setSpacing(4)
@@ -1548,13 +1893,13 @@ class DynamicsPanel(CollapsibleSection):
             sb.valueChanged.connect(self._on_driving_changed)
             pw.addWidget(sb, r, 1)
             return sb
-        self._power_hp        = prow('Power (wheel):',    0, 1000, 0,     ' hp',  pr, dec=1, step=5); pr += 1
-        self._engine_rpm      = prow('Engine RPM:',       0, 20000, 0,    ' rpm', pr, dec=0, step=100); pr += 1
-        self._primary_ratio   = prow('Primary ratio:',  0.5, 20,   3.55, ':1',   pr, dec=2, step=0.1); pr += 1
-        self._sprocket_drive  = prow('Sprocket (drive):', 8,  30,   13,   ' T',   pr, dec=0, step=1); pr += 1
-        self._sprocket_driven = prow('Sprocket (rear):',  20, 80,   48,   ' T',   pr, dec=0, step=1); pr += 1
-        self._tire_radius     = prow('Tire radius:',    100, 500,  203,   ' mm',  pr, dec=0, step=1); pr += 1
-        self._turn_radius     = prow('Turn radius:',    1.0, 200,  4.5,   ' m',   pr, dec=1, step=0.5); pr += 1
+        self._power_hp        = prow('Power (wheel):',    0,  1e6,   75.0, ' hp',  pr, dec=1, step=5); pr += 1
+        self._engine_rpm      = prow('Engine RPM:',       0,  1e6, 10000,  ' rpm', pr, dec=0, step=100); pr += 1
+        self._primary_ratio   = prow('Primary ratio:',  0.01, 1e6,  3.55,  ':1',   pr, dec=2, step=0.1); pr += 1
+        self._sprocket_drive  = prow('Sprocket (drive):', 1,  1e6,   11,    ' T',  pr, dec=0, step=1); pr += 1
+        self._sprocket_driven = prow('Sprocket (rear):',  1,  1e6,   39,    ' T',  pr, dec=0, step=1); pr += 1
+        self._tire_radius     = prow('Tire radius:',    0.1, 1e6,  203,    ' mm', pr, dec=0, step=1); pr += 1
+        self._turn_radius     = prow('Turn radius:',   0.01, 1e6,   10.0,  ' m',  pr, dec=1, step=0.5); pr += 1
         self.add_layout(pw)
 
         # Drivetrain selector
@@ -1596,14 +1941,39 @@ class DynamicsPanel(CollapsibleSection):
         self.add_widget(self._dyn_constants)
 
         # ── Acceleration inputs ──────────────────────────────────────────
-        acc_grid = QGridLayout(); acc_grid.setSpacing(4)
-        acc_grid.addWidget(QLabel('Lateral g:'), 0, 0)
+        # Lat-g is a Cornering-only input (held value for the single-
+        # point Solve; the swept value comes from the lat-g range).
+        # Lon-g serves BOTH modes:
+        #   Cornering : held lon-g for the combined sweep (sign drives
+        #               sub-case: 0 = pure lat, − = +braking, + = +accel)
+        #   Straights : applied lon-g for the trajectory (sign drives
+        #               direction: + = acceleration, − = braking)
+        # Each lives in its own row host so they can be hidden
+        # independently — Lat-g hides in Straights, Lon-g stays.
+        lat_row = QHBoxLayout()
+        lat_row.setContentsMargins(0, 0, 0, 0)
+        self._lat_g_label = QLabel('Lateral g:')
+        lat_row.addWidget(self._lat_g_label)
         self._lat_g = _spin(-99, 99, 1.0, ' g', dec=2, step=0.05)
-        acc_grid.addWidget(self._lat_g, 0, 1)
-        acc_grid.addWidget(QLabel('Longitudinal g:'), 1, 0)
+        lat_row.addWidget(self._lat_g)
+        lat_row.addStretch()
+        self._lat_row_host = QWidget()
+        self._lat_row_host.setLayout(lat_row)
+        self.add_widget(self._lat_row_host)
+
+        lon_row = QHBoxLayout()
+        lon_row.setContentsMargins(0, 0, 0, 0)
+        self._lon_g_label = QLabel('Longitudinal g:')
+        lon_row.addWidget(self._lon_g_label)
         self._lon_g = _spin(-99, 99, 0.0, ' g', dec=2, step=0.05)
-        acc_grid.addWidget(self._lon_g, 1, 1)
-        self.add_layout(acc_grid)
+        lon_row.addWidget(self._lon_g)
+        lon_row.addStretch()
+        self._lon_row_host = QWidget()
+        self._lon_row_host.setLayout(lon_row)
+        self.add_widget(self._lon_row_host)
+        # Backwards-compat alias — anything that referenced
+        # `_acc_grid_host` will still work via this attribute.
+        self._acc_grid_host = self._lat_row_host
 
         # ── Buttons ──────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
@@ -1635,7 +2005,10 @@ class DynamicsPanel(CollapsibleSection):
             'QPushButton:checked { background: #6A1B9A; color: white; border-color: #CE93D8; }'
             'QPushButton:hover { background: #2a2a2a; }')
         self._apply_aero_btn.setToolTip(
-            'Include aero downforce (from Aero Load Targets panel) in dynamics solve/sweep')
+            'Include aero downforce in dynamics solve/sweep.  Source is\n'
+            'controlled by the "Aero source" combobox below — either the\n'
+            'Aero Load Targets inverse-solved deficit, or user-supplied\n'
+            'CFD numbers (Custom).')
         self._apply_aero_btn.toggled.connect(self._on_aero_toggle)
         aero_row.addWidget(self._apply_aero_btn)
         self._aero_label = QLabel('OFF')
@@ -1644,21 +2017,165 @@ class DynamicsPanel(CollapsibleSection):
         aero_row.addStretch()
         self.add_layout(aero_row)
 
-        # ── Sweep axes (checkboxes) + range ──────────────────────────────
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel('Sweep:'))
-        self._sweep_lat_cb = QCheckBox('Lateral')
+        # ── Aero source toggle (Solved | Custom CFD) ─────────────────────
+        # The original "Apply Aero" path only supports loading the deficit
+        # produced by the Aero Load Targets inverse solver — useful for
+        # sizing an aero target, but the WRONG direction for validating a
+        # CFD result against measured handling.  "Custom" mode lets the
+        # user type in measured/CFD downforce + CoP and drive the same
+        # V²-scaled aero injection pipeline with those numbers.
+        src_row = QHBoxLayout()
+        src_row.addWidget(QLabel('Aero source:'))
+        self._aero_source = QComboBox()
+        self._aero_source.addItem('Solved (from Aero panel)', 'solved')
+        self._aero_source.addItem('Custom (CFD validation)',  'custom')
+        self._aero_source.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #6A1B9A; }')
+        self._aero_source.currentIndexChanged.connect(self._on_aero_source_changed)
+        src_row.addWidget(self._aero_source, 1)
+        self.add_layout(src_row)
+
+        # ── Custom aero inputs (visible only when "Custom" is selected) ──
+        # The user enters the downforce produced at a chosen reference
+        # speed plus the CoP location.  Internally we convert to a CL·A
+        # so the V²-scaling pipeline downstream is unchanged:
+        #     CL·A = 2·F_ref / (ρ·V_ref²)
+        #     F_DF(g) at constant turn-radius R is then
+        #         0.5·ρ·V²·CL·A   with   V² = g·g_earth·R
+        # which still satisfies the existing "Fz per g" convention.
+        self._aero_custom_box = QGroupBox('Custom aero (CFD validation)')
+        self._aero_custom_box.setStyleSheet(
+            'QGroupBox { color: #CE93D8; font-size: 11px; border: 1px solid #333; '
+            'border-radius: 3px; margin-top: 6px; padding: 6px; }'
+            'QGroupBox::title { left: 6px; padding: 0 4px; }')
+        cag = QGridLayout(self._aero_custom_box); cag.setSpacing(4)
+        cr = 0
+
+        cag.addWidget(QLabel('Total DF @ ref:'), cr, 0)
+        self._aero_F_ref = _spin(0.0, 1e6, 250.0, ' N', dec=1, step=10)
+        self._aero_F_ref.setToolTip(
+            'Total aero downforce (both axles combined) at the reference\n'
+            'speed below.  Sign convention: positive = pushes the car DOWN.')
+        cag.addWidget(self._aero_F_ref, cr, 1); cr += 1
+
+        cag.addWidget(QLabel('Ref speed:'), cr, 0)
+        self._aero_V_ref = _spin(0.1, 1e6, 60.0, ' km/h', dec=1, step=5)
+        self._aero_V_ref.setToolTip(
+            'Speed at which the downforce above was measured / simulated.\n'
+            'CL·A is back-calculated as  2·F_ref / (ρ·V_ref²),  then\n'
+            'downforce scales with V² at any other speed.')
+        cag.addWidget(self._aero_V_ref, cr, 1); cr += 1
+
+        cag.addWidget(QLabel('CoP (% rear):'), cr, 0)
+        self._aero_cop_rear = _spin(0.0, 100.0, 50.0, ' %', dec=1, step=1)
+        self._aero_cop_rear.setToolTip(
+            'Centre-of-pressure expressed as the fraction of total\n'
+            'downforce on the rear axle.  50% = balanced;  60% = rear-\n'
+            'biased (typical for high-rake cars), 40% = front-biased.')
+        cag.addWidget(self._aero_cop_rear, cr, 1); cr += 1
+
+        cag.addWidget(QLabel('Air density:'), cr, 0)
+        self._aero_rho = _spin(0.01, 10.0, 1.225, ' kg/m³', dec=3, step=0.005)
+        self._aero_rho.setToolTip(
+            'Air density at the operating point.  1.225 kg/m³ is ISA sea\n'
+            'level / 15 °C.  Drops to ~1.18 in hot weather, ~1.10 at\n'
+            'altitude — meaningful for outdoor events.')
+        cag.addWidget(self._aero_rho, cr, 1); cr += 1
+
+        # Read-only readout: equivalent CL·A + downforce at reference V
+        # so the user can sanity-check against their CFD output.
+        self._aero_custom_info = QLabel('')
+        self._aero_custom_info.setStyleSheet(
+            'color: #CE93D8; font-size: 10px; font-style: italic;')
+        self._aero_custom_info.setWordWrap(True)
+        cag.addWidget(self._aero_custom_info, cr, 0, 1, 2); cr += 1
+
+        # Recompute the readout whenever a custom-aero spinbox changes,
+        # and fire params_changed so dependent code (live wheel-rate
+        # display, etc.) is not stuck on stale numbers.
+        for sb in (self._aero_F_ref, self._aero_V_ref,
+                   self._aero_cop_rear, self._aero_rho):
+            sb.valueChanged.connect(self._on_custom_aero_changed)
+
+        self.add_widget(self._aero_custom_box)
+        # Hidden until Custom is selected.  We don't want it eating
+        # vertical space when the panel is in Solved mode (the default).
+        self._aero_custom_box.setVisible(False)
+        self._on_custom_aero_changed()   # populate readout
+
+        # ── Test mode: Cornering or Straights ──────────────────────────
+        # Two top-level scenarios.  Sub-mode is INFERRED from input
+        # signs — no extra dropdowns:
+        #
+        #   Cornering   : sweep lat-g range; sign of Lon-g spin selects
+        #                 the cornering sub-case automatically:
+        #                     lon = 0  →  pure lat-g
+        #                     lon < 0  →  lat-g + braking
+        #                     lon > 0  →  lat-g + acceleration
+        #
+        #   Straights   : time-domain trajectory.  Start speed selects:
+        #                     start = 0       →  acceleration from rest
+        #                     start > 0       →  braking from velocity
+        #
+        # Hidden state — kept for backwards compat with legacy save
+        # files / sweep code paths but no longer surfaced in the UI.
+        # The new test combo drives all visibility.
+        self._sweep_lat_cb = QCheckBox()
         self._sweep_lat_cb.setChecked(True)
-        self._sweep_lat_cb.setStyleSheet('QCheckBox { font-size: 11px; }')
-        self._sweep_lon_cb = QCheckBox('Longitudinal')
+        self._sweep_lat_cb.setVisible(False)
+        self._sweep_lon_cb = QCheckBox()
         self._sweep_lon_cb.setChecked(False)
-        self._sweep_lon_cb.setStyleSheet('QCheckBox { font-size: 11px; }')
-        mode_row.addWidget(self._sweep_lat_cb)
-        mode_row.addWidget(self._sweep_lon_cb)
+        self._sweep_lon_cb.setVisible(False)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel('Test:'))
+        self._test_mode = QComboBox()
+        self._test_mode.addItem('Cornering',  'cornering')
+        self._test_mode.addItem('Straights',  'straights')
+        self._test_mode.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #1a5276; }')
+        self._test_mode.setMaximumWidth(140)
+        self._test_mode.currentIndexChanged.connect(self._on_test_mode_changed)
+        mode_row.addWidget(self._test_mode)
         mode_row.addStretch()
         self.add_layout(mode_row)
 
+        # ── Sweep-by axis toggle ───────────────────────────────────────
+        # User picks ONE independent variable for lateral / combined
+        # sweeps; the other is derived from v² = a_y · g_e · R so the
+        # operating points stay self-consistent.  No over-constraint:
+        #   "by g"     : sweep lat-g, derive v = √(g·g_e·R)
+        #   "by speed" : sweep v, derive lat_g = v²/(g_e·R)
+        # Longitudinal trajectory mode ignores this — it sweeps time.
+        # Wrap each row in a QWidget so the whole row (label + spinboxes)
+        # can be hidden as a unit when not relevant.
+        axis_row = QHBoxLayout()
+        axis_row.setContentsMargins(0, 0, 0, 0)
+        axis_row.addWidget(QLabel('Sweep by:'))
+        self._sweep_axis = QComboBox()
+        self._sweep_axis.addItem('Lat-g',  'g')
+        self._sweep_axis.addItem('Speed',  'speed')
+        self._sweep_axis.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #1a5276; }')
+        self._sweep_axis.setMaximumWidth(110)
+        self._sweep_axis.currentIndexChanged.connect(self._on_sweep_axis_changed)
+        axis_row.addWidget(self._sweep_axis)
+        axis_row.addStretch()
+        self._axis_host = QWidget()
+        self._axis_host.setLayout(axis_row)
+        self.add_widget(self._axis_host)
+
         sweep_row = QHBoxLayout()
+        sweep_row.setContentsMargins(0, 0, 0, 0)
         sweep_row.addWidget(QLabel('Range:'))
         self._g_min = _spin(-99, 99, 0, ' g', dec=2, step=0.1)
         self._g_min.setMaximumWidth(65)
@@ -1667,7 +2184,114 @@ class DynamicsPanel(CollapsibleSection):
         self._g_max = _spin(-99, 99, 2.0, ' g', dec=2, step=0.1)
         self._g_max.setMaximumWidth(65)
         sweep_row.addWidget(self._g_max)
-        self.add_layout(sweep_row)
+        sweep_row.addStretch()
+        self._g_sweep_host = QWidget()
+        self._g_sweep_host.setLayout(sweep_row)
+        self.add_widget(self._g_sweep_host)
+
+        # Speed-sweep range — visible only when the axis combo is set
+        # to "Speed".  Initial values are intentionally 0..60 mph so a
+        # newly-built panel doesn't accidentally sweep a meaningless
+        # zero-to-zero range.
+        v_sweep_row = QHBoxLayout()
+        v_sweep_row.setContentsMargins(0, 0, 0, 0)
+        v_sweep_row.addWidget(QLabel('Range:'))
+        self._v_min = _spin(0.0, 1e4, 0.0, ' mph', dec=1, step=5.0)
+        self._v_min.setMaximumWidth(85)
+        v_sweep_row.addWidget(self._v_min)
+        v_sweep_row.addWidget(QLabel('to'))
+        self._v_max = _spin(0.0, 1e4, 60.0, ' mph', dec=1, step=5.0)
+        self._v_max.setMaximumWidth(85)
+        v_sweep_row.addWidget(self._v_max)
+        v_sweep_row.addStretch()
+        self._v_sweep_host = QWidget()
+        self._v_sweep_host.setLayout(v_sweep_row)
+        self._v_sweep_host.setVisible(False)
+        self.add_widget(self._v_sweep_host)
+
+        # Wire sweep-mode checkboxes to update visibility too — the
+        # "Sweep by" combo + range rows only apply when at least one
+        # of {Lateral, combined} is being swept.  Pure longitudinal is
+        # a time-domain trajectory and ignores all three.
+        self._sweep_lat_cb.stateChanged.connect(self._on_sweep_mode_changed)
+        self._sweep_lon_cb.stateChanged.connect(self._on_sweep_mode_changed)
+
+        # ── Acceleration trajectory inputs ─────────────────────────────
+        # Longitudinal sweep is a time-domain trajectory:
+        #   F_engine = P/v   (power-limited, capped by traction at low v)
+        #   F_drag   = ½·ρ·CdA·v²
+        #   a(t)     = (F_engine − F_drag) / m
+        # The integrator runs from start_speed_mph until achievable
+        # accel decays toward terminal (drag balances power) — no
+        # hardcoded duration, the trajectory ends when physics says.
+        # Lateral sweeps ignore all three of these inputs.
+        sv_row = QHBoxLayout()
+        sv_row.addWidget(QLabel('Start speed:'))
+        self._start_speed = _spin(0.0, 1e4, 0.0, ' mph', dec=1, step=5.0)
+        self._start_speed.setMaximumWidth(85)
+        self._start_speed.setToolTip(
+            'Initial velocity at t = 0 of the longitudinal trajectory.\n'
+            'The car accelerates / decelerates from this speed.\n'
+            'Lateral sweeps ignore this (speed comes from a_y·R).')
+        sv_row.addWidget(self._start_speed)
+        sv_row.addWidget(QLabel('End speed:'))
+        self._end_speed = _spin(0.0, 1e4, 0.0, ' mph', dec=1, step=5.0)
+        self._end_speed.setMaximumWidth(85)
+        self._end_speed.setToolTip(
+            'Optional ceiling for the longitudinal trajectory.\n'
+            'When > 0, the run terminates at this speed (or earlier if\n'
+            'physics says).  When 0, the trajectory runs to its natural\n'
+            'end (terminal speed for accel, v = 0 for braking).')
+        sv_row.addWidget(self._end_speed)
+        sv_row.addStretch()
+        self.add_layout(sv_row)
+
+        # ── Trajectory direction (longitudinal mode) ───────────────────
+        # Picks whether the time-domain run is an acceleration (engine
+        # propelling against drag) or a braking event (max-grip
+        # deceleration of all 4 tires until v = 0).  Lateral sweeps
+        # ignore this — they're steady-state operating-point sweeps.
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel('Direction:'))
+        self._traj_direction = QComboBox()
+        self._traj_direction.addItem('Accelerate', 'accel')
+        self._traj_direction.addItem('Brake',      'brake')
+        self._traj_direction.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #1a5276; }')
+        self._traj_direction.setMaximumWidth(110)
+        self._traj_direction.setToolTip(
+            'Longitudinal trajectory direction:\n'
+            '  • Accelerate — v grows from start_speed, engine vs drag,\n'
+            '    terminates at terminal speed (P = drag·v).\n'
+            '  • Brake — v drops from start_speed at full 4-tire μ·g until\n'
+            '    v = 0.  Use start_speed > 0 for a meaningful run.')
+        dir_row.addWidget(self._traj_direction)
+        dir_row.addStretch()
+        self.add_layout(dir_row)
+
+        aero_row = QHBoxLayout()
+        aero_row.addWidget(QLabel('CdA:'))
+        self._cda = _spin(0.001, 1e3, 1.0, ' m²', dec=3, step=0.05)
+        self._cda.setMaximumWidth(95)
+        self._cda.setToolTip(
+            'Drag coefficient × frontal area (m²).\n'
+            '  Sedan ≈ 0.6 · 2.2 = 1.3   |   FSAE no aero ≈ 1.0\n'
+            '  FSAE with aero ≈ 1.5–2.0  |   F1 ≈ 1.3–1.5\n'
+            'Bounds the longitudinal-trajectory terminal speed via\n'
+            '   v_term = ∛(2·P / (ρ·CdA))')
+        aero_row.addWidget(self._cda)
+        aero_row.addWidget(QLabel('Air density:'))
+        self._air_rho = _spin(0.01, 100.0, 1.225, ' kg/m³', dec=3, step=0.005)
+        self._air_rho.setMaximumWidth(95)
+        self._air_rho.setToolTip(
+            'Air density ρ (kg/m³).  ISA sea level / 15 °C = 1.225.\n'
+            'Drops to ~1.18 in hot weather, ~1.10 at altitude.')
+        aero_row.addWidget(self._air_rho)
+        aero_row.addStretch()
+        self.add_layout(aero_row)
 
         # ── Graph picker ─────────────────────────────────────────────────
         self._graph_checks = {}
@@ -1682,7 +2306,9 @@ class DynamicsPanel(CollapsibleSection):
             ('utilization',    'Tire Utilization'),
             ('understeer',     'Understeer Gradient'),
             ('steer_correction', 'Steer Correction'),
+            ('steering_wheel_angle', 'Steering Wheel Angle'),
             ('path_deviation',   'Path Deviation'),
+            ('speed',          'Speed'),
         ]
         _DEFAULT_ON = {'fz', 'roll', 'travel', 'lt', 'utilization'}
 
@@ -1741,11 +2367,117 @@ class DynamicsPanel(CollapsibleSection):
         self._status.setStyleSheet(f'color: {C_SUB}; font-size: 11px;')
         self.add_widget(self._status)
 
+        # Set initial input visibility based on the default test mode.
+        try:
+            self._on_test_mode_changed()
+        except Exception:
+            pass
+
     # ── Public API ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _compute_arb_wheel_rate_Npm(OD_mm: float, ID_mm: float,
+                                    L_half_mm: float, A_mm: float,
+                                    MR: float, G_Npmm2: float,
+                                    E_Npmm2: float) -> float:
+        """Wheel-rate contribution of one anti-roll bar (N/m).
+
+        Hollow-shaft form — the area moments scale with (OD⁴−ID⁴) so a
+        solid bar is the special case ID = 0.  Combines the torsional
+        stiffness of the half-bar and the cantilever bending stiffness
+        of the arm in series, then reduces through the bar→wheel motion
+        ratio.
+
+            J = π·(OD⁴ − ID⁴) / 32          polar 2nd moment (hollow)
+            I = π·(OD⁴ − ID⁴) / 64          area  2nd moment (hollow)
+            K_t = G·J / (A²·L_half)         torsion bar (force at arm tip)
+            K_a = 3·E·I / A³                arm cantilever bending
+            K_arb = (K_t·K_a) / (K_t + K_a) two springs in series
+            K_w   = K_arb / MR_arb²         wheel reflection
+
+        Returns 0 if OD/L/A/MR are non-positive (so the panel never
+        crashes mid-typing) or if ID ≥ OD (degenerate "tube wall = 0").
+        ID < 0 is silently clamped to 0.
+        """
+        import math
+        OD = float(OD_mm); ID = max(0.0, float(ID_mm))
+        L  = float(L_half_mm); A = float(A_mm); MR = float(MR)
+        G  = float(G_Npmm2); E = float(E_Npmm2)
+        if min(OD, L, A, MR) <= 0.0:
+            return 0.0
+        if ID >= OD:                       # zero or negative wall thickness
+            return 0.0
+        D4 = OD ** 4 - ID ** 4             # mm⁴ (positive by check above)
+        J = math.pi * D4 / 32.0            # mm⁴
+        I = math.pi * D4 / 64.0            # mm⁴
+        K_t = G * J / (A * A * L)          # N/mm at arm tip (torsion bar)
+        K_a = 3.0 * E * I / (A * A * A)    # N/mm at arm tip (arm bending)
+        if K_t > 0.0 and K_a > 0.0:
+            K_arb = (K_t * K_a) / (K_t + K_a)
+        else:
+            K_arb = max(K_t, K_a)
+        K_w_Npmm = K_arb / (MR * MR)       # N/mm at wheel
+        return K_w_Npmm * 1000.0           # → N/m
+
+    def set_derived_arb_geometry(self, front: dict, rear: dict) -> None:
+        """Push kinematic-derived ARB arm length / half-length / MR.
+
+        Called by main_window before any :meth:`get_params` so the wheel-rate
+        formula always uses the latest geometry from the kinematic model
+        rather than stale numbers.  Each dict must carry the keys
+        ``'arm_length_mm'``, ``'half_length_mm'``, ``'mr'``.
+        """
+        for key in ('arm_length_mm', 'half_length_mm', 'mr'):
+            if key not in front or key not in rear:
+                return                              # ignore malformed update
+        self._derived_arb_geom['F'] = {k: float(front[k]) for k in
+                                       ('arm_length_mm', 'half_length_mm', 'mr')}
+        self._derived_arb_geom['R'] = {k: float(rear[k]) for k in
+                                       ('arm_length_mm', 'half_length_mm', 'mr')}
+        self._refresh_arb_geom_label()
+
+    def _refresh_arb_geom_label(self) -> None:
+        """Refresh the read-only ARB geometry readout from the cache."""
+        if not hasattr(self, '_arb_geom_label'):
+            return
+        f = self._derived_arb_geom['F']
+        r = self._derived_arb_geom['R']
+        self._arb_geom_label.setText(
+            f"Auto ARB:  F  half {f['half_length_mm']:.1f}  arm {f['arm_length_mm']:.1f} mm   "
+            f"MR {f['mr']:.3f}\n"
+            f"           R  half {r['half_length_mm']:.1f}  arm {r['arm_length_mm']:.1f} mm   "
+            f"MR {r['mr']:.3f}"
+        )
+
     def get_params(self) -> dict:
-        """Return dynamics parameters dict for VehicleParams construction."""
-        return {
+        """Return dynamics parameters dict for VehicleParams construction.
+
+        ``arb_rate_*_Npm`` are *derived* from the bar geometry inputs
+        via :meth:`_compute_arb_wheel_rate_Npm`; nothing in the panel
+        types in a wheel-rate ARB number directly any more.  Of the
+        geometry inputs, the panel only owns D / G / E — the arm length,
+        half-length and MR are pulled from the kinematic model and
+        pushed in via :meth:`set_derived_arb_geometry`.
+        """
+        G  = self._arb_G.value()
+        E  = self._arb_E.value()
+        f_geom = self._derived_arb_geom['F']
+        r_geom = self._derived_arb_geom['R']
+        arb_f_Npm = self._compute_arb_wheel_rate_Npm(
+            OD_mm=self._arb_OD_f.value(),
+            ID_mm=self._arb_ID_f.value(),
+            L_half_mm=f_geom['half_length_mm'],
+            A_mm=f_geom['arm_length_mm'],
+            MR=f_geom['mr'],
+            G_Npmm2=G, E_Npmm2=E)
+        arb_r_Npm = self._compute_arb_wheel_rate_Npm(
+            OD_mm=self._arb_OD_r.value(),
+            ID_mm=self._arb_ID_r.value(),
+            L_half_mm=r_geom['half_length_mm'],
+            A_mm=r_geom['arm_length_mm'],
+            MR=r_geom['mr'],
+            G_Npmm2=G, E_Npmm2=E)
+        params = {
             'total_mass_kg':          self._total_mass.value(),
             'sprung_mass_kg':         self._sprung_mass.value(),
             'unsprung_mass_front_kg': self._us_front.value(),
@@ -1753,14 +2485,275 @@ class DynamicsPanel(CollapsibleSection):
             'spring_rate_front_Npm':  self._spring_f.value() * 175.127,  # lbf/in → N/m
             'spring_rate_rear_Npm':   self._spring_r.value() * 175.127,
             'tire_rate_Npm':          self._tire_rate.value() * 175.127,
-            'arb_rate_front_Npm':     self._arb_f.value() * 175.127,
-            'arb_rate_rear_Npm':      self._arb_r.value() * 175.127,
+            'arb_rate_front_Npm':     arb_f_Npm,
+            'arb_rate_rear_Npm':      arb_r_Npm,
             'power_hp':               self._power_hp.value(),
             'engine_rpm':             self._engine_rpm.value(),
             'total_drive_ratio':      self._primary_ratio.value() * (self._sprocket_driven.value() / max(self._sprocket_drive.value(), 1)),
             'tire_radius_m':          self._tire_radius.value() / 1000,
             'drivetrain':             self._drivetrain.currentText(),
         }
+        # Aero drag — bounds terminal speed in time-domain trajectory.
+        # Guarded with hasattr because get_params can fire from another
+        # widget's signal during _build() before these spinboxes exist
+        # (custom-aero readout calls params_changed which calls
+        # get_params).  When missing, omit the key — VehicleParams uses
+        # its own defaults for both fields, no magic numbers here.
+        if hasattr(self, '_cda'):
+            params['cda_m2'] = self._cda.value()
+        if hasattr(self, '_air_rho'):
+            params['air_density_kg_m3'] = self._air_rho.value()
+        return params
+
+    # ── Save / load (every input on the panel) ───────────────────────────
+
+    def get_state(self) -> dict:
+        """JSON-friendly snapshot of every user-facing input on the panel.
+
+        Used by the project save/load flow.  Excludes values that are
+        *derived* — the ARB arm length / half-length / MR readout is
+        rebuilt from the kinematic model on load, the dyn-constants /
+        driving-info labels are recomputed.  Includes the tire-data file
+        path, the graph-picker selection and the corner selection so
+        re-opening a project restores the user's full UI state, not just
+        the numerical inputs.
+        """
+        return {
+            # Vehicle masses + springs
+            'total_mass_kg':       float(self._total_mass.value()),
+            'sprung_mass_kg':      float(self._sprung_mass.value()),
+            'unsprung_front_kg':   float(self._us_front.value()),
+            'unsprung_rear_kg':    float(self._us_rear.value()),
+            'spring_front_lbfin':  float(self._spring_f.value()),
+            'spring_rear_lbfin':   float(self._spring_r.value()),
+            'tire_rate_lbfin':     float(self._tire_rate.value()),
+            # ARB material / diameters (arm-length / half-length / MR are
+            # *derived* from the kinematic model on load).  ID = 0 is a
+            # solid bar — the saved key set is the same regardless of
+            # cross-section so older v2 hollow-less files still load.
+            'arb_OD_f_mm':         float(self._arb_OD_f.value()),
+            'arb_ID_f_mm':         float(self._arb_ID_f.value()),
+            'arb_OD_r_mm':         float(self._arb_OD_r.value()),
+            'arb_ID_r_mm':         float(self._arb_ID_r.value()),
+            'arb_G_Npmm2':         float(self._arb_G.value()),
+            'arb_E_Npmm2':         float(self._arb_E.value()),
+            # Powertrain
+            'power_hp':            float(self._power_hp.value()),
+            'engine_rpm':          float(self._engine_rpm.value()),
+            'primary_ratio':       float(self._primary_ratio.value()),
+            'sprocket_drive':      float(self._sprocket_drive.value()),
+            'sprocket_driven':     float(self._sprocket_driven.value()),
+            'tire_radius_mm':      float(self._tire_radius.value()),
+            'turn_radius_m':       float(self._turn_radius.value()),
+            'drivetrain':          self._drivetrain.currentText(),
+            # Solve / sweep setpoints
+            'lateral_g':           float(self._lat_g.value()),
+            'longitudinal_g':      float(self._lon_g.value()),
+            'sweep_lat':           bool(self._sweep_lat_cb.isChecked()),
+            'sweep_lon':           bool(self._sweep_lon_cb.isChecked()),
+            'g_min':               float(self._g_min.value()),
+            'g_max':               float(self._g_max.value()),
+            'v_min_mph':           float(self._v_min.value()),
+            'v_max_mph':           float(self._v_max.value()),
+            'sweep_axis':          self._sweep_axis.currentData() or 'g',
+            'test_mode':           self._test_mode.currentData() or 'cornering',
+            'start_speed_mph':     float(self._start_speed.value()),
+            'end_speed_mph':       float(self._end_speed.value()),
+            'cda_m2':              float(self._cda.value()),
+            'air_density_kg_m3':   float(self._air_rho.value()),
+            'traj_direction':      self._traj_direction.currentData() or 'accel',
+            # UI selections
+            'apply_aero':          bool(self._apply_aero_btn.isChecked()),
+            'aero_source':         self.get_aero_source(),
+            'aero_F_ref_N':        float(self._aero_F_ref.value()),
+            'aero_V_ref_kph':      float(self._aero_V_ref.value()),
+            'aero_cop_rear_pct':   float(self._aero_cop_rear.value()),
+            'aero_air_density':    float(self._aero_rho.value()),
+            'graphs':              [k for k, cb in self._graph_checks.items()
+                                    if cb.isChecked()],
+            'corners':             [lbl for lbl, cb in self._corner_cbs.items()
+                                    if cb.isChecked()],
+            # Tire-data file (absolute path; falls back gracefully if
+            # the file moved between save & load)
+            'tire_path':           str(self._tire_path),
+        }
+
+    def set_state(self, d: dict) -> None:
+        """Restore every input from a dict produced by :meth:`get_state`.
+
+        Missing keys are silently left at their current (default) value
+        so an older save file that lacks newer fields still loads.  All
+        widget signals are blocked during the bulk update so we don't
+        emit ``params_changed`` 25 times — a single
+        :meth:`_on_driving_changed` call at the end refreshes everything
+        downstream.
+        """
+        if not isinstance(d, dict):
+            return
+
+        def _set_spin(sb, key):
+            if key in d:
+                try:
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        # Block signals on every widget that emits during set so the
+        # bulk load is atomic from the controller's perspective.
+        widgets = [
+            self._total_mass, self._sprung_mass, self._us_front, self._us_rear,
+            self._spring_f, self._spring_r, self._tire_rate,
+            self._arb_OD_f, self._arb_ID_f, self._arb_OD_r, self._arb_ID_r,
+            self._arb_G, self._arb_E,
+            self._power_hp, self._engine_rpm, self._primary_ratio,
+            self._sprocket_drive, self._sprocket_driven,
+            self._tire_radius, self._turn_radius,
+            self._lat_g, self._lon_g, self._g_min, self._g_max,
+            self._drivetrain, self._sweep_lat_cb, self._sweep_lon_cb,
+            self._apply_aero_btn,
+            self._aero_source, self._aero_F_ref, self._aero_V_ref,
+            self._aero_cop_rear, self._aero_rho,
+        ]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            _set_spin(self._total_mass,      'total_mass_kg')
+            _set_spin(self._sprung_mass,     'sprung_mass_kg')
+            _set_spin(self._us_front,        'unsprung_front_kg')
+            _set_spin(self._us_rear,         'unsprung_rear_kg')
+            _set_spin(self._spring_f,        'spring_front_lbfin')
+            _set_spin(self._spring_r,        'spring_rear_lbfin')
+            _set_spin(self._tire_rate,       'tire_rate_lbfin')
+            # ARB OD/ID — back-compat: old v2 saves used a single
+            # diameter per axle (arb_D_f_mm / arb_D_r_mm) which we
+            # treat as OD with ID = 0 (solid bar).
+            if 'arb_OD_f_mm' in d:
+                _set_spin(self._arb_OD_f,    'arb_OD_f_mm')
+            elif 'arb_D_f_mm' in d:
+                _set_spin(self._arb_OD_f,    'arb_D_f_mm')
+                self._arb_ID_f.setValue(0.0)
+            if 'arb_OD_r_mm' in d:
+                _set_spin(self._arb_OD_r,    'arb_OD_r_mm')
+            elif 'arb_D_r_mm' in d:
+                _set_spin(self._arb_OD_r,    'arb_D_r_mm')
+                self._arb_ID_r.setValue(0.0)
+            _set_spin(self._arb_ID_f,        'arb_ID_f_mm')
+            _set_spin(self._arb_ID_r,        'arb_ID_r_mm')
+            _set_spin(self._arb_G,           'arb_G_Npmm2')
+            _set_spin(self._arb_E,           'arb_E_Npmm2')
+            _set_spin(self._power_hp,        'power_hp')
+            _set_spin(self._engine_rpm,      'engine_rpm')
+            _set_spin(self._primary_ratio,   'primary_ratio')
+            _set_spin(self._sprocket_drive,  'sprocket_drive')
+            _set_spin(self._sprocket_driven, 'sprocket_driven')
+            _set_spin(self._tire_radius,     'tire_radius_mm')
+            _set_spin(self._turn_radius,     'turn_radius_m')
+            _set_spin(self._lat_g,           'lateral_g')
+            _set_spin(self._lon_g,           'longitudinal_g')
+            _set_spin(self._g_min,           'g_min')
+            _set_spin(self._g_max,           'g_max')
+            _set_spin(self._v_min,           'v_min_mph')
+            _set_spin(self._v_max,           'v_max_mph')
+            _set_spin(self._start_speed,     'start_speed_mph')
+            _set_spin(self._cda,             'cda_m2')
+            _set_spin(self._air_rho,         'air_density_kg_m3')
+
+            # Sweep-axis combo
+            if 'sweep_axis' in d:
+                target = str(d['sweep_axis'])
+                for i in range(self._sweep_axis.count()):
+                    if self._sweep_axis.itemData(i) == target:
+                        self._sweep_axis.setCurrentIndex(i)
+                        break
+            # Trajectory direction combo (legacy hidden)
+            if 'traj_direction' in d:
+                target = str(d['traj_direction'])
+                for i in range(self._traj_direction.count()):
+                    if self._traj_direction.itemData(i) == target:
+                        self._traj_direction.setCurrentIndex(i)
+                        break
+            # Test mode combo
+            if 'test_mode' in d:
+                target = str(d['test_mode'])
+                for i in range(self._test_mode.count()):
+                    if self._test_mode.itemData(i) == target:
+                        self._test_mode.setCurrentIndex(i)
+                        break
+
+            if 'drivetrain' in d:
+                idx = self._drivetrain.findText(str(d['drivetrain']))
+                if idx >= 0:
+                    self._drivetrain.setCurrentIndex(idx)
+
+            if 'sweep_lat' in d:
+                self._sweep_lat_cb.setChecked(bool(d['sweep_lat']))
+            if 'sweep_lon' in d:
+                self._sweep_lon_cb.setChecked(bool(d['sweep_lon']))
+            if 'apply_aero' in d:
+                self._apply_aero_btn.setChecked(bool(d['apply_aero']))
+
+            # Aero source + custom inputs.  Tolerate missing keys for
+            # forward compat: an older save without aero_source loads
+            # in 'solved' mode (current behaviour) and the custom-aero
+            # spinboxes keep their defaults.
+            if 'aero_source' in d:
+                target = str(d['aero_source'])
+                for i in range(self._aero_source.count()):
+                    if self._aero_source.itemData(i) == target:
+                        self._aero_source.setCurrentIndex(i)
+                        break
+            _set_spin(self._aero_F_ref,     'aero_F_ref_N')
+            _set_spin(self._aero_V_ref,     'aero_V_ref_kph')
+            _set_spin(self._aero_cop_rear,  'aero_cop_rear_pct')
+            _set_spin(self._aero_rho,       'aero_air_density')
+
+            # Graph & corner checkboxes — block per-widget too because
+            # the parent block above doesn't cover the dict children.
+            if isinstance(d.get('graphs'), list):
+                wanted = set(d['graphs'])
+                for key, cb in self._graph_checks.items():
+                    cb.blockSignals(True)
+                    cb.setChecked(key in wanted)
+                    cb.blockSignals(False)
+            if isinstance(d.get('corners'), list):
+                wanted = set(d['corners'])
+                for key, cb in self._corner_cbs.items():
+                    cb.blockSignals(True)
+                    cb.setChecked(key in wanted)
+                    cb.blockSignals(False)
+
+            # Tire data file — only update the label if a path was
+            # actually saved; empty string means "no tire loaded".
+            if 'tire_path' in d:
+                path = str(d['tire_path'])
+                self._tire_path = path
+                if path:
+                    name = path.split('/')[-1].split('\\')[-1]
+                    self._tire_label.setText(name)
+                    self._tire_label.setStyleSheet(
+                        f'color: {C_TEXT}; font-size: 11px;')
+                else:
+                    self._tire_label.setText('No file loaded')
+                    self._tire_label.setStyleSheet(
+                        f'color: {C_SUB}; font-size: 11px;')
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+        # Refresh dependent UI now that all widgets are bulk-loaded:
+        # custom-aero readout + show/hide the custom group based on the
+        # restored source, and run the driving-info / dyn-constants
+        # pipeline.  Either step is best-effort — a panel reconstruction
+        # bug shouldn't block the file load itself.
+        try:
+            self._on_aero_source_changed()
+            self._on_custom_aero_changed()
+        except Exception:
+            pass
+        try:
+            self._on_driving_changed()
+        except Exception:
+            self.params_changed.emit(self.get_params())
 
     def update_constants(self, veh):
         """Update the computed dynamics constants display from a VehicleParams."""
@@ -1770,6 +2763,13 @@ class DynamicsPanel(CollapsibleSection):
         wr_f = veh.wheel_rate_front_Npm
         wr_r = veh.wheel_rate_rear_Npm
         lines.append(f'Wheel rate:  F {wr_f/175.127:.0f}  R {wr_r/175.127:.0f} lbf/in')
+        # ARB wheel rates (derived from geometry — sanity check against
+        # workbook B63/C63: should land near those numbers when the
+        # geometry inputs match the workbook).
+        arb_f = veh.arb_rate_front_Npm
+        arb_r = veh.arb_rate_rear_Npm
+        lines.append(f'ARB wheel:   F {arb_f/175.127:.1f}  R {arb_r/175.127:.1f} lbf/in'
+                     f'   ({arb_f/1000:.2f} / {arb_r/1000:.2f} N/mm)')
         # Ride rates (series spring+tire)
         rr_f = veh.ride_rate_front_Npm
         rr_r = veh.ride_rate_rear_Npm
@@ -1945,28 +2945,53 @@ class DynamicsPanel(CollapsibleSection):
         })
 
     def _on_sweep(self):
-        lat = self._sweep_lat_cb.isChecked()
-        lon = self._sweep_lon_cb.isChecked()
-        if lat and lon:
-            mode = 'combined'
+        # New test-mode dispatch:
+        #   Cornering : always route through 'combined' so the friction-
+        #               circle clamp applies regardless of lon-g sign.
+        #               Sub-mode is implied by the lon-g spin value:
+        #                  lon = 0  → pure lateral (clamp is a no-op here)
+        #                  lon < 0  → cornering + braking
+        #                  lon > 0  → cornering + acceleration
+        #   Straights : longitudinal trajectory.  Direction inferred
+        #               from start_speed (0 = accel from rest, > 0 =
+        #               brake from velocity).
+        test = self._test_mode.currentData() or 'cornering'
+        if test == 'straights':
+            # Pure straight line — lat-g forced to 0.  The trajectory's
+            # applied longitudinal-g comes from the Lon-g spin (sign
+            # picks accel/brake; magnitude is the target g, clamped
+            # per-step by traction / power / μ-circle).  start_speed
+            # is the initial v.  Nothing else.
+            mode = 'longitudinal'
+            lat_g_fixed = 0.0
+            lon_g_fixed = self._lon_g.value()
+        else:
+            mode = 'combined'             # friction-circle clamp always on
             lat_g_fixed = self._lat_g.value()
             lon_g_fixed = self._lon_g.value()
-        elif lon:
-            mode = 'longitudinal'
-            lat_g_fixed = self._lat_g.value()
-            lon_g_fixed = 0.0  # swept, not fixed
-        else:
-            mode = 'lateral'
-            lat_g_fixed = 0.0  # swept, not fixed
-            lon_g_fixed = 0.0  # unchecked = no longitudinal
+        # Sweep axis: 'g' (lat-g sweep) or 'speed' (mph sweep with R fixed).
+        # Longitudinal mode is always a time-domain trajectory and
+        # ignores this — start/end derive from start_speed + drag.
+        sweep_axis = self._sweep_axis.currentData()
         self.sweep_requested.emit({
             'mode': mode,
-            'g_min': self._g_min.value(),
-            'g_max': self._g_max.value(),
-            'n_points': 41,
-            'lateral_g': lat_g_fixed,
-            'longitudinal_g': lon_g_fixed,
-            'turn_radius_m': self._turn_radius.value(),
+            'sweep_axis':       sweep_axis,
+            'g_min':            self._g_min.value(),
+            'g_max':            self._g_max.value(),
+            'v_min_mph':        self._v_min.value(),
+            'v_max_mph':        self._v_max.value(),
+            'n_points':         41,
+            'lateral_g':        lat_g_fixed,
+            'longitudinal_g':   lon_g_fixed,
+            'turn_radius_m':    self._turn_radius.value(),
+            # Acceleration-trajectory inputs.  Only the longitudinal
+            # sweep uses these.
+            'start_speed_mph':  self._start_speed.value(),
+            'end_speed_mph':    self._end_speed.value(),
+            # Direction inferred from start_speed sign (+0 = accel from
+            # rest, > 0 = brake from velocity).  No separate dropdown.
+            'traj_direction':   ('brake' if self._start_speed.value() > 0
+                                  else 'accel'),
         })
 
     def _on_aero_toggle(self, checked: bool):
@@ -1993,6 +3018,156 @@ class DynamicsPanel(CollapsibleSection):
         else:
             self._aero_label.setText('OFF')
             self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
+
+    # ── Aero source: Solved (inverse) vs Custom (CFD) ───────────────────
+
+    def _on_test_mode_changed(self, *_):
+        """Sync the hidden Lateral/Longitudinal checkboxes with the new
+        Test combo, and refresh visibility of mode-specific inputs.
+
+        Cornering  →  Lateral sweep + (combined when lon-g != 0)
+        Straights  →  Longitudinal trajectory only
+        """
+        is_straights = (self._test_mode.currentData() == 'straights')
+        # Update hidden checkboxes for the existing _on_sweep dispatch
+        # to read.  Cornering = always lateral checked, longitudinal
+        # off (combined is detected later by lon-g sign != 0).
+        self._sweep_lat_cb.blockSignals(True)
+        self._sweep_lon_cb.blockSignals(True)
+        if is_straights:
+            self._sweep_lat_cb.setChecked(False)
+            self._sweep_lon_cb.setChecked(True)
+        else:
+            self._sweep_lat_cb.setChecked(True)
+            self._sweep_lon_cb.setChecked(False)
+        self._sweep_lat_cb.blockSignals(False)
+        self._sweep_lon_cb.blockSignals(False)
+        self._on_sweep_mode_changed()
+
+    def _on_sweep_axis_changed(self, *_):
+        """Defer to the mode-change handler — axis is forced to 'g' in
+        the new Cornering mode anyway."""
+        self._on_sweep_mode_changed()
+
+    def _on_sweep_mode_changed(self, *_):
+        """Show / hide mode-specific inputs based on sweep checkboxes.
+
+        The dynamics panel has THREE distinct modes, mutually exclusive:
+
+          1. Lateral only   — steady-state lat-g (or speed) sweep at
+                              the panel's fixed lon-g.  Trajectory
+                              inputs (Direction / Start / End / CdA /
+                              ρ) are HIDDEN.
+          2. Longitudinal only — time-domain acceleration or braking
+                              trajectory.  `Sweep by`, `Range g`, and
+                              `Range mph` are HIDDEN.
+          3. Both checked (Combined) — steady-state lat-g sweep at the
+                              user-set fixed lon-g.  STILL a steady-
+                              state sweep, NOT a trajectory — trajectory
+                              inputs are HIDDEN here too because they
+                              don't affect the combined solve.
+
+        Net rule:
+          • Trajectory inputs visible iff long-only.
+          • Lateral-axis inputs visible iff lateral checked.
+        """
+        is_cornering = (self._test_mode.currentData() == 'cornering')
+        is_straights = not is_cornering
+
+        # Cornering visible inputs:  lat-g range + lat-g spin + lon-g spin.
+        # Straights visible inputs:  start_speed + lon-g spin only.
+        # Everything else hidden in both modes (Poka Yoke — user can't
+        # enter a value that doesn't apply to the active test).
+        self._axis_host.setVisible(False)
+        self._g_sweep_host.setVisible(is_cornering)
+        self._v_sweep_host.setVisible(False)
+
+        # Lat-g spin: cornering only (Straights is straight-line, lat=0)
+        if hasattr(self, '_lat_row_host'):
+            self._lat_row_host.setVisible(is_cornering)
+        # Lon-g spin: visible in BOTH modes —
+        #   Cornering : held lon-g for the combined sweep
+        #   Straights : applied lon-g for the trajectory
+        if hasattr(self, '_lon_row_host'):
+            self._lon_row_host.setVisible(True)
+
+        # Straights-only: start_speed.  end_speed / CdA / ρ no longer
+        # surface in the UI per the "two inputs only" spec — they
+        # remain VehicleParams defaults internally.
+        if hasattr(self, '_traj_direction'):
+            self._traj_direction.setVisible(False)
+        if hasattr(self, '_start_speed'):
+            self._start_speed.setVisible(is_straights)
+            if hasattr(self, '_start_speed_label'):
+                self._start_speed_label.setVisible(is_straights)
+        for w in (getattr(self, '_end_speed', None),
+                  getattr(self, '_cda', None),
+                  getattr(self, '_air_rho', None)):
+            if w is not None:
+                w.setVisible(False)
+
+    def _on_aero_source_changed(self, *_):
+        """Show/hide the custom-aero group based on the source combobox.
+        Also re-emit ``apply_aero_toggled`` so main_window re-computes the
+        aero load with the now-active source."""
+        is_custom = (self._aero_source.currentData() == 'custom')
+        self._aero_custom_box.setVisible(is_custom)
+        # Re-fire the toggle signal so downstream wiring re-queries the
+        # active source — without this, switching from Solved → Custom
+        # while "Apply Aero" is on leaves stale numbers in the dynamics.
+        if self._apply_aero_btn.isChecked():
+            self.apply_aero_toggled.emit(True)
+
+    def _on_custom_aero_changed(self, *_):
+        """Refresh the read-only ``CL·A`` + downforce-at-ref readout.
+
+        Same V²-scaling identity used downstream:
+            CL·A = 2 · F_ref / (ρ · V_ref²)
+            F(V) = 0.5 · ρ · V² · CL·A
+        Echoes back the equivalent CL·A in m² and the downforce at a few
+        useful reference speeds so the user can sanity-check the numbers
+        against their CFD output before switching Apply Aero on.
+        """
+        if not hasattr(self, '_aero_custom_info'):
+            return
+        F_ref = float(self._aero_F_ref.value())
+        V_ref_kph = float(self._aero_V_ref.value())
+        rho = float(self._aero_rho.value())
+        rear_pct = float(self._aero_cop_rear.value())
+        V_ref_ms = V_ref_kph / 3.6
+        if V_ref_ms <= 0 or rho <= 0:
+            self._aero_custom_info.setText('Invalid ref speed or air density.')
+            return
+        CLA = 2.0 * F_ref / (rho * V_ref_ms ** 2)
+        # Echo at three speed points: 30/60/100 km/h
+        F_30  = 0.5 * rho * (30/3.6) ** 2 * CLA
+        F_60  = 0.5 * rho * (60/3.6) ** 2 * CLA
+        F_100 = 0.5 * rho * (100/3.6) ** 2 * CLA
+        f_split = (1.0 - rear_pct / 100.0)
+        r_split = (rear_pct / 100.0)
+        self._aero_custom_info.setText(
+            f"CL·A = {CLA:.3f} m²   |   "
+            f"F at 30/60/100 km/h = {F_30:.0f} / {F_60:.0f} / {F_100:.0f} N\n"
+            f"Per-axle split @ ref:  F = {F_ref*f_split:.0f} N   "
+            f"R = {F_ref*r_split:.0f} N  ({rear_pct:.0f}% rear)"
+        )
+        self.params_changed.emit(self.get_params())
+
+    def get_custom_aero_params(self) -> dict:
+        """Public getter for main_window's `_get_aero_Fz_per_g` to read
+        when the source combobox is in Custom mode.  Returns a plain
+        dict so the wiring code doesn't need to know about the spinboxes
+        directly."""
+        return {
+            'F_ref_N':       float(self._aero_F_ref.value()),
+            'V_ref_kph':     float(self._aero_V_ref.value()),
+            'cop_rear_pct':  float(self._aero_cop_rear.value()),
+            'air_density':   float(self._aero_rho.value()),
+        }
+
+    def get_aero_source(self) -> str:
+        """Returns 'solved' or 'custom'."""
+        return str(self._aero_source.currentData() or 'solved')
 
     def _on_graph_changed(self):
         self.graph_selection_changed.emit(self.get_selected_graphs())
@@ -2117,9 +3292,9 @@ class AeroPanel(CollapsibleSection):
     def _build(self):
         g = QGridLayout(); g.setSpacing(4); r = 0
         g.addWidget(QLabel('Lateral g:'), r, 0)
-        self._lat_g = _spin(0, 3, 1.5, ' g', dec=2, step=0.1); g.addWidget(self._lat_g, r, 1); r += 1
+        self._lat_g = _spin(-99, 99, 1.5, ' g', dec=2, step=0.1); g.addWidget(self._lat_g, r, 1); r += 1
         g.addWidget(QLabel('Long. g:'), r, 0)
-        self._lon_g = _spin(-3, 3, 0, ' g', dec=2, step=0.1); g.addWidget(self._lon_g, r, 1); r += 1
+        self._lon_g = _spin(-99, 99, 0, ' g', dec=2, step=0.1); g.addWidget(self._lon_g, r, 1); r += 1
         g.addWidget(QLabel('Target util:'), r, 0)
         self._tgt = _spin(0.1, 1.0, 0.80, '', dec=2, step=0.05); g.addWidget(self._tgt, r, 1); r += 1
         self.add_layout(g)
@@ -2176,6 +3351,33 @@ class AeroPanel(CollapsibleSection):
             'longitudinal_g': self._lon_g.value(),
             'target_util': self._tgt.value(),
         })
+
+    # ── Save / load (every input on the panel) ───────────────────────
+    def get_state(self) -> dict:
+        """JSON-friendly snapshot of every input on the aero panel."""
+        return {
+            'lateral_g':      float(self._lat_g.value()),
+            'longitudinal_g': float(self._lon_g.value()),
+            'target_util':    float(self._tgt.value()),
+        }
+
+    def set_state(self, d: dict) -> None:
+        """Restore every input from a dict produced by :meth:`get_state`."""
+        if not isinstance(d, dict):
+            return
+        for key, sb in (
+            ('lateral_g',      self._lat_g),
+            ('longitudinal_g', self._lon_g),
+            ('target_util',    self._tgt),
+        ):
+            if key in d:
+                try:
+                    sb.blockSignals(True)
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+                finally:
+                    sb.blockSignals(False)
 
     def show_result(self, r):
         """r: AeroResult — per-corner deficit, axle needs, total, rear bias."""
@@ -2251,20 +3453,20 @@ class LoadsPanel(CollapsibleSection):
         s['pad_mu'] = _spin(0.1, 1.0, 0.45, '', dec=2, step=0.05)
         g.addWidget(s['pad_mu'], r, 1)
         g.addWidget(QLabel('Piston area:'), r, 2)
-        s['piston_area'] = _spin(50, 5000, 793.5, ' mm\u00b2', dec=1, step=50)
+        s['piston_area'] = _spin(0.1, 1e6, 793.5, ' mm\u00b2', dec=1, step=50)
         g.addWidget(s['piston_area'], r, 3)
 
         r += 1
         g.addWidget(QLabel('Pad radius:'), r, 0)
-        s['pad_radius'] = _spin(30, 200, 94.4, ' mm', dec=1, step=5)
+        s['pad_radius'] = _spin(0.1, 1e6, 94.4, ' mm', dec=1, step=5)
         g.addWidget(s['pad_radius'], r, 1)
         g.addWidget(QLabel('Pistons/cal:'), r, 2)
-        s['num_pistons'] = _spin(1, 6, 1, '', dec=0, step=1)
+        s['num_pistons'] = _spin(1, 99, 1, '', dec=0, step=1)
         g.addWidget(s['num_pistons'], r, 3)
 
         r += 1
         g.addWidget(QLabel('Bolt spacing:'), r, 0)
-        s['bolt_spacing'] = _spin(10, 200, 60, ' mm', dec=1, step=5)
+        s['bolt_spacing'] = _spin(0.1, 1e6, 60, ' mm', dec=1, step=5)
         g.addWidget(s['bolt_spacing'], r, 1)
 
         return g, s
@@ -2286,10 +3488,10 @@ class LoadsPanel(CollapsibleSection):
 
         r = 1
         upr.addWidget(QLabel('Bearing spacing:'), r, 0)
-        self._brg_spacing = _spin(10, 200, 50, ' mm', dec=1, step=5)
+        self._brg_spacing = _spin(0.1, 1e6, 50, ' mm', dec=1, step=5)
         upr.addWidget(self._brg_spacing, r, 1)
         upr.addWidget(QLabel('CP offset:'), r, 2)
-        self._cp_offset = _spin(0, 200, 30, ' mm', dec=1, step=5)
+        self._cp_offset = _spin(0, 1e6, 30, ' mm', dec=1, step=5)
         self._cp_offset.setToolTip(
             'Contact-patch plane offset from inner bearing along spindle')
         upr.addWidget(self._cp_offset, r, 3)
@@ -2341,6 +3543,59 @@ class LoadsPanel(CollapsibleSection):
             cp_offset_mm=self._cp_offset.value(),
             caliper_angle_deg=self._cal_angle.value(),
         )
+
+    # ── Save / load (every input on the panel) ───────────────────────
+    @staticmethod
+    def _brake_state(brk: dict) -> dict:
+        """Snapshot one brake-section's spinbox dict to plain floats."""
+        return {k: float(sb.value()) for k, sb in brk.items()}
+
+    def _apply_brake_state(self, brk: dict, d: dict) -> None:
+        """Restore one brake-section's spinbox dict from a saved dict."""
+        if not isinstance(d, dict):
+            return
+        for k, sb in brk.items():
+            if k in d:
+                try:
+                    sb.blockSignals(True)
+                    sb.setValue(float(d[k]))
+                finally:
+                    sb.blockSignals(False)
+
+    def get_state(self) -> dict:
+        """JSON-friendly snapshot of every input on the loads panel:
+        front + rear brake parameters and the upright/bearing geometry.
+        These feed the static load calculator, so they're as much an
+        "input" as the dynamics inputs.
+        """
+        return {
+            'brake_front':    self._brake_state(self._brk_f),
+            'brake_rear':     self._brake_state(self._brk_r),
+            'bearing_spacing_mm': float(self._brg_spacing.value()),
+            'cp_offset_mm':       float(self._cp_offset.value()),
+            'caliper_angle_deg':  float(self._cal_angle.value()),
+        }
+
+    def set_state(self, d: dict) -> None:
+        """Restore every input from a dict produced by :meth:`get_state`.
+        Tolerates missing keys."""
+        if not isinstance(d, dict):
+            return
+        self._apply_brake_state(self._brk_f, d.get('brake_front', {}))
+        self._apply_brake_state(self._brk_r, d.get('brake_rear', {}))
+        for key, sb in (
+            ('bearing_spacing_mm', self._brg_spacing),
+            ('cp_offset_mm',       self._cp_offset),
+            ('caliper_angle_deg',  self._cal_angle),
+        ):
+            if key in d:
+                try:
+                    sb.blockSignals(True)
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+                finally:
+                    sb.blockSignals(False)
 
     # ── results popup ────────────────────────────────────────────────
     def show_loads(self, loads: dict, lat_g: float = 0.0, lon_g: float = 0.0):
@@ -2567,6 +3822,387 @@ class LoadsPanel(CollapsibleSection):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  BRAKE CALCULATOR PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BrakeCalcPanel(CollapsibleSection):
+    """
+    Brake system calculator.
+
+    Computes line pressure, brake torque, caliper clamping force,
+    lockup pedal force, and single-event rotor temperature rise
+    for all 4 corners.
+    """
+    compute_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__('Brake Calculator', header_color='#D32F2F')
+        self._build()
+
+    def _build(self):
+        # ── Operating point ──────────────────────────────────────────
+        op_grid = QGridLayout(); op_grid.setSpacing(4)
+        op_grid.addWidget(QLabel('Lateral g:'), 0, 0)
+        self._lat_g = _spin(-5, 5, 1.0, ' g', dec=2, step=0.1)
+        op_grid.addWidget(self._lat_g, 0, 1)
+        op_grid.addWidget(QLabel('Lon g:'), 0, 2)
+        self._lon_g = _spin(-5, 5, 0.0, ' g', dec=2, step=0.1)
+        op_grid.addWidget(self._lon_g, 0, 3)
+        self.add_layout(op_grid)
+
+        # ── System-level params ──────────────────────────────────────
+        sys_grid = QGridLayout(); sys_grid.setSpacing(4)
+        lbl = QLabel('Brake System')
+        lbl.setStyleSheet('font-weight: bold; color: #FFA726;')
+        sys_grid.addWidget(lbl, 0, 0, 1, 4)
+
+        r = 1
+        sys_grid.addWidget(QLabel('Pedal ratio:'), r, 0)
+        self._pedal_ratio = _spin(1.0, 20.0, 5.0, ':1', dec=1, step=0.25)
+        self._pedal_ratio.setToolTip('Mechanical advantage of brake pedal lever arm')
+        sys_grid.addWidget(self._pedal_ratio, r, 1)
+
+        sys_grid.addWidget(QLabel('Bias (front):'), r, 2)
+        self._bias_front = _spin(0, 100, 65, ' %', dec=0, step=1)
+        self._bias_front.setToolTip('Brake bias bar setting: % of total force to front')
+        sys_grid.addWidget(self._bias_front, r, 3)
+
+        r += 1
+        sys_grid.addWidget(QLabel('MC bore F:'), r, 0)
+        self._mc_bore_f = _spin(5.0, 40.0, 15.87, ' mm', dec=2, step=0.5)
+        self._mc_bore_f.setToolTip('Front master cylinder bore diameter (5/8" = 15.87mm)')
+        sys_grid.addWidget(self._mc_bore_f, r, 1)
+
+        sys_grid.addWidget(QLabel('MC bore R:'), r, 2)
+        self._mc_bore_r = _spin(5.0, 40.0, 15.87, ' mm', dec=2, step=0.5)
+        self._mc_bore_r.setToolTip('Rear master cylinder bore diameter')
+        sys_grid.addWidget(self._mc_bore_r, r, 3)
+
+        self.add_layout(sys_grid)
+
+        # ── Rotor thermal ────────────────────────────────────────────
+        th_grid = QGridLayout(); th_grid.setSpacing(4)
+        th_lbl = QLabel('Rotor Thermal')
+        th_lbl.setStyleSheet('font-weight: bold; color: #FFA726;')
+        th_grid.addWidget(th_lbl, 0, 0, 1, 4)
+
+        r = 1
+        th_grid.addWidget(QLabel('Rotor mass F:'), r, 0)
+        self._rotor_mass_f = _spin(0.1, 20.0, 1.5, ' kg', dec=2, step=0.1)
+        th_grid.addWidget(self._rotor_mass_f, r, 1)
+        th_grid.addWidget(QLabel('Rotor mass R:'), r, 2)
+        self._rotor_mass_r = _spin(0.1, 20.0, 1.2, ' kg', dec=2, step=0.1)
+        th_grid.addWidget(self._rotor_mass_r, r, 3)
+
+        r += 1
+        th_grid.addWidget(QLabel('Cp (rotor):'), r, 0)
+        self._rotor_cp = _spin(100, 2000, 460, ' J/kg·K', dec=0, step=10)
+        self._rotor_cp.setToolTip('Specific heat capacity of rotor material\n'
+                                   'Cast iron ≈ 460 J/kg·K\n'
+                                   'Carbon-carbon ≈ 710 J/kg·K')
+        th_grid.addWidget(self._rotor_cp, r, 1)
+        th_grid.addWidget(QLabel('Ambient:'), r, 2)
+        self._ambient_temp = _spin(-20, 60, 25, ' °C', dec=0, step=5)
+        th_grid.addWidget(self._ambient_temp, r, 3)
+
+        r += 1
+        th_grid.addWidget(QLabel('Brake from:'), r, 0)
+        self._brake_speed = _spin(0, 200, 60, ' mph', dec=0, step=5)
+        self._brake_speed.setToolTip('Initial speed for single-event thermal calc')
+        th_grid.addWidget(self._brake_speed, r, 1)
+        th_grid.addWidget(QLabel('to:'), r, 2)
+        self._brake_speed_end = _spin(0, 200, 0, ' mph', dec=0, step=5)
+        th_grid.addWidget(self._brake_speed_end, r, 3)
+
+        self.add_layout(th_grid)
+
+        # ── Compute button ───────────────────────────────────────────
+        self._compute_btn = QPushButton('Compute Brakes')
+        self._compute_btn.setStyleSheet(
+            'QPushButton { background: #B71C1C; color: white; padding: 6px 16px; '
+            'border-radius: 3px; font-weight: bold; }'
+            'QPushButton:hover { background: #D32F2F; }')
+        self._compute_btn.clicked.connect(lambda: self.compute_requested.emit())
+        self.add_widget(self._compute_btn)
+
+        # ── Status ───────────────────────────────────────────────────
+        self._status = QLabel('')
+        self._status.setStyleSheet('color: #888; font-size: 11px;')
+        self.add_widget(self._status)
+
+    def get_system_params(self, tire_radius_m: float = 0.203):
+        from vahan.loads import BrakeSystemParams
+        return BrakeSystemParams(
+            pedal_ratio=self._pedal_ratio.value(),
+            mc_bore_front_mm=self._mc_bore_f.value(),
+            mc_bore_rear_mm=self._mc_bore_r.value(),
+            bias_pct_front=self._bias_front.value(),
+            tire_radius_m=tire_radius_m,
+        )
+
+    def get_thermal_params(self) -> dict:
+        return {
+            'rotor_mass_f_kg': self._rotor_mass_f.value(),
+            'rotor_mass_r_kg': self._rotor_mass_r.value(),
+            'rotor_cp':        self._rotor_cp.value(),
+            'ambient_C':       self._ambient_temp.value(),
+            'speed_start_mph': self._brake_speed.value(),
+            'speed_end_mph':   self._brake_speed_end.value(),
+        }
+
+    # ── Save / load ─────────────────────────────────────────────────
+    def get_state(self) -> dict:
+        return {
+            'lat_g':          self._lat_g.value(),
+            'lon_g':          self._lon_g.value(),
+            'pedal_ratio':    self._pedal_ratio.value(),
+            'mc_bore_f_mm':   self._mc_bore_f.value(),
+            'mc_bore_r_mm':   self._mc_bore_r.value(),
+            'bias_front_pct': self._bias_front.value(),
+            'rotor_mass_f_kg': self._rotor_mass_f.value(),
+            'rotor_mass_r_kg': self._rotor_mass_r.value(),
+            'rotor_cp':        self._rotor_cp.value(),
+            'ambient_C':       self._ambient_temp.value(),
+            'speed_start_mph': self._brake_speed.value(),
+            'speed_end_mph':   self._brake_speed_end.value(),
+        }
+
+    def set_state(self, d: dict) -> None:
+        if not isinstance(d, dict):
+            return
+        _map = {
+            'lat_g':          self._lat_g,
+            'lon_g':          self._lon_g,
+            'pedal_ratio':    self._pedal_ratio,
+            'mc_bore_f_mm':   self._mc_bore_f,
+            'mc_bore_r_mm':   self._mc_bore_r,
+            'bias_front_pct': self._bias_front,
+            'rotor_mass_f_kg': self._rotor_mass_f,
+            'rotor_mass_r_kg': self._rotor_mass_r,
+            'rotor_cp':        self._rotor_cp,
+            'ambient_C':       self._ambient_temp,
+            'speed_start_mph': self._brake_speed,
+            'speed_end_mph':   self._brake_speed_end,
+        }
+        for key, sb in _map.items():
+            if key in d:
+                try:
+                    sb.blockSignals(True)
+                    sb.setValue(float(d[key]))
+                finally:
+                    sb.blockSignals(False)
+
+    # ── Results display ─────────────────────────────────────────────
+    def show_results(self, results: dict, Fz: dict,
+                     lat_g: float = 0.0, lon_g: float = 0.0,
+                     thermal: dict = None):
+        """Display brake calc results in a popup dialog.
+
+        thermal : dict, optional
+            Per-corner thermal results from compute_brake_thermal().
+            Keys: 'FL'...'RR' → dict with 'energy_J', 'delta_T_C', 'peak_T_C'.
+        """
+        self._status.setText(
+            f'Computed at {lat_g:.2f}g lateral, {lon_g:.2f}g longitudinal')
+
+        rows = [
+            ('header', 'VERTICAL LOADS', None, None),
+            ('Fz',                    'Fz_N',                    'N',   0),
+            ('Tire μ (from TTC)',     'tire_mu',                 '',    2),
+            ('', None, None, None),
+
+            ('header', 'LOCKUP THRESHOLD', None, None),
+            ('Lockup Fx',             'lockup_Fx_N',             'N',   0),
+            ('Lockup brake torque',   'lockup_torque_Nm',        'Nm',  1),
+            ('Lockup clamp force',    'lockup_clamp_N',          'N',   0),
+            ('Lockup line pressure',  'lockup_line_pressure_MPa','MPa', 2),
+            ('Lockup pedal force',    'lockup_pedal_force_N',    'N',   1),
+        ]
+
+        # Append thermal rows if available
+        if thermal:
+            rows.append(('', None, None, None))
+            rows.append(('header', 'ROTOR THERMAL  (single braking event, adiabatic)', None, None))
+            rows.append(('Energy absorbed',  '_thermal_energy_kJ',  'kJ',  2))
+            rows.append(('Temperature rise', '_thermal_delta_T_C',  '°C',  0))
+            rows.append(('Peak rotor temp',  '_thermal_peak_T_C',   '°C',  0))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Brake Calculator')
+        dlg.setMinimumSize(700, 500 if thermal else 420)
+        dlg.setStyleSheet('''
+            QDialog { background: #000; color: #e0e0e0; }
+            QLabel  { color: #e0e0e0; }
+            QTableWidget { background: #0a0a0a; color: #e0e0e0;
+                           gridline-color: #2a2a2a; border: none; font-size: 12px; }
+            QHeaderView::section { background: #111; color: #ccc;
+                                   border: 1px solid #2a2a2a; padding: 4px;
+                                   font-weight: bold; font-size: 12px; }
+        ''')
+        lay = QVBoxLayout(dlg)
+
+        # ── Header ───────────────────────────────────────────────────
+        lon_desc = ''
+        if lon_g < -0.01:
+            lon_desc = f', {abs(lon_g):.2f}g braking'
+        elif lon_g > 0.01:
+            lon_desc = f', {lon_g:.2f}g acceleration'
+        cond = QLabel(f'Operating point:  {lat_g:.2f}g lateral{lon_desc}')
+        cond.setStyleSheet(
+            'color: #FFA726; font-size: 14px; font-weight: bold; padding: 6px;')
+        lay.addWidget(cond)
+
+        # Show system summary
+        sp = self.get_system_params()
+        import math
+        mc_f_area = sp.mc_area_front_mm2
+        mc_r_area = sp.mc_area_rear_mm2
+        sys_lbl = QLabel(
+            f'Pedal ratio {sp.pedal_ratio:.1f}:1  |  '
+            f'MC bore F/R {sp.mc_bore_front_mm:.1f}/{sp.mc_bore_rear_mm:.1f} mm  '
+            f'({mc_f_area:.0f}/{mc_r_area:.0f} mm²)  |  '
+            f'Bias {sp.bias_pct_front:.0f}% front  |  '
+            f'Tire R {sp.tire_radius_m*1000:.0f} mm  |  '
+            f'Tire μ from TTC (per corner)')
+        sys_lbl.setStyleSheet('color: #aaa; font-size: 11px; padding: 2px 6px;')
+        sys_lbl.setWordWrap(True)
+        lay.addWidget(sys_lbl)
+
+        # ── Table ────────────────────────────────────────────────────
+        tbl = QTableWidget(len(rows), 4)
+        tbl.setHorizontalHeaderLabels(['FL', 'FR', 'RL', 'RR'])
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+
+        vlabels = []
+        for ri, (label_txt, attr, unit, dec) in enumerate(rows):
+            if label_txt == 'header':
+                vlabels.append('')
+                for c in range(4):
+                    it = QTableWidgetItem(attr if c == 0 else '')
+                    if c == 0:
+                        it.setForeground(QColor('#FFA726'))
+                        f = it.font(); f.setBold(True); it.setFont(f)
+                    it.setBackground(QColor('#111111'))
+                    tbl.setItem(ri, c, it)
+                tbl.setSpan(ri, 0, 1, 4)
+                continue
+
+            if attr is None:
+                vlabels.append('')
+                for c in range(4):
+                    it = QTableWidgetItem('')
+                    it.setBackground(QColor('#0a0a0a'))
+                    tbl.setItem(ri, c, it)
+                continue
+
+            vlabels.append(f'{label_txt} ({unit})' if unit else label_txt)
+            for c, corner in enumerate(['FL', 'FR', 'RL', 'RR']):
+                # Thermal pseudo-attrs start with '_thermal_'
+                if attr.startswith('_thermal_') and thermal:
+                    th = thermal.get(corner, {})
+                    th_key = attr.replace('_thermal_', '')
+                    val = th.get(th_key, 0)
+                else:
+                    cr = results.get(corner)
+                    val = getattr(cr, attr, 0) if cr else 0
+                val = val + 0.0
+                txt = f'{val:.{dec}f}'
+                it = QTableWidgetItem(txt)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Color thermal peak temp by severity
+                if attr == '_thermal_peak_T_C' and val > 0:
+                    if val > 600:
+                        it.setForeground(QColor('#EF5350'))   # red — too hot
+                    elif val > 400:
+                        it.setForeground(QColor('#FFA726'))   # orange — warm
+                    else:
+                        it.setForeground(QColor('#66BB6A'))   # green — fine
+                else:
+                    it.setForeground(QColor('#e0e0e0'))
+                tbl.setItem(ri, c, it)
+
+        tbl.setVerticalHeaderLabels(vlabels)
+        tbl.resizeRowsToContents()
+        lay.addWidget(tbl)
+
+        # ── Lockup summary ───────────────────────────────────────────
+        # Which corner locks first? = lowest lockup pedal force
+        lockup_forces = {}
+        for corner in ['FL', 'FR', 'RL', 'RR']:
+            cr = results.get(corner)
+            if cr and cr.lockup_pedal_force_N > 0:
+                lockup_forces[corner] = cr.lockup_pedal_force_N
+
+        if lockup_forces:
+            first = min(lockup_forces, key=lockup_forces.get)
+            first_force = lockup_forces[first]
+            first_lbl = QLabel(
+                f'⚠  First lockup: {first} at {first_force:.0f} N pedal force  '
+                f'({first_force / 4.448:.0f} lbf)')
+            axle = 'Front' if first[0] == 'F' else 'Rear'
+            first_lbl.setStyleSheet(
+                'color: #EF5350; font-size: 13px; font-weight: bold; padding: 6px;')
+            lay.addWidget(first_lbl)
+
+            # Show front vs rear lockup balance
+            front_avg = (lockup_forces.get('FL', 0) + lockup_forces.get('FR', 0)) / 2
+            rear_avg = (lockup_forces.get('RL', 0) + lockup_forces.get('RR', 0)) / 2
+            if front_avg > 0 and rear_avg > 0:
+                if front_avg < rear_avg:
+                    balance = f'Fronts lock first ({front_avg:.0f} vs {rear_avg:.0f} N)'
+                    color = '#FFA726'
+                else:
+                    balance = f'Rears lock first ({rear_avg:.0f} vs {front_avg:.0f} N)'
+                    color = '#EF5350'
+                bal_lbl = QLabel(balance)
+                bal_lbl.setStyleSheet(
+                    f'color: {color}; font-size: 12px; padding: 2px 6px;')
+                lay.addWidget(bal_lbl)
+
+        # ── Thermal summary ───────────────────────────────────────────
+        if thermal:
+            peak_temps = {c: thermal[c]['peak_T_C'] for c in ['FL', 'FR', 'RL', 'RR']}
+            hottest = max(peak_temps, key=peak_temps.get)
+            hottest_T = peak_temps[hottest]
+            tp = self.get_thermal_params()
+            speed_str = (f'{tp["speed_start_mph"]:.0f} → '
+                         f'{tp["speed_end_mph"]:.0f} mph')
+
+            if hottest_T > 600:
+                temp_color = '#EF5350'
+                verdict = 'EXCEEDS SAFE LIMIT'
+            elif hottest_T > 400:
+                temp_color = '#FFA726'
+                verdict = 'warm but acceptable'
+            else:
+                temp_color = '#66BB6A'
+                verdict = 'within safe range'
+
+            th_lbl = QLabel(
+                f'Hottest rotor: {hottest} at {hottest_T:.0f}°C  '
+                f'({verdict})  —  {speed_str} adiabatic stop')
+            th_lbl.setStyleSheet(
+                f'color: {temp_color}; font-size: 12px; font-weight: bold; padding: 4px 6px;')
+            lay.addWidget(th_lbl)
+
+        # ── Buttons ──────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
+                      'border-radius: 3px; } QPushButton:hover { background: #555; }')
+
+        close_btn = QPushButton('Close')
+        close_btn.setStyleSheet(_btn_style)
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        dlg.exec()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  DYNAMICS OPTIMIZER PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2578,6 +4214,7 @@ _OPT_METRICS = [
     ('lltd_pct',                'LLTD (elastic LT front)', '%'),
     ('utilization_max',         'Max utilization',     ''),
     ('utilization_spread',      'Util. spread',        ''),
+    ('ideal_ackermann_pct',     'Ideal Ackermann',     '%'),
 ]
 
 
@@ -2600,10 +4237,16 @@ class DynamicsOptPanel(CollapsibleSection):
         # ── Operating point ──────────────────────────────────────────
         op_grid = QGridLayout(); op_grid.setSpacing(4)
         op_grid.addWidget(QLabel('Analyze at:'), 0, 0)
-        self._opt_lat_g = _spin(-5, 5, 1.2, ' g lat', dec=2, step=0.1)
+        self._opt_lat_g = _spin(-99, 99, 1.2, ' g lat', dec=2, step=0.1)
         op_grid.addWidget(self._opt_lat_g, 0, 1)
-        self._opt_lon_g = _spin(-5, 5, 0.0, ' g lon', dec=2, step=0.1)
+        self._opt_lon_g = _spin(-99, 99, 0.0, ' g lon', dec=2, step=0.1)
         op_grid.addWidget(self._opt_lon_g, 0, 2)
+        op_grid.addWidget(QLabel('Turn radius:'), 1, 0)
+        self._opt_turn_radius = _spin(1.0, 200.0, 7.5, ' m', dec=1, step=0.5)
+        self._opt_turn_radius.setToolTip(
+            'Turn radius for ideal Ackermann computation.\n'
+            'FSAE typical: 4–10 m skidpad, 6–15 m endurance.')
+        op_grid.addWidget(self._opt_turn_radius, 1, 1)
         self.add_layout(op_grid)
 
         # ── Analyze button ───────────────────────────────────────────
@@ -2702,6 +4345,7 @@ class DynamicsOptPanel(CollapsibleSection):
         self.analyze_requested.emit({
             'lateral_g': self._opt_lat_g.value(),
             'longitudinal_g': self._opt_lon_g.value(),
+            'turn_radius_m': self._opt_turn_radius.value(),
         })
         self._opt_status.setText('Analyzing...')
         self._analyze_btn.setEnabled(False)
@@ -2715,9 +4359,13 @@ class DynamicsOptPanel(CollapsibleSection):
 
         bl = analysis['baseline']
         parts = []
+        import math
         for key, label, unit in _OPT_METRICS:
             val = bl.get(key, 0)
-            parts.append(f'{label}: {val:.2f}{unit}')
+            if math.isnan(val):
+                parts.append(f'{label}: N/A')
+            else:
+                parts.append(f'{label}: {val:.2f}{unit}')
         self._baseline_label.setText('Baseline:  ' + '  |  '.join(parts))
         self._opt_status.setText(
             f'Done — {len(analysis["sensitivities"])} knobs analyzed')
@@ -2741,6 +4389,10 @@ class DynamicsOptPanel(CollapsibleSection):
                 label = l; unit = u; break
         if self._analysis is not None:
             bl = self._analysis['baseline'].get(key, 0)
+            if math.isnan(bl):
+                self._target_dir_label.setText(
+                    f'{label}: N/A (no tire model or turn radius)')
+                return
             predicted = bl + delta
             self._target_dir_label.setText(
                 f'Target: {label} {bl:.2f}{unit} -> {predicted:.2f}{unit}')
@@ -2844,11 +4496,13 @@ class DynamicsOptPanel(CollapsibleSection):
             # Side effects — show as absolute values (baseline -> predicted)
             se_parts = []
             for metric, delta in rec['side_effects'].items():
-                if abs(delta) < 0.001:
+                if math.isnan(delta) or abs(delta) < 0.001:
                     continue
                 for k, l, u in _OPT_METRICS:
                     if k == metric:
                         bl = baseline.get(metric, 0)
+                        if math.isnan(bl):
+                            continue
                         se_parts.append(f'{l}: {bl:.2f} -> {bl + delta:.2f}{u}')
                         break
             item = QTableWidgetItem('\n'.join(se_parts) if se_parts else 'None')
@@ -2932,3 +4586,540 @@ class DynamicsOptPanel(CollapsibleSection):
             'border-radius: 3px; font-weight: bold; }')
         lay.addWidget(close_btn)
         dlg.exec()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SKIDPAD / TRANSIENT PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TRANSIENT_TESTS = [
+    ('skidpad',       'FSAE Skidpad (single circle)'),
+    ('skidpad_full',  'FSAE Skidpad (full figure-8)'),
+    ('step',          'Step steer'),
+    ('ramp',          'Ramp steer'),
+    ('sine',          'Sine (freq sweep)'),
+]
+
+_TRANSIENT_SIGNALS = [
+    ('yaw_rate',    'Yaw rate (deg/s)'),
+    ('ay',          'Lateral g'),
+    ('roll',        'Roll angle (deg)'),
+    ('beta',        'Body slip (deg)'),
+    ('velocity',    'Velocity (m/s)'),
+    ('slip_angle',  'Tire slip angles'),
+    ('Fz',          'Per-corner Fz'),
+    ('path',        'Trajectory (X-Y)'),
+    ('steer',       'Steering input'),
+]
+
+# Solve-mode toggle for closed-loop skidpad tests.  Either the driver
+# picks the speed (and the resulting lateral-g falls out of the sim), or
+# they pick the target lateral-g (and the speed is derived from the
+# steady-state relation v² = a_y · g · R).  Mutually exclusive — cannot
+# "solve for both" because on a fixed-radius path they are linked.
+_TRANSIENT_SOLVE_MODES = [
+    ('target_speed', 'Target speed'),
+    ('target_lat_g', 'Target lateral g'),
+]
+
+
+class SkidpadPanel(CollapsibleSection):
+    """
+    Time-domain transient dynamics — skidpad, step-steer, ramp-steer.
+
+    Emits simulate_requested with a dict of all simulation parameters.
+    Main window builds the TransientSolver, runs it in a worker,
+    and routes results back via show_result().
+    """
+    simulate_requested = pyqtSignal(dict)
+    signals_changed    = pyqtSignal(list)    # selected plot signals
+
+    def __init__(self):
+        super().__init__('Skidpad / Transient', header_color='#FFB74D')
+        self._build()
+
+    def _build(self):
+        # ── Test type ───────────────────────────────────────────────────
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel('Test:'))
+        self._test_combo = QComboBox()
+        for key, label in _TRANSIENT_TESTS:
+            self._test_combo.addItem(label, key)
+        self._test_combo.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #7B3F00; }')
+        self._test_combo.currentIndexChanged.connect(self._on_test_changed)
+        type_row.addWidget(self._test_combo, 1)
+        self.add_layout(type_row)
+
+        # ── Solve mode toggle ────────────────────────────────────────────
+        # For closed-loop skidpad tests, the driver can either specify a
+        # target speed (and read off the resulting lateral-g) OR specify
+        # a target lateral-g (and have the speed derived from the
+        # steady-state relation v = √(a_y · g · R)).  These are mutually
+        # exclusive because on a fixed-radius path the two are linked —
+        # picking one pins the other.
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel('Solve for:'))
+        self._solve_mode_combo = QComboBox()
+        for key, label in _TRANSIENT_SOLVE_MODES:
+            self._solve_mode_combo.addItem(label, key)
+        self._solve_mode_combo.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #7B3F00; }')
+        self._solve_mode_combo.currentIndexChanged.connect(self._on_solve_mode_changed)
+        mode_row.addWidget(self._solve_mode_combo, 1)
+        self.add_layout(mode_row)
+
+        # ── Driving conditions ───────────────────────────────────────────
+        # We keep a {key: (QLabel, QSpinBox)} map so redundant rows can be
+        # hidden based on test type (FSAE skidpad fixes radius at 9.125 m,
+        # derives peak steer from δ = L / R, sim duration from lap time).
+        self._rows: dict = {}
+        g = QGridLayout(); g.setSpacing(4)
+        r = 0
+        def row(key, label_txt, lo, hi, val, suf, r, dec=1, step=1.0):
+            lbl = QLabel(label_txt)
+            g.addWidget(lbl, r, 0)
+            sb = _spin(lo, hi, val, suf, dec=dec, step=step)
+            g.addWidget(sb, r, 1)
+            self._rows[key] = (lbl, sb)
+            return sb
+
+        # Target speed in MPH — internally converted to m/s in get_params().
+        # Default 23.3 mph ≈ 37.4 km/h ≈ typical FSAE skidpad entry speed.
+        self._target_speed   = row('speed',   'Target speed:',  0.1, 1e6, 23.3, ' mph',  r, dec=1, step=1); r += 1
+        # Target lateral-g: only used when the mode toggle is on "Target
+        # lateral g".  Default 1.50 g ≈ typical FSAE skidpad cornering
+        # limit on slicks.  Speed then falls out as v = √(a_y · g · R).
+        self._target_lat_g   = row('lat_g',   'Target lat g:',  0.01, 5.0, 1.50, ' g',   r, dec=2, step=0.05); r += 1
+        self._skidpad_radius = row('radius',  'Skidpad radius:', 0.01, 1e6, 9.125, ' m', r, dec=3, step=0.5); r += 1
+        self._steer_deg      = row('steer',   'Peak steer:',    -1e4, 1e4, 12.0, ' deg', r, dec=1, step=1); r += 1
+        self._ramp_duration  = row('ramp',    'Ramp duration:', 0.001, 1e6, 0.5, ' s',   r, dec=2, step=0.1); r += 1
+        self._sim_duration   = row('sim',     'Sim duration:',  0.01, 1e6, 5.0, ' s',   r, dec=1, step=0.5); r += 1
+        self._dt_ms          = row('dt',      'Time step:',     0.001, 1e6, 2.0, ' ms', r, dec=1, step=0.5); r += 1
+        self.add_layout(g)
+
+        # Direction (left/right) — only meaningful for skidpad, but useful elsewhere
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel('Direction:'))
+        self._dir_combo = QComboBox()
+        self._dir_combo.addItems(['Left', 'Right'])
+        self._dir_combo.setStyleSheet(
+            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
+            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
+            'selection-background-color: #7B3F00; }')
+        self._dir_combo.setMaximumWidth(100)
+        dir_row.addWidget(self._dir_combo)
+        dir_row.addStretch()
+        self.add_layout(dir_row)
+
+        # ── Transient-specific params ────────────────────────────────────
+        # Inertias (Ixx, Izz) and Ackermann % are auto-computed from the
+        # car + hardpoint geometry in the dispatch.  Body roll damping is
+        # **derived** from these damper bump/rebound coefficients via
+        #     c_phi = Σ_axle (c_bump+c_rebound)·MR²·t²/4
+        # using the motion-ratio and track-width fields already in the
+        # car spec.  The derived c_phi is echoed back below in the
+        # _auto_info label.  Defaults below are placeholders only — set
+        # them from the actual damper dyno curve (e.g. low-frequency
+        # bump/rebound slopes from your "Springs, Dampers, Anti-roll"
+        # workbook).
+        gg = QGroupBox('Damper rates & steer lag')
+        gg.setStyleSheet(
+            'QGroupBox { color: #FFB74D; font-size: 11px; border: 1px solid #333; '
+            'border-radius: 3px; margin-top: 6px; padding: 6px; }'
+            'QGroupBox::title { left: 6px; padding: 0 4px; }')
+        gl = QGridLayout(gg); gl.setSpacing(4)
+        def grow(label, lo, hi, val, suf, r, dec=1, step=1.0):
+            gl.addWidget(QLabel(label), r, 0)
+            sb = _spin(lo, hi, val, suf, dec=dec, step=step)
+            gl.addWidget(sb, r, 1)
+            return sb
+        r = 0
+        # Damper coefficients are at the SHOCK (force/velocity slope at
+        # the damper body, not at the wheel).  Conversion to wheel rate
+        # uses the kinematic motion ratio from the car spec.
+        self._dmp_F_bump = grow('Damper F bump:',    0, 1e6, 1305.0, ' N·s/m', r, dec=0, step=25); r += 1
+        self._dmp_F_reb  = grow('Damper F rebound:', 0, 1e6, 2936.0, ' N·s/m', r, dec=0, step=25); r += 1
+        self._dmp_R_bump = grow('Damper R bump:',    0, 1e6, 1483.0, ' N·s/m', r, dec=0, step=25); r += 1
+        self._dmp_R_reb  = grow('Damper R rebound:', 0, 1e6, 3338.0, ' N·s/m', r, dec=0, step=25); r += 1
+        self._steer_tau  = grow('Steer lag:',        0, 1e6,    0.02, ' s',     r, dec=3, step=0.005); r += 1
+        self._steer_tau.setToolTip(
+            'First-order lag between commanded and actual steer angle.\n'
+            '• 0.01–0.02 s for closed-loop path-following (Stanley) — '
+            'fast actuator, controller is stable.\n'
+            '• 0.10–0.25 s only for human-driven open-loop tests — '
+            'will destabilise closed-loop controllers.\n'
+            '• 0 is invalid (ODE goes singular); the solver clamps '
+            'silently to 1 ms.')
+        self.add_widget(gg)
+
+        # Auto-computed readout — populated by main_window before each sim.
+        self._auto_info = QLabel(
+            'Izz, Ixx, Ackermann — auto-computed from car + kinematics at run time.')
+        self._auto_info.setStyleSheet(
+            'color: #888; font-size: 10px; font-style: italic; '
+            'background: #0a0a0a; padding: 4px 6px; border: 1px solid #1a1a1a; '
+            'border-radius: 3px;')
+        self._auto_info.setWordWrap(True)
+        self.add_widget(self._auto_info)
+
+        # ── Simulate button ──────────────────────────────────────────────
+        self._sim_btn = QPushButton('Simulate')
+        self._sim_btn.setStyleSheet(
+            'QPushButton { background: #7B3F00; color: white; padding: 6px 16px; '
+            'border-radius: 3px; font-weight: bold; }'
+            'QPushButton:hover { background: #A0522D; }'
+            'QPushButton:disabled { background: #333; color: #666; }')
+        self._sim_btn.clicked.connect(self._on_simulate)
+        self.add_widget(self._sim_btn)
+
+        # ── Status ────────────────────────────────────────────────────────
+        self._status = QLabel('')
+        self._status.setStyleSheet(f'color: {C_SUB}; font-size: 11px;')
+        self._status.setWordWrap(True)
+        self.add_widget(self._status)
+
+        # ── Results readout ──────────────────────────────────────────────
+        self._results_lbl = QLabel('')
+        self._results_lbl.setStyleSheet(
+            'color: #FFB74D; font-size: 11px; font-family: monospace; '
+            'background: #0a0a0a; padding: 6px; border: 1px solid #1a1a1a; '
+            'border-radius: 3px;')
+        self._results_lbl.setWordWrap(True)
+        self.add_widget(self._results_lbl)
+
+        # ── Plot signal picker ───────────────────────────────────────────
+        sig_lbl = QLabel('Plots:')
+        sig_lbl.setStyleSheet('color: #e0e0e0; font-size: 11px; font-weight: bold;')
+        self.add_widget(sig_lbl)
+
+        self._sig_list = QListWidget()
+        self._sig_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self._sig_list.setMaximumHeight(140)
+        self._sig_list.setStyleSheet(
+            'QListWidget { background: #0a0a0a; color: #e0e0e0; '
+            'border: 1px solid #333; font-size: 11px; }'
+            'QListWidget::item { padding: 2px 6px; }'
+            'QListWidget::item:selected { background: #7B3F00; color: white; }')
+        for key, label in _TRANSIENT_SIGNALS:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            self._sig_list.addItem(item)
+        # Default selections
+        for i in range(self._sig_list.count()):
+            key = self._sig_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if key in ('yaw_rate', 'ay', 'roll'):
+                self._sig_list.item(i).setSelected(True)
+        self._sig_list.itemSelectionChanged.connect(self._on_signals_changed)
+        self.add_widget(self._sig_list)
+
+        # Initialize visibility based on default test
+        self._on_test_changed()
+
+    # ── Test type dependent visibility ───────────────────────────────────
+
+    def _show_rows(self, visible_keys: set):
+        """Show only the (label, spinbox) rows whose keys are in visible_keys;
+        hide the rest so redundant inputs don't clutter the UI."""
+        for key, (lbl, sb) in self._rows.items():
+            vis = key in visible_keys
+            lbl.setVisible(vis)
+            sb.setVisible(vis)
+
+    def _on_test_changed(self):
+        key = self._test_combo.currentData()
+        # FSAE skidpad fixes radius at 9.125 m, peak steer = L/R, sim
+        # duration = lap count × lap time.  Only the speed (and timestep)
+        # are real user inputs — hide everything else.
+        # The target-lat-g row is shown for skidpad tests only (they have
+        # a fixed radius so v = √(a_y·g·R) is well-defined); for open
+        # straight-line tests (step/ramp/sine) lateral-g isn't a setpoint
+        # so the mode toggle is forced back to "Target speed".
+        if key == 'skidpad_full':
+            self._show_rows({'speed', 'lat_g', 'dt'})
+            self._skidpad_radius.setValue(9.125)        # FSAE regulation
+            self._solve_mode_combo.setEnabled(True)
+            # Time step stays at whatever user picked.
+        elif key == 'skidpad':
+            # Single-circle legacy mode — let the user pick radius + ramp.
+            self._show_rows({'speed', 'lat_g', 'radius', 'ramp', 'sim', 'dt'})
+            self._solve_mode_combo.setEnabled(True)
+        elif key == 'ramp':
+            self._show_rows({'speed', 'steer', 'ramp', 'sim', 'dt'})
+            self._force_target_speed_mode()
+        elif key == 'step':
+            self._show_rows({'speed', 'steer', 'sim', 'dt'})
+            self._force_target_speed_mode()
+        elif key == 'sine':
+            self._show_rows({'speed', 'steer', 'ramp', 'sim', 'dt'})
+            self._force_target_speed_mode()
+        else:
+            self._show_rows(set(self._rows.keys()))
+            self._solve_mode_combo.setEnabled(True)
+
+        # For sine, peak steer becomes amplitude and ramp becomes frequency (Hz)
+        if key == 'sine':
+            self._ramp_duration.setSuffix(' Hz')
+            self._ramp_duration.setValue(0.8)   # 0.8 Hz default
+        else:
+            self._ramp_duration.setSuffix(' s')
+
+        # Re-apply the solve-mode enable/disable so the visible row
+        # actually matches the current mode.
+        self._on_solve_mode_changed()
+
+    def _force_target_speed_mode(self):
+        """For open tests (step/ramp/sine) there's no fixed radius, so
+        target-lat-g mode is meaningless.  Snap the combo back to
+        target_speed and grey it out."""
+        for i in range(self._solve_mode_combo.count()):
+            if self._solve_mode_combo.itemData(i) == 'target_speed':
+                self._solve_mode_combo.blockSignals(True)
+                self._solve_mode_combo.setCurrentIndex(i)
+                self._solve_mode_combo.blockSignals(False)
+                break
+        self._solve_mode_combo.setEnabled(False)
+
+    def _on_solve_mode_changed(self):
+        """Enable the active setpoint spin and grey out the other so it
+        reads as obviously non-authoritative.  The visible rows are
+        still controlled by ``_on_test_changed`` — we only tweak the
+        enabled state here, never the visibility."""
+        mode = self._solve_mode_combo.currentData()
+        speed_active = (mode == 'target_speed')
+        # Target speed spin is authoritative in target_speed mode;
+        # lat-g spin is authoritative in target_lat_g mode.
+        self._target_speed.setEnabled(speed_active)
+        self._target_lat_g.setEnabled(not speed_active)
+        # Visual cue: labels lose their contrast when the field isn't
+        # in use, so users don't enter a value that gets ignored.
+        sp_lbl = self._rows['speed'][0]
+        lg_lbl = self._rows['lat_g'][0]
+        sp_lbl.setStyleSheet('' if speed_active else 'color: #555;')
+        lg_lbl.setStyleSheet('color: #555;' if speed_active else '')
+
+    # ── Public API ───────────────────────────────────────────────────────
+
+    def get_params(self) -> dict:
+        # Target speed is in mph on the UI; convert to SI for the solver.
+        # 1 mph = 0.44704 m/s (exact).
+        # ``solve_mode`` controls whether ``target_speed_ms`` is used
+        # directly, or whether the dispatch derives it from
+        # ``target_lat_g`` via v = √(a_y · g · R).
+        return {
+            'test_type':        self._test_combo.currentData(),
+            'solve_mode':       self._solve_mode_combo.currentData(),
+            'target_speed_ms':  self._target_speed.value() * 0.44704,
+            'target_lat_g':     self._target_lat_g.value(),
+            'skidpad_radius_m': self._skidpad_radius.value(),
+            'peak_steer_deg':   self._steer_deg.value(),
+            'ramp_duration_s':  self._ramp_duration.value(),
+            'sim_duration_s':   self._sim_duration.value(),
+            'dt_s':             self._dt_ms.value() / 1000.0,
+            'direction':        self._dir_combo.currentText().lower(),
+            # Damper bump/rebound coefficients (N·s/m at the shock).
+            # main_window combines these with the car's motion ratio and
+            # track width to derive `roll_damping_Nms_rad`; nothing
+            # downstream reads `roll_damping` directly any more.
+            'damper_F_bump_Nspm':    self._dmp_F_bump.value(),
+            'damper_F_rebound_Nspm': self._dmp_F_reb.value(),
+            'damper_R_bump_Nspm':    self._dmp_R_bump.value(),
+            'damper_R_rebound_Nspm': self._dmp_R_reb.value(),
+            'steer_tau_s':      self._steer_tau.value(),
+            # Ixx, Izz, Ackermann %, and derived roll damping are
+            # auto-filled by main_window and pushed back via
+            # set_auto_info() for display.
+        }
+
+    # ── Save / load (every input on the panel) ───────────────────────────
+
+    def get_state(self) -> dict:
+        """JSON-friendly snapshot of every user-facing input on the
+        skidpad/transient panel.  Stores the *raw* widget values (mph,
+        ms, deg) rather than SI so a save file is human-readable and
+        consistent with what the user typed.  The auto-info readout
+        (Izz, Ixx, Ackermann %, derived roll damping) is recomputed on
+        every solve so it isn't worth saving.
+        """
+        return {
+            'test_type':           self._test_combo.currentData(),
+            'solve_mode':          self._solve_mode_combo.currentData(),
+            'direction':           self._dir_combo.currentText(),
+            'target_speed_mph':    float(self._target_speed.value()),
+            'target_lat_g':        float(self._target_lat_g.value()),
+            'skidpad_radius_m':    float(self._skidpad_radius.value()),
+            'peak_steer_deg':      float(self._steer_deg.value()),
+            'ramp_duration':       float(self._ramp_duration.value()),
+            'sim_duration_s':      float(self._sim_duration.value()),
+            'dt_ms':               float(self._dt_ms.value()),
+            'damper_F_bump_Nspm':  float(self._dmp_F_bump.value()),
+            'damper_F_rebound_Nspm': float(self._dmp_F_reb.value()),
+            'damper_R_bump_Nspm':  float(self._dmp_R_bump.value()),
+            'damper_R_rebound_Nspm': float(self._dmp_R_reb.value()),
+            'steer_tau_s':         float(self._steer_tau.value()),
+            'plot_signals':        self.get_selected_signals(),
+        }
+
+    def set_state(self, d: dict) -> None:
+        """Restore every input from a dict produced by :meth:`get_state`.
+
+        The combobox values are restored by their ``UserRole`` data
+        (``currentData()``) — same way :meth:`get_params` reads them —
+        so they survive renames of the visible label without breaking
+        the save format.
+        """
+        if not isinstance(d, dict):
+            return
+
+        def _set_spin(sb, key):
+            if key in d:
+                try:
+                    sb.setValue(float(d[key]))
+                except (TypeError, ValueError):
+                    pass
+
+        def _set_combo_by_data(combo, key):
+            if key not in d:
+                return
+            target = d[key]
+            for i in range(combo.count()):
+                if combo.itemData(i) == target:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(i)
+                    combo.blockSignals(False)
+                    return
+
+        widgets = [
+            self._test_combo, self._solve_mode_combo, self._dir_combo,
+            self._target_speed, self._target_lat_g, self._skidpad_radius,
+            self._steer_deg, self._ramp_duration, self._sim_duration,
+            self._dt_ms, self._dmp_F_bump, self._dmp_F_reb,
+            self._dmp_R_bump, self._dmp_R_reb, self._steer_tau,
+        ]
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            # 1) Combo selections first — _on_test_changed reads them.
+            _set_combo_by_data(self._test_combo,       'test_type')
+            _set_combo_by_data(self._solve_mode_combo, 'solve_mode')
+            if 'direction' in d:
+                idx = self._dir_combo.findText(str(d['direction']))
+                if idx >= 0:
+                    self._dir_combo.setCurrentIndex(idx)
+
+            # 2) Apply test-type visibility / enable rules NOW (before
+            # writing spinbox values) — for the skidpad_full test type
+            # this forces the radius to the FSAE regulation 9.125 m,
+            # which is correct behaviour for that mode but would clobber
+            # the saved value if we wrote the radius first.  Writing
+            # spinboxes *after* _on_test_changed lets the saved values
+            # win for any field that the test type doesn't lock.
+            try:
+                self._on_test_changed()
+            except Exception:
+                pass
+
+            # 3) Spinboxes — saved values overwrite any test-type forcing.
+            _set_spin(self._target_speed,    'target_speed_mph')
+            _set_spin(self._target_lat_g,    'target_lat_g')
+            _set_spin(self._skidpad_radius,  'skidpad_radius_m')
+            _set_spin(self._steer_deg,       'peak_steer_deg')
+            _set_spin(self._ramp_duration,   'ramp_duration')
+            _set_spin(self._sim_duration,    'sim_duration_s')
+            _set_spin(self._dt_ms,           'dt_ms')
+            _set_spin(self._dmp_F_bump,      'damper_F_bump_Nspm')
+            _set_spin(self._dmp_F_reb,       'damper_F_rebound_Nspm')
+            _set_spin(self._dmp_R_bump,      'damper_R_bump_Nspm')
+            _set_spin(self._dmp_R_reb,       'damper_R_rebound_Nspm')
+            _set_spin(self._steer_tau,       'steer_tau_s')
+
+            # Plot-signal selections (multi-select list)
+            if isinstance(d.get('plot_signals'), list):
+                wanted = set(d['plot_signals'])
+                self._sig_list.blockSignals(True)
+                for i in range(self._sig_list.count()):
+                    it = self._sig_list.item(i)
+                    key = it.data(Qt.ItemDataRole.UserRole)
+                    it.setSelected(key in wanted)
+                self._sig_list.blockSignals(False)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    def set_auto_info(self, yaw_Izz: float, sprung_Ixx: float,
+                      ackermann_pct: float,
+                      sim_duration_s: float = float('nan'),
+                      peak_steer_deg: float = float('nan'),
+                      derived_speed_ms: float = float('nan'),
+                      derived_roll_damping: float = float('nan')):
+        """Echo the auto-computed transient parameters back to the UI
+        so the user can see what the dispatch used.  ``derived_speed_ms``
+        is only populated when the panel is in target-lat-g mode — it's
+        the speed that came out of v = √(a_y · g · R).
+        ``derived_roll_damping`` is the c_phi the dispatch built from
+        the damper bump/rebound rates × MR² × t²/4.
+        """
+        parts = [
+            f'Izz = {yaw_Izz:,.1f} kg·m²',
+            f'Ixx = {sprung_Ixx:,.1f} kg·m²',
+            f'Ackermann = {ackermann_pct:+.0f} %',
+        ]
+        if not np.isnan(derived_roll_damping):
+            parts.append(f'c_phi = {derived_roll_damping:,.0f} N·m·s/rad')
+        if not np.isnan(peak_steer_deg):
+            parts.append(f'Peak steer = {peak_steer_deg:.2f}°')
+        if not np.isnan(sim_duration_s):
+            parts.append(f'Sim duration = {sim_duration_s:.1f} s')
+        if not np.isnan(derived_speed_ms):
+            # Echo both SI and driver-friendly units so the lat-g value
+            # is reconcilable with the Target speed field.
+            mph = derived_speed_ms / 0.44704
+            parts.append(f'Derived speed = {derived_speed_ms:.2f} m/s ({mph:.1f} mph)')
+        self._auto_info.setText('Auto: ' + '   '.join(parts))
+
+    def get_selected_signals(self) -> list:
+        out = []
+        for i in range(self._sig_list.count()):
+            it = self._sig_list.item(i)
+            if it.isSelected():
+                out.append(it.data(Qt.ItemDataRole.UserRole))
+        return out
+
+    def set_solving(self, busy: bool):
+        self._sim_btn.setEnabled(not busy)
+        self._sim_btn.setText('Simulating...' if busy else 'Simulate')
+
+    def set_status(self, msg: str):
+        self._status.setText(msg)
+
+    def show_result(self, result):
+        """Display the TransientResult metrics in the readout label."""
+        if result is None:
+            self._results_lbl.setText('')
+            return
+        lines = [
+            f'Peak lateral g     : {result.peak_lateral_g:6.3f}',
+            f'Steady lateral g   : {result.steady_state_lateral_g:6.3f}',
+            f'Peak roll          : {result.peak_roll_deg:6.2f} deg',
+            f'Steady roll        : {result.steady_state_roll_deg:6.2f} deg',
+            f'Yaw rise time (10-90): {result.yaw_rate_rise_time_s*1000:6.0f} ms',
+            f'Yaw overshoot      : {result.yaw_rate_overshoot_pct:6.1f} %',
+            f'Yaw settling time  : {result.yaw_rate_settling_time_s*1000:6.0f} ms',
+            f'Peak US (alpha_F-R): {result.peak_understeer_deg:6.2f} deg',
+        ]
+        self._results_lbl.setText('\n'.join(lines))
+
+    # ── Signals ──────────────────────────────────────────────────────────
+
+    def _on_simulate(self):
+        self.simulate_requested.emit(self.get_params())
+
+    def _on_signals_changed(self):
+        self.signals_changed.emit(self.get_selected_signals())
