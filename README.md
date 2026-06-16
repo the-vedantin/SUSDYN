@@ -2,10 +2,142 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.0 (Kinematics + Dynamics + Loads)
+**Version:** 2.7 (Multi-Topology + Kinematics + Steady & Transient Dynamics + Loads + Aero + Brakes + Onshape)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
+> ## ⚠️ Topology Support Status — please read
+>
+> The **stable, fully-validated** configuration is **pushrod actuation + bellcrank ARB, with the front pushrod on the UCA and the rear pushrod on the LCA.** This is the topology every metric, sweep, dynamics and loads path has been exhaustively tested against.
+>
+> **Every other topology is UNDER DEVELOPMENT / BETA**, including:
+> - **Actuation:** direct-acting damper, pullrod
+> - **ARB:** control-arm (drop-link-on-LCA), T-bar
+> - **Springing:** decoupled twin-bellcrank (heave + roll coilovers), heave-spring + T-bar (3rd spring)
+>
+> Their kinematics, 3D, dynamics and loads are wired and pass the regression net, but are **not yet exhaustively validated against hand calcs.** Treat their numbers as indicative, not final.
+>
+> **🛠️ Contributors are strongly encouraged to test these topologies and suggest fixes** — open an issue or PR. See the *Topology Support* section below for what's wired per configuration.
+
 ![Main Window](screenshots/main_window.png)
+
+---
+
+## Recent Patch Notes (v2.7) — Multi-Topology + ONE MODEL
+
+> ⚠️ Everything in this section is **BETA** for non-standard topologies (see the notice at the top). The standard pushrod-UCA-front / pushrod-LCA-rear + bellcrank-ARB car is the validated reference.
+
+### Topology system
+- **Full topology matrix** — every car is now defined by four independent axles-level choices: **DamperActuation** {direct, pushrod, pullrod} × **DamperMount** {UCA, LCA, upright} × **ARBType** {bellcrank, control-arm, T-bar, none} × **SpringConfig** {corner, decoupled, heave-T-bar}. Front and rear can differ (mixed cars supported). 69 valid configurations regression-tested.
+- **Topology wizard / Change Topology** picks the configuration; all default hardpoints, ARB hardware and central mechanisms repopulate for the chosen car.
+
+![Topology selection wizard](screenshots/topology_wizard.png)
+
+### ONE MODEL invariant (the headline)
+- **The 3D view, EVERY kinematic graph, the dynamics AND the loads now all derive from the single solved model** for whatever topology is active — no duplicate or hardcoded models. Move a hardpoint and the 3D, the graphs and the dynamics all change together, because they read the same solve.
+- A regression net (`test_one_model.py`) asserts, per topology: actuation chain is **coplanar**, the motion-ratio graph **responds** to the active spring's hardpoint, and **graph == dynamics** at design. Plus a 69-car topology sweep (`_tmp_topo_sweep.py`) checking ghosts, loads residual, and dynamics on every configuration.
+
+### Decoupled (twin-bellcrank, heave + roll coilovers)
+- A **twin-bellcrank cradle**: each pushrod feeds its own bellcrank; a cross-car **heave** coilover (symmetric Z) and a cross-car **roll** coilover (asymmetric Z) decouple the two modes. `vahan/monoshock.py TwinRockerDecoupledSolver` (2-DOF Newton-Raphson).
+- Graph, dynamics and loads all rebuild the cradle **fresh** from current geometry (no stale cache) — heave MR and roll MR match between graph and dynamics; the rigid pushrods stay rigid and the modes stay decoupled (roll coil ≈ unchanged in pure heave).
+
+![Decoupled twin-bellcrank in 3D](screenshots/decoupled_3d.png)
+
+### Heave-spring + T-bar (ONE T-bar)
+- The 3rd-spring + T-bar car is modeled as **one physical T-bar** doing **both** jobs: it **pivots** about its lateral axis (heave → 3rd spring compresses) and **twists** about its shaft axis (roll → torsion). `vahan/heave_tbar.py HeaveTBarRockerSolver` drives the full chain: wheel → pushrod → (skewed-plane) rocker → drop link → T-bar → 3rd spring.
+- Each corner's bellcrank carries a **corner damper** on one end and a **drop link to the single T-bar** on the other. The one T-bar replaces a separate ARB bar — it provides heave rate (3rd spring) and roll (torsion) together. 3D draws the live linkage; heave MR + roll twist come from the bar; the roll **rate** is derived from the same bar's geometry (bar OD/material stay user inputs). Nudging one hardpoint moves both the heave graph and the roll rate.
+
+### Group-move hardpoint controls (Direct Edit panel)
+- **Move whole groups at once:** spring setup up/down (inboard actuation points), ARB up/down, inboard control-arm + toe-link points in/out — as a single undoable step, with the actuation chain re-coplanarized after the move. Track/wheelbase/offset scaling moves the relevant hardpoint groups so you can stretch the car in any direction.
+
+![Group-move + plane-tilt controls (Direct Edit panel)](screenshots/group_move.png)
+
+### Live graph-on-edit
+- Editing a hardpoint (WASD nudge or group move) now **re-sweeps the kinematic graphs** (debounced 150 ms) so they track the change live — not just the 3D view. Coplanarity is enforced for **every** rocker topology after any dimension scaling.
+
+### Tire / grip characterization plots
+- **New "Tire / Grip Plots" button** in the Dynamics panel opens a 2×2 tire view, straight from the loaded tire model + the current lat/lon-g operating point:
+  - **Lateral force vs slip angle** — Fy(α) family at several normal loads (shows the peak slip angle and load sensitivity)
+  - **Cornering stiffness vs normal load** — Cα(Fz), degressive
+  - **Aligning moment vs slip angle** — Mz(α) from the TTC data (zero for the linear fallback — annotated to load TTC data for Mz)
+  - **Friction circle** — each corner's (Fx, Fy) operating point normalised by its grip capacity μ·Fz against the unit circle; set a longitudinal g and re-open to see the points spread into combined braking/acceleration
+- Uses the loaded TTC model (e.g. a Hoosier `.mat`) or the linear fallback; colourblind-safe load ramp + corner colours.
+
+![Tire / grip characterization](screenshots/tire_plots.png)
+
+### Fixes
+- **Dynamics longitudinal-sweep crash fixed** — `_on_dynamics_sweep_done` referenced the removed `_total_mass` spinbox; total mass is now derived (sprung + unsprung F + R) the same way the panel computes it.
+- **GUI watermark** — "Made by Yu @ Cougar Racing" in the top-right of the 3D viewport.
+
+---
+
+## Previous Patch Notes (v2.6)
+
+### Dynamic Ideal Ackermann (Sensitivity Analyzer)
+- **New output metric: `ideal_ackermann_pct`** — computes the Ackermann % the tires *want* at a given operating point using tire-model inversion. Not self-referential: Fy comes from equilibrium (Newton's 2nd law at a known g), then the tire model is inverted in one direction only (Fy,Fz → slip angle).
+- **Turn radius input** added to the Dynamics Optimizer panel (default 7.5 m). Required for the ideal Ackermann computation — without it the metric shows N/A.
+- Sensitivity of ideal Ackermann to every existing knob (spring rates, ARB, CG, MR, RC height) is computed and displayed. Shows how parameter changes affect what the tires want — e.g. stiffer front springs → more front load transfer asymmetry → tires want more Ackermann.
+- Formula: `geo_diff = atan(L/(R-t/2)) - atan(L/(R+t/2))`, then `required_diff = geo_diff + (SA_inner - SA_outer)`, `ideal_ack% = required_diff / geo_diff × 100`. Values >100% mean the tires want more inner steer than pure geometry gives (typical at high g where the inner tire is unloaded).
+
+### Ackermann Optimizer (IK Solver)
+- **`Ackermann %` added to the IK target metric dropdown.** Selecting it auto-switches to steer mode and auto-selects only `tie_rod_inner` (rack position) as design variables.
+- **New `rack_position` variable group** in `ORTHO_GROUPS` — moves the inboard tie-rod pickup (rack end) in X/Y/Z without touching `tie_rod_outer`. Changes Ackermann geometry by repositioning the rack while keeping the outer ball joint on the knuckle fixed — preserves steering ratio and rack length.
+- Workflow: run the sensitivity analyzer to get the ideal Ackermann % target → punch that into the IK solver → optimizer moves the rack to match.
+
+### Brake Calculator (new panel)
+- **New collapsible panel** in the right sidebar with its own lateral/longitudinal g spinners.
+- **Inputs:** Pedal ratio, front/rear master cylinder bore, brake bias %. Caliper parameters (pad μ, piston area, pad radius, pistons/caliper) are read from the existing Component Loads panel. Tire μ is pulled automatically from TTC data per corner (load-sensitive via `peak_mu(Fz, camber)`), tire radius from VehicleParams.
+- **Lockup analysis:** Per-corner lockup Fx, brake torque, caliper clamp force, line pressure, and pedal force. Summary shows which corner locks first and whether fronts or rears lock first.
+- **Rotor thermal:** Single braking event adiabatic temperature rise. Inputs: front/rear rotor mass, specific heat (Cp), ambient temp, brake-from/to speed. Outputs per corner: energy absorbed (kJ), ΔT, peak rotor temp. Color-coded: green <400°C, orange 400–600°C, red >600°C.
+
+---
+
+## Previous Patch Notes (v2.5)
+
+### Dynamics UI — Two-mode redesign (Poka Yoke)
+- **Two top-level test modes: Cornering and Straights.**  Inputs are physically gated by the active mode — user cannot enter values that don't apply.
+- **Cornering:** Lateral g + Longitudinal g (signed: 0 = pure lateral, - = braking, + = accel). Steady-state sweep with friction-circle clamp.
+- **Straights:** Start speed (mph) + Longitudinal g (signed). Time-domain trajectory where the sign of lon-g drives direction — no separate dropdown, no redundant inputs.
+- **target_lon_g is always literal.** 0g = coast (drag only), +0.5g = moderate throttle, +3g = traction-limited. No hidden "0 means full throttle" fallback. Every distinct input produces a distinct graph.
+- Removed: end_speed, CdA, air density, trajectory direction dropdown from the panel (they remain on VehicleParams internally).
+
+### Dynamics solver (v2.4 continued)
+- **Longitudinal sweep is now a real time-domain acceleration trajectory.** Integrates `v(t)` from `start_speed_mph` using `F_engine = P/v` minus `F_drag = ½·ρ·CdA·v²`. Run terminates naturally when `a → 0` (terminal speed). X-axis = **time (s)**, speed grows monotonically, longitudinal-g traces the traction-then-power-then-drag envelope, pitch follows g.
+- **Drag is parametric, not hardcoded.** New `cda_m2` and `air_density_kg_m3` fields on `VehicleParams`, exposed in the DynamicsPanel. Terminal speed `v_term = ∛(2P/(ρ·CdA))` falls out of the math — no magic numbers, no hardcoded duration.
+- **Friction circle is drivetrain-aware.** Combined cornering + accel/braking sweeps now correctly clamp achievable longitudinal-g as lat-g grows. RWD accel: `a_x_max = rear_frac · √(μ²−a_y²)`. Braking: `a_x_max = (front_frac/brake_bias) · √(μ²−a_y²)` (front tires saturate first when bias > weight share). Pitch curve drops with lat-g instead of sitting flat.
+- **Roll moment arm fix.** Was using whole-vehicle `cg_height_m`, should be sprung-CG height. New `VehicleParams.sprung_cg_height_m` property = `(m·h_cg − m_u·h_u)/m_s`. ~7 % systematic under-prediction of roll moment fixed in 4 callsites (transient + steady-state).
+- **Pitch moment formula fix.** `m_s · ax · (h_cg − h_us)` had no physical meaning — replaced with `m_s · ax · h_s`.
+- **Tire-model fallback unified.** `SteadyStateSolver.__init__` now installs a `LinearTireModel` when no tire data is loaded, killing the hardcoded `mu = 1.5` literal that was buried in `_effective_mu` and `max_accel_g`.
+- **Steering Wheel Angle / Steer Correction plots fixed.** Were using a fixed `turn_radius_m` (constant Ackermann at all lat-g); now derive R from `v²/(a_y·g_e)` so SWA = 0 at lat = 0 and grows with corner sharpness.
+
+### Live Values panel
+- **Metric scope respected.** Catalog entries now carry a `scope` field (`corner` / `axle` / `front` / `rear` / `vehicle`). Anti-dive shows once on the front axle (was: 4 different per-corner values that drifted by ~10 %). Anti-squat / anti-lift on the rear. Roll-centre height shown per-axle. Vehicle-level metrics (turn radius, roll-axis inclination) shown once.
+- **Roll Axis Inclination** added as a new kinematic metric — angle the front-RC-to-rear-RC line makes with horizontal in side view (`atan2(RC_R − RC_F, wheelbase)`).
+- **Instant Centre Y/Z** now uses **kinematic finite-difference** (Aronhold rigid-body construction) instead of intersecting static YZ-arm projections. Smooth across the full sweep, no asymptotic spikes when projected arm slopes match.
+- **Rocker angle** wraps to `[−180°, +180°)` (was reporting 706°, −1092° due to solver branch winding).
+
+### ARBs
+- **Hollow bars supported.** OD + ID inputs per axle (was: single Ø); cross-section moments scale with `OD⁴ − ID⁴`. ID = 0 reproduces the solid-bar formula.
+- **Geometry auto-derived.** Arm length, half-length and motion ratio come from the kinematic hardpoints (`arb_pivot`, `arb_arm_end`, `arb_drop_top`) and the rocker chain. No redundant geometric inputs in the panel.
+
+### Aero
+- **Custom (CFD validation) source.** Apply Aero now has two sources via a combobox: `Solved` (inverse from the Aero panel) and `Custom`. Custom takes user-typed `F_ref / V_ref / CoP%` and back-calculates `CL·A = 2·F_ref/(ρ·V_ref²)`, applied via the same V²-scaled pipeline. Lets you validate handling against CFD numbers directly without inverting the solver.
+
+### Save / Load
+- **Project format v2.** Every input on Dynamics, Skidpad, Loads and Aero panels round-trips through `Save Project` / `Load Project`. Old v1 files (geometry only) still load — `panels` block falls back to defaults when missing.
+
+### Report Export (File → Export Report…)
+- **[Example report (Google Docs)](https://docs.google.com/document/d/1onLCdDAopES1Kb3C31Rbo0flc9Yq8WNX/edit)**
+- **One-click `.docx` generation** — exports the current state of the solver (whatever you see is what you get). Opens and edits in Google Docs without formatting issues.
+- Uses your **live panel settings**: g range, lon-g, start speed, aero toggle, loads — not hardcoded defaults.
+- Sections: cover (3D screenshot), vehicle params table, heave kinematics (camber, toe, RC height, anti-dive/squat, MR), roll kinematics, steady-state cornering (roll, Fz, utilization, LLTD, pitch), acceleration trajectory, braking trajectory, **component loads** (member axial, BJ reactions, bearing + caliper bolt forces).
+- Aero V²-scaled per-g-point if Apply Aero is on.
+- **Auto-generated analysis box** per graph — summarizes what the curve says (e.g. "FL camber gains −0.021 deg/mm in bump", "First tire saturates at 1.32 g — FR leads").
+- **Editable design-rationale placeholder** (dashed box) under each analysis — type your engineering justification directly in Google Docs.
+- Runs all sweeps fresh from current state in a background thread with progress dialog — UI stays responsive.
+- Matplotlib Agg backend renders to embedded PNG at 150 DPI. Arial font only, no Word-specific features — clean Google Docs import guaranteed.
+
+### Known gaps
+- **Tire pressure / temperature**: TTC `P` column is read and stored as `pressure_kPa_mean`/`pressure_psi`, but not surfaced in the panel. **Temperature columns (`TSTI/TSTC/TSTO`) are NOT read at all** — the loader silently drops them. Operating P/T inputs (with delta-warning vs. test conditions) are queued for v2.5.
 
 ---
 
@@ -28,12 +160,57 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Degressive tire model with load sensitivity (`C_alpha ~ (Fz/Fz_ref)^n`, n < 1)
 - Understeer gradient from back-calculated slip angles
 - Friction circle tire utilization per corner
-- Roll angle, pitch angle, LLTD
+- Roll angle (uses **sprung-CG height** for the moment arm, not whole-vehicle CG), pitch angle (`m_s · ax · h_s` formulation), LLTD
+- **Drivetrain-aware friction-circle clamp** on combined sweeps — RWD accel saturates the rear axle at `a_x_max = rear_frac · √(μ²−a_y²)`; braking saturates the front when bias exceeds front weight share. Pitch curves drop with lat-g instead of sitting flat.
+- Anti-roll bar wheel rate **derived from bar geometry** (G·J/L² for torsion + 3·E·I/A³ for arm bending in series), with hollow bars supported via separate OD and ID inputs per axle. Arm length, half-length and ARB motion ratio auto-computed from the kinematic hardpoints — no redundant geometric inputs.
+
+### Longitudinal Acceleration Trajectory (Straights mode)
+- **Inputs: Start speed (mph) + Longitudinal g (signed).** Sign drives direction: positive = throttle, negative = brake, zero = coast. No separate dropdown.
+- Time-domain integration: `v(t+dt) = v(t) + [F_engine(v) − F_drag(v)] / m · dt`
+- `F_engine = P/v` capped by traction at low v; `F_drag = ½·ρ·CdA·v²`
+- **User target always literal:** 0.5g = 0.5g applied (clamped by traction/power when over). 0g = coast. No hidden "full throttle" fallback.
+- **No hardcoded duration** — terminates naturally when `a → 0` at terminal speed `v_term = ∛(2P/(ρ·CdA))`
+- Plot X = time (monotonic); Y = speed, longitudinal-g, pitch, roll, etc. — all evolve together along the real trajectory
+
+#### Traction model (drive-limited acceleration)
+
+The traction limit INCLUDES longitudinal weight transfer onto the driven axle, solved as a fixed point with the tire model's load-sensitive μ and the friction circle (lateral demand reduces available longitudinal grip):
+
+```
+a = μ(Fz_driven) · driven_fraction(a) · √(1 − (a_y/a_y,max)²)
+driven_fraction(a) = static_driven_fraction ± a · h_cg / L      (RWD +, FWD −)
+```
+
+`SteadyStateSolver._traction_g_dynamic()` is the single implementation used by `max_accel_g`, the acceleration trajectory, AND the combined-sweep friction-circle clamp — the three can never disagree. AWD uses all four tires; braking uses the full 4-tire μ with brake-bias-aware front/rear saturation. Numbers depend entirely on your tire data, masses and geometry — the software makes no claims about any particular car.
+
+### Transient Dynamics (Skidpad / Step / Ramp / Sine)
+- Time-domain bicycle + roll model integrated with RK4 (`vahan/transient.py`)
+- Test types: FSAE skidpad (single circle or full figure-8), step steer, ramp steer, sine-frequency sweep
+- Solve modes: **target speed** (read off the lateral-g) or **target lateral-g** (derive speed from `v = √(a_y · g · R)`)
+- Per-corner kinematic effects (camber change, RC migration) precomputed at init as travel→metric lookup tables; cheap interpolation inside the integration loop
+- Damper bump/rebound rates (per axle) reflected through the motion ratio + track to derive body-roll damping `c_phi`
+- Closed-loop path tracking via Stanley controller with first-order steer-actuator lag
+- Outputs: peak/steady lateral-g, peak/steady roll, yaw-rate rise/settling, peak understeer, full time-history of any signal
 
 ### Sensitivity & Optimization
 - Central finite-difference sensitivity of any dynamic output to any vehicle parameter
 - Practical step sizes (e.g. 1 mm spring preload, 1 N/mm spring rate)
 - Recommendation engine: which parameter changes achieve a target understeer/roll/pitch delta
+- **Dynamic ideal Ackermann %** — tire-model inversion at a given turn radius and Fz distribution. Shows what Ackermann the tires want, and how every knob affects it
+
+### Aero Load Targets
+- Computes per-corner Fz deficit to reach a target tire utilization at a given g level
+- Bisection solver finds the additional downforce needed per corner
+- Axle-level packaging: sizes to the worse (more loaded) corner per axle
+- Outputs: per-corner deficit, front/rear axle need, total downforce, rear aero bias %
+- Sweep mode plots deficit vs lateral g with velocity secondary axis
+
+### Apply Aero (V² Scaling)
+- Toggle in Dynamics panel applies aero downforce to dynamics solve/sweep
+- V²-scaled: downforce ∝ V², and at constant turn radius V² ∝ g, so aero load scales linearly with g
+- **Two sources** controlled by the "Aero source" combobox:
+  - **Solved** — uses the inverse-solved deficit from the Aero Load Targets panel ("what aero do I *need* to hit a target?"). Normalised to per-1g, multiplied by g at each sweep point.
+  - **Custom (CFD validation)** — user types in measured/CFD numbers: total downforce at a reference speed, CoP location (% rear), and air density. CL·A is back-calculated as `2·F_ref / (ρ·V_ref²)` and applied via the same V²-scaled pipeline. Lets you validate handling against CFD without inverting the solve.
 
 ### Component Loads
 - 6x6 static equilibrium on upright free body for all member axial forces
@@ -43,11 +220,31 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 - Separate front/rear brake parameters (pad mu, piston area, pad radius, bolt spacing)
 - Brake system: torque, caliper clamp, line pressure
 
+### Brake Calculator
+- **Lockup analysis:** Per-corner lockup force, torque, clamp, line pressure, pedal force at any lateral/longitudinal g
+- **Tire μ from TTC data** — load-sensitive per corner via `peak_mu(Fz, camber)`, no manual entry
+- **Rotor thermal:** Adiabatic single-event temperature rise from KE dump into rotor thermal mass
+- Master cylinder sizing: front/rear bore, pedal ratio, bias bar %
+
+### Report Export
+- **File → Export Report…** generates a full Vehicle Dynamics `.docx` (editable in Google Docs)
+- Exports the **current solver state** — your g range, lon-g, start speed, aero, loads
+- Content: 3D screenshot, vehicle params, heave kinematics (camber, toe, RC, anti-dive/squat, MR), roll kinematics, cornering sweep, accel trajectory, braking trajectory, component loads
+- Aero V²-scaled if Apply Aero is toggled on
+- Each graph has an **auto-analysis callout** and an **editable design-rationale box**
+- Background thread with progress dialog — UI stays responsive
+- Requirements: `python-docx`, `Pillow` (in `requirements.txt`)
+
 ### 3D Visualization
 - Interactive OpenGL viewport (VisPy) with full-car wireframe rendering
 - Colour-coded suspension members (UCA, LCA, tie rod, pushrod, rocker, spring/damper)
 - Roll centre and roll axis overlays
-- Click-to-select hardpoint editing
+
+### Onshape FeatureScript Export
+- **View → All Hardpoints** popup shows all 18 hardpoints × 4 corners in a single table (including ARB bellcrank)
+- **Copy for Onshape** produces a single-line pipe-delimited string ready to paste into the `VahanHardpoints` custom feature
+- `VahanHardpoints.fs` FeatureScript custom feature: paste data → up to 72 labelled 3D construction points appear in the Part Studio
+- Points are labelled by corner and name (e.g. `FL uca_front`, `RR arb_pivot`) in the feature tree
 
 ### Kinematic Curves
 - Live metric plots across wheel travel for all four corners
@@ -66,8 +263,11 @@ vahan/                         GUI (PyQt6)
   analysis.py
   optimizer.py
   tire_model.py
-  dynamics.py
-  loads.py
+  steering.py      (rack ↔ road-wheel angle chain)
+  dynamics.py      (SteadyStateSolver + AeroDownforceSolver + sensitivity)
+  transient.py     (RK4 bicycle+roll model — skidpad / step / ramp / sine)
+  report_gen.py    (DOCX report generator — matplotlib + python-docx, no Qt)
+  loads.py         (component forces + brake calculator + rotor thermal)
 ```
 
 The `vahan/` package is a pure computation library with zero GUI dependencies. The `gui/` layer wraps it in a desktop application. Either can be used independently.
@@ -100,12 +300,12 @@ All directional force outputs use V/H:
 
 Member axial forces: positive = tension (pulled apart), negative = compression (pushed together).
 
-### Mapping from OptimumK Export
+### Mapping from External Kinematics Export
 
-The team's OptimumK export uses inches with X=longitudinal, Y=lateral, Z=vertical. Vahan swaps X/Y and converts to metres:
+The team's external kinematics export uses inches with X=longitudinal, Y=lateral, Z=vertical. Vahan swaps X/Y and converts to metres:
 
-| OptimumK (in) | Vahan (m) | Example |
-|---------------|-----------|---------|
+| Source (in) | Vahan (m) | Example |
+|-------------|-----------|---------|
 | X = 4.625 | Y = 4.625 * 0.0254 = 0.11748 m | lca_front Y |
 | Y = 8.5 | X = 8.5 * 0.0254 = 0.21590 m | lca_front X |
 | Z = 4.75 | Z = 4.75 * 0.0254 = 0.12065 m | lca_front Z |
@@ -116,9 +316,9 @@ The team's OptimumK export uses inches with X=longitudinal, Y=lateral, Z=vertica
 
 ![Hardpoint Editing and 3D View](screenshots/3d_view.png)
 
-### The 14 Hardpoints
+### The 18 Hardpoints
 
-Each suspension corner is defined by 14 points in 3D space (42 scalar coordinates):
+Each suspension corner is defined by 15 suspension points + 3 ARB bellcrank points = 18 points total (54 scalar coordinates):
 
 **Control Arms (6 points)**
 | Point | Description | Role |
@@ -141,7 +341,7 @@ Each suspension corner is defined by 14 points in 3D space (42 scalar coordinate
 |-------|-------------|------|
 | `wheel_center` | Hub centre | Moves with wheel (driven by travel) |
 
-**Pushrod/Rocker (5 points)**
+**Pushrod/Rocker (6 points)**
 | Point | Description | Role |
 |-------|-------------|------|
 | `pushrod_outer` | Pushrod attachment on arm/upright | Moves with arm |
@@ -149,6 +349,14 @@ Each suspension corner is defined by 14 points in 3D space (42 scalar coordinate
 | `rocker_pivot` | Rocker chassis pivot | Fixed to chassis |
 | `rocker_spring_pt` | Rocker end touching spring/damper | Moves with rocker |
 | `spring_chassis_pt` | Chassis spring/damper mount | Fixed to chassis |
+| `rocker_axis_pt` | Second point defining rocker rotation axis | Fixed to chassis |
+
+**ARB Bellcrank (3 points per axle, shared L/R)**
+| Point | Description | Role |
+|-------|-------------|------|
+| `arb_drop_top` | Drop link attachment on rocker | Moves with rocker |
+| `arb_arm_end` | ARB blade tip | Rotates about torsion bar axis |
+| `arb_pivot` | Torsion bar rotation axis | Fixed to chassis |
 
 ### Default Values (Front Left Corner, metres)
 
@@ -413,6 +621,7 @@ C_alpha(Fz) = C_alpha_ref * (Fz / Fz_ref) ^ n
 
 ![Dynamics Panel](screenshots/dynamics_panel.png)
 
+
 ### Overview
 
 `vahan/dynamics.py` provides `SteadyStateSolver` — computes the vehicle's steady-state response to lateral and longitudinal acceleration. Uses iterative roll convergence with per-corner kinematic state updates.
@@ -454,6 +663,16 @@ Per-corner outputs: `Fz`, `Fy`, `Fx`, `brake_torque`, `travel`, `camber`, `utili
 
 Scalar outputs: `roll_angle_deg`, `pitch_angle_deg`, `understeer_gradient_deg`, `lltd_pct`
 
+### Velocity Axis on Sweep Plots
+
+All dynamics and aero sweep plots display a secondary x-axis showing speed in mph. For lateral sweeps at constant turn radius R:
+
+```
+V = sqrt(g * 9.81 * R)    (m/s)    ->    mph = V * 2.237
+```
+
+For longitudinal sweeps with known power: `V = P / (F)` where `F = g * m * 9.81`.
+
 ### Sensitivity Analysis
 
 ![Dynamics Optimization and Sensitivity](screenshots/dynamics_opt.png)
@@ -471,6 +690,132 @@ Each parameter has a practical step size representing a realistic shop adjustmen
 - CG height: 5 mm
 
 The recommendation engine finds which parameter changes produce a desired delta in the target metric (e.g., "reduce understeer gradient by 0.5 deg").
+
+---
+
+## Transient Dynamics Solver
+
+![Skidpad / Transient Panel](screenshots/skidpad_panel.png)
+
+### Overview
+
+`vahan/transient.py` provides `TransientSolver` — a time-domain solver for skidpad, step-steer, ramp-steer, and sine-sweep tests. Where the steady-state solver answers "what does the car do at constant lateral g?", the transient solver answers "how does the car *get there* — how fast does yaw rate rise, how much does it overshoot, how long until roll settles?"
+
+### State Vector (7 states)
+
+```
+[ Y, X, ψ, vx, vy, r, φ ]
+   Y, X       inertial-frame position (m)
+   ψ          yaw angle (rad)
+   vx, vy     body-frame velocities (m/s)
+   r          yaw rate (rad/s)
+   φ          body roll (rad)
+```
+
+Steer angle is a separate first-order state with time constant `steer_tau_s` so a step input doesn't excite an infinite-derivative spike.
+
+### Kinematic Lookup Tables
+
+Camber change and roll-centre migration depend on suspension travel, but solving the 12-DOF Newton-Raphson constraint solver inside an RK4 step would be prohibitively slow. Instead, at solver init each corner is swept across ~20 travel points, the relevant metrics (camber, RC height, motion ratio) are stored, and the integration loop interpolates. Per-step cost drops to a few `np.interp` calls instead of a Newton solve.
+
+### Body Roll Damping
+
+Damper bump/rebound rates (per axle, at the shock) are reflected to the wheel via the kinematic motion ratio, then to roll via the track:
+
+```
+c_phi = Σ_axle  (c_bump + c_rebound) · MR² · t² / 4         (N·m·s/rad)
+```
+
+Nothing in the panel asks for `c_phi` directly any more — it's derived from the four damper coefficient inputs and the auto-derived motion ratios.
+
+### Test Types
+
+| Mode | Steer profile | Solve target |
+|------|---------------|--------------|
+| `skidpad`      | Closed-loop Stanley path follower on a fixed-radius circle | Target speed OR target lat-g (`v = √(a_y · g · R)`) |
+| `skidpad_full` | Same, full FSAE figure-8 (R = 9.125 m, fixed) | Same |
+| `step`         | Open-loop instantaneous step (smoothed by `steer_tau_s`) | Target speed |
+| `ramp`         | Open-loop linear ramp from 0 to peak over `ramp_duration_s` | Target speed |
+| `sine`         | Open-loop frequency sweep — peak amplitude × sin(2π·f·t) | Target speed |
+
+### Outputs
+
+Every state and intermediate force is recorded at every dt. Reported metrics include:
+
+- **Peak / steady lateral-g** (steady = mean of last 25%)
+- **Peak / steady roll angle**
+- **Yaw rate rise time** (10–90% of steady)
+- **Yaw rate overshoot %**
+- **Yaw rate settling time** (within ±5% of steady)
+- **Peak understeer** (`α_F − α_R` from per-tire slip angles)
+- Per-corner Fz, Fy, utilization, camber, travel — full time history
+
+The GUI exposes a multi-select plot picker so any signal can be added to the time-history graph.
+
+![Transient Simulation Time History](screenshots/transient_sim.png)
+
+The plot above is a 10° road-wheel step at 12 m/s on the default vehicle — yaw inertia, roll inertia, and roll damping are all derived from `VehicleParams` and the SkidpadPanel damper bump/rebound coefficients via the formulas given above (Izz ≈ 202 kg·m², Ixx ≈ 40 kg·m², c_φ ≈ 2660 N·m·s/rad).
+
+---
+
+## Aero Load Targets Solver
+
+![Aero Load Targets Panel](screenshots/aero_panel.png)
+
+### Overview
+
+`AeroDownforceSolver` in `vahan/dynamics.py` answers: "How much additional vertical load does each corner need to bring tire utilization down to a target?" This is the aerodynamicist's starting point — it tells you how much downforce your aero package must produce, and where.
+
+### Solve Algorithm
+
+At a given lateral g (and optional longitudinal g):
+
+1. Run the steady-state dynamics solver to get per-corner Fz, Fy, Fx, camber
+2. Compute demand at each corner: `demand = sqrt(Fy^2 + Fx^2)`
+3. Compute grip at current Fz: `grip = mu(Fz, camber) * Fz`
+4. If `demand / grip > target_util`, bisection-search for additional Fz:
+   - Bracket: `[0, max_total / 4]`
+   - Target: `demand / grip(Fz + dFz) <= target_util`
+   - 60 iterations, 0.1 N precision
+5. Axle-level packaging: `front_need = max(FL, FR)`, `rear_need = max(RL, RR)`
+6. Total and rear bias: `total = front + rear`, `bias = rear / total * 100%`
+
+**Why bisection over analytical inversion:** The tire's peak mu is load-sensitive (degressive). As Fz increases, mu decreases, so grip is nonlinear in Fz. Bisection handles this robustly.
+
+### AeroResult
+
+```
+downforce:        {FL, FR, RL, RR}   per-corner deficit (N)
+utilization_aero: {FL, FR, RL, RR}   utilization after adding Fz
+front_axle_need_N                     axle-level front deficit
+rear_axle_need_N                      axle-level rear deficit
+total_downforce_N                     total deficit
+rear_aero_bias_pct                    % of total on rear axle
+capped                                corners that hit the per-corner cap
+```
+
+### Sweep Mode
+
+![Aero Sweep Across Lateral g](screenshots/aero_sweep.png)
+
+`AeroDownforceSolver.sweep(g_range)` solves at each g point and returns arrays of front/rear/total deficit vs lateral g. The GUI plots these with a velocity secondary x-axis (mph) computed from the turn radius set in the Dynamics panel:
+
+```
+V = sqrt(g * 9.81 * R)    (m/s, converted to mph)
+```
+
+### Apply Aero (V² Scaling)
+
+The "Apply Aero" toggle in the Dynamics panel feeds the solved aero deficit back into dynamics. Since aerodynamic downforce scales with V², and at constant turn radius V² = g * R * 9.81, the aero force scales linearly with g:
+
+```
+aero_Fz_per_g = {corner: deficit / g_ref}     (normalised to 1g)
+aero_Fz(g)    = {corner: per_g * |g|}          (at any sweep point)
+```
+
+This is added to the static loads in the dynamics solver before the roll iteration begins. The total weight for renormalisation becomes `W_vehicle + sum(aero_Fz)`.
+
+When active, the dynamics sweep worker loops manually through each g point, computing V²-scaled aero at each step, rather than using the vectorised sweep.
 
 ---
 
@@ -599,24 +944,6 @@ line_pressure = caliper_clamp / piston_area   (MPa = N/mm^2)
 
 ![Full Application Layout](screenshots/main_window.png)
 
-### Layout
-
-```
-+-------------------+----------------------------+--------------------+
-|   Left Sidebar    |      Centre 3D View        |   Right Panel      |
-|                   |                            |                    |
-| Motion Control    |   VisPy/OpenGL rendering   | Matplotlib Graphs  |
-| Car Parameters    |   of suspension geometry   | (metric curves)    |
-| Front Hardpoints  |                            |                    |
-| Rear Hardpoints   |   + NavCube (orientation)  | Values Table       |
-| Metric Picker     |                            | (current metrics)  |
-| Steering          |                            |                    |
-| Inverse Kin.      |                            |                    |
-| Dynamics          |                            |                    |
-| Dyn. Optimizer    |                            |                    |
-| Component Loads   |                            |                    |
-+-------------------+----------------------------+--------------------+
-```
 
 ### Panels (Left Sidebar)
 
@@ -629,8 +956,10 @@ All panels are collapsible sections:
 - **SteeringPanel** — Rack ratio, travel limits, Ackermann
 - **AlignmentPanel** — Static camber, toe, caster display
 - **InverseKinematicsPanel** — Target metric, range, locks, method, tube ODs, solve/explore
-- **DynamicsPanel** — Lateral/longitudinal g inputs, vehicle params, solve/sweep
+- **DynamicsPanel** — Vehicle masses, springs, ARB OD/ID + G/E, powertrain, lat/lon g inputs, solve/sweep, Apply Aero toggle. Auto-derived ARB arm length / half-length / MR shown in green readout.
+- **SkidpadPanel** — Test type (skidpad / step / ramp / sine), solve mode (target speed or target lat-g), per-axle damper bump/rebound rates, steer lag, time step, multi-select plot signal picker
 - **DynamicsOptPanel** — Target metric delta, sensitivity grid, recommendations
+- **AeroPanel** — Lateral/longitudinal g, target utilization, solve/sweep, deficit table + summary
 - **LoadsPanel** — Front/rear brake params, upright geometry, compute button, results popup
 
 ### 3D View
@@ -649,7 +978,90 @@ The entire UI uses a grayscale colour scheme (dark background, grey text/borders
 
 ---
 
-## Vehicle Data (2026 Car)
+## Onshape Integration
+
+![All Hardpoints Popup](screenshots/all_hardpoints.png)
+
+### Overview
+
+Vahan can export all suspension hardpoints directly into an Onshape Part Studio as 3D construction points via a custom FeatureScript feature. This bridges the kinematic design loop in Vahan with the CAD model in Onshape — no manual coordinate entry.
+
+![Onshape Part Studio with Suspension Points](screenshots/onshape_points.png)
+
+### Hardpoints Exported
+
+The export covers all 18 hardpoints × 4 corners (FL, FR, RL, RR) = up to 72 points:
+
+**Suspension (15 per corner)**
+| Point | Description |
+|-------|-------------|
+| `uca_front` / `uca_rear` / `uca_outer` | Upper control arm chassis pickups + ball joint |
+| `lca_front` / `lca_rear` / `lca_outer` | Lower control arm chassis pickups + ball joint |
+| `tie_rod_inner` / `tie_rod_outer` | Rack end and steer arm pickup |
+| `wheel_center` | Hub centre |
+| `pushrod_outer` / `pushrod_inner` | Pushrod endpoints |
+| `rocker_pivot` / `rocker_spring_pt` / `spring_chassis_pt` / `rocker_axis_pt` | Rocker and spring geometry |
+
+**ARB Bellcrank (3 per corner)**
+| Point | Description |
+|-------|-------------|
+| `arb_drop_top` | Drop link attachment point on rocker (moves with rocker) |
+| `arb_arm_end` | ARB blade tip (rotates about torsion bar axis) |
+| `arb_pivot` | Torsion bar rotation axis, fixed to chassis |
+
+FL and RL are the input (left-side) values. FR and RR are automatically X-mirrored.
+
+### Export Workflow
+
+1. In Vahan: **View → All Hardpoints**
+2. Click **Copy for Onshape**
+3. In Onshape: open your Part Studio → insert the **Vahan Hardpoints** custom feature
+4. Paste the clipboard contents into the **Paste Data** field
+5. Click the green checkmark — up to 72 labelled construction points appear
+
+### VahanHardpoints.fs — FeatureScript Custom Feature
+
+`VahanHardpoints.fs` is a self-contained Onshape FeatureScript with no external library dependencies.
+
+**Quickest way to use it:** open the Feature Studio directly in Onshape, copy the feature, and paste it into your own document's Feature Studio:
+
+> [Open VahanHardpoints Feature Studio on Onshape](https://cad.onshape.com/documents/0fd1ba4fa3000364cc5e975c/w/c68fedaa2bfec6c13cd02fce/e/19856db1245e96443584ccac)
+
+Alternatively, copy the contents of `VahanHardpoints.fs` from this repo into a new Feature Studio in your Onshape document.
+
+**How it works:**
+
+- The **Paste Data** field accepts a single-line string (pipe `|` separated records, comma-separated fields per record)
+- Format per record: `name,FL_X,FL_Y,FL_Z,FR_X,FR_Y,FR_Z,RL_X,RL_Y,RL_Z,RR_X,RR_Y,RR_Z` (coordinates in mm)
+- The feature body parses this string directly and calls `opPoint` for each non-zero coordinate set — no editing logic dependency
+- Each point body is labelled with `setProperty / PropertyType.NAME` (e.g. `FL uca_front`)
+- **Show FL / FR / RL / RR** toggles hide/show each corner's points without deleting them
+- Coordinate groups (FL / FR / RL / RR) in the feature dialog show the parsed values and allow manual per-point overrides when Paste Data is cleared
+
+**Paste Data format (single line):**
+```
+uca_front,263.53,-127.00,263.53,-263.53,-127.00,263.53,...|uca_rear,...|...
+```
+
+**Manual override mode:** Clear the Paste Data field. Edit individual X/Y/Z params in the corner groups directly. Points are created from the parameter values instead of the paste string.
+
+### Coordinate System
+
+Vahan and Onshape share the same coordinate convention in the exported data:
+
+| Axis | Direction | Origin |
+|------|-----------|--------|
+| X | Lateral (outboard positive for left corner) | Vehicle centreline |
+| Y | Longitudinal (forward positive) | Front axle |
+| Z | Vertical (up positive) | Ground |
+
+All exported values are in **millimetres**.
+
+---
+
+## Default Vehicle Parameters
+
+> These are the EDITABLE DEFAULTS the software ships with (one team's example data).  They are inputs, not claims — every value lives in a panel and your numbers replace them.
 
 ### Vehicle Parameters
 
@@ -680,12 +1092,40 @@ The entire UI uses a grayscale colour scheme (dark background, grey text/borders
 
 ### Anti-Roll Bars
 
+ARB wheel rate is derived from bar geometry (G, E, OD, ID) and the kinematic linkage. The arm length, half-length (active twist span), and bar→wheel motion ratio are auto-computed from the kinematic hardpoints (`arb_pivot`, `arb_arm_end`, `arb_drop_top`) and the rocker chain — the user only owns OD, ID and the material constants.
+
+```
+J = π·(OD⁴ − ID⁴) / 32                 polar 2nd moment  (hollow general form)
+I = π·(OD⁴ − ID⁴) / 64                 area  2nd moment  (hollow general form)
+K_torsion  = G·J / (A²·L_half)         half-bar twist stiffness at the arm tip
+K_armBend  = 3·E·I / A³                cantilever bending of the arm
+K_arb      = (K_t · K_a) / (K_t + K_a) two springs in series
+K_wheel    = K_arb / MR²               wheel-rate contribution
+```
+
+Setting ID = 0 reproduces the solid-bar formula exactly.
+
 | Parameter | Front | Rear | Unit |
 |-----------|-------|------|------|
-| ARB OD / ID | 12.7 / 9.75 | 12.7 / 9.75 | mm |
-| Arm length | 84.3-90 | 104.8 | mm |
-| ARB motion ratio | 2.4-2.5 | 2.92-3.0 | -- |
+| ARB OD / ID | 12.70 / 9.65 | 12.70 / 9.65 | mm |
+| Arm length (auto-derived) | 84.3-90 | 104.8 | mm |
+| ARB motion ratio (auto-derived) | 2.4-2.5 | 2.92-3.0 | -- |
 | ARB wheel rate per wheel | 16.8-20.9 | 6.5-10.5 | N/mm |
+
+### Powertrain & Aero (longitudinal trajectory inputs)
+
+| Parameter | Value | Unit |
+|-----------|-------|------|
+| Wheel power | 75 | hp |
+| Engine RPM | 10 000 | rpm |
+| Primary ratio | 3.55 : 1 | -- |
+| Drive sprocket | 11 | T |
+| Driven sprocket | 39 | T |
+| Drivetrain | RWD | -- |
+| Tire radius | 203 | mm |
+| **CdA** | 1.0 | m² |
+| **Air density (ρ)** | 1.225 | kg/m³ |
+
 
 ### Roll & Pitch Stiffness
 
@@ -723,12 +1163,16 @@ The entire UI uses a grayscale colour scheme (dark background, grey text/borders
 | `vahan/metrics_catalog.py` | 30+ metric definitions + dynamics sensitivities |
 | `vahan/optimizer.py` | IK solver, orthogonal groups, collision detection |
 | `vahan/tire_model.py` | Linear tire model with load sensitivity |
-| `vahan/dynamics.py` | Steady-state dynamics solver + sensitivity analysis |
+| `vahan/steering.py` | Steering-wheel ↔ rack ↔ road-wheel angle chain |
+| `vahan/dynamics.py` | Steady-state dynamics solver + sensitivity + aero deficit solver |
+| `vahan/transient.py` | Time-domain transient solver (skidpad / step / ramp / sine), RK4 bicycle + roll model |
 | `vahan/loads.py` | Component force calculator (members, bearings, brakes) |
-| `gui/main_window.py` | Main window, steering model, dynamics/loads wiring |
-| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, loads, optimizer) |
+| `gui/main_window.py` | Main window, steering model, dynamics/transient/loads/aero wiring, JSON save/load |
+| `gui/panels.py` | All sidebar panels (motion, IK, dynamics, skidpad, optimizer, aero, loads) |
 | `gui/view3d.py` | VisPy 3D rendering + NavCube |
 | `app.py` | Entry point |
+| `VahanHardpoints.fs` | Onshape FeatureScript: paste hardpoints → 3D construction points in Part Studio |
+| `VahanLayout.fs` | Onshape FeatureScript: companion to `VahanHardpoints.fs` for layout/sketch wiring |
 
 ---
 
@@ -771,9 +1215,13 @@ The GUI opens with default FSAE hardpoints loaded.
 4. **Inverse solve** — Set target curves, select which hardpoints to adjust, and hit Solve
 5. **Explore** — Run widened search to find alternative solutions across the design space
 6. **Dynamics** — Set lateral/longitudinal g, solve for load transfer, roll, utilization
-7. **Sensitivity** — Analyze which vehicle parameters most affect your target metric
-8. **Component loads** — Set brake params and upright geometry, compute forces at operating point
-9. **Save/Load** — File menu for JSON geometry files
+7. **Transient** — Pick a test (skidpad / step / ramp / sine), choose target speed or target lat-g, set damper rates, simulate
+8. **Sensitivity** — Analyze which vehicle parameters most affect your target metric
+9. **Aero targets** — Set target utilization, solve for downforce deficit, sweep across g range
+10. **Apply Aero** — Toggle aero on in Dynamics panel to see dynamics curves with V²-scaled downforce
+11. **Component loads** — Set brake params and upright geometry, compute forces at operating point
+12. **Export to Onshape** — View → All Hardpoints → Copy for Onshape → paste into `VahanHardpoints` FeatureScript feature in Part Studio
+13. **Save/Load** — File menu writes a v2 `.vahan` JSON file capturing all hardpoints, ARB geometry, vehicle params, motion settings, and **every input** on the Dynamics, Skidpad, Loads, and Aero panels. Older v1 files (geometry only) still load.
 
 ### Sign Convention Cheat Sheet
 
@@ -795,3 +1243,5 @@ The GUI opens with default FSAE hardpoints loaded.
 ## License
 
 Personal project by [@the-vedantin](https://github.com/the-vedantin).
+
+Vahan is provided "as is". The user assumes all risk for component failures, incorrect calculations, or faulty data.

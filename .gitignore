@@ -12,6 +12,22 @@ build/
 
 # Tire test data (TTC consortium — cannot redistribute)
 tire_data/
+TTC/
+
+# TTC-DERIVED renders.  Per the FSAE TTC agreement, only DE-IDENTIFIED,
+# attributed plots may be published — so any screenshot showing measured tire
+# grip (Fy-vs-SA, friction circle, cornering-stiffness-vs-load) for an
+# IDENTIFIED tire must NOT ship.  Make tire-plot screenshots from the
+# parametric LinearTireModel instead, or de-identify + credit FSAE TTC/Calspan.
+screenshots/tire_plots.png
+screenshots/*tire*grip*.png
 
 # Reference spreadsheets (local only)
 sus_calc_ref/
+
+# Session scratch + verification artifacts (NOT product code)
+_tmp_*
+*_result.txt
+
+# Large / non-redistributable reference material
+RCVD*.pdf

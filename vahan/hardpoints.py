@@ -46,26 +46,31 @@ class DoubleWishboneHardpoints:
     # Wheel
     wheel_center: np.ndarray   # hub / wheel-center (moves with upright)
 
-    # Pushrod / Rocker
-    pushrod_outer:     np.ndarray  # outboard end of pushrod (body-dependent: see solver)
-    pushrod_inner:     np.ndarray  # inboard end of pushrod  (fixed to rocker arm)
-    rocker_pivot:      np.ndarray  # rocker bell-crank pivot (chassis-fixed)
-    rocker_spring_pt:  np.ndarray  # rocker end that contacts spring/damper
-    spring_chassis_pt: np.ndarray  # top (chassis) mount of spring/damper
+    # ── Pushrod / Rocker (used by PUSHROD / PULLROD actuation) ───────────
+    # All optional — None when the active topology is DIRECT damper.
+    pushrod_outer:     np.ndarray = field(default=None)
+    pushrod_inner:     np.ndarray = field(default=None)
+    rocker_pivot:      np.ndarray = field(default=None)
+    rocker_spring_pt:  np.ndarray = field(default=None)
+    spring_chassis_pt: np.ndarray = field(default=None)
+    # Rocker rotation axis (optional — defaults to a Y-parallel axis through
+    # rocker_pivot if the user doesn't supply an explicit second point).
+    rocker_axis_pt:    np.ndarray = field(default=None)
 
-    # Rocker rotation axis (optional)
-    # A second point that — together with rocker_pivot — defines the rotation axis.
-    # If None, defaults to rocker_pivot + [0, 0.0254, 0]  (Y-parallel axis, 1 inch offset).
-    rocker_axis_pt: np.ndarray = field(default=None)
+    # ── Direct damper (used by DIRECT actuation) ─────────────────────────
+    # damper_chassis_pt = top mount on chassis (fixed)
+    # damper_outer_pt   = bottom mount on a moving body (UCA / LCA / upright)
+    damper_chassis_pt: np.ndarray = field(default=None)
+    damper_outer_pt:   np.ndarray = field(default=None)
 
     def __post_init__(self):
-        """Cast every field to a float64 numpy array on construction."""
+        """Cast every populated field to a float64 numpy array on construction."""
         for name in self.__dataclass_fields__:
             val = getattr(self, name)
             if val is not None:
                 setattr(self, name, np.asarray(val, dtype=float))
-        # Auto-compute rocker_axis_pt if not provided
-        if self.rocker_axis_pt is None:
+        # Auto-compute rocker_axis_pt only if we have a rocker_pivot
+        if self.rocker_axis_pt is None and self.rocker_pivot is not None:
             self.rocker_axis_pt = self.rocker_pivot + np.array([0., 0.0254, 0.])
 
     @classmethod
@@ -79,8 +84,12 @@ class DoubleWishboneHardpoints:
 
         Axis convention: X=lateral, Y=longitudinal, Z=up.
         Negating X produces the mirror-image corner (left <-> right).
+        Optional fields (rocker / damper, depending on topology) are
+        carried through as-None or mirrored when populated.
         """
         def flip(v):
+            if v is None:
+                return None
             w = v.copy()
             w[0] = -w[0]
             return w
@@ -101,6 +110,8 @@ class DoubleWishboneHardpoints:
             rocker_spring_pt=flip(self.rocker_spring_pt),
             spring_chassis_pt=flip(self.spring_chassis_pt),
             rocker_axis_pt=flip(self.rocker_axis_pt),
+            damper_chassis_pt=flip(self.damper_chassis_pt),
+            damper_outer_pt=flip(self.damper_outer_pt),
         )
 
     # keep old name as alias for compatibility

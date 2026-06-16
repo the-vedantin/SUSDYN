@@ -77,6 +77,72 @@ def _rodrigues(v: np.ndarray, axis: np.ndarray, theta: float) -> np.ndarray:
     return c * v + s * np.cross(axis, v) + (1.0 - c) * np.dot(axis, v) * axis
 
 
+# ─── bellcrank coplanarity check ─────────────────────────────────────────────
+
+# The points that must all lie in the single bellcrank plane.  The plane is
+# defined by the two rocker arms (pivot->pushrod_inner, pivot->rocker_spring_pt);
+# every other listed point must lie in it for a true PLANAR bellcrank where the
+# pushrod, the plate, and the corner shock all act in one plane.
+BELLCRANK_PLANE_PTS = (
+    'pushrod_inner', 'rocker_spring_pt',     # define the plane (+ rocker_pivot)
+    'pushrod_outer', 'spring_chassis_pt',    # rod + shock must lie in it
+    'rocker_tbar_drop_pt',                   # T-bar drop arm (when present)
+)
+
+
+def bellcrank_plane_residual(hp_like) -> dict:
+    """Out-of-plane distance of every bellcrank point, in millimetres.
+
+    `hp_like` may be a dict OR a hardpoints dataclass.  Returns::
+
+        {'normal': n_hat,            # plane normal (unit) = rocker axis
+         'distances_mm': {pt: d},    # signed out-of-plane distance per point
+         'worst_mm': float,          # max |distance|
+         'worst_pt': str,
+         'coplanar': bool}           # worst <= tol (2 mm)
+
+    Returns {'coplanar': True, 'worst_mm': 0.0, ...} for corners with no
+    rocker (direct / decoupled) -- nothing to be coplanar.
+    """
+    def _get(name):
+        if isinstance(hp_like, dict):
+            return hp_like.get(name)
+        return getattr(hp_like, name, None)
+
+    pivot = _get('rocker_pivot')
+    a_in  = _get('pushrod_inner')
+    a_sp  = _get('rocker_spring_pt')
+    if pivot is None or a_in is None or a_sp is None:
+        return {'normal': None, 'distances_mm': {}, 'worst_mm': 0.0,
+                'worst_pt': None, 'coplanar': True}
+
+    P = np.asarray(pivot, float)
+    arm_push   = np.asarray(a_in, float) - P
+    arm_spring = np.asarray(a_sp, float) - P
+    n = np.cross(arm_push, arm_spring)
+    nn = float(np.linalg.norm(n))
+    if nn < 1e-12:
+        # Colinear arms -- plane undefined.  Flag as non-coplanar (degenerate).
+        return {'normal': None, 'distances_mm': {}, 'worst_mm': float('inf'),
+                'worst_pt': 'rocker (degenerate arms)', 'coplanar': False}
+    n_hat = n / nn
+
+    dists = {}
+    worst = 0.0
+    worst_pt = None
+    for name in BELLCRANK_PLANE_PTS:
+        p = _get(name)
+        if p is None:
+            continue
+        d_mm = float(np.dot(np.asarray(p, float) - P, n_hat)) * 1000.0
+        dists[name] = d_mm
+        if abs(d_mm) > worst:
+            worst = abs(d_mm)
+            worst_pt = name
+    return {'normal': n_hat, 'distances_mm': dists, 'worst_mm': worst,
+            'worst_pt': worst_pt, 'coplanar': worst <= 2.0}
+
+
 # ─── constraint system ───────────────────────────────────────────────────────
 
 class SuspensionConstraints:
@@ -89,20 +155,31 @@ class SuspensionConstraints:
 
     def __init__(self, hp: DoubleWishboneHardpoints,
                  tierod_len_sq: float | None = None,
-                 pushrod_body: str = 'upright'):
+                 pushrod_body: str = 'upright',
+                 damper_actuation: str = 'pushrod',
+                 damper_body: str = 'lca'):
         """
-        hp             : hardpoints at the current position (may have steered tie_rod_inner)
-        tierod_len_sq  : override for the squared tie-rod length.
-                         Must be supplied when tie_rod_inner has been moved by rack travel
-                         so the physical rod length stays constant regardless of rack pos.
-                         If None, computed from hp (correct for non-steered corners).
-        pushrod_body   : which rigid body carries pushrod_outer.
-                         'upright' (default) — pushrod mounts to the upright.
-                         'uca'               — pushrod outer is fixed to the UCA.
-                         'lca'               — pushrod outer is fixed to the LCA.
+        hp               : hardpoints at the current position (may have steered tie_rod_inner)
+        tierod_len_sq    : override for the squared tie-rod length.
+                           Must be supplied when tie_rod_inner has been moved by rack travel
+                           so the physical rod length stays constant regardless of rack pos.
+                           If None, computed from hp (correct for non-steered corners).
+        pushrod_body     : which rigid body carries pushrod_outer.
+                           'upright' (default) — pushrod mounts to the upright.
+                           'uca'               — pushrod outer is fixed to the UCA.
+                           'lca'               — pushrod outer is fixed to the LCA.
+        damper_actuation : 'pushrod' (default) — wheel → pushrod → rocker → spring.
+                           'pullrod' — same kinematics, lower rocker.
+                           'direct'  — spring/damper bolts directly between chassis
+                                       and a moving body (no rocker, no rod).
+        damper_body      : when damper_actuation == 'direct', which body the damper's
+                           outer end is rigidly attached to.  'lca' (default), 'uca',
+                           or 'upright'.  Ignored for pushrod / pullrod actuation.
         """
         self.hp = hp
         self._pushrod_body = pushrod_body
+        self._damper_actuation = damper_actuation
+        self._damper_body = damper_body
 
         # Precompute squared link lengths from design hardpoints
         self._L2 = {
@@ -136,35 +213,137 @@ class SuspensionConstraints:
         spin_world = np.array([1.0, 0.0, 0.0])
         self._spin_axis_local = self._F0.T @ spin_world   # upright-frame
 
-        # ── pushrod outer: body-frame local coords ─────────────────────────
-        # Which rigid body carries pushrod_outer determines which frame is used.
-        if pushrod_body == 'uca':
-            # UCA body: rotates about uca_front -> uca_rear axis
-            F_push0 = _build_frame(hp.uca_front, hp.uca_rear, hp.uca_outer)
-            self._pushrod_outer_local = F_push0.T @ (hp.pushrod_outer - hp.uca_front)
-        elif pushrod_body == 'lca':
-            # LCA body: rotates about lca_front -> lca_rear axis
-            F_push0 = _build_frame(hp.lca_front, hp.lca_rear, hp.lca_outer)
-            self._pushrod_outer_local = F_push0.T @ (hp.pushrod_outer - hp.lca_front)
-        else:
-            # 'upright' (default): pushrod outer fixed to upright
-            self._pushrod_outer_local = self._F0.T @ (hp.pushrod_outer - self._upright_origin_0)
+        # ── Pushrod / rocker setup OR direct-damper setup ──────────────────
+        if damper_actuation in ('pushrod', 'pullrod'):
+            # pushrod outer: body-frame local coords
+            # Which rigid body carries pushrod_outer determines which frame is used.
+            if pushrod_body == 'uca':
+                F_push0 = _build_frame(hp.uca_front, hp.uca_rear, hp.uca_outer)
+                self._pushrod_outer_local = F_push0.T @ (hp.pushrod_outer - hp.uca_front)
+            elif pushrod_body == 'lca':
+                F_push0 = _build_frame(hp.lca_front, hp.lca_rear, hp.lca_outer)
+                self._pushrod_outer_local = F_push0.T @ (hp.pushrod_outer - hp.lca_front)
+            else:
+                # 'upright': pushrod outer fixed to upright
+                self._pushrod_outer_local = self._F0.T @ (hp.pushrod_outer - self._upright_origin_0)
 
-        # ── rocker geometry ────────────────────────────────────────────────
-        pivot          = hp.rocker_pivot
-        arm_push       = hp.pushrod_inner   - pivot
-        arm_spring     = hp.rocker_spring_pt - pivot
-        self._rocker_pivot       = pivot.copy()
-        self._rocker_arm_push    = arm_push.copy()
-        self._rocker_arm_spring  = arm_spring.copy()
-        # Rocker rotation axis: use explicit axis point if available (from hardpoints),
-        # otherwise fall back to the normal of the two-arm plane.
-        axis_pt = getattr(hp, 'rocker_axis_pt', None)
-        if axis_pt is not None and np.linalg.norm(axis_pt - pivot) > 1e-9:
-            self._rocker_axis = _norm(axis_pt - pivot)
+            # Rocker geometry
+            pivot          = hp.rocker_pivot
+            arm_push       = hp.pushrod_inner   - pivot
+            arm_spring     = hp.rocker_spring_pt - pivot
+            self._rocker_pivot       = pivot.copy()
+            self._rocker_arm_push    = arm_push.copy()
+            self._rocker_arm_spring  = arm_spring.copy()
+            # ── Rocker rotation axis ─────────────────────────────────────
+            # HARD CONSTRAINT (design rule): the bellcrank pivot axis is
+            # NORMAL to the bellcrank plane, so the plate rotates strictly
+            # IN its own plane.  That plane is spanned by the two rocker
+            # arms (pivot->pushrod_inner and pivot->rocker_spring_pt).  We
+            # therefore ALWAYS take the axis as the normal of that plane.
+            #
+            # A user-supplied rocker_axis_pt only disambiguates the SIGN of
+            # the normal (which way it points) -- it can NOT tilt the axis
+            # off the normal.  A tilted axis would sweep the plate as a CONE
+            # and pull the pushrod / spring out of plane (the "skewed
+            # pullrod" failure).  The previous code trusted rocker_axis_pt
+            # outright, which silently allowed exactly that.
+            plane_n = np.cross(arm_push, arm_spring)
+            axis_pt = getattr(hp, 'rocker_axis_pt', None)
+            if np.linalg.norm(plane_n) < 1e-12:
+                # Degenerate (arms colinear) -- no plane to be normal to.
+                # Fall back to the explicit axis point, else +Y.
+                if axis_pt is not None and np.linalg.norm(axis_pt - pivot) > 1e-9:
+                    self._rocker_axis = _norm(axis_pt - pivot)
+                else:
+                    self._rocker_axis = np.array([0., 1., 0.])
+            else:
+                n_hat = _norm(plane_n)
+                # Keep the user's intended axis sense if they gave one.
+                if (axis_pt is not None
+                        and np.linalg.norm(axis_pt - pivot) > 1e-9
+                        and np.dot(np.asarray(axis_pt) - pivot, n_hat) < 0.0):
+                    n_hat = -n_hat
+                self._rocker_axis = n_hat
+            self._L_pushrod   = float(np.sqrt(_d2(hp.pushrod_inner, hp.pushrod_outer)))
+
+            # Unused-direct-damper placeholders so attribute access never raises
+            self._damper_outer_local = None
+            self._damper_chassis_pt  = None
+
+        elif damper_actuation == 'direct':
+            # No rocker, no pushrod.  Damper bolts straight between chassis and
+            # a moving body.  Precompute damper_outer's position in that body's
+            # local frame so we can transform it forward at every solve.
+            if hp.damper_chassis_pt is None or hp.damper_outer_pt is None:
+                raise ValueError(
+                    "Direct-damper topology requires `damper_chassis_pt` and "
+                    "`damper_outer_pt` to be set on the hardpoints.")
+            self._damper_chassis_pt = hp.damper_chassis_pt.copy()
+            if damper_body == 'uca':
+                F_d0 = _build_frame(hp.uca_front, hp.uca_rear, hp.uca_outer)
+                self._damper_outer_local = F_d0.T @ (hp.damper_outer_pt - hp.uca_front)
+            elif damper_body == 'lca':
+                F_d0 = _build_frame(hp.lca_front, hp.lca_rear, hp.lca_outer)
+                self._damper_outer_local = F_d0.T @ (hp.damper_outer_pt - hp.lca_front)
+            else:  # upright
+                self._damper_outer_local = self._F0.T @ (hp.damper_outer_pt - self._upright_origin_0)
+
+            # Pushrod / rocker attribute placeholders
+            self._pushrod_outer_local = None
+            self._rocker_pivot = None
+            self._rocker_arm_push = None
+            self._rocker_arm_spring = None
+            self._rocker_axis = None
+            self._L_pushrod   = 0.0
+
+        elif damper_actuation == 'cradle_link':
+            # DECOUPLED / external-cradle topology.  The corner has a
+            # pushrod (rigid rod between upright and an external cradle
+            # bellcrank) but NO per-corner rocker or spring -- those live
+            # on the central twin-bellcrank cradle solver (vahan/monoshock.py).
+            #
+            # This mode tracks pushrod_outer through the configured
+            # rigid body (UCA/LCA/upright) so the external cradle solver
+            # can be fed the live world position.  It SKIPS the rocker
+            # solve entirely (no dummy values, no fake rocker geometry).
+            # SolvedState fields that would normally come from the rocker
+            # are returned as NaN to make accidental use immediately
+            # visible -- if anything downstream reads `state.spring_length`
+            # for a cradle_link corner without going through the cradle
+            # solver, it'll see NaN and propagate it loudly.
+            if hp.pushrod_outer is None:
+                raise ValueError(
+                    "cradle_link topology requires `pushrod_outer` to be set.")
+            if pushrod_body == 'uca':
+                F_push0 = _build_frame(hp.uca_front, hp.uca_rear, hp.uca_outer)
+                self._pushrod_outer_local = F_push0.T @ (hp.pushrod_outer - hp.uca_front)
+            elif pushrod_body == 'lca':
+                F_push0 = _build_frame(hp.lca_front, hp.lca_rear, hp.lca_outer)
+                self._pushrod_outer_local = F_push0.T @ (hp.pushrod_outer - hp.lca_front)
+            else:
+                self._pushrod_outer_local = self._F0.T @ (hp.pushrod_outer - self._upright_origin_0)
+            # No rocker -- attribute placeholders
+            self._rocker_pivot = None
+            self._rocker_arm_push = None
+            self._rocker_arm_spring = None
+            self._rocker_axis = None
+            self._L_pushrod   = 0.0
+            # No direct damper -- attribute placeholders
+            self._damper_outer_local = None
+            self._damper_chassis_pt  = None
         else:
-            self._rocker_axis = _norm(np.cross(arm_push, arm_spring))
-        self._L_pushrod   = float(np.sqrt(_d2(hp.pushrod_inner, hp.pushrod_outer)))
+            raise ValueError(f"Unknown damper_actuation: {damper_actuation}")
+
+        # ── static-sag geometric offset (advanced / scripting) ────────────
+        # Shifts the interpretation of `travel` in solve(): an external caller
+        # requesting travel=T actually solves the kinematics at T + sag_offset_m.
+        # Normal GUI use leaves this at 0.  The "Apply Sag to Hardpoints"
+        # button in the MotionPanel does NOT use this — it rewrites the
+        # hardpoint dict permanently instead, so there's no hidden offset
+        # sitting on the solver.  The attribute is kept for scripting /
+        # testing use cases where you want to probe the sagged state
+        # without committing to new hardpoints.
+        self.sag_offset_m = 0.0
 
     # ── residual vector ──────────────────────────────────────────────────────
 
@@ -338,13 +517,19 @@ class SuspensionConstraints:
         """
         hp = self.hp
 
+        # Shift the drive constraint by the sag offset so that "display" travel
+        # (what the caller passes in and what we return on SolvedState.travel)
+        # is referenced to the physics-consistent static ride height instead of
+        # the raw hardpoint position.  When sag_offset_m == 0 this is a no-op.
+        effective_travel = travel + self.sag_offset_m
+
         if x0 is None:
             x0 = np.concatenate([hp.uca_outer, hp.lca_outer,
                                   hp.tie_rod_outer, hp.wheel_center])
 
         x = x0.copy()
         for i in range(max_iter):
-            r = self._residuals(x, travel)
+            r = self._residuals(x, effective_travel)
             if np.max(np.abs(r)) < tol:
                 break
             J  = self._jacobian(x)
@@ -353,7 +538,8 @@ class SuspensionConstraints:
         else:
             raise RuntimeError(
                 f"Main solver did not converge at travel={travel*1000:.2f} mm "
-                f"(max residual={np.max(np.abs(r)):.2e})."
+                f"(effective {effective_travel*1000:.2f} mm, "
+                f"max residual={np.max(np.abs(r)):.2e})."
             )
 
         uca_out = x[0:3]
@@ -365,6 +551,89 @@ class SuspensionConstraints:
         # ── upright frame — always used for spin axis ──────────────────────
         F_upright = _build_frame(lca_out, uca_out, tr_out)
         spin_axis_world = _norm(F_upright @ self._spin_axis_local)
+
+        # ── Spring / damper path: pushrod+rocker, direct, or cradle_link
+        if self._damper_actuation == 'cradle_link':
+            # External-cradle path (DECOUPLED).  Transform pushrod_outer
+            # through its rigid body and return state with rocker fields
+            # as NaN to flag accidental use.
+            if self._pushrod_body == 'uca':
+                F_push = _build_frame(hp.uca_front, hp.uca_rear, uca_out)
+                pushrod_outer_world = F_push @ self._pushrod_outer_local + hp.uca_front
+            elif self._pushrod_body == 'lca':
+                F_push = _build_frame(hp.lca_front, hp.lca_rear, lca_out)
+                pushrod_outer_world = F_push @ self._pushrod_outer_local + hp.lca_front
+            else:
+                pushrod_outer_world = F_upright @ self._pushrod_outer_local + lca_out
+            nan = float('nan')
+            nan_pt = np.array([nan, nan, nan])
+            return SolvedState(
+                travel=travel,
+                uca_outer      = uca_out.copy(),
+                lca_outer      = lca_out.copy(),
+                tr_outer       = tr_out.copy(),
+                wheel_center   = wc.copy(),
+                pushrod_outer  = pushrod_outer_world,
+                spin_axis      = spin_axis_world,
+                # Cradle-resident fields: NaN because they live on the
+                # external cradle solver, not this corner solver.  Any
+                # caller reading these without going through the cradle
+                # solver will see NaN propagate immediately.
+                pushrod_inner    = nan_pt,
+                rocker_spring_pt = nan_pt,
+                rocker_angle     = nan,
+                spring_length    = nan,
+                uca_front      = hp.uca_front.copy(),
+                uca_rear       = hp.uca_rear.copy(),
+                lca_front      = hp.lca_front.copy(),
+                lca_rear       = hp.lca_rear.copy(),
+                tr_inner       = hp.tie_rod_inner.copy(),
+                rocker_pivot      = nan_pt,
+                spring_chassis_pt = nan_pt,
+            )
+
+        if self._damper_actuation == 'direct':
+            # Direct damper: damper_outer is rigidly attached to the chosen
+            # body; chassis end is fixed.  Damper length = ||outer - chassis||.
+            if self._damper_body == 'uca':
+                F_d = _build_frame(hp.uca_front, hp.uca_rear, uca_out)
+                damper_outer_world = F_d @ self._damper_outer_local + hp.uca_front
+            elif self._damper_body == 'lca':
+                F_d = _build_frame(hp.lca_front, hp.lca_rear, lca_out)
+                damper_outer_world = F_d @ self._damper_outer_local + hp.lca_front
+            else:
+                damper_outer_world = F_upright @ self._damper_outer_local + lca_out
+
+            spring_length = float(np.linalg.norm(
+                damper_outer_world - self._damper_chassis_pt))
+
+            # Re-use the rocker/pushrod state fields as a uniform place to
+            # report the damper endpoints — downstream code (3D viewer, dynamics)
+            # already reads spring_chassis_pt + rocker_spring_pt as the spring's
+            # two endpoints, which works directly for the direct-damper case.
+            return SolvedState(
+                travel=travel,
+                uca_outer      = uca_out.copy(),
+                lca_outer      = lca_out.copy(),
+                tr_outer       = tr_out.copy(),
+                wheel_center   = wc.copy(),
+                pushrod_outer  = damper_outer_world,
+                spin_axis      = spin_axis_world,
+                # Damper endpoints reported via the same field names so the
+                # rest of the codebase (which expects rocker_spring_pt /
+                # spring_chassis_pt) works without changes.
+                pushrod_inner    = damper_outer_world,
+                rocker_spring_pt = damper_outer_world,
+                rocker_angle     = 0.0,
+                spring_length    = spring_length,
+                uca_front      = hp.uca_front.copy(),
+                uca_rear       = hp.uca_rear.copy(),
+                lca_front      = hp.lca_front.copy(),
+                lca_rear       = hp.lca_rear.copy(),
+                tr_inner       = hp.tie_rod_inner.copy(),
+                rocker_pivot      = self._damper_chassis_pt.copy(),
+                spring_chassis_pt = self._damper_chassis_pt.copy(),
+            )
 
         # ── pushrod outer — body-dependent ────────────────────────────────
         if self._pushrod_body == 'uca':

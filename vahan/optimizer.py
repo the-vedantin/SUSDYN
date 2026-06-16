@@ -19,6 +19,13 @@ from vahan.solver import SuspensionConstraints, SolvedState
 from vahan.kinematics import KinematicMetrics
 from vahan.metrics_catalog import CATALOG_MAP, compute_ackermann_post
 
+# Valid constructor kwargs for the double-wishbone corner solver.  A live GUI
+# hp dict also carries topology-specific extras (tbar_*, arb_lca_attach,
+# rocker_tbar_drop_pt, decoupled-cradle points) and may hold None-valued slots
+# (e.g. DIRECT has no pushrod) — none of those may be forwarded to the
+# dataclass, which rejects unknown kwargs.
+_DWH_FIELD_NAMES = set(DoubleWishboneHardpoints.__dataclass_fields__)
+
 
 # ─── Design variable specification ───────────────────────────────────────────
 
@@ -70,6 +77,17 @@ ORTHO_GROUPS: dict[str, list[dict]] = {
         dict(point='tie_rod_inner', coord=0),   # lateral position also affects Ackermann
         dict(point='tie_rod_outer', coord=0),
     ],
+    # Group 2c — Rack position only: moves the inboard tie-rod pickup
+    # (= rack end) in X/Y/Z WITHOUT touching tie_rod_outer.  This changes
+    # Ackermann geometry by repositioning the rack while keeping the outer
+    # ball joint (on the upright/knuckle) fixed — preserving steering ratio
+    # and rack length.  Use when the dynamic ideal Ackermann target differs
+    # from the current Ackermann curve.
+    'rack_position': [
+        dict(point='tie_rod_inner', coord=0),   # lateral (X) — rack offset
+        dict(point='tie_rod_inner', coord=1),   # fore-aft (Y) — rack fore/aft
+        dict(point='tie_rod_inner', coord=2),   # vertical (Z) — rack height
+    ],
     # Group 3 — Anti-dive/squat/lift: side-view pivot axis TILT.
     # Only change the Z-difference between front & rear inboard mounts,
     # NOT their average Z (which would shift front-view geometry).
@@ -113,6 +131,14 @@ ORTHO_GROUPS: dict[str, list[dict]] = {
         dict(point='uca_outer', coord=1),
         dict(point='lca_outer', coord=1),
     ],
+    # Group 7 — ARB motion ratio: ARB bellcrank geometry.
+    # arb_drop_top connects to the rocker, arb_arm_end is the lever,
+    # arb_pivot is the torsion bar rotation axis.
+    'arb_mr': [
+        dict(point='arb_drop_top', coord=0), dict(point='arb_drop_top', coord=2),
+        dict(point='arb_arm_end', coord=0), dict(point='arb_arm_end', coord=2),
+        dict(point='arb_pivot', coord=0), dict(point='arb_pivot', coord=2),
+    ],
 }
 
 # Backward compat alias
@@ -122,6 +148,7 @@ PRESETS = ORTHO_GROUPS
 # Each tuple: (metric_key, group_key) — group_key indexes ORTHO_GROUPS.
 SOLVE_ORDER = [
     'motion_ratio',   # completely independent
+    'arb_mr',         # ARB bellcrank — independent of suspension arms
     'toe',            # near-zero cross-contamination
     'ackermann',      # same variable group as toe (steer mode only)
     'anti_dive',      # side-view, minimal front-view effect
@@ -320,6 +347,55 @@ class Target:
     tolerance:  float = 0.0   # dead-band: no penalty inside ±tolerance
 
 
+# ─── ARB bellcrank solver (for IK evaluation) ────────────────────────────────
+
+def _rodrigues(v, k, theta):
+    """Rodrigues' rotation: rotate v about axis k by angle theta."""
+    ct, st_ = np.cos(theta), np.sin(theta)
+    return v * ct + np.cross(k, v) * st_ + k * np.dot(k, v) * (1 - ct)
+
+
+def _solve_arb_bellcrank(arb_drop_top_world, arb_hp):
+    """
+    Solve for the ARB bellcrank angle given the drop-link attachment position.
+
+    Returns (arb_angle_rad, drop_link_travel_m).
+    """
+    pv = arb_hp['arb_pivot']
+    ae0 = arb_hp['arb_arm_end']
+    dt0 = arb_hp['arb_drop_top']
+
+    bc_axis = np.array([1., 0., 0.])  # torsion bar runs lateral (X)
+    arm_vec = ae0 - pv
+    arm_len2 = float(arm_vec @ arm_vec)
+    if arm_len2 < 1e-12:
+        return 0., 0.
+
+    dl_vec0 = dt0 - ae0
+    dl_len2 = float(dl_vec0 @ dl_vec0)
+
+    theta = 0.0
+    for _ in range(60):
+        arm_rot = _rodrigues(arm_vec, bc_axis, theta)
+        ae_world = pv + arm_rot
+        diff = ae_world - arb_drop_top_world
+        res = float(diff @ diff) - dl_len2
+        if abs(res) < 1e-14:
+            break
+        d_arm = np.cross(bc_axis, arm_rot)
+        drdt = float(2.0 * diff @ d_arm)
+        if abs(drdt) < 1e-14:
+            break
+        theta -= res / drdt
+        # Clamp to physical range (no bellcrank rotates > 90 deg)
+        theta = max(-np.pi / 2, min(np.pi / 2, theta))
+
+    ae_world = pv + _rodrigues(arm_vec, bc_axis, theta)
+    drop_link_travel = float(np.linalg.norm(ae_world - arb_drop_top_world)
+                             - np.sqrt(dl_len2))
+    return theta, drop_link_travel
+
+
 # ─── Forward evaluation helper ───────────────────────────────────────────────
 
 def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
@@ -340,6 +416,44 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
     d = hp_work['tie_rod_outer'] - hp_work['tie_rod_inner']
     tierod_len_sq = float(d @ d)
 
+    # Separate ARB points (not part of DoubleWishboneHardpoints)
+    _ARB_KEYS = {'arb_drop_top', 'arb_arm_end', 'arb_pivot'}
+    arb_hp = {k: hp_work[k] for k in _ARB_KEYS if k in hp_work
+              and hp_work[k] is not None}
+    has_arb = len(arb_hp) == 3
+    # Forward ONLY recognised double-wishbone fields with real, finite values.
+    # This silently ignores topology-specific extras (control-arm / T-bar ARB
+    # points, decoupled-cradle nodes), None slots (e.g. DIRECT has no pushrod),
+    # AND NaN slots (e.g. a cradle-resident pushrod_inner) so the corner solver
+    # can be built for EVERY topology, not just bellcrank/corner cars.
+    hp_solver = {k: v for k, v in hp_work.items()
+                 if k in _DWH_FIELD_NAMES and v is not None
+                 and np.all(np.isfinite(np.asarray(v, float)))}
+
+    # ── Pick the damper-actuation mode the available hardpoints can build ──
+    # Camber/toe/caster/RC-height/anti-geometry all come purely from the
+    # 12-constraint wishbone+tierod solve and are INDEPENDENT of the damper
+    # path; the mode only governs which optional pushrod/rocker/damper locals
+    # SuspensionConstraints.__init__ constructs.  Letting it default to
+    # 'pushrod' crashes DIRECT cars (no pushrod at all) and DECOUPLED cars
+    # (pushrod_outer present, but the rocker/spring live on the external
+    # cradle).  Detecting the buildable mode here lets IK geometry work for
+    # EVERY topology — the solver returns valid wishbone geometry and flags
+    # the unused spring path as NaN.
+    if all(k in hp_solver for k in ('pushrod_outer', 'pushrod_inner',
+                                    'rocker_pivot', 'rocker_spring_pt')):
+        _damper_act = 'pushrod'        # full per-corner rocker (corner / heave-tbar)
+    elif 'pushrod_outer' in hp_solver:
+        _damper_act = 'cradle_link'    # DECOUPLED: rocker lives on the external cradle
+    elif 'damper_chassis_pt' in hp_solver and 'damper_outer_pt' in hp_solver:
+        _damper_act = 'direct'         # DIRECT: damper bolts straight to a moving body
+    else:
+        # No pushrod and no direct-damper points: synthesize a dummy
+        # pushrod_outer (never read by geometry metrics) so the wishbone solve
+        # can still run.  Defensive — unreached by the current topology space.
+        hp_solver['pushrod_outer'] = np.asarray(hp_solver['uca_outer'], float)
+        _damper_act = 'cradle_link'
+
     keys = metric_keys or list(CATALOG_MAP.keys())
     # Ackermann post-processing needs the toe curve — ensure it's computed
     _need_toe_for_ackermann = ('ackermann' in keys and 'toe' not in keys
@@ -348,14 +462,19 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
     out = {k: np.full(len(travel_arr), np.nan) for k in compute_keys}
     extra = anti_kwargs or {}
 
+    # Need ARB metrics?
+    _arb_keys_needed = [k for k in compute_keys if k.startswith('arb_')]
+
     # For non-steer modes, build solver once (much faster)
     base_solver = None
     if motion != 'steer':
         hp_obj = DoubleWishboneHardpoints(
-            **{k: np.array(v, float) for k, v in hp_work.items()})
+            **{k: np.array(v, float) for k, v in hp_solver.items()})
         base_solver = SuspensionConstraints(hp_obj,
                                              tierod_len_sq=tierod_len_sq,
-                                             pushrod_body=pushrod_body)
+                                             pushrod_body=pushrod_body,
+                                             damper_actuation=_damper_act,
+                                             damper_body=pushrod_body)
 
     # Two-pass sweep from center outward for warm-start continuity
     n = len(travel_arr)
@@ -371,14 +490,16 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
             if motion == 'steer':
                 rack_mm_per_rev = 60.0
                 rack_m = t_raw * rack_mm_per_rev / 360.0 / 1000.0
-                hp_steer = {k: v.copy() for k, v in hp_work.items()}
-                hp_steer['tie_rod_inner'] = (hp_work['tie_rod_inner']
+                hp_steer = {k: v.copy() for k, v in hp_solver.items()}
+                hp_steer['tie_rod_inner'] = (hp_solver['tie_rod_inner']
                                              + np.array([rack_m, 0., 0.]))
                 hp_obj = DoubleWishboneHardpoints(
                     **{k: np.array(v, float) for k, v in hp_steer.items()})
                 solver = SuspensionConstraints(hp_obj,
                                                tierod_len_sq=tierod_len_sq,
-                                               pushrod_body=pushrod_body)
+                                               pushrod_body=pushrod_body,
+                                               damper_actuation=_damper_act,
+                                               damper_body=pushrod_body)
                 t_solve = 0.0
             else:
                 solver = base_solver
@@ -395,6 +516,30 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
                                                travel_prev=travel_prev, **extra)
                 except Exception:
                     pass
+
+            # ARB metrics: compute from rocker angle + ARB bellcrank
+            if has_arb and _arb_keys_needed:
+                try:
+                    pv = st.rocker_pivot
+                    ax_pt = pv + np.array([0., 0.0254, 0.])
+                    r_axis = ax_pt - pv
+                    rn = np.linalg.norm(r_axis)
+                    if rn > 1e-9:
+                        r_axis = r_axis / rn
+                    else:
+                        r_axis = np.array([0., 1., 0.])
+                    arm_dt = arb_hp['arb_drop_top'] - pv
+                    dt_w = pv + _rodrigues(arm_dt, r_axis, st.rocker_angle)
+                    ang, dl_t = _solve_arb_bellcrank(dt_w, arb_hp)
+                    if 'arb_angle' in out:
+                        out['arb_angle'][idx] = np.degrees(ang)
+                    if 'arb_drop_travel' in out:
+                        out['arb_drop_travel'][idx] = dl_t * 1000
+                    if 'arb_mr' in out:
+                        out['arb_mr'][idx] = min(abs(np.degrees(ang) / (t_raw * 1000)), 5.0) if abs(t_raw) > 1e-9 else float('nan')
+                except Exception:
+                    pass
+
             spring_prev = m.spring_length
             travel_prev = t_raw
         except Exception:
@@ -550,6 +695,28 @@ class InverseSolver:
                 if gap < margin:
                     coll[k] = 2000.0 * (margin - gap)
             parts.append(coll)
+
+        # Rocker coplanarity constraint: rocker_pivot, pushrod_inner, and
+        # rocker_spring_pt must lie on the same plane (defined by the
+        # design-position normal).  The rocker is a planar mechanism.
+        hp_curr = self.ds.unpack(x) if not self._collision_pairs else hp
+        if all(k in hp_curr for k in ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')):
+            pv = hp_curr['rocker_pivot']
+            pi = hp_curr['pushrod_inner']
+            rs = hp_curr['rocker_spring_pt']
+            # Design-position plane normal
+            if not hasattr(self, '_rocker_plane_normal'):
+                pv0 = self.hp_dict['rocker_pivot']
+                a = self.hp_dict['pushrod_inner'] - pv0
+                b = self.hp_dict['rocker_spring_pt'] - pv0
+                n = np.cross(a, b)
+                norm = np.linalg.norm(n)
+                self._rocker_plane_normal = n / norm if norm > 1e-9 else np.array([0., 1., 0.])
+            n_hat = self._rocker_plane_normal
+            # Penalise out-of-plane deviation for both arm tips
+            dev_pi = float(np.dot(pi - pv, n_hat))
+            dev_rs = float(np.dot(rs - pv, n_hat))
+            parts.append(np.array([5000.0 * dev_pi, 5000.0 * dev_rs]))
 
         return np.concatenate(parts)
 

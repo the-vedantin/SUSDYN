@@ -195,7 +195,7 @@ class TireModel:
     interpolation with clamping at grid bounds.
 
     Typical usage:
-        model = TireModel.from_mat_file('B2356run5.mat')
+        model = TireModel.from_mat_file('your_tire_data.mat')
         Fy = model.Fy(slip_angle_deg=3.0, Fz_N=800, camber_deg=2.0)
     """
 
@@ -218,6 +218,12 @@ class TireModel:
             Number of initial warmup samples to discard (default 1500).
         """
         self.tire_id = ttc.tire_id
+        self.test_id = ttc.test_id
+
+        # Store pressure stats before filtering
+        p_raw = ttc.pressure_kPa
+        self.pressure_kPa_mean = float(np.median(p_raw[p_raw > 0])) if np.any(p_raw > 0) else 0.0
+        self.pressure_psi = self.pressure_kPa_mean * 0.145038
 
         # Discard warmup
         n = len(ttc.slip_angle_deg)
@@ -367,10 +373,42 @@ class TireModel:
         return (fy_pos - fy_neg) / (2 * da)
 
     def peak_mu(self, Fz_N, camber_deg=0.0):
-        """Peak friction coefficient: mu = peak_Fy / Fz."""
+        """Peak friction coefficient: mu = peak_Fy / Fz.
+
+        LOAD SENSITIVITY: mu falls as Fz rises (real, measured tire physics).
+        Above the tested Fz range we EXTEND that decline using the last
+        measured segment's slope.  Two physical guards, NOT optimistic ones:
+
+          * absolute floor 0.3 — warm rubber keeps a sliding-friction grip
+            of ~0.3 even hopelessly overloaded; mu never goes to zero.
+          * grip-FORCE ceiling — total grip Fy = mu*Fz may NOT exceed the
+            peak force the tire ever made.  Without this, a constant-mu floor
+            makes Fy climb again with load ("more load -> more grip"), the
+            exact error load sensitivity exists to remove.  With it, grip
+            force saturates and then declines as load keeps rising.
+        """
         fz = np.atleast_1d(np.asarray(Fz_N, float))
+        fz_max = float(self._fz_axis[-1])
         peak = self.peak_Fy(fz, camber_deg)
-        return np.where(fz > 1.0, peak / fz, 0.0).squeeze()
+        mu = np.where(fz > 1.0, peak / np.maximum(fz, 1.0), 0.0)
+        over = fz > fz_max
+        if np.any(over):
+            mu_at_max = float(self.peak_Fy(fz_max, camber_deg)) / fz_max
+            # local mu(Fz) slope at the edge of the data (last grid segment)
+            slope = 0.0
+            if len(self._fz_axis) >= 2:
+                f_prev = float(self._fz_axis[-2])
+                mu_prev = float(self.peak_Fy(f_prev, camber_deg)) / f_prev
+                slope = (mu_at_max - mu_prev) / max(fz_max - f_prev, 1e-6)
+                slope = min(slope, 0.0)        # mu never RISES beyond data
+            mu_lin = mu_at_max + slope * (fz - fz_max)
+            mu_lin = np.maximum(mu_lin, 0.3)   # rubber sliding-friction floor
+            # grip-force ceiling: Fy never exceeds the peak measured force
+            Fy_peak = float(np.max([self.peak_Fy(f, camber_deg)
+                                    for f in self._fz_axis]))
+            mu_cap = Fy_peak / np.maximum(fz, 1.0)
+            mu = np.where(over, np.minimum(mu_lin, mu_cap), mu)
+        return mu.squeeze()
 
     def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0):
         """
@@ -460,57 +498,110 @@ class TireModel:
 
 class LinearTireModel:
     """
-    Simple tire model for use without TTC data.
+    Simple parametric tire model used when no TTC .mat data is loaded.
 
-    Includes load sensitivity (degressivity) so that cornering stiffness
-    does not scale linearly with Fz — heavier loaded tires are less
-    efficient, which is what creates understeer/oversteer tendencies.
+    Per RCVD audit (chapters 2.4, 2.5, 14.2) the parametric model needs
+    to capture THREE load-sensitivities and camber thrust:
 
-    C_alpha(Fz) = C_alpha_ref * (Fz / Fz_ref)^load_sensitivity
-    where load_sensitivity < 1.0 means degressive (realistic).
-    Typical FSAE tire: 0.7-0.85.
+    1. Cornering stiffness vs Fz:
+           C_alpha(Fz) = C_alpha_ref * (Fz / Fz_ref) ** load_sensitivity_Ca
+       load_sensitivity_Ca < 1.0  ->  degressive (realistic, RCVD p27-29).
 
-    Fy = -C_alpha(Fz) * slip_angle, saturated at mu * Fz.
+    2. Peak friction coefficient vs Fz (RCVD section 2.4, fig 2.10):
+           mu(Fz)     = mu_ref     * (Fz / Fz_ref) ** (load_sensitivity_mu - 1)
+       load_sensitivity_mu < 1.0  ->  peak mu falls with load.  Typical
+       FSAE Hoosier ~0.85.  Previously this was a constant -- understeer
+       gradient errors up to 15 % at limit.
+
+    3. Camber thrust (RCVD section 2.5, fig 2.24-2.26):
+           Fy_camber = C_gamma * sin(camber_rad)   (adds to slip-angle Fy)
+       For small camber angles sin(gamma) ~= gamma so the relationship
+       is approximately linear in degrees: C_gamma ~ 0.1 * C_alpha per
+       RCVD's typical numbers.  Default disabled (C_gamma_N_per_deg=0)
+       so old behaviour is preserved unless the user opts in.
+
+    Fy_total = -C_alpha(Fz) * slip_angle  +  C_gamma * sin(camber_rad),
+    saturated symmetrically at mu(Fz) * Fz.
     """
 
     def __init__(self, C_alpha_N_per_deg: float = 200.0,
                  Fz_ref_N: float = 700.0,
                  mu: float = 1.5,
-                 load_sensitivity: float = 0.8):
+                 load_sensitivity: float = 0.8,
+                 load_sensitivity_mu: float = 0.9,
+                 C_gamma_N_per_deg: float = 0.0):
         self._Ca = C_alpha_N_per_deg
         self._Fz_ref = Fz_ref_N
-        self._mu = mu
-        self._ls = load_sensitivity
-        self.tire_id = f'Linear (Ca={C_alpha_N_per_deg}, mu={mu}, ls={load_sensitivity})'
+        self._mu_ref = mu
+        self._ls_Ca = load_sensitivity
+        self._ls_mu = load_sensitivity_mu
+        self._Cg = C_gamma_N_per_deg
+        self.tire_id = (f'Linear (Ca={C_alpha_N_per_deg}, mu={mu}, '
+                        f'ls_Ca={load_sensitivity}, ls_mu={load_sensitivity_mu}, '
+                        f'Cg={C_gamma_N_per_deg})')
+
+    # ─── Backward-compat: callers reading ._mu still get the reference ──
+    @property
+    def _mu(self):
+        return self._mu_ref
+
+    def _mu_of_Fz(self, fz_arr: np.ndarray) -> np.ndarray:
+        """RCVD load-sensitive peak mu: mu(Fz) = mu_ref * (Fz/Fz_ref)^(ls_mu - 1).
+
+        Floored at mu_ref / 4 to avoid pathological zero-mu at very low Fz
+        (which can happen for an inside wheel near liftoff -- numerically
+        the formula goes to infinity there, which is wrong).
+        """
+        ratio = np.maximum(fz_arr / self._Fz_ref, 1e-3)
+        mu = self._mu_ref * ratio ** (self._ls_mu - 1.0)
+        return np.minimum(np.maximum(mu, self._mu_ref / 4.0),
+                          self._mu_ref * 2.0)
 
     def Fy(self, slip_angle_deg, Fz_N, camber_deg=0.0):
         sa = np.atleast_1d(np.asarray(slip_angle_deg, float))
         fz = np.atleast_1d(np.asarray(Fz_N, float))
+        gamma = np.atleast_1d(np.asarray(camber_deg, float))
         fz_safe = np.maximum(fz, 0.0)
-        ca = self._Ca * (fz_safe / self._Fz_ref) ** self._ls
-        fy_linear = -ca * sa
-        fy_max = self._mu * fz_safe
-        return np.clip(fy_linear, -fy_max, fy_max).squeeze()
+        ca = self._Ca * (fz_safe / self._Fz_ref) ** self._ls_Ca
+        # Slip-angle component
+        fy_slip = -ca * sa
+        # Camber thrust component (RCVD section 2.5).  sin(gamma_rad) ~= gamma
+        # for small angles; using sin keeps it exact at large camber too.
+        fy_camber = self._Cg * np.sin(np.deg2rad(gamma))
+        fy = fy_slip + fy_camber
+        # Saturate at load-sensitive peak
+        mu = self._mu_of_Fz(fz_safe)
+        fy_max = mu * fz_safe
+        return np.clip(fy, -fy_max, fy_max).squeeze()
 
     def Mz(self, slip_angle_deg, Fz_N, camber_deg=0.0):
         return np.zeros_like(np.atleast_1d(np.asarray(slip_angle_deg, float))).squeeze()
 
     def peak_Fy(self, Fz_N, camber_deg=0.0):
-        return self._mu * np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0)).squeeze()
+        fz = np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0))
+        return (self._mu_of_Fz(fz) * fz).squeeze()
 
     def cornering_stiffness(self, Fz_N, camber_deg=0.0):
         fz = np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0))
-        return (self._Ca * (fz / self._Fz_ref) ** self._ls).squeeze()
+        return (self._Ca * (fz / self._Fz_ref) ** self._ls_Ca).squeeze()
 
     def peak_mu(self, Fz_N, camber_deg=0.0):
-        return self._mu
+        """Now load-sensitive per RCVD section 2.4 (previously constant)."""
+        fz = np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0))
+        return self._mu_of_Fz(fz).squeeze()
 
     def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0):
         fz = max(float(Fz_N), 0.0)
         if fz < 1.0:
             return 0.0
-        ca = self._Ca * (fz / self._Fz_ref) ** self._ls
+        ca = self._Ca * (fz / self._Fz_ref) ** self._ls_Ca
         if ca < 0.1:
             return 0.0
-        sa = abs(float(Fy_target_N)) / ca
-        return min(sa, abs(float(Fy_target_N)) / (self._mu * fz + 1e-9) + 2.0)
+        # Subtract camber-thrust contribution from the target before
+        # solving the slip-angle component -- otherwise we under-predict
+        # required slip angle when there's camber.
+        fy_camber = self._Cg * float(np.sin(np.deg2rad(camber_deg)))
+        fy_residual = float(Fy_target_N) - fy_camber
+        sa = abs(fy_residual) / ca
+        mu = float(self._mu_of_Fz(np.array([fz]))[0])
+        return min(sa, abs(fy_residual) / (mu * fz + 1e-9) + 2.0)

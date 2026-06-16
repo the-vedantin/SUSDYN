@@ -16,40 +16,40 @@ from vispy import scene, app as vispy_app
 vispy_app.use_app('pyqt6')
 
 from PyQt6.QtCore import Qt, pyqtSignal, QPointF
-from PyQt6.QtWidgets import QWidget
-from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF
+from PyQt6.QtWidgets import QWidget, QLabel
+from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPolygonF, QTransform
 
 
 # ── NavCube widget ────────────────────────────────────────────────────────────
 
 class NavCube(QWidget):
-    """Orientation cube overlay — click faces/edges to snap the camera."""
-    view_requested = pyqtSignal(float, float)  # azimuth, elevation
+    """
+    Onshape-style solid orientation cube with perspective-warped face labels.
+
+    Convention: X = lateral / width, Y = longitudinal / length, Z = up.
+    VisPy TurntableCamera: az=0 → camera at -Y looking at +Y (front of car).
+    """
+    view_requested = pyqtSignal(float, float)
 
     _VERTS = np.array([
         [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],   # 0-3 bottom
         [-1, -1,  1], [1, -1,  1], [1, 1,  1], [-1, 1,  1],   # 4-7 top
     ], dtype=float)
 
-    # (vertex_indices, outward_normal, label, snap_azimuth, snap_elevation)
-    # snap_az = None means keep current azimuth (for top/bottom)
+    # (fill_vi, outward_normal, label, snap_az, snap_el,
+    #  text_vi = [TL, TR, BR, BL] when viewed head-on)
     _FACES = [
-        ([0, 1, 2, 3], [0, 0, -1], 'BTM',   None,  -90),
-        ([4, 5, 6, 7], [0, 0,  1], 'TOP',   None,   90),
-        ([0, 1, 5, 4], [0, -1, 0], 'FRONT', 180,     0),
-        ([2, 3, 7, 6], [0,  1, 0], 'REAR',    0,     0),
-        ([0, 3, 7, 4], [-1, 0, 0], 'LEFT',  270,     0),
-        ([1, 2, 6, 5], [1,  0, 0], 'RIGHT',  90,     0),
+        ([0,1,2,3], [ 0, 0,-1], 'Bottom', None, -90, [0,1,2,3]),
+        ([4,5,6,7], [ 0, 0, 1], 'Top',    None,  90, [7,6,5,4]),
+        ([0,1,5,4], [ 0,-1, 0], 'Front',    0,   0,  [4,5,1,0]),
+        ([2,3,7,6], [ 0, 1, 0], 'Back',   180,   0,  [6,7,3,2]),
+        ([0,3,7,4], [-1, 0, 0], 'Left',   270,   0,  [7,4,0,3]),
+        ([1,2,6,5], [ 1, 0, 0], 'Right',   90,   0,  [5,6,2,1]),
     ]
 
-    _COLORS = {
-        'FRONT': QColor(224, 123, 48, 200),
-        'REAR':  QColor(224, 123, 48, 140),
-        'LEFT':  QColor(80, 130, 200, 180),
-        'RIGHT': QColor(80, 130, 200, 120),
-        'TOP':   QColor(100, 180, 100, 180),
-        'BTM':   QColor(100, 180, 100, 120),
-    }
+    # Fixed directional light for consistent face shading
+    _LIGHT = np.array([0.35, -0.25, 0.85])
+    _LIGHT = _LIGHT / np.linalg.norm(_LIGHT)
 
     def __init__(self, parent=None, size=110):
         super().__init__(parent)
@@ -65,72 +65,127 @@ class NavCube(QWidget):
             self._az, self._el = az, el
             self.update()
 
-    # ── projection helpers ────────────────────────────────────────────────
-
     def _cam_dir(self):
+        """Camera position direction — matches VisPy TurntableCamera."""
         az, el = np.radians(self._az), np.radians(self._el)
-        return np.array([np.sin(az)*np.cos(el), np.cos(az)*np.cos(el), np.sin(el)])
+        return np.array([np.sin(az)*np.cos(el),
+                         -np.cos(az)*np.cos(el),
+                         np.sin(el)])
 
-    def _project(self, verts=None):
-        """Orthographic project world 3D → widget 2D. Returns (N,2) in widget coords."""
-        if verts is None:
-            verts = self._VERTS
+    def _project(self, verts):
+        """Orthographic projection matching VisPy TurntableCamera."""
         az, el = np.radians(self._az), np.radians(self._el)
         ca, sa = np.cos(az), np.sin(az)
         ce, se = np.cos(el), np.sin(el)
-        R = np.array([[ca, -sa, 0], [sa * se, ca * se, ce]])
-        pts = (R @ verts.T).T          # (N, 2) in projection space
+        # Camera right = (ca, sa, 0), camera up = (-sa*se, ca*se, ce)
+        R = np.array([[ca, sa, 0],
+                      [-sa * se, ca * se, ce]])
+        pts = (R @ np.asarray(verts).T).T
         s = self._sz * 0.30
         c = self._sz / 2
         pts = pts * s + c
-        pts[:, 1] = self._sz - pts[:, 1]  # flip Y for widget coords
+        pts[:, 1] = self._sz - pts[:, 1]   # flip Y for screen coords
         return pts
 
-    # ── painting ──────────────────────────────────────────────────────────
-
     def paintEvent(self, _event):
-        pts = self._project()
+        pts = self._project(self._VERTS)
         cam = self._cam_dir()
 
-        # collect visible faces with depth
+        # Only front-facing faces (dot > 0), sorted back-to-front
         draws = []
-        for vi, nrm, label, *_ in self._FACES:
+        for vi, nrm, label, snap_az, snap_el, text_vi in self._FACES:
             n = np.asarray(nrm, float)
-            if np.dot(n, cam) <= 0.01:
+            dot = float(np.dot(n, cam))
+            if dot <= 0.0:
                 continue
             depth = float(np.mean(self._VERTS[vi] @ cam))
-            draws.append((depth, vi, label))
-        draws.sort(key=lambda x: x[0])  # painter's algorithm: back→front
+            shade = max(float(np.dot(n, self._LIGHT)), 0.08)
+            draws.append((depth, vi, label, dot, text_vi, shade))
+        draws.sort(key=lambda x: x[0])
 
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        font = QFont('Segoe UI', 9, QFont.Weight.Bold)
-        p.setFont(font)
 
-        for _, vi, label in draws:
-            poly = QPolygonF([QPointF(float(pts[i, 0]), float(pts[i, 1])) for i in vi])
-            p.setPen(QPen(QColor(180, 180, 180, 80), 1.0))
-            p.setBrush(self._COLORS[label])
+        edge_pen = QPen(QColor(25, 28, 38), 2.0)
+
+        # ── 1. Solid opaque faces ───────────────────────────────────────
+        for _, vi, label, dot, text_vi, shade in draws:
+            poly = QPolygonF([QPointF(float(pts[i, 0]), float(pts[i, 1]))
+                              for i in vi])
+            g = int(52 + 68 * shade)
+            col = QColor(g - 2, g, g + 6)
+            p.setPen(edge_pen)
+            p.setBrush(col)
             p.drawPolygon(poly)
-            cx = float(np.mean([pts[i, 0] for i in vi]))
-            cy = float(np.mean([pts[i, 1] for i in vi]))
-            p.setPen(QColor(255, 255, 255, 230))
-            p.drawText(int(cx) - 22, int(cy) - 7, 44, 14,
-                       int(Qt.AlignmentFlag.AlignCenter), label)
+
+        # ── 2. Perspective-warped text on each visible face ─────────────
+        for _, vi, label, dot, text_vi, shade in draws:
+            if dot < 0.15:
+                continue
+            tw, th = 100., 44.
+            src = QPolygonF([QPointF(0, 0), QPointF(tw, 0),
+                             QPointF(tw, th), QPointF(0, th)])
+            dst = QPolygonF([QPointF(float(pts[i, 0]), float(pts[i, 1]))
+                             for i in text_vi])
+            xform = QTransform()
+            ok = QTransform.quadToQuad(src, dst, xform)
+            if ok:
+                p.save()
+                p.setTransform(xform, True)
+                alpha = int(min(255, 120 + 135 * dot))
+                p.setFont(QFont('Segoe UI', 14, QFont.Weight.Bold))
+                p.setPen(QColor(195, 200, 212, alpha))
+                p.drawText(0, 0, int(tw), int(th),
+                           int(Qt.AlignmentFlag.AlignCenter), label)
+                p.restore()
+
+        # ── 3. XYZ axes from front-left-bottom corner (vertex 0) ───────
+        ax_pts_3d = np.array([
+            [-1, -1, -1],      # origin (vertex 0)
+            [ 1.25, -1, -1],   # X tip
+            [-1, 1.25, -1],    # Y tip
+            [-1, -1, 1.25],    # Z tip
+            [ 1.5, -1, -1],    # X label
+            [-1, 1.5, -1],     # Y label
+            [-1, -1, 1.5],     # Z label
+        ])
+        ap = self._project(ax_pts_3d)
+        axes = [('X', QColor(220, 75, 75), 1),
+                ('Y', QColor(75, 190, 75), 2),
+                ('Z', QColor(75, 140, 230), 3)]
+        for lbl, col, ti in axes:
+            ox, oy = float(ap[0, 0]), float(ap[0, 1])
+            ex, ey = float(ap[ti, 0]), float(ap[ti, 1])
+            p.setPen(QPen(col, 2.0))
+            p.drawLine(QPointF(ox, oy), QPointF(ex, ey))
+            # arrowhead
+            dx, dy = ex - ox, ey - oy
+            ln = max((dx * dx + dy * dy) ** 0.5, 1e-6)
+            ux, uy = dx / ln, dy / ln
+            p.drawLine(QPointF(ex, ey),
+                       QPointF(ex - ux * 5 + uy * 3, ey - uy * 5 - ux * 3))
+            p.drawLine(QPointF(ex, ey),
+                       QPointF(ex - ux * 5 - uy * 3, ey - uy * 5 + ux * 3))
+        # axis labels
+        p.setFont(QFont('Segoe UI', 8, QFont.Weight.Bold))
+        for lbl, col, ti in axes:
+            li = ti + 3   # label point index (4, 5, 6)
+            p.setPen(col)
+            p.drawText(int(ap[li, 0]) - 6, int(ap[li, 1]) - 6, 12, 12,
+                       int(Qt.AlignmentFlag.AlignCenter), lbl)
         p.end()
 
-    # ── click → snap ──────────────────────────────────────────────────────
-
     def mousePressEvent(self, event):
-        pts = self._project()
+        pts = self._project(self._VERTS)
         mx, my = event.position().x(), event.position().y()
         cam = self._cam_dir()
 
         best, best_d = None, -1e9
-        for vi, nrm, label, snap_az, snap_el in self._FACES:
-            if np.dot(np.asarray(nrm, float), cam) <= 0.01:
+        for vi, nrm, label, snap_az, snap_el, _tv in self._FACES:
+            if np.dot(np.asarray(nrm, float), cam) <= 0.0:
                 continue
-            if self._pt_in_poly(mx, my, [(float(pts[i, 0]), float(pts[i, 1])) for i in vi]):
+            if self._pt_in_poly(mx, my,
+                    [(float(pts[i, 0]), float(pts[i, 1])) for i in vi]):
                 d = float(np.mean(self._VERTS[vi] @ cam))
                 if d > best_d:
                     best_d = d
@@ -149,7 +204,8 @@ class NavCube(QWidget):
         for i in range(n):
             xi, yi = poly[i]
             xj, yj = poly[j]
-            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            if ((yi > py) != (yj > py)) and \
+               (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
                 inside = not inside
             j = i
         return inside
@@ -214,6 +270,10 @@ def _merge(meshes):
     return np.vstack(all_v), np.vstack(all_f)
 
 
+
+
+
+
 def build_tire_mesh(center, spin_axis, outer_r, rim_r, half_w, n=48):
     """Tyre = tread cylinder + two sidewall annuli. NO rim — rim is interior."""
     c = np.asarray(center, float)
@@ -225,8 +285,41 @@ def build_tire_mesh(center, spin_axis, outer_r, rim_r, half_w, n=48):
     return _merge(parts)
 
 
+def build_cylinder_between(p0, p1, radius, n=20):
+    """Closed cylinder (with end caps) spanning p0 → p1 at given radius.
+
+    Used for spring / damper rendering: pass the spring's two endpoints
+    in world coords and the user-set OD/2 as radius.  Returns (verts, faces)
+    suitable for a scene.Mesh.  Cap faces are included so the cylinder
+    appears solid from any angle.
+
+    Degenerate input (p0 ≈ p1) returns a zero-area placeholder so the
+    caller can blindly assign it without checking.
+    """
+    p0 = np.asarray(p0, float)
+    p1 = np.asarray(p1, float)
+    L  = float(np.linalg.norm(p1 - p0))
+    if L < 1e-9 or radius <= 0.0:
+        # Degenerate — caller still needs valid vertices/faces
+        return (np.zeros((3, 3), np.float32),
+                np.array([[0, 1, 2]], np.uint32))
+    axis = (p1 - p0) / L
+    center = 0.5 * (p0 + p1)
+    half_w = 0.5 * L
+    # Side cylinder (open) — same construction as the tyre tread band
+    side_v, side_f = _torus_section_mesh(center, axis, radius, half_w, n)
+    # Two end caps via _annulus_mesh with r_inner=0
+    cap0_v, cap0_f = _annulus_mesh(center - half_w * axis, axis, 0.0, radius, n)
+    cap1_v, cap1_f = _annulus_mesh(center + half_w * axis, axis, 0.0, radius, n)
+    return _merge([(side_v, side_f), (cap0_v, cap0_f), (cap1_v, cap1_f)])
+
+
 # ── link topology ─────────────────────────────────────────────────────────────
 # (key_a, key_b, RGBA)
+# Note: rocker_spring_pt → spring_chassis_pt is now rendered as a SOLID
+# CYLINDER (see _spring_meshes in update_scene) using the user's spring/
+# damper OD.  The skinny grey line was redundant and would clip through
+# the cylinder, so it's removed from this list.
 LINKS = [
     ('uca_front',        'uca_outer',         (0.20, 0.55, 0.90, 1.0)),
     ('uca_rear',         'uca_outer',         (0.20, 0.55, 0.90, 1.0)),
@@ -234,7 +327,6 @@ LINKS = [
     ('lca_rear',         'lca_outer',         (0.90, 0.25, 0.25, 1.0)),
     ('tie_rod_inner',    'tie_rod_outer',     (0.25, 0.80, 0.40, 1.0)),
     ('pushrod_outer',    'pushrod_inner',     (0.95, 0.55, 0.10, 1.0)),
-    ('rocker_spring_pt', 'spring_chassis_pt', (0.50, 0.50, 0.50, 1.0)),
 ]
 
 CHASSIS_PTS = frozenset({
@@ -303,7 +395,81 @@ class View3D:
         # Per-corner meshes (4 corners max)
         self._tire_meshes    = [self._new_mesh((0.18, 0.18, 0.18, 0.6)) for _ in range(4)]
         self._upright_meshes = [self._new_mesh((0.50, 0.40, 0.30, 0.30)) for _ in range(4)]
-        self._rocker_meshes  = [self._new_mesh((0.55, 0.20, 0.70, 0.75)) for _ in range(4)]
+        self._rocker_meshes  = [self._new_mesh((0.85, 0.70, 0.12, 0.75)) for _ in range(4)]
+        # Spring / damper cylinder per corner — radius set via set_spring_dims
+        self._spring_meshes  = [self._new_mesh((0.75, 0.75, 0.78, 0.70)) for _ in range(4)]
+        # Outside diameters in METRES.  Defaults match the wizard defaults
+        # so a fresh View3D renders correctly even before the host calls
+        # set_spring_dims().
+        self._spring_od_m = 0.063
+        self._damper_od_m = 0.050
+
+        # ── Decoupled (twin-bellcrank) visuals ───────────────────────────
+        # Per axle (front + rear) we render:
+        #   * LEFT bellcrank plate    →  self._cradle_meshes
+        #   * RIGHT bellcrank plate   →  self._cradle_lat_spring_meshes
+        #   * HEAVE coilover cylinder →  self._cradle_obl_spring_meshes
+        #     (cross-car, between heave_damper_left and heave_damper_right)
+        #   * ROLL coilover cylinder  →  self._cradle_roll_damper_meshes
+        #     (cross-car, diagonal, asymmetric Z so heave doesn't compress it)
+        # Slot names kept from the old (wrong) cradle model so we don't
+        # have to rewire downstream code — they're just repurposed.
+        # Drawn only when the topology supplies the cradle hardpoints,
+        # otherwise set to an empty placeholder triangle.
+        self._cradle_meshes  = [self._new_mesh((0.85, 0.70, 0.12, 0.75))
+                                for _ in range(2)]   # LEFT bellcrank (purple)
+        self._cradle_lat_spring_meshes = [
+            self._new_mesh((0.20, 0.55, 0.90, 0.75)) for _ in range(2)]
+        # RIGHT bellcrank (blue) — distinct colour so the two bellcranks
+        # are visually distinguishable in the 3D view.
+        self._cradle_obl_spring_meshes = [
+            self._new_mesh((0.95, 0.55, 0.10, 0.85)) for _ in range(2)]
+        # HEAVE coilover (orange-ish)
+        self._cradle_roll_damper_meshes = [
+            self._new_mesh((0.95, 0.20, 0.20, 0.85)) for _ in range(2)]
+        # ROLL coilover (red — visually distinct from heave damper)
+
+        # ── HEAVE_TBAR third-element shock ───────────────────────────────
+        # The heave 3rd element is a SHOCK (damper cylinder), NOT a bare
+        # line.  One per axle (front / rear), drawn between the heave
+        # spring's bracket attach and its chassis attach.  Orange-ish to
+        # read as a damper, matching the decoupled heave coilover.
+        self._heave_tbar_shock_meshes = [
+            self._new_mesh((0.95, 0.55, 0.10, 0.85)) for _ in range(2)]
+
+        # ── HEAVE_TBAR linkage (per-segment COLOURED) + bellcrank plates +
+        #    corner-damper cylinders.  The whole heave-T-bar mechanism gets its
+        #    own coloured render path (not the single-colour ARB line) so the
+        #    pushrod, lever, torsion bar, drop links + corner dampers are all
+        #    distinguishable.  Colours kept to the colour-blind-safe set
+        #    (white / yellow / red / blue + grey).
+        self._htb_link_vis = scene.Line(
+            pos=np.zeros((2, 3), np.float32),
+            color=np.ones((2, 4), np.float32),
+            connect='segments', width=2.6, antialias=True,
+            parent=self._view.scene,
+        )
+        # 4 bellcrank plates (FL, FR, RL, RR) — filled translucent gold.
+        self._htb_bell_meshes = [
+            self._new_mesh((0.78, 0.64, 0.12, 0.55)) for _ in range(4)]
+        # 4 corner-damper cylinders (FL, FR, RL, RR) — orange, read as dampers.
+        self._htb_coil_meshes = [
+            self._new_mesh((0.95, 0.55, 0.10, 0.85)) for _ in range(4)]
+
+        # ── Baseline GHOST overlay ────────────────────────────────────────
+        # Grey copy of the linkage frozen at 'Set baseline' time, so the
+        # designer can always see where they started while nudging points.
+        self._ghost_vis = scene.Line(
+            pos=np.zeros((2, 3), np.float32),
+            color=(0.55, 0.55, 0.58, 0.38),
+            connect='segments', width=1.6, antialias=True,
+            parent=self._view.scene,
+        )
+        self._ghost_vis.visible = False
+        # last-uploaded linkage line arrays (for ghost capture)
+        self._last_link_pos = None
+        self._last_arb_pos = None
+        self._last_htb_pos = None
 
         self._ground = self._make_ground_grid()
         self._ground.visible = True
@@ -342,6 +508,32 @@ class View3D:
         )
         self._roll_axis_vis.visible = True
 
+        # ── CG sphere (translucent white) ────────────────────────────────
+        self._cg_marker = scene.Markers(parent=self._view.scene)
+        self._cg_marker.set_data(
+            pos=np.zeros((1, 3), np.float32),
+            face_color=(1.0, 1.0, 1.0, 0.35),
+            size=22, edge_width=0,
+        )
+        self._cg_marker.visible = False
+
+        # ── Pitch-axis overlays (front/rear SVIC + pitch axis line) ──────
+        self._svic_markers = scene.Markers(parent=self._view.scene)
+        self._svic_markers.set_data(
+            pos=np.zeros((2, 3), np.float32),
+            face_color=(1.0, 0.85, 0.0, 0.55),
+            size=18, edge_width=0,
+        )
+        self._svic_markers.visible = False
+
+        self._pitch_axis_vis = scene.Line(
+            pos=np.zeros((2, 3), np.float32),
+            color=(1.0, 0.85, 0.0, 0.30),
+            connect='segments', width=2.0,
+            parent=self._view.scene,
+        )
+        self._pitch_axis_vis.visible = False
+
         # ── camera state ──────────────────────────────────────────────────
         self._mouse_last = None
         self._mouse_btn  = None
@@ -349,15 +541,28 @@ class View3D:
         # ── hook Qt events directly on the native widget ──────────────────
         n = self._canvas.native
         n.setMouseTracking(True)
+        n.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         n.mousePressEvent   = self._qt_press
         n.mouseMoveEvent    = self._qt_move
         n.mouseReleaseEvent = self._qt_release
         n.wheelEvent        = self._qt_wheel
+        n.keyPressEvent     = self._qt_keypress
 
         # ── NavCube overlay ───────────────────────────────────────────────
         self._navcube = NavCube(parent=n, size=110)
         self._navcube.view_requested.connect(self._snap_camera)
         self._navcube.set_orientation(self._cam.azimuth, self._cam.elevation)
+
+        # ── Watermark (top-right credit) ──────────────────────────────────
+        self._watermark = QLabel('Made by Yu @ Cougar Racing', parent=n)
+        self._watermark.setStyleSheet(
+            'color: rgba(205, 210, 220, 165); background: transparent;'
+            'font: 600 11px "Segoe UI";')
+        self._watermark.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._watermark.adjustSize()
+        self._watermark.raise_()
+
         # position in top-right; will be repositioned on resize
         self._orig_resize = n.resizeEvent
         n.resizeEvent = self._qt_resize
@@ -365,7 +570,17 @@ class View3D:
         # ── picking state ─────────────────────────────────────────────────
         self._hp_snap:    list[tuple] = []   # [(name, pos3d), ...]
         self._selected:   str | None  = None
+        self._selected_corner: str | None = None
         self._on_pick_cb  = None
+
+        # ── direct-edit state ─────────────────────────────────────────────
+        # WASD/QE moves the selected hardpoint by `_increment_mm`; keys 1–6
+        # rebind the increment.  Movement is in WORLD frame and applied to
+        # the FL/RL stored data (FR/RR are mirrored on render).
+        self._edit_mode      = False
+        self._increment_mm   = 1.0
+        self._on_move_cb     = None     # cb(hp_name, corner, delta_xyz_m)
+        self._on_increment_cb = None    # cb(increment_mm)
 
         # ── tire params ───────────────────────────────────────────────────
         self._tire_outer_r = 0.203
@@ -388,6 +603,44 @@ class View3D:
 
     def set_on_pick(self, cb):
         self._on_pick_cb = cb
+
+    # ── Direct-edit mode API ──────────────────────────────────────────────
+    def set_edit_mode(self, enabled: bool):
+        """Enter/leave keyboard-driven hardpoint editing."""
+        self._edit_mode = bool(enabled)
+        if self._edit_mode:
+            self._canvas.native.setFocus()
+        self._canvas.update()
+
+    def is_edit_mode(self) -> bool:
+        return self._edit_mode
+
+    def set_on_move(self, cb):
+        """cb(hp_name, corner_label, delta_xyz_m) — fired on WASD/QE in edit mode."""
+        self._on_move_cb = cb
+
+    def set_on_increment(self, cb):
+        """cb(increment_mm) — fired when keys 1-6 change the step."""
+        self._on_increment_cb = cb
+
+    def get_increment_mm(self) -> float:
+        return self._increment_mm
+
+    def get_selection(self):
+        """Return (hp_name, corner) of the currently picked point, or (None, None)."""
+        return self._selected, self._selected_corner
+
+    def set_selection(self, hp_name: str | None, corner: str | None):
+        """Programmatically set the picked hardpoint (used by the edit panel)."""
+        self._selected = hp_name
+        self._selected_corner = corner
+        if self._edit_mode:
+            self._canvas.native.setFocus()
+        self._canvas.update()
+
+    def set_increment_mm(self, mm: float):
+        """Programmatically set the keyboard nudge step."""
+        self._increment_mm = float(mm)
 
     def toggle_ground(self, visible: bool):
         self._ground.visible = visible
@@ -416,12 +669,61 @@ class View3D:
             )
         self._canvas.update()
 
+    def update_cg(self, xyz):
+        """Update CG sphere position. xyz: (x, y, z) in metres."""
+        if xyz is not None:
+            self._cg_marker.set_data(
+                pos=np.array([xyz], np.float32),
+                face_color=(1.0, 1.0, 1.0, 0.35),
+                size=22, edge_width=0,
+            )
+            self._cg_marker.visible = True
+        else:
+            self._cg_marker.visible = False
+        self._canvas.update()
+
+    def set_cg_visible(self, visible: bool):
+        self._cg_marker.visible = visible
+        self._canvas.update()
+
     def set_rc_visible(self, visible: bool):
         self._rc_markers.visible = visible
         self._canvas.update()
 
     def set_roll_axis_visible(self, visible: bool):
         self._roll_axis_vis.visible = visible
+        self._canvas.update()
+
+    def update_pitch_axis(self, pitch_center_xyz, half_width: float = 1.0):
+        """
+        Draw the pitch axis as a LATERAL line (along X) through the pitch center.
+
+        The pitch center is the side-view intersection of the front and rear
+        suspension force lines (contact patch → SVIC), analogous to how the
+        roll center is the front-view intersection of the arm IC lines.
+        The pitch axis runs perpendicular to the roll axis (which is longitudinal).
+
+        pitch_center_xyz : (x, y, z) metres
+        half_width       : half-length of the displayed line (m), default = track half-width
+        """
+        if pitch_center_xyz is not None:
+            pc = np.asarray(pitch_center_xyz, float)
+            p_left  = np.array([pc[0] - half_width, pc[1], pc[2]], np.float32)
+            p_right = np.array([pc[0] + half_width, pc[1], pc[2]], np.float32)
+            self._svic_markers.set_data(
+                pos=np.array([pc], np.float32),
+                face_color=(1.0, 0.85, 0.0, 0.60),
+                size=20, edge_width=0,
+            )
+            self._pitch_axis_vis.set_data(
+                pos=np.array([p_left, p_right], np.float32),
+                color=(1.0, 0.85, 0.0, 0.35),
+            )
+        self._canvas.update()
+
+    def set_pitch_axis_visible(self, visible: bool):
+        self._svic_markers.visible = visible
+        self._pitch_axis_vis.visible = visible
         self._canvas.update()
 
     def update_rack(self, rack_left: np.ndarray, rack_right: np.ndarray):
@@ -456,7 +758,9 @@ class View3D:
 
             # links
             for pa, pb, col in LINKS:
-                if pa in pts and pb in pts:
+                if (pa in pts and pb in pts
+                        and np.all(np.isfinite(pts[pa]))
+                        and np.all(np.isfinite(pts[pb]))):
                     link_pos += [pts[pa], pts[pb]]
                     link_col += [col, col]
 
@@ -472,10 +776,48 @@ class View3D:
                 link_col += [(0.65, 0.50, 0.38, 1.0)] * 2
 
             # rocker polygon: pivot at centre, 3 arms (pushrod, spring, ARB drop)
-            # order by angle so the fan covers the whole rocker plate
+            # order by angle so the fan covers the whole rocker plate.
+            #
+            # Direct-damper topologies report rocker_pivot == pushrod_inner
+            # (the rocker collapses to a point because there's no rocker).
+            # Detect that and skip the rocker mesh — the spring line still
+            # draws between rocker_spring_pt and spring_chassis_pt, which for
+            # direct damper are the damper's two endpoints (i.e. the damper).
             rk4 = ('rocker_pivot', 'arb_drop_top', 'pushrod_inner', 'rocker_spring_pt')
             rk3 = ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')
-            if all(k in pts for k in rk4):
+
+            def _have(keys):
+                # Key present AND every coordinate finite.  DECOUPLED corners
+                # report NaN pushrod_inner / rocker_spring_pt (the pushrod
+                # feeds the shared twin-bellcrank cradle, NOT a per-corner
+                # rocker), so this NaN guard keeps a stale bellcrank from a
+                # previously-selected topology from being re-drawn.
+                return all(k in pts and np.all(np.isfinite(pts[k]))
+                           for k in keys)
+
+            _rocker_collapsed = (_have(('rocker_pivot', 'pushrod_inner'))
+                                 and float(np.linalg.norm(
+                                     pts['rocker_pivot'] - pts['pushrod_inner'])) < 1e-4)
+            # A genuine rocker PLATE has the pushrod attach and the spring
+            # attach at DISTINCT points (non-zero spread).  A DIRECT damper
+            # re-keys BOTH pushrod_inner and rocker_spring_pt to the same
+            # damper-outer point, so the "plate" is degenerate.  Pulling
+            # arb_drop_top into the 4-point fan there paints a large phantom
+            # triangle -- a rocker that physically isn't present (e.g. DIRECT
+            # damper + control-arm ARB shares the arb_drop_top vertex).
+            # Require real spread before drawing the quad; otherwise fall
+            # through to the degenerate triangle (rk3), which still renders
+            # the damper as a line via its edges.
+            _rocker_has_spread = (
+                _have(('pushrod_inner', 'rocker_spring_pt'))
+                and float(np.linalg.norm(
+                    pts['pushrod_inner'] - pts['rocker_spring_pt'])) > 1e-4)
+            if _rocker_collapsed:
+                # Hide the rocker mesh entirely; clear it to a zero triangle.
+                self._rocker_meshes[ci].set_data(
+                    vertices=np.zeros((3, 3), np.float32),
+                    faces=np.array([[0, 1, 2]], np.uint32))
+            elif _have(rk4) and _rocker_has_spread:
                 rv = np.array([pts[k] for k in rk4], np.float32)
                 # fan from pivot: tri0=(0,1,2), tri1=(0,2,3)
                 self._rocker_meshes[ci].set_data(
@@ -483,14 +825,22 @@ class View3D:
                 for pa2, pb2 in [(rk4[0],rk4[1]),(rk4[1],rk4[2]),
                                  (rk4[2],rk4[3]),(rk4[3],rk4[0])]:
                     link_pos += [pts[pa2], pts[pb2]]
-                    link_col += [(0.65, 0.25, 0.80, 1.0)] * 2
-            elif all(k in pts for k in rk3):
+                    link_col += [(0.85, 0.70, 0.12, 1.0)] * 2
+            elif _have(rk3):
                 rv = np.array([pts[k] for k in rk3], np.float32)
                 self._rocker_meshes[ci].set_data(
                     vertices=rv, faces=np.array([[0,1,2]], np.uint32))
                 for pa2, pb2 in [(rk3[0],rk3[1]),(rk3[1],rk3[2]),(rk3[2],rk3[0])]:
                     link_pos += [pts[pa2], pts[pb2]]
-                    link_col += [(0.65, 0.25, 0.80, 1.0)] * 2
+                    link_col += [(0.85, 0.70, 0.12, 1.0)] * 2
+            else:
+                # No valid per-corner rocker (DECOUPLED — pushrod goes to the
+                # shared cradle — or missing/NaN rocker points).  Clear the
+                # mesh so a bellcrank drawn for a prior topology disappears
+                # instead of lingering on screen.
+                self._rocker_meshes[ci].set_data(
+                    vertices=np.zeros((3, 3), np.float32),
+                    faces=np.array([[0, 1, 2]], np.uint32))
 
             # tire (tread + sidewalls only, translucent)
             tv, tf = build_tire_mesh(
@@ -499,10 +849,26 @@ class View3D:
             self._tire_meshes[ci].set_data(vertices=tv, faces=tf)
 
             # markers
+            #
+            # `editable` is the set of keys that are REAL hardpoints for this
+            # corner (== the keys of the corner's per-axle hp dict).  It is set
+            # by the renderer in main_window._assemble_corners.  _state_to_pts
+            # unconditionally injects derived render points (e.g. a direct
+            # damper reports pushrod_inner == damper attach; a decoupled corner
+            # is fed by a shared cradle) — those points are needed to DRAW the
+            # geometry but must NOT become pickable markers, because clicking a
+            # phantom that isn't in the edit list selects nothing (a ghost
+            # marker).  Gate marker creation on `editable` so only genuine,
+            # movable hardpoints get a pickable dot + a _hp_snap entry.
+            editable = corner.get('editable')   # None for legacy callers
             for name in HP_NAMES:
                 if name not in pts:
                     continue
+                if editable is not None and name not in editable:
+                    continue   # derived / visualisation-only point, not a hardpoint
                 p = pts[name]
+                if not np.all(np.isfinite(p)):
+                    continue   # DECOUPLED: pushrod_inner / rocker_spring_pt NaN
                 mk_pos.append(p)
                 if name == self._selected:
                     c = _C_SEL
@@ -515,8 +881,9 @@ class View3D:
 
         # upload lines
         if link_pos:
+            self._last_link_pos = np.array(link_pos, np.float32)
             self._links_vis.set_data(
-                pos=np.array(link_pos, np.float32),
+                pos=self._last_link_pos,
                 color=np.array(link_col, np.float32))
 
         # upload markers
@@ -529,11 +896,316 @@ class View3D:
         # ARB
         if arb_segs:
             ap = np.array([p for seg in arb_segs for p in seg], np.float32)
+            self._last_arb_pos = ap
             self._arb_vis.set_data(pos=ap, color=(0.90, 0.80, 0.10, 1.0))
         else:
+            self._last_arb_pos = None
             self._arb_vis.set_data(pos=np.zeros((2,3), np.float32))
 
+        # ── Spring / damper cylinders (per corner) ───────────────────────
+        # Draw a translucent cylinder of the user-set OD between
+        # rocker_spring_pt and spring_chassis_pt.  Direct-damper topologies
+        # re-key those points to the damper endpoints upstream, so this
+        # one path handles both spring-on-rocker and direct-damper rendering.
+        for ci, corner in enumerate(corners):
+            if ci >= len(self._spring_meshes):
+                break
+            pts = corner['pts']
+            if ('rocker_spring_pt' in pts) and ('spring_chassis_pt' in pts) \
+                    and np.all(np.isfinite(pts['rocker_spring_pt'])) \
+                    and np.all(np.isfinite(pts['spring_chassis_pt'])):
+                # Pick OD: damper for collapsed-rocker (DIRECT) case,
+                # spring otherwise.  We use rocker_pivot == pushrod_inner
+                # as the marker for "rocker collapsed → this segment is
+                # the damper alone" (same heuristic used for the rocker
+                # mesh).
+                if ('rocker_pivot' in pts and 'pushrod_inner' in pts
+                        and float(np.linalg.norm(
+                            pts['rocker_pivot'] - pts['pushrod_inner'])) < 1e-4):
+                    od_m = self._damper_od_m
+                else:
+                    od_m = self._spring_od_m
+                v, f = build_cylinder_between(
+                    pts['rocker_spring_pt'], pts['spring_chassis_pt'],
+                    radius=0.5 * od_m, n=20)
+                self._spring_meshes[ci].set_data(vertices=v, faces=f)
+            else:
+                # No spring on this corner (e.g. DECOUPLED corner has none)
+                self._spring_meshes[ci].set_data(
+                    vertices=np.zeros((3, 3), np.float32),
+                    faces=np.array([[0, 1, 2]], np.uint32))
+
         self._canvas.update()
+
+    # ── Decoupled twin-bellcrank rendering ──────────────────────────────
+    def update_decoupled_cradles(self, front_dict: dict | None,
+                                 rear_dict:  dict | None) -> None:
+        """Render the reference twin-bellcrank decoupled layout per axle.
+
+        Each non-empty dict must carry the 10 keys (L + R) for the two
+        bellcranks + the two cross-car coilovers:
+            rocker_pivot_left/right, rocker_axis_pt_left/right,
+            pushrod_inner_left/right,
+            heave_damper_left/right,   (cross-car HEAVE coilover ends)
+            roll_damper_left/right     (cross-car ROLL coilover ends —
+                                        asymmetric Z: LEFT below pivot,
+                                        RIGHT above pivot)
+
+        Rendering:
+          * Two bellcrank plates per axle (LEFT + RIGHT), each as a
+            triangle-fan quadrilateral whose vertices are the 4
+            rocker-resident points (pivot, pushrod_inner, heave_attach,
+            roll_attach).  We reuse self._cradle_meshes[slot] for the
+            LEFT bellcrank and self._cradle_lat_spring_meshes[slot] for
+            the RIGHT bellcrank (was: lateral spring mesh, now repurposed).
+          * Heave coilover: cross-car cylinder between heave_damper_left
+            and heave_damper_right, using the DAMPER OD.
+          * Roll coilover: cross-car cylinder between roll_damper_left
+            and roll_damper_right, using the SPRING OD (slightly thicker
+            so the user can tell them apart at a glance — the colour
+            also differs: lateral mesh = orange-ish, oblique mesh = blue).
+          * For backward-compat with the old cradle-mesh attribute names,
+            we keep ``self._cradle_meshes`` (one quad per axle) and
+            reuse the two spring mesh slots for: ``_cradle_lat_spring_meshes``
+            → ROLL coilover cylinder, ``_cradle_obl_spring_meshes`` →
+            HEAVE coilover cylinder + RIGHT bellcrank.  Total visual
+            slots per axle: 1 LEFT bellcrank + 1 RIGHT bellcrank + 2
+            damper cylinders, plus we add a small line/cylinder for
+            each rocker's pivot axis indicator.
+        """
+        empty_v = np.zeros((3, 3), np.float32)
+        empty_f = np.array([[0, 1, 2]], np.uint32)
+
+        for slot, d in enumerate((front_dict, rear_dict)):
+            # Note: with the redesign we now need MORE mesh slots than the
+            # old 3 per axle.  Reuse what's already wired and clear unused:
+            left_bell_mesh   = self._cradle_meshes[slot]
+            right_bell_mesh  = self._cradle_lat_spring_meshes[slot]
+            heave_coil_mesh  = self._cradle_obl_spring_meshes[slot]
+            # roll damper cylinder needs its own slot — see __init__
+
+            # Clear if this axle isn't decoupled
+            if not d or 'rocker_pivot_left' not in d:
+                left_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
+                right_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
+                heave_coil_mesh.set_data(vertices=empty_v, faces=empty_f)
+                if hasattr(self, '_cradle_roll_damper_meshes'):
+                    self._cradle_roll_damper_meshes[slot].set_data(
+                        vertices=empty_v, faces=empty_f)
+                continue
+
+            try:
+                pivL = np.asarray(d['rocker_pivot_left'],    float)
+                pivR = np.asarray(d['rocker_pivot_right'],   float)
+                pinL = np.asarray(d['pushrod_inner_left'],   float)
+                pinR = np.asarray(d['pushrod_inner_right'],  float)
+                heaveL = np.asarray(d['heave_damper_left'],  float)
+                heaveR = np.asarray(d['heave_damper_right'], float)
+                rollL  = np.asarray(d['roll_damper_left'],   float)
+                rollR  = np.asarray(d['roll_damper_right'],  float)
+            except KeyError:
+                left_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
+                right_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
+                heave_coil_mesh.set_data(vertices=empty_v, faces=empty_f)
+                if hasattr(self, '_cradle_roll_damper_meshes'):
+                    self._cradle_roll_damper_meshes[slot].set_data(
+                        vertices=empty_v, faces=empty_f)
+                continue
+
+            # Bellcrank quadrilateral as triangle-fan from the centre.
+            # SVD-projected angle ordering keeps the fan non-self-crossing
+            # for arbitrary 3-D quad orientations.
+            def _bell_quad(pivot, pin, heave_pt, roll_pt):
+                centre = 0.25 * (pivot + pin + heave_pt + roll_pt)
+                pts4 = np.array([pivot, pin, heave_pt, roll_pt], np.float32)
+                rel = pts4 - centre
+                try:
+                    _, _, vh = np.linalg.svd(rel, full_matrices=False)
+                    u_loc = rel @ vh[0]
+                    v_loc = rel @ vh[1]
+                    order = np.argsort(np.arctan2(v_loc, u_loc))
+                    pts4 = pts4[order]
+                except np.linalg.LinAlgError:
+                    pass
+                verts = np.vstack([centre[None, :].astype(np.float32), pts4])
+                faces = np.array([[0, 1, 2], [0, 2, 3], [0, 3, 4], [0, 4, 1]],
+                                 np.uint32)
+                return verts, faces
+
+            vL, fL = _bell_quad(pivL, pinL, heaveL, rollL)
+            vR, fR = _bell_quad(pivR, pinR, heaveR, rollR)
+            left_bell_mesh.set_data(vertices=vL, faces=fL)
+            right_bell_mesh.set_data(vertices=vR, faces=fR)
+
+            # Heave coilover cylinder (cross-car) — use DAMPER OD so it
+            # looks distinct from the spring; renders in the obl_spring
+            # slot which has a blue tint.
+            v, f = build_cylinder_between(
+                heaveL, heaveR, radius=0.5 * self._damper_od_m, n=20)
+            heave_coil_mesh.set_data(vertices=v, faces=f)
+
+            # Roll coilover cylinder (cross-car, diagonal) — separate
+            # mesh slot so it renders with its own colour.
+            if hasattr(self, '_cradle_roll_damper_meshes'):
+                v, f = build_cylinder_between(
+                    rollL, rollR, radius=0.5 * self._spring_od_m, n=20)
+                self._cradle_roll_damper_meshes[slot].set_data(
+                    vertices=v, faces=f)
+
+    # ── HEAVE_TBAR third-element shock rendering ─────────────────────────
+    def update_heave_tbar_shock(self, front_heave: dict | None,
+                                rear_heave:  dict | None) -> None:
+        """Render the HEAVE_TBAR third element as a SHOCK (damper cylinder).
+
+        The heave 3rd element is a damper/coilover, NOT a suspension link —
+        per the user's design intent it must read as a shock cylinder in the
+        3D view, not a thin line.  Draw a cylinder of the damper OD between
+        the bracket-side spring attach (``heave_spring_tbar_pt``) and the
+        chassis-side attach (``heave_spring_chassis_pt``) for each axle that
+        carries a heave element; clear the slot otherwise.
+
+        The endpoints are the design-ride pose (the same pose at which every
+        other element in update_scene is drawn), so this is faithful to the
+        solved geometry without inventing any motion.
+        """
+        empty_v = np.zeros((3, 3), np.float32)
+        empty_f = np.array([[0, 1, 2]], np.uint32)
+        for slot, d in enumerate((front_heave, rear_heave)):
+            mesh = self._heave_tbar_shock_meshes[slot]
+            if not d or 'heave_spring_tbar_pt' not in d \
+                    or 'heave_spring_chassis_pt' not in d:
+                mesh.set_data(vertices=empty_v, faces=empty_f)
+                continue
+            p0 = np.asarray(d['heave_spring_tbar_pt'],    float)
+            p1 = np.asarray(d['heave_spring_chassis_pt'], float)
+            if not (np.all(np.isfinite(p0)) and np.all(np.isfinite(p1))):
+                mesh.set_data(vertices=empty_v, faces=empty_f)
+                continue
+            v, f = build_cylinder_between(p0, p1,
+                                          radius=0.5 * self._damper_od_m, n=20)
+            mesh.set_data(vertices=v, faces=f)
+
+    # ── HEAVE_TBAR full mechanism (coloured linkage + plates + dampers) ──
+    @staticmethod
+    def _plate_mesh(pts):
+        """Triangle-fan plate from N (>=3) coplanar-ish points, ordered around
+        their centroid (SVD projection) so the fan never self-crosses."""
+        pts = [np.asarray(p, float) for p in pts
+               if p is not None and np.all(np.isfinite(p))]
+        if len(pts) < 3:
+            return (np.zeros((3, 3), np.float32), np.array([[0, 1, 2]], np.uint32))
+        P = np.array(pts, float)
+        c = P.mean(axis=0)
+        rel = P - c
+        try:
+            _, _, vh = np.linalg.svd(rel, full_matrices=False)
+            order = np.argsort(np.arctan2(rel @ vh[1], rel @ vh[0]))
+            P = P[order]
+        except np.linalg.LinAlgError:
+            pass
+        verts = np.vstack([c[None, :], P]).astype(np.float32)
+        n = len(P)
+        faces = np.array([[0, i + 1, (i + 1) % n + 1] for i in range(n)], np.uint32)
+        return verts, faces
+
+    def update_heave_tbar(self, front_pose: dict | None,
+                          rear_pose: dict | None) -> None:
+        """Render the heave-T-bar mechanism (both axles) from the solver's
+        ``pose_axle()`` output: ONE T-bar (grey torsion bar + gold lever across),
+        per-side gold bellcrank PLATES, WHITE pushrods, blue drop links, and the
+        two orange corner-damper cylinders.  Each element is colour-coded so the
+        pushrod is distinct from the rest (no longer one flat ARB colour)."""
+        WHITE = (0.92, 0.92, 0.96, 1.0); GOLD = (0.85, 0.70, 0.12, 1.0)
+        GREY = (0.55, 0.55, 0.60, 1.0); BLUE = (0.30, 0.55, 0.95, 1.0)
+        LINE_SPEC = [
+            ('pushrod_outer_L', 'pushrod_inner_L', WHITE),
+            ('pushrod_outer_R', 'pushrod_inner_R', WHITE),
+            ('tbar_pivot', 'junc', GREY),
+            ('left_tip', 'junc', GOLD), ('junc', 'right_tip', GOLD),
+            ('drop_foot_L', 'left_tip', BLUE), ('drop_foot_R', 'right_tip', BLUE),
+            ('rocker_pivot_L', 'pushrod_inner_L', GOLD),
+            ('rocker_pivot_L', 'drop_foot_L', GOLD),
+            ('rocker_pivot_L', 'coil_rocker_L', GOLD),
+            ('rocker_pivot_R', 'pushrod_inner_R', GOLD),
+            ('rocker_pivot_R', 'drop_foot_R', GOLD),
+            ('rocker_pivot_R', 'coil_rocker_R', GOLD),
+        ]
+        empty_v = np.zeros((3, 3), np.float32)
+        empty_f = np.array([[0, 1, 2]], np.uint32)
+        pos, col = [], []
+        for slot, p in enumerate((front_pose, rear_pose)):
+            bL, bR = 2 * slot, 2 * slot + 1
+            if not p:
+                for mi in (bL, bR):
+                    self._htb_bell_meshes[mi].set_data(vertices=empty_v, faces=empty_f)
+                    self._htb_coil_meshes[mi].set_data(vertices=empty_v, faces=empty_f)
+                continue
+            for a, b, c in LINE_SPEC:
+                pa, pb = p.get(a), p.get(b)
+                if (pa is not None and pb is not None
+                        and np.all(np.isfinite(pa)) and np.all(np.isfinite(pb))):
+                    pos += [pa, pb]; col += [c, c]
+            # bellcrank plates (L + R)
+            for mi, keys in ((bL, ('rocker_pivot_L', 'pushrod_inner_L', 'drop_foot_L', 'coil_rocker_L')),
+                             (bR, ('rocker_pivot_R', 'pushrod_inner_R', 'drop_foot_R', 'coil_rocker_R'))):
+                v, f = self._plate_mesh([p.get(k) for k in keys])
+                self._htb_bell_meshes[mi].set_data(vertices=v, faces=f)
+            # corner-damper cylinders (L + R)
+            for mi, (rk, ch) in ((bL, ('coil_rocker_L', 'coil_chassis_L')),
+                                 (bR, ('coil_rocker_R', 'coil_chassis_R'))):
+                rkp, chp = p.get(rk), p.get(ch)
+                if (rkp is not None and chp is not None
+                        and np.all(np.isfinite(rkp)) and np.all(np.isfinite(chp))):
+                    v, f = build_cylinder_between(rkp, chp, radius=0.5 * self._damper_od_m, n=18)
+                    self._htb_coil_meshes[mi].set_data(vertices=v, faces=f)
+                else:
+                    self._htb_coil_meshes[mi].set_data(vertices=empty_v, faces=empty_f)
+        if pos:
+            self._last_htb_pos = np.array(pos, np.float32)
+            self._htb_link_vis.set_data(pos=self._last_htb_pos,
+                                        color=np.array(col, np.float32))
+        else:
+            self._last_htb_pos = None
+            self._htb_link_vis.set_data(pos=np.zeros((2, 3), np.float32),
+                                        color=np.ones((2, 4), np.float32))
+        self._canvas.update()
+
+    # ── Baseline ghost API ───────────────────────────────────────────────
+    def capture_ghost(self):
+        """Concatenate the currently-rendered linkage line segments into one
+        array (links + ARB + heave-T-bar) — frozen by set_ghost()."""
+        segs = [p for p in (self._last_link_pos, self._last_arb_pos,
+                            self._last_htb_pos)
+                if p is not None and len(p) >= 2]
+        return np.vstack(segs).copy() if segs else None
+
+    def set_ghost(self, pos) -> None:
+        """Freeze `pos` (segment-pair array) as the grey baseline ghost."""
+        if pos is None or len(pos) < 2:
+            self._ghost_vis.visible = False
+        else:
+            self._ghost_vis.set_data(pos=np.asarray(pos, np.float32),
+                                     color=(0.55, 0.55, 0.58, 0.38))
+            self._ghost_vis.visible = True
+        self._canvas.update()
+
+    def set_ghost_visible(self, visible: bool) -> None:
+        self._ghost_vis.visible = bool(visible)
+        self._canvas.update()
+
+    # ── Public dimension setter ─────────────────────────────────────────
+    def set_spring_dims(self, spring_od_mm: float, damper_od_mm: float) -> None:
+        """Update the spring / damper outside diameter (mm).
+
+        Called by the host whenever the user-input OD changes (wizard, car
+        panel, file load).  Next ``update_scene`` call rebuilds the spring
+        cylinders at the new size.
+        """
+        try:
+            self._spring_od_m = max(0.001, float(spring_od_mm) / 1000.0)
+            self._damper_od_m = max(0.001, float(damper_od_mm) / 1000.0)
+        except (TypeError, ValueError):
+            pass
 
     # ── internal ─────────────────────────────────────────────────────────────
 
@@ -627,12 +1299,101 @@ class View3D:
         except Exception:
             pass
 
+    # ── Keyboard (direct-edit mode only) ──────────────────────────────────
+    # World-frame conventions: +X = lateral outboard for FL/RL (= driver's
+    # left), +Y = longitudinal forward, +Z = up.
+    #   W / S  →  +Y / −Y  (forward / back)
+    #   A / D  →  +X / −X  (outboard / inboard, for FL/RL stored points)
+    #   Q / E  →  +Z / −Z  (up / down)
+    #   1-6    →  set step: 0.1 / 0.5 / 1 / 2 / 5 / 10 mm
+    # Keys stored as plain ints — see eventFilter note in main_window.py.
+    _INCREMENT_TABLE_MM = {
+        int(Qt.Key.Key_1): 0.1, int(Qt.Key.Key_2): 0.5, int(Qt.Key.Key_3): 1.0,
+        int(Qt.Key.Key_4): 2.0, int(Qt.Key.Key_5): 5.0, int(Qt.Key.Key_6): 10.0,
+    }
+    _MOVE_TABLE = {
+        int(Qt.Key.Key_W): (1, +1.0), int(Qt.Key.Key_S): (1, -1.0),
+        int(Qt.Key.Key_A): (0, +1.0), int(Qt.Key.Key_D): (0, -1.0),
+        int(Qt.Key.Key_Q): (2, +1.0), int(Qt.Key.Key_E): (2, -1.0),
+    }
+    _CONSTRAINT_KEYS = {
+        int(Qt.Key.Key_F): 'free',
+        int(Qt.Key.Key_L): 'link',
+        int(Qt.Key.Key_P): 'plane',
+    }
+
+    def set_on_constraint(self, cb):
+        """cb(mode) — fired when F/L/P toggles the nudge constraint."""
+        self._on_constraint_cb = cb
+
+    def _cycle_selection(self, step: int):
+        """Tab / Shift+Tab: walk the pickable points of the CURRENT corner
+        (falls back to all corners when nothing is selected yet)."""
+        if not self._hp_snap:
+            return
+        corner = self._selected_corner or 'FL'
+        names = [n for n, _p, c in self._hp_snap if c == corner]
+        if not names:
+            names = [n for n, _p, c in self._hp_snap]
+            corner = self._hp_snap[0][2]
+        if not names:
+            return
+        try:
+            i = names.index(self._selected)
+        except ValueError:
+            i = -step   # so the first Tab lands on names[0]
+        nxt = names[(i + step) % len(names)]
+        self._selected = nxt
+        self._selected_corner = corner
+        if self._on_pick_cb:
+            self._on_pick_cb(nxt, corner)
+        self._canvas.update()
+
+    def _qt_keypress(self, event):
+        if not self._edit_mode:
+            return
+        try:
+            key = int(event.key())
+            # Tab / Shift+Tab (or N / B — Qt's focus chain can eat Tab) —
+            # cycle through the corner's points
+            if key in (int(Qt.Key.Key_Tab), int(Qt.Key.Key_Backtab),
+                       int(Qt.Key.Key_N), int(Qt.Key.Key_B)):
+                back = (key in (int(Qt.Key.Key_Backtab), int(Qt.Key.Key_B))
+                        or bool(event.modifiers()
+                                & Qt.KeyboardModifier.ShiftModifier))
+                self._cycle_selection(-1 if back else +1)
+                return
+            # F / L / P — nudge constraint mode
+            if key in self._CONSTRAINT_KEYS:
+                cb = getattr(self, '_on_constraint_cb', None)
+                if cb:
+                    cb(self._CONSTRAINT_KEYS[key])
+                return
+            if key in self._INCREMENT_TABLE_MM:
+                self._increment_mm = self._INCREMENT_TABLE_MM[key]
+                if self._on_increment_cb:
+                    self._on_increment_cb(self._increment_mm)
+                return
+            if (self._selected is None or self._selected_corner is None
+                    or self._on_move_cb is None or key not in self._MOVE_TABLE):
+                return
+            axis, sign = self._MOVE_TABLE[key]
+            delta = np.zeros(3, dtype=float)
+            delta[axis] = sign * self._increment_mm / 1000.0
+            self._on_move_cb(self._selected, self._selected_corner, delta)
+        except Exception:
+            pass
+
     def _qt_resize(self, event):
-        """Reposition NavCube to top-right corner on resize."""
+        """Reposition the watermark + NavCube to the top-right corner on resize."""
         if self._orig_resize:
             self._orig_resize(event)
         w = event.size().width()
-        self._navcube.move(w - self._navcube.width() - 4, 4)
+        self._watermark.adjustSize()
+        self._watermark.move(w - self._watermark.width() - 8, 6)
+        # NavCube sits just below the watermark so neither overlaps.
+        self._navcube.move(w - self._navcube.width() - 4,
+                           6 + self._watermark.height() + 4)
 
     def _snap_camera(self, az, el):
         """Snap the camera to the requested orientation."""
@@ -666,6 +1427,7 @@ class View3D:
                     best_d2, best_name, best_corner = d2, name, corner_label
             if best_name:
                 self._selected = best_name
+                self._selected_corner = best_corner
                 self._on_pick_cb(best_name, best_corner)
         except Exception:
             pass

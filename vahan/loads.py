@@ -125,7 +125,10 @@ def compute_corner_loads(
 
     Uses 3D static equilibrium on the upright free body.
     The upright is connected to 6 members (UCA front, UCA rear, LCA front,
-    LCA rear, tie rod, pushrod), each carrying axial force only.
+    LCA rear, tie rod, and the actuation link), each carrying axial force only.
+    The 6th member is the pushrod for pushrod/pullrod corners, the live
+    pushrod (to the cradle bellcrank) for DECOUPLED corners, or the damper
+    line for DIRECT-acting corners.
     6 unknowns, 6 equations (3 force + 3 moment) → exact solution.
 
     After solving the 6×6 system, decomposes forces into V/H at ball joints,
@@ -145,6 +148,22 @@ def compute_corner_loads(
     push_o = np.asarray(state.pushrod_outer, dtype=float)
     push_i = np.asarray(state.pushrod_inner, dtype=float)
     wc     = np.asarray(state.wheel_center, dtype=float)
+
+    # ── DIRECT-damper corner: use the damper line as the actuation member ──
+    # A direct-acting damper is mounted on the chassis and connected straight
+    # to the upright/control-arm — there is NO pushrod.  The kinematic solver
+    # therefore collapses the pushrod to a single point (push_o == push_i) and
+    # reports the damper endpoints via rocker_spring_pt (moving end, == push_o)
+    # and spring_chassis_pt (the fixed chassis end).  Using the zero-length
+    # pushrod as the 6th force member makes the upright free body singular, so
+    # substitute the real damper line (push_o → spring_chassis_pt): same attach
+    # point on the moving body, real axial direction to the chassis.
+    if np.linalg.norm(push_o - push_i) < 1e-9:
+        chassis_pt = np.asarray(getattr(state, 'spring_chassis_pt', push_i),
+                                dtype=float)
+        if (chassis_pt.shape == (3,) and np.all(np.isfinite(chassis_pt))
+                and np.linalg.norm(push_o - chassis_pt) > 1e-9):
+            push_i = chassis_pt
 
     # Contact patch = wheel center projected to ground (Z=0)
     cp = np.array([wc[0], wc[1], 0.0])
@@ -358,6 +377,213 @@ def _compute_brake_forces(result: ComponentLoads, bp: BrakeParams):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  BRAKE SYSTEM CALCULATOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class BrakeSystemParams:
+    """System-level brake parameters (pedal + master cylinders)."""
+    pedal_ratio: float = 5.0            # mechanical advantage of pedal lever
+    mc_bore_front_mm: float = 15.87     # front master cylinder bore (5/8")
+    mc_bore_rear_mm: float = 15.87      # rear master cylinder bore (5/8")
+    bias_pct_front: float = 65.0        # brake bias % to front (from bias bar)
+    tire_radius_m: float = 0.203        # loaded tire radius
+
+    @property
+    def mc_area_front_mm2(self) -> float:
+        return np.pi * (self.mc_bore_front_mm / 2) ** 2
+
+    @property
+    def mc_area_rear_mm2(self) -> float:
+        return np.pi * (self.mc_bore_rear_mm / 2) ** 2
+
+
+@dataclass
+class BrakeCornerResult:
+    """Brake calculator output for one corner."""
+    # Current operating point
+    Fz_N: float = 0.0
+    tire_mu: float = 0.0               # peak μ used (from tire model or fallback)
+    brake_torque_Nm: float = 0.0
+    line_pressure_MPa: float = 0.0
+    clamp_force_N: float = 0.0
+    # At lockup
+    lockup_Fx_N: float = 0.0               # Fx that locks this tire
+    lockup_torque_Nm: float = 0.0           # brake torque at lockup
+    lockup_clamp_N: float = 0.0             # caliper clamp at lockup
+    lockup_line_pressure_MPa: float = 0.0   # line pressure at lockup
+    lockup_pedal_force_N: float = 0.0       # pedal force that locks this corner
+    # Margins
+    lockup_margin_pct: float = 0.0          # how far from lockup (100% = at limit)
+
+
+def compute_brake_system(
+    Fz: dict,
+    brake_params_f: BrakeParams,
+    brake_params_r: BrakeParams,
+    system: BrakeSystemParams,
+    tire_model=None,
+    cambers: dict = None,
+) -> dict:
+    """
+    Compute brake pressures, torques, and lockup limits for all 4 corners.
+
+    Parameters
+    ----------
+    Fz : dict
+        Per-corner vertical loads {'FL': N, 'FR': N, 'RL': N, 'RR': N}.
+    brake_params_f, brake_params_r : BrakeParams
+        Per-caliper parameters (front / rear).
+    system : BrakeSystemParams
+        System-level params (pedal, master cylinders, bias).
+    tire_model : optional
+        Tire model with ``peak_mu(Fz_N, camber_deg)`` — pulls μ per corner
+        from TTC data (load-sensitive).  Falls back to 1.5 if None.
+    cambers : dict, optional
+        Per-corner camber {'FL': deg, ...} for peak_mu lookup.
+
+    Returns
+    -------
+    dict of {corner_label: BrakeCornerResult}
+    """
+    results = {}
+    bias_f = system.bias_pct_front / 100.0
+    bias_r = 1.0 - bias_f
+    r_tire = system.tire_radius_m
+    if cambers is None:
+        cambers = {}
+
+    for label in ['FL', 'FR', 'RL', 'RR']:
+        is_front = label[0] == 'F'
+        bp = brake_params_f if is_front else brake_params_r
+        fz = max(Fz.get(label, 0), 0.0)
+
+        r_pad = bp.pad_radius_mm / 1000.0
+        A_piston = bp.piston_area_mm2
+        mu_pad = bp.pad_mu
+        n_pistons = bp.num_pistons
+
+        # Peak tire μ from tire model (load-sensitive) or fallback
+        if tire_model is not None and hasattr(tire_model, 'peak_mu'):
+            cam = abs(cambers.get(label, 0.0))
+            mu_tire = float(tire_model.peak_mu(max(fz, 1.0), cam))
+        else:
+            mu_tire = 1.5
+
+        cr = BrakeCornerResult(Fz_N=fz)
+        cr.tire_mu = mu_tire
+
+        # ── Lockup threshold ─────────────────────────────────────
+        # The tire locks when Fx > mu_tire × Fz
+        lockup_Fx = mu_tire * fz                            # N
+        lockup_torque = lockup_Fx * r_tire                  # Nm
+
+        # Caliper clamp to produce that torque
+        # T = clamp × mu_pad × r_pad × 2 (both pads)
+        if mu_pad > 0 and r_pad > 0:
+            lockup_clamp = lockup_torque / (mu_pad * r_pad * 2)
+        else:
+            lockup_clamp = 0.0
+
+        # Line pressure to produce that clamp
+        # clamp = P × A_piston × n_pistons (floating caliper: ×2 for both sides)
+        # For floating caliper with n_pistons on one side:
+        #   clamp = P × A_piston × n_pistons
+        # (the floating side mirrors the force → both pads grip equally)
+        effective_piston_area = A_piston * n_pistons
+        if effective_piston_area > 0:
+            lockup_pressure = lockup_clamp / effective_piston_area  # N/mm² = MPa
+        else:
+            lockup_pressure = 0.0
+
+        # Pedal force to generate that line pressure
+        # P_line = F_pedal × pedal_ratio / A_mc
+        # → F_pedal = P_line × A_mc / pedal_ratio
+        mc_area = system.mc_area_front_mm2 if is_front else system.mc_area_rear_mm2
+        if system.pedal_ratio > 0:
+            lockup_pedal = lockup_pressure * mc_area / system.pedal_ratio
+        else:
+            lockup_pedal = 0.0
+
+        cr.lockup_Fx_N = lockup_Fx
+        cr.lockup_torque_Nm = lockup_torque
+        cr.lockup_clamp_N = lockup_clamp
+        cr.lockup_line_pressure_MPa = lockup_pressure
+        cr.lockup_pedal_force_N = lockup_pedal
+
+        results[label] = cr
+
+    return results
+
+
+def compute_brake_thermal(
+    vehicle_mass_kg: float,
+    bias_pct_front: float,
+    speed_start_mph: float,
+    speed_end_mph: float,
+    rotor_mass_f_kg: float,
+    rotor_mass_r_kg: float,
+    rotor_cp: float = 460.0,
+    ambient_C: float = 25.0,
+) -> dict:
+    """
+    Single braking event adiabatic rotor temperature rise.
+
+    Assumes 100% of kinetic energy goes into the rotors (worst case —
+    no convective cooling during the stop).  Energy is split by brake
+    bias, then divided equally between left/right per axle.
+
+    Parameters
+    ----------
+    vehicle_mass_kg : float
+        Total vehicle mass (driver included).
+    bias_pct_front : float
+        Brake bias % to front axle.
+    speed_start_mph, speed_end_mph : float
+        Braking from → to (mph).
+    rotor_mass_f_kg, rotor_mass_r_kg : float
+        Mass of ONE front / rear rotor.
+    rotor_cp : float
+        Specific heat of rotor material (J/kg·K).
+    ambient_C : float
+        Ambient / initial rotor temperature (°C).
+
+    Returns
+    -------
+    dict of {corner_label: {'energy_kJ': float, 'delta_T_C': float, 'peak_T_C': float}}
+    """
+    mph_to_ms = 0.44704
+    v1 = speed_start_mph * mph_to_ms
+    v2 = speed_end_mph * mph_to_ms
+    KE = 0.5 * vehicle_mass_kg * (v1 ** 2 - v2 ** 2)  # joules
+    if KE < 0:
+        KE = 0.0
+
+    bias_f = bias_pct_front / 100.0
+    energy_front_axle = KE * bias_f
+    energy_rear_axle = KE * (1.0 - bias_f)
+
+    results = {}
+    for label in ['FL', 'FR', 'RL', 'RR']:
+        is_front = label[0] == 'F'
+        energy_per_rotor = (energy_front_axle if is_front else energy_rear_axle) / 2.0
+        m_rotor = rotor_mass_f_kg if is_front else rotor_mass_r_kg
+
+        if m_rotor > 0 and rotor_cp > 0:
+            delta_T = energy_per_rotor / (m_rotor * rotor_cp)
+        else:
+            delta_T = 0.0
+
+        results[label] = {
+            'energy_kJ': energy_per_rotor / 1000.0,
+            'delta_T_C': delta_T,
+            'peak_T_C': ambient_C + delta_T,
+        }
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  CONVENIENCE: COMPUTE ALL 4 CORNERS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -371,12 +597,85 @@ def compute_all_corners(
     wheel_radius_m: float = 0.203,
     motion_ratio_f: float = 1.0,
     motion_ratio_r: float = 1.0,
+    cradle_solvers: dict | None = None,
+    heave_tbar_solvers: dict | None = None,
 ) -> dict:
     """
     Compute component loads for all 4 corners from a dynamics result.
 
     Returns dict: {'FL': ComponentLoads, 'FR': ..., 'RL': ..., 'RR': ...}
+
+    cradle_solvers (optional): {'front': TwinRockerDecoupledSolver|None,
+    'rear': ...}.  For DECOUPLED corners the per-corner kinematic solver leaves
+    pushrod_inner = NaN because the cradle (where the pushrod's inner end lives)
+    is solved separately.  When the matching cradle solver is supplied, it is
+    driven with the live left/right pushrod_outer to recover the true live
+    pushrod_inner so the upright free body has a valid actuation member.
     """
+    # ── Phase 1: solve every corner's kinematic state up front ───────────────
+    states = {}
+    for label in ['FL', 'FR', 'RL', 'RR']:
+        solver = solvers.get(label)
+        if solver is None:
+            states[label] = None
+            continue
+        travel_m = dyn_result.travel.get(label, 0) / 1000  # mm → m
+        try:
+            states[label] = solver.solve(travel_m)
+        except Exception:
+            states[label] = None
+
+    # ── Phase 2: fill DECOUPLED cradle-end (pushrod_inner) from cradle solver ─
+    # The cradle solver needs BOTH wheels' live pushrod_outer to pose the
+    # twin-rocker cradle, so this must happen after all corners are solved.
+    if cradle_solvers:
+        for axle_key, (lbl_L, lbl_R) in (('front', ('FL', 'FR')),
+                                         ('rear',  ('RL', 'RR'))):
+            cs = cradle_solvers.get(axle_key)
+            sL, sR = states.get(lbl_L), states.get(lbl_R)
+            if cs is None or sL is None or sR is None:
+                continue
+            try:
+                cst = cs.solve(np.asarray(sL.pushrod_outer, dtype=float),
+                               np.asarray(sR.pushrod_outer, dtype=float))
+                sL.pushrod_inner = np.asarray(cst.pushrod_inner_L, dtype=float)
+                sR.pushrod_inner = np.asarray(cst.pushrod_inner_R, dtype=float)
+            except Exception:
+                pass  # leave NaN → compute_corner_loads falls back to lstsq
+
+    # ── Phase 2b: fill HEAVE-T-BAR pushrod_inner from the heave-T-bar rocker ──
+    # Same idea as the cradle fill: cradle_link corners report pushrod_inner =
+    # NaN because the pushrod's inner end lives on the external heave-T-bar
+    # rocker.  The HeaveTBarRockerSolver models the LEFT side; the RIGHT corner
+    # is the X-mirror (pose the left solver with the mirrored pushrod_outer and
+    # mirror the result back).
+    if heave_tbar_solvers:
+        def _mir(p):
+            q = np.asarray(p, dtype=float).copy(); q[0] *= -1.0; return q
+        for axle_key, (lbl_L, lbl_R) in (('front', ('FL', 'FR')),
+                                         ('rear',  ('RL', 'RR'))):
+            hs = heave_tbar_solvers.get(axle_key)
+            if hs is None:
+                continue
+            sL, sR = states.get(lbl_L), states.get(lbl_R)
+            # Only fill when the corner left pushrod_inner as NaN (i.e. it is a
+            # cradle_link corner).  A pushrod-mode heave-T-bar corner already has
+            # a valid corner pushrod_inner — DON'T overwrite it with the rocker's.
+            if sL is not None and not np.all(np.isfinite(np.asarray(sL.pushrod_inner, float))):
+                try:
+                    sL.pushrod_inner = np.asarray(
+                        hs.pose(np.asarray(sL.pushrod_outer, dtype=float))['pushrod_inner'],
+                        dtype=float)
+                except Exception:
+                    pass
+            if sR is not None and not np.all(np.isfinite(np.asarray(sR.pushrod_inner, float))):
+                try:
+                    sR.pushrod_inner = _mir(
+                        hs.pose(_mir(sR.pushrod_outer))['pushrod_inner'])
+                except Exception:
+                    pass
+
+    # ── Phase 3: component loads per corner ──────────────────────────────────
     results = {}
     for label in ['FL', 'FR', 'RL', 'RR']:
         Fz = dyn_result.Fz.get(label, 0)
@@ -389,22 +688,9 @@ def compute_all_corners(
         up = upright_params_f if is_front else upright_params_r
         mr = motion_ratio_f if is_front else motion_ratio_r
 
-        solver = solvers.get(label)
-        if solver is None:
-            # No kinematic solver — still compute bearing / brake forces
-            cl = ComponentLoads(Fz_N=Fz, Fy_N=Fy, Fx_N=Fx, brake_torque_Nm=bt)
-            _compute_bearing_loads(cl, bp, up, wheel_radius_m)
-            _compute_caliper_bolt_loads(cl, bp, up)
-            _compute_brake_forces(cl, bp)
-            results[label] = cl
-            continue
-
-        # Get kinematic state at this corner's travel
-        travel_m = dyn_result.travel.get(label, 0) / 1000  # mm → m
-        try:
-            state = solver.solve(travel_m)
-        except Exception:
-            # Kinematic solve failed — still compute bearing / brake forces
+        state = states.get(label)
+        if state is None:
+            # No solver or kinematic solve failed — still compute bearing/brake
             cl = ComponentLoads(Fz_N=Fz, Fy_N=Fy, Fx_N=Fx, brake_torque_Nm=bt)
             _compute_bearing_loads(cl, bp, up, wheel_radius_m)
             _compute_caliper_bolt_loads(cl, bp, up)
