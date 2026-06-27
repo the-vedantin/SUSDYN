@@ -31,3 +31,6 @@ _tmp_*
 
 # Large / non-redistributable reference material
 RCVD*.pdf
+
+# Vendor manual (Drexler diff) — not ours to publish
+diffy.pdf

@@ -1475,6 +1475,30 @@ class InverseKinematicsPanel(CollapsibleSection):
         self._target_hi = _spin(-500, 500, 30.0, dec=2, step=0.5)
         grid.addWidget(self._target_hi, r, 1); r += 1
 
+        # Curve shape between the two endpoints — a NONLINEAR target (e.g.
+        # progressive/exponential MR) for a rising-rate that resists aero
+        # heave and holds ride height.  Linear reproduces the old ramp.
+        grid.addWidget(QLabel('Curve:'), r, 0)
+        self._curve = _NoScrollCombo()
+        self._curve.addItems(['Linear', 'Progressive', 'Digressive',
+                              'Exponential'])
+        self._curve.setToolTip(
+            'Shape of the target between @Min (droop) and @Max (bump):\n'
+            ' Linear      — straight ramp\n'
+            ' Progressive — rises slowly then fast (τ^p): most stiffening DEEP '
+            'in bump → best for holding ride height under downforce\n'
+            ' Digressive  — rises fast then plateaus\n'
+            ' Exponential — smooth exp curve')
+        self._curve.currentIndexChanged.connect(self._on_curve_change)
+        grid.addWidget(self._curve, r, 1); r += 1
+        grid.addWidget(QLabel('Curvature:'), r, 0)
+        self._curvature = _spin(0.2, 8.0, 2.0, dec=1, step=0.2)
+        self._curvature.setToolTip('Strength of the nonlinearity (power p / '
+                                   'exp k).  1 = linear-ish; higher = sharper. '
+                                   'Ignored for Linear.')
+        self._curvature.setEnabled(False)
+        grid.addWidget(self._curvature, r, 1); r += 1
+
         # Bound (how far points can move)
         grid.addWidget(QLabel('Max Movement:'), r, 0)
         self._bound = _spin(0.01, 1e6, 10, ' mm', dec=1, step=1)
@@ -1621,6 +1645,10 @@ class InverseKinematicsPanel(CollapsibleSection):
         self._target_lo.setValue(0.0)
         self._target_hi.setValue(-2.0)
 
+    def _on_curve_change(self, _idx):
+        # curvature only matters for the nonlinear shapes
+        self._curvature.setEnabled(self._curve.currentText() != 'Linear')
+
     def _on_metric_change(self, _idx):
         key = self._metric.currentData()
         for mkey, _, unit, lo, hi in IK_METRICS:
@@ -1687,6 +1715,8 @@ class InverseKinematicsPanel(CollapsibleSection):
             'metric_key':   self._metric.currentData(),
             'target_lo':    self._target_lo.value(),
             'target_hi':    self._target_hi.value(),
+            'target_shape': self._curve.currentText().lower(),
+            'target_curvature': self._curvature.value(),
             'bound_mm':     self._bound.value(),
             'method':       self._method.currentText(),
             'hp_names':     hp_names,

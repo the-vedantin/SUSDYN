@@ -85,6 +85,8 @@ class LaptimePage(QWidget):
         ('aero',   'Aero down/drag',   False),
         ('rpm',    'RPM + gear',       False),
         ('power',  'Power',            False),
+        ('diff',   'Diff yaw moment',  False),
+        ('rideh',  'Ride height',      False),
     ]
 
     def __init__(self, main):
@@ -106,6 +108,7 @@ class LaptimePage(QWidget):
         except Exception:
             pass
         self._refresh_tire_active()
+        self._on_diff_changed()
 
     # ── UI ───────────────────────────────────────────────────────────────
     def _build(self):
@@ -146,28 +149,40 @@ class LaptimePage(QWidget):
             g.addWidget(sb, row, col * 2 + 1)
             return sb
 
-        # ── TIRE dataset selector — populated from local tire_data/ files ─
+        # ── TIRE selector — separate FRONT and REAR axle dropdowns, both
+        #    populated from local tire_data/ files.  Pick a different tire for
+        #    each axle to run a SPLIT compound setup (e.g. one in front, one in
+        #    back).  Labels are read from each file's tire id at runtime, so no
+        #    tire names are hard-coded here (TTC-compliant).
         self._tire_rounds = self._discover_tires()
         if self._tire_rounds:
             hdr('TIRE  (local dataset)')
             g = grid()
-            g.addWidget(QLabel('Tire:'), 0, 0)
-            self._tire_combo = QComboBox()
-            self._tire_combo.setStyleSheet('QComboBox { font-size:11px; }')
-            # index 0 = neutral placeholder (whatever's currently loaded), so
-            # the dropdown never claims a tire it hasn't loaded.
-            self._tire_combo.addItem('(loaded tire — pick to swap)')
+            g.addWidget(QLabel('Front:'), 0, 0)
+            self._tire_combo_f = QComboBox()
+            self._tire_combo_f.setStyleSheet('QComboBox { font-size:11px; }')
+            self._tire_combo_f.addItem('(loaded tire — pick to swap)')
             for lbl, _fn in self._tire_rounds:
-                self._tire_combo.addItem(lbl)
-            self._tire_combo.setToolTip(
-                'Swap the loaded tire data.  The list is built from the .mat '
-                'files in your local tire_data/ folder; labels come from each '
-                "file's own tire id.  Re-Sim to compare lap times.")
-            # 'activated' fires on every USER pick (even the same item) so a
-            # tire always loads when chosen — currentIndexChanged would skip a
-            # re-pick of the current index.
-            self._tire_combo.activated.connect(self._on_tire_round)
-            g.addWidget(self._tire_combo, 0, 1)
+                self._tire_combo_f.addItem(lbl)
+            self._tire_combo_f.setToolTip(
+                'Front-axle tire.  Built from your local tire_data/ files; '
+                'labels are each file’s own tire id.  Re-Sim to compare.')
+            self._tire_combo_f.activated.connect(self._on_tire_front)
+            g.addWidget(self._tire_combo_f, 0, 1)
+
+            g.addWidget(QLabel('Rear:'), 1, 0)
+            self._tire_combo_r = QComboBox()
+            self._tire_combo_r.setStyleSheet('QComboBox { font-size:11px; }')
+            self._tire_combo_r.addItem('(same as front)')
+            for lbl, _fn in self._tire_rounds:
+                self._tire_combo_r.addItem(lbl)
+            self._tire_combo_r.setToolTip(
+                'Rear-axle tire.  Leave on "(same as front)" for one compound '
+                'all round, or pick a different tire to run a SPLIT setup '
+                '(e.g. a grippier compound on the rear).')
+            self._tire_combo_r.activated.connect(self._on_tire_rear)
+            g.addWidget(self._tire_combo_r, 1, 1)
+
             self._tire_active = QLabel('')
             self._tire_active.setStyleSheet('color:#8a8a92; font-size:10px;')
             self._tire_active.setWordWrap(True)
@@ -185,12 +200,38 @@ class LaptimePage(QWidget):
                          'Share of total downforce on the REAR axle.')
         self._grip = spin(g, 4, 0, 'Grip scale:', 0.3, 1.2, 0.65, 2, 0.05, ' ×',
                           'Track-vs-TTC-belt derate (0.6–0.7 typical).')
+        self._rh_f = spin(g, 5, 0, 'Static RH F:', 0.0, 300.0, 50.0, 0, 2.0,
+                          ' mm',
+                          'Front ride height at STATIC SAG (car on its springs '
+                          'with driver).  Aero downforce drops it from here as '
+                          'speed builds — see the Ride height graph.')
+        self._rh_r = spin(g, 6, 0, 'Static RH R:', 0.0, 300.0, 50.0, 0, 2.0,
+                          ' mm', 'Rear ride height at static sag.')
+        # Ride-height CAP: hold ride height >= cap at a reference speed.
+        self._rh_refspeed = spin(g, 7, 0, 'Cap @ speed:', 5.0, 300.0, 100.0, 0,
+                                 5.0, ' kph',
+                                 'Reference speed to size/check the ride-height '
+                                 'cap at (typ. your fastest sustained point).')
+        self._rh_cap_f = spin(g, 8, 0, 'RH cap F:', 0.0, 300.0, 25.0, 0, 1.0,
+                              ' mm', 'Minimum front ride height you will allow '
+                              '(splitter/floor clearance, bump-stop gap).')
+        self._rh_cap_r = spin(g, 9, 0, 'RH cap R:', 0.0, 300.0, 25.0, 0, 1.0,
+                              ' mm', 'Minimum rear ride height you will allow.')
         # Live reference-speed readout: ties the Cl·A input to the number
         # aero people actually quote ("N at 60 mph"), so a wrong entry is
         # obvious immediately.
         self._aero_ref = QLabel('')
         self._aero_ref.setStyleSheet('color:#8a8a92; font-size:10px;')
         side.addWidget(self._aero_ref)
+        self._rh_cap_readout = QLabel('')
+        self._rh_cap_readout.setStyleSheet('font-size:10px;')
+        self._rh_cap_readout.setWordWrap(True)
+        self._rh_cap_readout.setToolTip(
+            'First-order sizing at the operating-point rate.  The Ride height '
+            'GRAPH is the accurate result — it integrates the real (possibly '
+            'nonlinear) MR(travel) curve, so a progressive MR shows less heave '
+            'there.')
+        side.addWidget(self._rh_cap_readout)
 
         def _upd_ref(*_):
             v = 60 / 2.23694                      # 60 mph in m/s
@@ -199,7 +240,9 @@ class LaptimePage(QWidget):
             self._aero_ref.setText(
                 f'≈ {F:+.0f} N ({F/9.81:+.0f} kgf) downforce @ 60 mph · '
                 f'drag {float(self._cda.value())*q:.0f} N @ 60 mph')
-        for sb in (self._cla, self._cda, self._rho):
+            self._update_rh_cap()
+        for sb in (self._cla, self._cda, self._rho, self._cop, self._rh_f,
+                   self._rh_r, self._rh_refspeed, self._rh_cap_f, self._rh_cap_r):
             sb.valueChanged.connect(_upd_ref)
         _upd_ref()
 
@@ -218,6 +261,77 @@ class LaptimePage(QWidget):
                       ratio, 3, 0.01, '',
                       'Gearbox internal ratio.  0 = gear not fitted.')
             self._gear_spins.append(sb)
+
+        # ── DIFFERENTIAL (corner entry/exit balance via locking %) ────────
+        from vahan.differential import DREXLER_OPTIONS, Differential
+        # header with an info (ⓘ) button — same style as the suspension panels
+        drow = QHBoxLayout(); drow.setSpacing(6)
+        dlbl = QLabel('DIFFERENTIAL  (Drexler LSD)')
+        dlbl.setStyleSheet('color:#FFD600; font-size:11px; font-weight:bold;'
+                           'padding-top:6px;')
+        drow.addWidget(dlbl)
+        dinfo = QPushButton('ⓘ')
+        dinfo.setFixedSize(20, 20)
+        dinfo.setCursor(Qt.CursorShape.PointingHandCursor)
+        dinfo.setStyleSheet(
+            'QPushButton { background:#111111; color:#4FC3F7; '
+            'border:1px solid #2a2a2a; border-radius:10px; font-weight:bold; '
+            'font-size:12px; }'
+            'QPushButton:hover { background:#14344a; border-color:#4FC3F7; }')
+        dinfo.setToolTip('What does the differential do? Click for detail.')
+        dinfo.clicked.connect(self._show_diff_info)
+        drow.addWidget(dinfo)
+        drow.addStretch(1)
+        side.addLayout(drow)
+        g = grid()
+        g.addWidget(QLabel('Type:'), 0, 0)
+        self._diff_type = QComboBox()
+        self._diff_type.addItems(['Salisbury LSD', 'Open', 'Spool (locked)'])
+        self._diff_type.setToolTip(
+            'Open = no locking (free diff).  Spool = fully locked.  '
+            'Salisbury = Drexler ramp/clutch LSD (tune via ramp + preload).')
+        self._diff_type.currentIndexChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_type, 0, 1)
+        g.addWidget(QLabel('Ramp (pwr/coast):'), 1, 0)
+        self._diff_ramp = QComboBox()
+        self._diff_opts = list(DREXLER_OPTIONS.items())
+        for opt, (p, c) in self._diff_opts:
+            d = Differential('salisbury', p, c, 30)
+            self._diff_ramp.addItem(
+                f'{p:.0f}°/{c:.0f}°  ({d.power_locking_pct:.0f}/'
+                f'{d.coast_locking_pct:.0f}%)')
+        self._diff_ramp.setToolTip(
+            'Drexler ramp options (power°/coast°).  Smaller angle = more '
+            'locking.  More power-lock = more exit understeer + traction; '
+            'more coast-lock = more corner-entry stability (less rotation).')
+        self._diff_ramp.currentIndexChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_ramp, 1, 1)
+        g.addWidget(QLabel('Preload:'), 2, 0)
+        self._diff_preload = QDoubleSpinBox()
+        self._diff_preload.setRange(0.0, 100.0); self._diff_preload.setDecimals(0)
+        self._diff_preload.setSingleStep(5.0); self._diff_preload.setValue(30.0)
+        self._diff_preload.setSuffix(' Nm')
+        self._diff_preload.setToolTip('Clutch pre-clamp (Drexler: 25–35 Nm). '
+                                      'Acts at all times — baseline entry '
+                                      'stability even at neutral throttle.')
+        self._diff_preload.valueChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_preload, 2, 1)
+        g.addWidget(QLabel('Engine braking:'), 3, 0)
+        self._diff_engbrake = QDoubleSpinBox()
+        self._diff_engbrake.setRange(0.0, 60.0); self._diff_engbrake.setDecimals(0)
+        self._diff_engbrake.setSingleStep(2.0); self._diff_engbrake.setValue(12.0)
+        self._diff_engbrake.setSuffix(' Nm')
+        self._diff_engbrake.setToolTip(
+            'Closed-throttle engine-braking torque at the CRANK.  This is the '
+            'overrun torque that flows through the diff and works the COAST '
+            'ramp (set it from your dyno/feel; without it the coast ramp does '
+            'nothing on corner entry).')
+        self._diff_engbrake.valueChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_engbrake, 3, 1)
+        self._diff_readout = QLabel('')
+        self._diff_readout.setStyleSheet('color:#8a8a92; font-size:10px;')
+        self._diff_readout.setWordWrap(True)
+        side.addWidget(self._diff_readout)
 
         hdr('SIM')
         g = grid()
@@ -430,38 +544,209 @@ class LaptimePage(QWidget):
         return out
 
     def _refresh_tire_active(self):
-        """Show the currently-loaded tire's compound under the dropdown."""
+        """Show the active front/rear tire under the dropdowns."""
         if not hasattr(self, '_tire_active'):
             return
-        tm = getattr(self._main, '_tire_model', None)
-        tid = getattr(tm, 'tire_id', None)
-        if tid:
-            self._tire_active.setText(f'active: {tid}')
+        tf = getattr(self._main, '_tire_model', None)
+        tr = getattr(self._main, '_tire_model_rear', None)
+        fid = getattr(tf, 'tire_id', None) or '(parametric fallback)'
+        if tr is None:
+            self._tire_active.setText(f'F+R: {fid}')
         else:
-            self._tire_active.setText('active: (parametric fallback — no TTC '
-                                      'data loaded)')
+            rid = getattr(tr, 'tire_id', None) or '(parametric)'
+            self._tire_active.setText(f'SPLIT  F: {fid}\n       R: {rid}')
 
-    def _on_tire_round(self, combo_idx: int):
-        """Swap the global tire model to the selected TTC round, then (if a
-        lap already exists) auto re-sim so the comparison is immediate.
-        combo index 0 is the neutral '(loaded tire)' placeholder — no-op."""
-        idx = combo_idx - 1                       # account for placeholder
+    def _tire_path(self, idx: int):
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, 'tire_data', self._tire_rounds[idx][1])
+
+    def _after_tire_change(self, msg: str):
+        self._refresh_tire_active()
+        had = self._result is not None
+        self._status.setText(msg + ('  · re-simulating…' if had
+                                    else '  · hit Sim to compare'))
+        if had:
+            self._on_sim()                        # instant A/B
+
+    def _on_tire_front(self, combo_idx: int):
+        """Front-axle tire pick.  Index 0 is the '(loaded tire)' placeholder."""
+        idx = combo_idx - 1
         if not (0 <= idx < len(self._tire_rounds)):
             return
-        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(base, 'tire_data', self._tire_rounds[idx][1])
         try:
-            self._main._on_tire_file(path)        # swaps _tire_model app-wide
+            self._main._on_tire_file(self._tire_path(idx))   # sets _tire_model
         except Exception as e:
-            self._status.setText(f'Tire load failed: {e}')
+            self._status.setText(f'Front tire load failed: {e}')
             return
-        self._refresh_tire_active()
-        had_result = self._result is not None
-        self._status.setText(
-            f'Tire → {self._tire_rounds[idx][0]}'
-            + ('  · re-simulating…' if had_result else '  · hit Sim to compare'))
-        if had_result:
-            self._on_sim()                        # instant A/B
+        self._after_tire_change(f'Front tire → {self._tire_rounds[idx][0]}')
+
+    def _on_tire_rear(self, combo_idx: int):
+        """Rear-axle tire pick.  Index 0 = '(same as front)' -> no split."""
+        try:
+            if combo_idx == 0:
+                self._main._set_rear_tire(None)
+                self._after_tire_change('Rear tire → same as front')
+                return
+            idx = combo_idx - 1
+            if not (0 <= idx < len(self._tire_rounds)):
+                return
+            self._main._set_rear_tire(self._tire_path(idx))
+            self._after_tire_change(f'Rear tire → {self._tire_rounds[idx][0]}')
+        except Exception as e:
+            self._status.setText(f'Rear tire load failed: {e}')
+
+    def _update_rh_cap(self):
+        """Check (and size for) the ride-height cap at the reference speed:
+        does the current setup hold ride height >= cap, and if not, what ride
+        rate / spring rate would?"""
+        if not hasattr(self, '_rh_cap_readout'):
+            return
+        try:
+            from vahan.laptime import (downforce_at_speed_N, aero_heave_mm,
+                                       required_ride_rate_Npm,
+                                       wheel_rate_from_ride_rate_Npm)
+            veh = self._main._build_dynamics_solver()._veh
+            v = float(self._rh_refspeed.value()) / 3.6
+            cla = float(self._cla.value()); cop = float(self._cop.value()) / 100.0
+            rho = float(self._rho.value())
+            D = downforce_at_speed_N(cla, v, rho)
+            lines = [f'@ {self._rh_refspeed.value():.0f} kph: {D:.0f} N down']
+            ok_all = True
+            for tag, Daxle, kr, rh0, cap, mr, spr in (
+                ('F', D * (1 - cop), veh.ride_rate_front_Npm, self._rh_f.value(),
+                 self._rh_cap_f.value(), veh.motion_ratio_front,
+                 veh.spring_rate_front_Npm),
+                ('R', D * cop, veh.ride_rate_rear_Npm, self._rh_r.value(),
+                 self._rh_cap_r.value(), veh.motion_ratio_rear,
+                 veh.spring_rate_rear_Npm)):
+                heave = aero_heave_mm(Daxle, kr)
+                rh = rh0 - heave
+                if rh + 1e-6 >= cap:
+                    lines.append(f'{tag}: {rh:.0f} mm  ✓ (cap {cap:.0f})')
+                else:
+                    ok_all = False
+                    max_heave = max(rh0 - cap, 0.1)
+                    rr_need = required_ride_rate_Npm(Daxle, max_heave)
+                    wr_need = wheel_rate_from_ride_rate_Npm(
+                        rr_need, veh.tire_rate_Npm)
+                    if not np.isfinite(wr_need):
+                        lines.append(f'{tag}: {rh:.0f} mm  ✗ under cap '
+                                     f'{cap:.0f} — TIRE-limited (stiffer tire/'
+                                     f'lower aero needed)')
+                    else:
+                        # two levers to hold the cap: stiffer SPRING (const MR)
+                        # OR a higher MR at compression (the IK nonlinear-MR
+                        # target_hi — design a progressive MR rising to this).
+                        spr_need = wr_need / max(mr * mr, 1e-6)
+                        mr_need = (wr_need / max(spr, 1e-6)) ** 0.5
+                        lines.append(
+                            f'{tag}: {rh:.0f} mm ✗ under cap {cap:.0f} by '
+                            f'{cap-rh:.0f}. Hold it via spring ≥ '
+                            f'{spr_need/175.127:.0f} lbf/in (now '
+                            f'{spr/175.127:.0f}) OR MR→{mr_need:.2f} at '
+                            f'compression (now {mr:.2f}) — IK progressive '
+                            f'target_hi')
+            self._rh_cap_readout.setText('\n'.join(lines))
+            self._rh_cap_readout.setStyleSheet(
+                'font-size:10px; color:%s;' % ('#7a9a5a' if ok_all else '#c08a3a'))
+        except Exception:
+            self._rh_cap_readout.setText('')
+
+    def _show_diff_info(self):
+        """Popup explaining the differential (same look as the suspension
+        panels' ⓘ dialogs)."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextBrowser
+        try:
+            from gui import section_info
+            html = section_info.DIFFERENTIAL
+        except Exception:
+            html = '<p>Differential info unavailable.</p>'
+        dlg = QDialog(self)
+        dlg.setWindowTitle('ⓘ  Differential (Drexler FSAE LSD)')
+        dlg.resize(640, 720)
+        dlg.setStyleSheet('QDialog { background:#0a0a0a; }'
+                          'QTextBrowser { background:#0a0a0a; color:#e0e0e0; '
+                          'border:none; font-size:12px; }')
+        lay = QVBoxLayout(dlg)
+        tb = QTextBrowser(); tb.setOpenExternalLinks(False); tb.setHtml(html)
+        lay.addWidget(tb)
+        btn = QPushButton('Close'); btn.clicked.connect(dlg.accept)
+        btn.setStyleSheet(
+            'QPushButton { background:#1a5276; color:white; padding:6px 20px; '
+            'border-radius:3px; font-weight:bold; }'
+            'QPushButton:hover { background:#1f6da0; }')
+        lay.addWidget(btn)
+        dlg.exec()
+
+    def _on_diff_changed(self, *_):
+        """Push the differential config onto the live car, update the readout,
+        and (if a lap exists) re-sim so the balance effect is immediate."""
+        from vahan.differential import Differential
+        kinds = {0: 'salisbury', 1: 'open', 2: 'spool'}
+        kind = kinds.get(self._diff_type.currentIndex(), 'salisbury')
+        p, c = self._diff_opts[self._diff_ramp.currentIndex()][1]
+        d = Differential(kind, p, c, float(self._diff_preload.value()))
+        self._main._diff = d
+        self._main._engine_braking_Nm = float(self._diff_engbrake.value())
+        # gray out ramp/preload for open/spool (no ramp tuning there)
+        is_lsd = (kind == 'salisbury')
+        self._diff_ramp.setEnabled(is_lsd)
+        self._diff_preload.setEnabled(is_lsd)
+        self._diff_engbrake.setEnabled(is_lsd)
+        # readout: locking % + a representative exit-understeer yaw moment
+        try:
+            veh = self._main._build_dynamics_solver()._veh
+            r_t = max(veh.tire_radius_m, 1e-3)
+            track = float(getattr(veh, 'rear_track_m', 1.2))
+            mu0 = 1.5
+            try:
+                tm = getattr(self._main, '_tire_model', None)
+                if tm is not None:
+                    mu0 = float(tm.peak_mu(700.0, 0.0))
+            except Exception:
+                pass
+            cap = mu0 * veh.total_mass_kg * 9.80665 * (1.0 - veh.front_weight_fraction)
+            # ~200 Nm axle drive torque is a typical FSAE corner-exit value
+            mz_exit = d.yaw_moment_Nm(200.0, track, r_t, True, max_bias_N=cap)
+            mz_entry = d.yaw_moment_Nm(0.0, track, r_t, False, max_bias_N=cap)
+        except Exception:
+            mz_exit = mz_entry = 0.0
+        # the DECISION numbers: actual understeer-gradient shift this diff adds
+        # vs an open diff, at a power-on and a trailing-throttle corner.
+        du_pwr = du_coast = 0.0
+        try:
+            from vahan.differential import Differential as _D
+
+            def ug(diff, lon):
+                self._main._diff = diff
+                return self._main._build_dynamics_solver().solve(
+                    1.3, lon).understeer_gradient_deg
+            u_open_p, u_d_p = ug(_D('open'), 0.4), ug(d, 0.4)
+            u_open_c, u_d_c = ug(_D('open'), -0.4), ug(d, -0.4)
+            du_pwr, du_coast = u_d_p - u_open_p, u_d_c - u_open_c
+        except Exception:
+            pass
+        finally:
+            self._main._diff = d           # restore the chosen diff
+        if kind == 'open':
+            self._diff_readout.setText('Open — free inner/outer (least '
+                                       'understeer, least off-corner traction; '
+                                       'inner wheel spins under power).')
+        elif kind == 'spool':
+            self._diff_readout.setText(
+                f'Spool — fully locked.  vs open: {du_pwr:+.2f}° understeer on '
+                f'exit, {du_coast:+.2f}° on entry (max stability, draggy).')
+        else:
+            self._diff_readout.setText(
+                f'power {d.power_locking_pct:.0f}% / coast '
+                f'{d.coast_locking_pct:.0f}% lock\n'
+                f'vs open: {du_pwr:+.2f}° understeer on EXIT · '
+                f'{du_coast:+.2f}° on ENTRY (+ = more understeer/stable)')
+        had = self._result is not None
+        self._status.setText('Diff → ' + d.describe()
+                             + ('  · re-simulating…' if had else ''))
+        if had:
+            self._on_sim()
 
     def _on_track_changed(self, idx: int):
         if 0 <= idx < len(self._track_files):
@@ -499,6 +784,8 @@ class LaptimePage(QWidget):
             air_density=float(self._rho.value()),
             aero_cop_rear_frac=float(self._cop.value()) / 100.0,
             grip_scale=float(self._grip.value()),
+            static_rh_front_mm=float(self._rh_f.value()),
+            static_rh_rear_mm=float(self._rh_r.value()),
         )
         # remembered for the aero graph title + front/rear split
         self._last_aero = (float(self._cla.value()), float(self._cda.value()),
@@ -564,6 +851,15 @@ class LaptimePage(QWidget):
             f'peak accel {np.nanmax(res.lon_g):6.2f} g\n'
             f'top gear   {top_gear}   (geared top {v_top:.0f} kph '
             f'@ {self._redline.value():.0f})')
+        # min ride height (aero squat) — the "don't bottom out" number
+        try:
+            rf, rr = res.rh_front_mm, res.rh_rear_mm
+            if rf is not None and rr is not None:
+                self._readout.setText(self._readout.text() +
+                    f'\nmin RH     F {np.nanmin(rf):.0f} / R {np.nanmin(rr):.0f} mm'
+                    f'  (from {self._rh_f.value():.0f}/{self._rh_r.value():.0f})')
+        except Exception:
+            pass
         self._redraw()
 
     # ── drawing ──────────────────────────────────────────────────────────
@@ -741,6 +1037,48 @@ class LaptimePage(QWidget):
                     pk = float(self._main._dynamics_panel._power_hp.value())
                     ax.axhline(pk, color='#E53935', lw=0.8, ls='--',
                                alpha=0.6, label='engine peak')
+                except Exception:
+                    pass
+                self._legend(ax)
+            elif key == 'diff':
+                self._style(ax, 's (m)', 'N·m',
+                            'Differential yaw moment  (+ = understeer on exit / '
+                            'stabilising on entry)')
+                dy = getattr(res, 'diff_yaw_Nm', None)
+                if dy is not None:
+                    ax.fill_between(s, 0, dy, color='#FFD600', alpha=0.25)
+                    ax.plot(s, dy, color='#FFD600', lw=1.4, label='diff Mz')
+                ax.axhline(0, color='#555', lw=0.6)
+                self._legend(ax)
+            elif key == 'rideh':
+                self._style(ax, 's (m)', 'mm',
+                            'Ride height (drops as aero downforce builds)')
+                rf = getattr(res, 'rh_front_mm', None)
+                rr = getattr(res, 'rh_rear_mm', None)
+                if rf is not None:
+                    ax.plot(s, rf, color='#FFD600', lw=1.5, label='front')
+                    ax.axhline(float(np.nanmin(rf)), color='#FFD600', lw=0.7,
+                               ls=':', alpha=0.5,
+                               label=f'min F {np.nanmin(rf):.0f}')
+                if rr is not None:
+                    ax.plot(s, rr, color='#42A5F5', lw=1.5, label='rear')
+                    ax.axhline(float(np.nanmin(rr)), color='#42A5F5', lw=0.7,
+                               ls=':', alpha=0.5,
+                               label=f'min R {np.nanmin(rr):.0f}')
+                # ride-height CAPS — the floor you don't want to drop below
+                try:
+                    cf, cr = float(self._rh_cap_f.value()), float(self._rh_cap_r.value())
+                    ax.axhline(cf, color='#FF1744', lw=1.0, ls='--',
+                               label=f'cap F {cf:.0f}')
+                    if abs(cr - cf) > 0.5:
+                        ax.axhline(cr, color='#FF6E6E', lw=1.0, ls='--',
+                                   label=f'cap R {cr:.0f}')
+                    # shade the violation zone if the car drops below a cap
+                    lo = min(np.nanmin(rf) if rf is not None else cf,
+                             np.nanmin(rr) if rr is not None else cr)
+                    if lo < max(cf, cr):
+                        ax.axhspan(lo - 1, max(cf, cr), color='#FF1744',
+                                   alpha=0.06)
                 except Exception:
                     pass
                 self._legend(ax)

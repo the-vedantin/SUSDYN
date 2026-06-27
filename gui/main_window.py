@@ -2126,7 +2126,11 @@ class MainWindow(QMainWindow):
         # Constrained-nudge mode: 'free' | 'link' | 'plane'
         self._edit_constraint = 'free'
         self._3d_pending     = False     # deferred 3D update flag
-        self._tire_model     = None      # TireModel or LinearTireModel
+        self._tire_model     = None      # front-axle TireModel / LinearTireModel
+        self._tire_model_rear = None     # rear tire (None = same as front; set
+                                         # for a SPLIT front/rear compound setup)
+        from vahan.differential import Differential
+        self._diff = Differential()      # Drexler FSAE LSD (default option 1)
         self._dyn_sweep_data = None      # last dynamics sweep dict
         self._dyn_worker     = None      # active dynamics worker thread
 
@@ -6906,10 +6910,18 @@ class MainWindow(QMainWindow):
             motion=motion,
         )
 
-        # Primary target: linear ramp
+        # Primary target curve: lo (at min travel/droop) -> hi (at max/bump),
+        # with a selectable shape so a NONLINEAR (e.g. progressive/exponential)
+        # motion ratio can be targeted — a rising-rate MR that stiffens the
+        # wheel rate under compression to resist aero heave and hold ride
+        # height.  Linear (default) reproduces the old behaviour.
+        from vahan.optimizer import shaped_target
         target_lo = spec.get('target_lo', spec.get('target', 0.0))
         target_hi = spec.get('target_hi', target_lo)
-        target_ramp = np.linspace(float(target_lo), float(target_hi), n_pts)
+        target_ramp = shaped_target(
+            float(target_lo), float(target_hi), n_pts,
+            shape=spec.get('target_shape', 'linear'),
+            curvature=float(spec.get('target_curvature', 2.0)))
 
         # Auto-balance: primary weight scales with number of locks
         # so the primary isn't drowned out by lock penalties
@@ -6983,10 +6995,13 @@ class MainWindow(QMainWindow):
                 }
 
                 # Build target list (serialisable for multiprocessing)
-                from vahan.optimizer import _evaluate_sweep
+                from vahan.optimizer import _evaluate_sweep, shaped_target
                 target_lo = spec.get('target_lo', 0.0)
                 target_hi = spec.get('target_hi', target_lo)
-                target_ramp = np.linspace(float(target_lo), float(target_hi), n_pts)
+                target_ramp = shaped_target(
+                    float(target_lo), float(target_hi), n_pts,
+                    shape=spec.get('target_shape', 'linear'),
+                    curvature=float(spec.get('target_curvature', 2.0)))
 
                 # Auto-balanced weights (same logic as _build_ik_solver)
                 lock_metrics = spec.get('lock_metrics', [])
@@ -7580,6 +7595,13 @@ class MainWindow(QMainWindow):
         dyn_params = self._apply_topology_to_dyn_params(dyn_params)
 
 
+        # Differential params (corner entry/exit balance via locking %).
+        dyn_params['diff_kind'] = self._diff.kind
+        dyn_params['diff_power_ramp_deg'] = self._diff.power_ramp_deg
+        dyn_params['diff_coast_ramp_deg'] = self._diff.coast_ramp_deg
+        dyn_params['diff_preload_Nm'] = self._diff.preload_Nm
+        dyn_params['engine_braking_Nm'] = getattr(self, '_engine_braking_Nm', 12.0)
+
         veh = VehicleParams(**dyn_params)
         # Design roll-centre heights (same kinematic model) so the constants
         # readout can show the ROLL GRADIENT (deg/g) — the standard design-
@@ -7607,7 +7629,10 @@ class MainWindow(QMainWindow):
         if tire is None:
             from vahan.tire_model import LinearTireModel
             tire = LinearTireModel()
-        return SteadyStateSolver(veh, self._solvers, tire)
+        # Rear tire = front unless a split front/rear setup is active.
+        tire_rear = self._tire_model_rear
+        return SteadyStateSolver(veh, self._solvers, tire,
+                                 tire_model_rear=tire_rear)
 
     def _refresh_vehicle_constants(self):
         """Rebuild VehicleParams and push to the constants popup.
@@ -7659,6 +7684,16 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._dynamics_panel.set_status(f'Error: {e}')
             self.statusBar().showMessage(f'Tire load error: {e}', 6000)
+
+    def _set_rear_tire(self, path):
+        """Set the REAR-axle tire for a split front/rear compound setup.
+        path=None -> rear tire is the same as the front (the usual case)."""
+        if path is None:
+            self._tire_model_rear = None
+            return None
+        from vahan.tire_model import TireModel
+        self._tire_model_rear = TireModel.from_file(path)
+        return self._tire_model_rear
 
     def _on_tire_plots(self):
         """Render the tire / grip characterization plots (Fy vs slip angle,

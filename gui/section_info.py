@@ -371,8 +371,15 @@ so direct-acting and decoupled corners fit just as well as bell-crank ones.</p>
 <tr><td style="{_K}">Metric</td>
 <td>Camber, bump-steer (toe), anti-dive/squat/lift, Ackermann, RC height, caster,
 trail, motion ratio, ARB motion ratio.</td></tr>
-<tr><td style="{_K}">Target start &rarr; end</td>
-<td>A linear ramp across the travel range (e.g. &minus;2.5&deg; &rarr; +0.5&deg; camber).</td></tr>
+<tr><td style="{_K}">Target @Min &rarr; @Max</td>
+<td>The metric value at min travel (droop) and max travel (bump). Constant =
+both equal.</td></tr>
+<tr><td style="{_K}">Curve</td>
+<td>Shape between the endpoints: <b>Linear</b>, <b>Progressive</b> (τ^p &mdash;
+rises late/deep in bump), <b>Digressive</b> (rises early then plateaus), or
+<b>Exponential</b>. <b>Curvature</b> sets how sharp. This lets you target a
+<b>NONLINEAR motion ratio</b> &mdash; a rising-rate MR whose wheel rate (∝ MR²)
+stiffens under compression.</td></tr>
 <tr><td style="{_K}">Hardpoints + axes</td>
 <td>Which inboard/outboard points may move, and on which of X / Y / Z.</td></tr>
 <tr><td style="{_K}">Bound</td>
@@ -386,6 +393,21 @@ multi-modal fits.</td></tr>
 </table>
 <p>If several distinct geometries hit the target, a picker lists them with their
 max error and total point movement so you can choose the least-disruptive one.</p>
+
+{_sub('Nonlinear MR to hold ride height under aero')}
+<p>A rising-rate MR can resist aero squat: as downforce compresses the
+suspension, a higher MR stiffens the wheel rate and limits the heave. The
+Laptime page's <b>Ride height</b> graph models this through the real MR(travel)
+curve, and its <b>cap</b> readout gives the MR you need at compression
+(<i>target_hi</i> for a progressive curve).</p>
+<p style="{_WARN}">Positioning matters:</p>
+<p>The rate rise must land <b>at the aero-compression stroke</b> (typically the
+first 10&ndash;20 mm of bump), not deep in travel. A gently progressive curve
+over the full travel barely helps ride height &mdash; the MR has hardly risen by
+the time the aero load is reacted. Concentrate the rise near the operating
+point (use a sharper Curvature, or set @Max close to the aero-heave travel).
+A single rocker has limited freedom to hit a strong nonlinearity, so check the
+residual on the graph &mdash; it shows how close the geometry actually got.</p>
 """
 
 
@@ -669,8 +691,88 @@ out-of-plane error in one click.</td></tr>
 """
 
 
+DIFFERENTIAL = _h('Differential (Drexler FSAE LSD)') + f"""
+<p>The differential splits drive (and engine-overrun) torque between the two
+driven wheels. In a corner that split is asymmetric, which makes a
+<b>yaw moment</b> &mdash; so the diff directly sets how the car
+<b>over/understeers going into and out of corners</b>. The locking %% is the
+tuning knob.</p>
+
+{_sub('The three effects')}
+<table cellspacing="4">
+<tr><td style="{_K}">On power (corner exit)</td>
+<td>The clutch biases drive toward the slower <b>inner</b> wheel, so the axle's
+force asymmetry <b>resists the turn &rarr; understeer</b>. More power-lock = more
+exit understeer (and more traction off the corner).</td></tr>
+<tr><td style="{_K}">On coast (corner entry)</td>
+<td>Off-throttle, the clutch biases overrun to the inner wheel, which
+<b>resists the rear rotating &rarr; entry stability</b>. More coast-lock = less
+lift-off rotation; less coast-lock = a pointier, rotation-happy entry.</td></tr>
+<tr><td style="{_K}">Preload</td>
+<td>The clutch is pre-clamped, so a baseline of that stabilising effect is
+present <b>at all times</b>, even at neutral throttle.</td></tr>
+</table>
+
+{_sub('Inputs')}
+<table cellspacing="4">
+<tr><td style="{_K}">Type</td>
+<td><b>Open</b> = no locking (free inner/outer; least understeer, least
+traction). <b>Spool</b> = fully locked (max exit understeer + traction, draggy
+on entry). <b>Salisbury</b> = the Drexler ramp/clutch LSD (tunable).</td></tr>
+<tr><td style="{_K}">Ramp (pwr/coast)</td>
+<td>You set the <b>ramp angles</b> &mdash; exactly how you adjust the real diff
+(you swap ramps, you don't dial a %%). The first angle is the power side, the
+second the coast side. Smaller angle = more aggressive = more lock.</td></tr>
+<tr><td style="{_K}">Preload</td>
+<td>Clutch pre-clamp torque (Drexler: 25&ndash;35 Nm).</td></tr>
+</table>
+
+{_sub('Drexler ramp &rarr; locking %% (from the 2017 manual)')}
+<table cellspacing="4">
+<tr><td style="{_K}">30&deg;</td><td>~88%%</td>
+<td style="{_K}">40&deg;</td><td>~60%%</td>
+<td style="{_K}">45&deg;</td><td>~51%%</td>
+<td style="{_K}">50&deg;</td><td>~42%%</td>
+<td style="{_K}">60&deg;</td><td>~29%%</td></tr>
+</table>
+<p>The 3 selectable options (power/coast): <b>40/50</b> (basic),
+<b>45/60</b> (softest), <b>30/45</b> (most aggressive).</p>
+
+{_sub('How to tune it')}
+<table cellspacing="4">
+<tr><td>Pushing wide on corner exit?</td><td>Soften the <b>power</b> ramp
+(bigger angle, less lock) &rarr; option 45/60.</td></tr>
+<tr><td>Snappy / loose on turn-in?</td><td>Add <b>coast</b> lock (smaller coast
+angle) or more <b>preload</b> &rarr; calms entry rotation.</td></tr>
+<tr><td>Want max rotation for a tight course?</td><td>Less coast lock / less
+preload &rarr; pointier entry.</td></tr>
+</table>
+
+{_sub('Model + sign convention')}
+<p>The clutch biases the driven-axle torque, making an inter-wheel force bias
+ΔFx = lock%% &middot; drive-force (capped by the INNER wheel's grip from the
+solve) and a yaw moment Mz = ΔFx &middot; track/2. That moment is reacted by a
+front/rear lateral-force couple ΔFy = Mz / wheelbase, which shifts each axle's
+slip angle &mdash; so it feeds <b>directly into the understeer gradient</b>.
+<b>Positive = understeer (exit) / stabilising (entry).</b></p>
+<p>This is the single model: the diff now moves the <b>understeer gradient</b>
+on the Dynamics page, the lap detail pass, AND the <b>Diff yaw moment</b> graph
+channel &mdash; they all derive from the same solve. The readout shows the
+actual understeer-gradient shift (deg) vs an open diff, on exit and on entry.</p>
+
+<p style="{_WARN}">Engine braking:</p>
+<p>The coast ramp only acts on overrun torque through the diff, so it needs an
+<b>Engine braking</b> input (crank Nm, closed throttle). Set it from your dyno
+or feel &mdash; the brakes act at the wheels (outside the diff) and don't work
+the coast ramp. The quasi-steady lap-time <i>number</i> is balance-agnostic
+(driver assumed at the grip limit), so use the understeer-gradient readout and
+the yaw channel to tune balance, not the lap clock.</p>
+"""
+
+
 # Registry so panels can fetch by key and a smoke test can confirm coverage.
 SECTION_INFO = {
+    'differential':       DIFFERENTIAL,
     'motion':             MOTION,
     'steering':           STEERING,
     'car_params':         CAR_PARAMS,

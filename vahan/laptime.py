@@ -33,6 +33,41 @@ G = 9.80665
 #  Track
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Aero ride-height sizing — cap ride height for a given downforce at a speed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def downforce_at_speed_N(cla_m2: float, speed_ms: float,
+                         rho: float = 1.225) -> float:
+    """Total aero downforce (N) = Cl·A · ½ρv²."""
+    return float(cla_m2) * 0.5 * float(rho) * float(speed_ms) ** 2
+
+
+def aero_heave_mm(downforce_axle_N: float, ride_rate_Npm: float) -> float:
+    """Symmetric heave (mm) of one axle under its aero load.  Each of the two
+    wheels carries half the axle load against its ride rate (wheel rate in
+    series with the tire), so heave = (D_axle/2) / ride_rate."""
+    return (float(downforce_axle_N) / 2.0) / max(float(ride_rate_Npm), 1.0) * 1000.0
+
+
+def required_ride_rate_Npm(downforce_axle_N: float, max_heave_mm: float) -> float:
+    """Minimum per-wheel ride rate (N/m) so the axle's aero heave does not
+    exceed ``max_heave_mm`` — i.e. ride height stays at/above its cap."""
+    return (float(downforce_axle_N) / 2.0) / (max(float(max_heave_mm), 1e-3) / 1000.0)
+
+
+def wheel_rate_from_ride_rate_Npm(ride_rate_Npm: float,
+                                  tire_rate_Npm: float) -> float:
+    """Invert the spring-in-series-with-tire relation:
+        ride_rate = (wheel·tire)/(wheel+tire)  ->  wheel = ride·tire/(tire-ride)
+    Returns inf if the demanded ride rate meets/exceeds the tire rate (then the
+    TIRE is the limit — no spring can get you there)."""
+    rr, tr = float(ride_rate_Npm), float(tire_rate_Npm)
+    if tr <= rr + 1e-9:
+        return float('inf')
+    return rr * tr / (tr - rr)
+
+
 @dataclass
 class Track:
     name: str
@@ -83,6 +118,9 @@ class LapResult:
     engine_rpm: np.ndarray = None
     gear: np.ndarray = None              # selected gear per station (0 = n/a)
     power_used_W: np.ndarray = None
+    diff_yaw_Nm: np.ndarray = None       # diff yaw moment (+ understeer/stabilise)
+    rh_front_mm: np.ndarray = None       # front ride height vs distance
+    rh_rear_mm: np.ndarray = None        # rear ride height vs distance
     limit: np.ndarray = None      # 0=grip(corner) 1=power 2=braking per station
     # detailed (sampled stations, full steady-state solve)
     det_s_m: np.ndarray = None
@@ -106,11 +144,18 @@ class LapSimulator:
                  cda_m2: float | None = None,
                  air_density: float | None = None,
                  aero_cop_rear_frac: float = 0.5,
-                 grip_scale: float = 1.0):
+                 grip_scale: float = 1.0,
+                 static_rh_front_mm: float = 50.0,
+                 static_rh_rear_mm: float = 50.0):
         self.ss = ss_solver
         self.veh = ss_solver._veh
-        self.tire = ss_solver._tire
+        self.tire = ss_solver._tire                       # front (and default)
+        self.tire_rear = getattr(ss_solver, '_tire_rear', ss_solver._tire)
         self.cla = float(cla_m2)
+        # Static ride heights (mm) measured at static sag — the baseline the
+        # aero-induced heave drops from as downforce builds with speed.
+        self.rh_front0 = float(static_rh_front_mm)
+        self.rh_rear0 = float(static_rh_rear_mm)
         self.cda = float(cda_m2 if cda_m2 is not None else self.veh.cda_m2)
         self.rho = float(air_density if air_density is not None
                          else self.veh.air_density_kg_m3)
@@ -188,6 +233,43 @@ class LapSimulator:
     def drag_N(self, v):
         return self.cda * self._q(v)
 
+    # ── ride-height heave through the REAL (possibly nonlinear) wheel rate ──
+    def _build_rate_curves(self):
+        """Precompute, per axle, the cumulative wheel force vs compression
+        using MR(travel) from the corner solver, so a progressive/exponential
+        MR genuinely reduces aero heave.  Cached on the instance."""
+        if getattr(self, '_rate_curves', None) is not None:
+            return self._rate_curves
+        out = {}
+        for ax, label, mr0, spr in (
+            ('F', 'FL', self.veh.motion_ratio_front, self.veh.spring_rate_front_Npm),
+            ('R', 'RL', self.veh.motion_ratio_rear, self.veh.spring_rate_rear_Npm)):
+            ts = np.linspace(0.0, 0.08, 41)              # 0..80 mm bump
+            sv = self.ss._solvers.get(label)
+            mr = np.full_like(ts, float(mr0))
+            if sv is not None:
+                try:
+                    sl = np.array([sv.solve(float(t)).spring_length for t in ts])
+                    mr = np.abs(np.gradient(sl, ts))
+                    mr = np.clip(mr, 0.05, 5.0)
+                except Exception:
+                    pass
+            k_wheel = float(spr) * mr ** 2               # N/m at each travel
+            fcum = np.concatenate([[0.0], np.cumsum(
+                0.5 * (k_wheel[1:] + k_wheel[:-1]) * np.diff(ts))])
+            out[ax] = dict(ts=ts, fcum=fcum,
+                           kt=max(float(self.veh.tire_rate_Npm), 1.0))
+        self._rate_curves = out
+        return out
+
+    def _aero_heave_mm(self, curve, aero_load_per_wheel: float) -> float:
+        """Heave (mm) of one wheel under an additional aero load, through the
+        nonlinear wheel rate + tire in series."""
+        load = max(float(aero_load_per_wheel), 0.0)
+        dt = float(np.interp(load, curve['fcum'], curve['ts']))   # suspension
+        tire = load / curve['kt']                                  # tire defl
+        return (dt + tire) * 1000.0
+
     # ── grip helpers (load-sensitive μ from the ONE tire model) ────────
     def _mu_at_speed(self, v: float) -> float:
         """Vehicle-level lateral μ at speed v: per-tire Fz includes the aero
@@ -199,8 +281,8 @@ class LapSimulator:
         wf = self.veh.front_weight_fraction
         Fz_f = Fz_tot * wf / 2.0
         Fz_r = Fz_tot * (1.0 - wf) / 2.0
-        mu_f = float(self.tire.peak_mu(Fz_f, 0.0))
-        mu_r = float(self.tire.peak_mu(Fz_r, 0.0))
+        mu_f = float(self.tire.peak_mu(Fz_f, 0.0))         # front tire
+        mu_r = float(self.tire_rear.peak_mu(Fz_r, 0.0))    # rear tire (split)
         return min(mu_f, mu_r) * self.grip_scale   # conservative + derated
 
     def _ay_max_pointmass(self, v: float) -> float:
@@ -388,6 +470,22 @@ class LapSimulator:
             avg_speed_kph=float(track.length_m / t[-1] * 3.6),
             max_speed_kph=float(v.max() * 3.6),
         )
+        # ── ride height under downforce (PROGRESSIVE-MR aware) ─────────────
+        # Aero downforce compresses the suspension (heave), dropping ride
+        # height as speed builds.  The heave is found by integrating the REAL
+        # wheel-rate curve k_wheel(t) = spring_rate · MR(t)² from the corner
+        # solver — so a NONLINEAR (e.g. progressive) MR actually resists
+        # compression and holds ride height, instead of a constant rate that
+        # would ignore the rocker shape.  Tire deflection (load/tire-rate) adds
+        # in series.  Constant-MR collapses to the old load/ride_rate formula.
+        curves = self._build_rate_curves()
+        down = self.downforce_N(v)
+        heave_f_mm = np.array([self._aero_heave_mm(curves['F'],
+                              float(d) * (1.0 - self.cop_rear) / 2.0) for d in down])
+        heave_r_mm = np.array([self._aero_heave_mm(curves['R'],
+                              float(d) * self.cop_rear / 2.0) for d in down])
+        res.rh_front_mm = self.rh_front0 - heave_f_mm
+        res.rh_rear_mm = self.rh_rear0 - heave_r_mm
         # Load-sensitivity note: aero can push a tire past the tested load
         # range.  The grip there DOES fall with load (load sensitivity, applied
         # via peak_mu's extended decline + grip-force ceiling) — the only
@@ -431,6 +529,40 @@ class LapSimulator:
         res.engine_rpm = rpm_arr
         res.gear = gear_arr
         res.power_used_W = pwr_arr
+
+        # ── differential yaw moment (corner entry/exit balance) ───────────
+        # On power: drive torque through the diff -> power-ramp locking ->
+        # understeer.  Off power: the clutch preload still acts (a stabilising
+        # entry moment); the coast RAMP adds to it under engine braking, which
+        # this lap model doesn't separate from the brakes — so coast shows the
+        # preload baseline.  Sign: + = understeer (exit) / stabilising (entry).
+        from vahan.differential import Differential
+        diff = Differential.from_vehicle(self.veh)
+        r_t = max(self.veh.tire_radius_m, 1e-3)
+        track_r = float(getattr(self.veh, 'rear_track_m', 1.2))
+        # grip cap on the force bias: the driven axle can't bias more force
+        # than its tires can transmit (~ its peak μ × axle load).
+        mu0 = self._mu_at_speed(15.0) / max(self.grip_scale, 1e-3)
+        Fz_rear = self.veh.total_mass_kg * G * (1.0 - self.veh.front_weight_fraction)
+        max_bias = mu0 * Fz_rear
+        ratio = float(getattr(self.veh, 'total_drive_ratio', 10.0) or 10.0)
+        T_overrun = float(getattr(self.veh, 'engine_braking_Nm', 0.0)) * ratio
+        diff_arr = np.zeros(n)
+        for i in range(n):
+            on_power = lon_g[i] > 0.02
+            if on_power:
+                F_drive = pwr_arr[i] / max(v[i], 0.5)      # tractive force
+                T_axle = F_drive * r_t
+                cap = min(max_bias, F_drive)
+            elif lon_g[i] < -0.02:
+                T_axle = T_overrun        # engine braking -> coast ramp live
+                cap = max_bias
+            else:
+                T_axle = 0.0              # neutral -> preload only
+                cap = max_bias
+            diff_arr[i] = diff.yaw_moment_Nm(T_axle, track_r, r_t, on_power,
+                                             max_bias_N=cap)
+        res.diff_yaw_Nm = diff_arr
 
         # ── detailed pass: full steady-state solve at sampled stations ────
         _prog('Suspension detail pass…', 60)

@@ -83,6 +83,17 @@ class VehicleParams:
     drivetrain_efficiency: float = 0.92
     powertrain_type: str = 'ICE'    # 'ICE' or 'EV'
     peak_torque_Nm: float = 0.0     # EV only
+    # Limited-slip differential (Drexler FSAE LSD by default — see
+    # vahan/differential.py).  Sets corner entry/exit balance via locking %.
+    diff_kind: str = 'salisbury'    # 'open' | 'spool' | 'salisbury'
+    diff_power_ramp_deg: float = 40.0   # drive ramp  (-> power locking %)
+    diff_coast_ramp_deg: float = 50.0   # overrun ramp (-> coast locking %)
+    diff_preload_Nm: float = 30.0
+    # Engine-braking torque at the CRANK (Nm) on a closed throttle — the
+    # overrun torque that flows through the diff and engages the COAST ramp.
+    # Without it the coast ramp would be a dead input.  ×total_drive_ratio
+    # gives the axle overrun torque.
+    engine_braking_Nm: float = 12.0
     max_steer_angle_deg: float = 28.0
     front_brake_bias: float = 0.65
 
@@ -641,6 +652,7 @@ class SteadyStateResult:
 
     # Understeer gradient (front avg SA - rear avg SA, positive = understeer)
     understeer_gradient_deg: float = 0.0
+    diff_yaw_Nm: float = 0.0         # differential yaw moment at this point
 
     # Convergence info
     iterations: int = 0
@@ -670,7 +682,8 @@ class SteadyStateSolver:
     def __init__(self,
                  vehicle: VehicleParams,
                  solvers: dict,
-                 tire_model=None):
+                 tire_model=None,
+                 tire_model_rear=None):
         """
         Parameters
         ----------
@@ -678,7 +691,11 @@ class SteadyStateSolver:
         solvers : dict
             {'FL': SuspensionConstraints, 'FR': ..., 'RL': ..., 'RR': ...}
         tire_model : TireModel | LinearTireModel | None
-            If None, tire utilization is not computed.
+            Front-axle tire.  If None, the parametric fallback is used.
+        tire_model_rear : TireModel | LinearTireModel | None
+            Rear-axle tire.  None => same tire as the front (the usual case).
+            Set it to run a SPLIT tire setup (different compound front/rear);
+            every per-corner grip query then uses the axle's own tire.
         """
         self._veh = vehicle
         self._solvers = solvers
@@ -692,7 +709,8 @@ class SteadyStateSolver:
         if tire_model is None:
             from vahan.tire_model import LinearTireModel
             tire_model = LinearTireModel()
-        self._tire = tire_model
+        self._tire = tire_model                       # front (and default)
+        self._tire_rear = tire_model_rear or tire_model
         self._warm = {}  # per-corner warm start cache
         # Optional grip derate applied to the tire μ when computing
         # utilization (the friction-circle budget).  1.0 = raw belt μ
@@ -701,6 +719,50 @@ class SteadyStateSolver:
         # is consistent with the lap's grip-derated speed/lat-g — otherwise
         # the two channels silently disagree by the derate factor.
         self._mu_scale = 1.0
+
+    def _tire_for(self, label: str):
+        """Tire model for a corner — front tire for FL/FR, rear for RL/RR.
+        With no split set, both are the same object."""
+        return self._tire if label and label[0] == 'F' else self._tire_rear
+
+    def _diff_yaw_moment(self, ax, Fz: dict, C_a: dict):
+        """Differential yaw moment (N·m, + = understeer/stabilising) at this
+        operating point, and whether it's the power or coast ramp.
+
+          * on power  (ax>0): drive torque  T = m·ax·r  through the diff
+          * on coast  (ax<0): engine-overrun torque = engine_braking × ratio
+            (so the COAST RAMP is a live input); brakes act at the wheels,
+            outside the diff, so they're excluded.
+          * the inter-wheel force bias is capped by the INNER (less-loaded)
+            driven wheel's grip — it can't transmit more than μ·Fz_inner.
+        """
+        from vahan.differential import Differential
+        v = self._veh
+        diff = Differential.from_vehicle(v)
+        if diff.kind == 'open':
+            return 0.0, (ax > 0)
+        r = max(v.tire_radius_m, 1e-3)
+        dt = v.drivetrain.upper()
+        driven = ['RL', 'RR'] if dt == 'RWD' else \
+                 ['FL', 'FR'] if dt == 'FWD' else ['FL', 'FR', 'RL', 'RR']
+        track = (v.rear_track_m if dt == 'RWD' else
+                 v.front_track_m if dt == 'FWD' else
+                 0.5 * (v.front_track_m + v.rear_track_m))
+        on_power = ax > 0.02
+        if on_power:
+            T_axle = v.total_mass_kg * ax * r          # tractive torque
+        elif ax < -0.02:
+            ratio = float(getattr(v, 'total_drive_ratio', 10.0) or 10.0)
+            T_axle = float(getattr(v, 'engine_braking_Nm', 0.0)) * ratio
+        else:
+            T_axle = 0.0                                # preload only
+        # inner driven wheel grip cap
+        fz_inner = min(max(Fz.get(c, 0.0), 0.0) for c in driven)
+        tire = self._tire_for(driven[0])
+        mu_inner = float(tire.peak_mu(max(fz_inner, 1.0), 0.0)) * self._mu_scale
+        max_bias = mu_inner * fz_inner
+        mz = diff.yaw_moment_Nm(T_axle, track, r, on_power, max_bias_N=max_bias)
+        return mz, on_power
 
     def solve(self, lateral_g: float,
               longitudinal_g: float = 0.0,
@@ -904,12 +966,13 @@ class SteadyStateSolver:
             # for cornering-stiffness extrapolation).  LinearTireModel
             # is parametric and doesn't have a "test range" — treat its
             # min as 0 so we never bypass any data.
-            fz_data_min = float(getattr(self._tire, 'fz_range', (0.0,))[0])
             C_a = {}
             for label in ['FL', 'FR', 'RL', 'RR']:
+                tire = self._tire_for(label)          # split-tire aware
+                fz_data_min = float(getattr(tire, 'fz_range', (0.0,))[0])
                 fz_raw = max(Fz[label], 0.0)
                 fz_c = max(fz_raw, fz_data_min)
-                ca = abs(float(self._tire.cornering_stiffness(
+                ca = abs(float(tire.cornering_stiffness(
                     fz_c, abs(cambers.get(label, 0)))))
                 # Linear ramp below data range: C_a(Fz) → 0 as Fz → 0
                 if fz_raw < fz_data_min:
@@ -957,9 +1020,11 @@ class SteadyStateSolver:
                     fx_per_corner[lbl] = total_fx * (1 - bb_f) / 2
 
             for label in ['FL', 'FR', 'RL', 'RR']:
+                tire = self._tire_for(label)          # split-tire aware
+                fz_lo = float(getattr(tire, 'fz_range', (0.0,))[0])
                 fz_raw = max(Fz[label], 0.0)
-                fz_for_mu = max(fz_raw, fz_data_min)  # stable mu eval
-                mu = float(self._tire.peak_mu(
+                fz_for_mu = max(fz_raw, fz_lo)        # stable mu eval
+                mu = float(tire.peak_mu(
                     fz_for_mu, abs(cambers.get(label, 0.0)))) * self._mu_scale
                 grip_budget = mu * max(fz_raw, 0.01)  # → 0 smoothly
                 fy_req = fy_per_corner.get(label, 0.0)
@@ -976,21 +1041,40 @@ class SteadyStateSolver:
                 result.brake_torque[label] = abs(fx_per_corner.get(label, 0)) * tire_r
 
             # Understeer gradient: back-calculate slip angles from tire model
-            if abs(ay) > 0.1 and hasattr(self._tire, 'slip_angle_for_Fy'):
+            # (per-axle tire so a split setup shifts the balance correctly).
+            if abs(ay) > 0.1 and hasattr(self._tire, 'slip_angle_for_Fy') \
+                    and hasattr(self._tire_rear, 'slip_angle_for_Fy'):
                 try:
                     sa_fl = self._tire.slip_angle_for_Fy(
                         fy_per_corner['FL'], max(Fz['FL'], 1.0), abs(cambers.get('FL', 0)))
                     sa_fr = self._tire.slip_angle_for_Fy(
                         fy_per_corner['FR'], max(Fz['FR'], 1.0), abs(cambers.get('FR', 0)))
-                    sa_rl = self._tire.slip_angle_for_Fy(
+                    sa_rl = self._tire_rear.slip_angle_for_Fy(
                         fy_per_corner['RL'], max(Fz['RL'], 1.0), abs(cambers.get('RL', 0)))
-                    sa_rr = self._tire.slip_angle_for_Fy(
+                    sa_rr = self._tire_rear.slip_angle_for_Fy(
                         fy_per_corner['RR'], max(Fz['RR'], 1.0), abs(cambers.get('RR', 0)))
                     sa_front = (sa_fl + sa_fr) / 2
                     sa_rear = (sa_rl + sa_rr) / 2
                     result.understeer_gradient_deg = sa_front - sa_rear
                 except Exception:
                     pass
+
+            # ── DIFFERENTIAL: yaw moment -> understeer-gradient shift ──────
+            # The driven-axle drive/overrun torque, biased by the diff, makes
+            # a yaw moment that the tires must react with a front/rear lateral-
+            # force couple ΔFy = Mz_diff / wheelbase -> a slip-angle shift on
+            # each axle -> a real understeer-gradient change.  This is what
+            # closes the loop: the diff now MOVES the balance, not just a plot.
+            try:
+                mz_diff, on_power = self._diff_yaw_moment(ax, Fz, C_a)
+                result.diff_yaw_Nm = mz_diff
+                L = max(v.wheelbase_m, 1e-6)
+                Ca_f = max(C_a['FL'] + C_a['FR'], 1e-6)   # N/deg
+                Ca_r = max(C_a['RL'] + C_a['RR'], 1e-6)
+                d_understeer = (mz_diff / L) * (1.0 / Ca_f + 1.0 / Ca_r)
+                result.understeer_gradient_deg += d_understeer
+            except Exception:
+                pass
         else:
             # No tire model — still compute basic Fy/Fx from equilibrium
             total_fy = abs(v.total_mass_kg * ay)
@@ -1307,8 +1391,8 @@ class SteadyStateSolver:
         W = v.total_mass_kg * G
         Fz_f = W * v.front_weight_fraction / 2
         Fz_r = W * v.rear_weight_fraction / 2
-        mu_f = float(self._tire.peak_mu(Fz_f, 0.0))
-        mu_r = float(self._tire.peak_mu(Fz_r, 0.0))
+        mu_f = float(self._tire.peak_mu(Fz_f, 0.0))        # front tire
+        mu_r = float(self._tire_rear.peak_mu(Fz_r, 0.0))   # rear tire
         # Conservative: use the lower of the two so we don't pretend the
         # rear can save the front when the front saturates first.
         return min(mu_f, mu_r)
@@ -1695,7 +1779,15 @@ class SteadyStateSolver:
                 frac = 1.0
             frac = min(max(frac, 0.0), 1.0)
             Fz_per = W * frac / (2.0 if dt_kind != 'AWD' else 4.0)
-            mu = float(self._tire.peak_mu(Fz_per, 0.0))
+            # μ of the DRIVEN axle's tire (rear for RWD, front for FWD, the
+            # softer of the two for AWD so it's not optimistic on a split).
+            if dt_kind == 'RWD':
+                mu = float(self._tire_rear.peak_mu(Fz_per, 0.0))
+            elif dt_kind == 'FWD':
+                mu = float(self._tire.peak_mu(Fz_per, 0.0))
+            else:
+                mu = min(float(self._tire.peak_mu(Fz_per, 0.0)),
+                         float(self._tire_rear.peak_mu(Fz_per, 0.0)))
             mu_eff = float(np.sqrt(max(mu * mu - ay * ay, 0.0)))
             a_new = mu_eff * frac
             if abs(a_new - a_g) < 1e-6:
@@ -1724,8 +1816,8 @@ class SteadyStateSolver:
         # LinearTireModel fallback.  No hardcoded mu literal here.
         Fz_front = W * v.front_weight_fraction / 2
         Fz_rear  = W * v.rear_weight_fraction / 2
-        mu_f = float(self._tire.peak_mu(Fz_front, 0.0))
-        mu_r = float(self._tire.peak_mu(Fz_rear,  0.0))
+        mu_f = float(self._tire.peak_mu(Fz_front, 0.0))       # front tire
+        mu_r = float(self._tire_rear.peak_mu(Fz_rear,  0.0))  # rear tire
 
         # Traction limit (depends on driven axle) — WITH longitudinal weight
         # transfer onto the driven axle (fixed-point incl. load-sensitive μ).

@@ -338,6 +338,38 @@ class DesignSpace:
 
 # ─── Target specification ────────────────────────────────────────────────────
 
+def shaped_target(lo: float, hi: float, n: int,
+                  shape: str = 'linear', curvature: float = 2.0) -> np.ndarray:
+    """Build a target metric curve from ``lo`` (at MIN travel / droop) to
+    ``hi`` (at MAX travel / bump) with a chosen nonlinearity in normalised
+    travel τ ∈ [0,1].
+
+        linear       f = τ
+        progressive  f = τ^p          (p = curvature > 1: rises slowly then
+                                       fast — most stiffening DEEP in bump;
+                                       this is what holds ride height under
+                                       downforce as the suspension compresses)
+        digressive   f = 1 − (1−τ)^p  (rises fast then plateaus)
+        exponential  f = (e^{kτ}−1)/(e^{k}−1)   (k = curvature; smooth)
+
+    target(τ) = lo + (hi − lo)·f(τ).  Constant target -> lo == hi.
+    """
+    tau = np.linspace(0.0, 1.0, int(n))
+    s = (shape or 'linear').lower()
+    if s in ('progressive', 'power', 'rising'):
+        p = max(float(curvature), 0.1)
+        f = tau ** p
+    elif s in ('digressive', 'falling'):
+        p = max(float(curvature), 0.1)
+        f = 1.0 - (1.0 - tau) ** p
+    elif s in ('exponential', 'exp'):
+        k = float(curvature)
+        f = tau if abs(k) < 1e-6 else (np.exp(k * tau) - 1.0) / (np.exp(k) - 1.0)
+    else:
+        f = tau
+    return float(lo) + (float(hi) - float(lo)) * f
+
+
 @dataclass
 class Target:
     """A target for one metric — either a constant value or a full curve."""
