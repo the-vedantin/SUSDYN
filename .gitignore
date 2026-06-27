@@ -34,3 +34,9 @@ RCVD*.pdf
 
 # Vendor manual (Drexler diff) — not ours to publish
 diffy.pdf
+
+# 2027 design work-in-progress: churns every iteration AND references
+# TTC-derived tire grip numbers (identified compounds). Keep local-only so it
+# can never be accidentally pushed to the public repo. A de-identified final
+# report can be added deliberately later.
+DESIGN_2027/
