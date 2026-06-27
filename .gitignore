@@ -40,3 +40,6 @@ diffy.pdf
 # can never be accidentally pushed to the public repo. A de-identified final
 # report can be added deliberately later.
 DESIGN_2027/
+
+# Design work (NOT software) — git tracks the tool only
+configs/
