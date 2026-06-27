@@ -891,19 +891,15 @@ class SteadyStateSolver:
         # true static load at rest (spring_force = Fz_static − unspr_w, +unspr_w
         # back ⇒ Fz_static) and only bites the inside corner near lift-off,
         # exactly as intended.
-        for label in ['FL', 'FR', 'RL', 'RR']:
-            if label[0] == 'F':
-                wr = v.wheel_rate_front_Npm
-                unspr_w = v.unsprung_mass_front_kg / 2 * G
-            else:
-                wr = v.wheel_rate_rear_Npm
-                unspr_w = v.unsprung_mass_rear_kg / 2 * G
-            sprung_corner = max(Fz_static[label] - unspr_w, 0.0)
-            static_sag_m = sprung_corner / wr if wr > 0 else 0.0
-            spring_defl = static_sag_m + travels[label]  # +travel = bump
-            spring_force = wr * max(spring_defl, 0.0)
-            fz_floor = spring_force + unspr_w
-            Fz[label] = max(Fz[label], fz_floor)
+        for (a, b) in (('FL', 'FR'), ('RL', 'RR')):
+            ax_load = Fz_static[a] + Fz_static[b]
+            Fz[a] = max(Fz[a], 0.0)
+            Fz[b] = max(Fz[b], 0.0)
+            s = Fz[a] + Fz[b]
+            if s > 1e-6 and ax_load > 0:
+                k = ax_load / s
+                Fz[a] *= k
+                Fz[b] *= k
 
         # Renormalize so Σ Fz = vehicle weight + aero (total vertical load is conserved)
         W_total = v.total_mass_kg * G

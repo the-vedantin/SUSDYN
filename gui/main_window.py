@@ -2885,9 +2885,15 @@ class MainWindow(QMainWindow):
                     continue
                 # mr_slope = derivative at the middle of the sweep
                 idx = np.where(finite)[0]
-                # Take a few points around the centre for a robust slope
-                mid = idx[len(idx) // 2]
-                lo, hi = max(idx[0], mid - 5), min(idx[-1], mid + 5)
+                # Take a few points around the centre for a robust slope.
+                # Index INTO the finite list (idx) so lo/hi are guaranteed
+                # finite even when the sweep has NaN points (e.g. travel
+                # extremes that fail to solve) — otherwise mid±5 can land on
+                # a NaN sample and poison mr_slope → roll_angle → the whole
+                # dynamics solve returns NaN.
+                pos = len(idx) // 2
+                lo = int(idx[max(0, pos - 5)])
+                hi = int(idx[min(len(idx) - 1, pos + 5)])
                 if hi - lo < 2:
                     continue
                 # mr_slope in 1/m: dMR per metre of wheel travel.

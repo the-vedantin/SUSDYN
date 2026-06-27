@@ -318,6 +318,16 @@ class TireModel:
         # ── Precompute peak Fy for utilization calc ──────────────────────
         # For each (Fz, camber), find max |Fy| across all slip angles
         self._peak_fy_grid = np.max(np.abs(fy_grid), axis=0)  # (n_fz, n_ia)
+        # Smooth along the LOAD axis too.  The raw per-Fz scatter (±0.4 in mu at
+        # a single load) otherwise BURIES the load-sensitivity signal — the
+        # concavity of peak_Fy(Fz) — that drives the balance/utilization (more
+        # load transfer -> less axle grip) and the camber sensitivity.  A moving
+        # average preserves the mean (grip magnitude unchanged) while restoring
+        # a monotone, physically-meaningful load-sensitivity curve.
+        if self._peak_fy_grid.shape[0] >= 3:
+            for k in range(self._peak_fy_grid.shape[1]):
+                self._peak_fy_grid[:, k] = uniform_filter1d(
+                    self._peak_fy_grid[:, k], size=3)
         self._peak_fy_interp = RegularGridInterpolator(
             (self._fz_axis, self._camber_levels),
             self._peak_fy_grid, method='linear',
