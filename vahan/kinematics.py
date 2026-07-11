@@ -3,7 +3,8 @@ Kinematic metrics derived from a SolvedState.
 
 Axis convention (matches CAD environment):
     X  →  lateral   (outboard positive for the corner being modelled)
-    Y  →  longitudinal (forward positive)
+    Y  →  longitudinal (REARWARD positive — front axle sits at Y=0, rear axle
+                        at Y=+wheelbase, matching the CAD export convention)
     Z  →  up (positive)
 
 All angles in degrees. All lengths in metres unless stated otherwise.
@@ -11,7 +12,7 @@ All angles in degrees. All lengths in metres unless stated otherwise.
 Sign conventions (left corner default, right mirrors via _sign):
     Camber   negative = top of wheel leans inboard  (negative camber)
     Toe      positive = toe-in
-    Caster   positive = top of kingpin tilts rearward (-Y)
+    Caster   positive = top of kingpin tilts rearward (+Y, toward rear axle)
     KPI      positive = top of kingpin tilts inboard (-X for left corner)
     Scrub radius    positive = KP ground point is inboard of contact patch
     Mechanical trail positive = contact patch is behind KP ground point (+Y behind)
@@ -86,11 +87,14 @@ class KinematicMetrics:
     @property
     def caster(self) -> float:
         """
-        Caster angle (deg). Positive = top of kingpin leans rearward (-Y).
+        Caster angle (deg). Positive = top of kingpin leans rearward, toward
+        the rear axle.  +Y is REARWARD in this model (front axle Y=0, rear at
+        +wheelbase), so a rearward-leaning kingpin has uca_outer at greater Y
+        than lca_outer (kp[1] > 0) → positive caster.
         Side view (YZ plane).
         """
         kp = self.kingpin_axis
-        return np.degrees(np.arctan2(-kp[1], kp[2]))
+        return np.degrees(np.arctan2(kp[1], kp[2]))
 
     # ── KPI ──────────────────────────────────────────────────────────────────
 
@@ -128,11 +132,12 @@ class KinematicMetrics:
     def mechanical_trail(self) -> float:
         """
         Mechanical trail (m). Positive = contact patch behind KP ground point.
-        Longitudinal (Y) distance.
+        +Y is REARWARD in this model, so "behind" = contact patch further
+        rearward than the KP ground point → cp_y > kg_y → positive trail.
         """
         kg   = self._kingpin_ground()
         cp_y = self._s.wheel_center[1]
-        return -(cp_y - kg[1])
+        return (cp_y - kg[1])
 
     # ── roll centre ──────────────────────────────────────────────────────────
 

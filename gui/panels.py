@@ -525,6 +525,7 @@ class SteeringPanel(CollapsibleSection):
 class CarParamsPanel(CollapsibleSection):
     """Geometry (axle spacing, wheelbase, track, wheel offset), tire, CG."""
     params_changed = pyqtSignal(dict)
+    perspective_changed = pyqtSignal(bool)   # True = perspective, False = orthographic
 
     def __init__(self):
         super().__init__('Car Parameters')
@@ -602,6 +603,17 @@ class CarParamsPanel(CollapsibleSection):
         self._show_ground.stateChanged.connect(
             lambda _: self.params_changed.emit(self.get_params()))
         self.add_widget(self._show_ground)
+
+        # Perspective vs orthographic (CAD-style parallel) projection.
+        self._chk_perspective = QCheckBox('Perspective view (uncheck = orthographic / CAD)')
+        self._chk_perspective.setChecked(True)
+        self._chk_perspective.setToolTip(
+            'Perspective: far objects look smaller (natural eye view).\n'
+            'Orthographic (unchecked): parallel projection like CAD — no '
+            'foreshortening, so you can judge true alignment and check that '
+            'parts line up / clear each other without depth distortion.')
+        self._chk_perspective.toggled.connect(self.perspective_changed.emit)
+        self.add_widget(self._chk_perspective)
 
         # Track-width behaviour: by default only the OUTBOARD pickups
         # (uca_outer, lca_outer, tie_rod_outer, wheel_center, pushrod_outer)
@@ -6127,6 +6139,71 @@ def _panel_sep():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FRAME / INTERFERENCE PANEL  (own panel so the toggle is always visible)
+# ══════════════════════════════════════════════════════════════════════════════
+class FrameInterferencePanel(CollapsibleSection):
+    """Show the suspension at REAL part thickness in 3D and flag interferences.
+
+    A pure view aid.  Tick the box to draw control arms / pushrod / tie-rod /
+    rocker / ARB as solid tubes at the diameters entered here; parts on the
+    same corner that overlap are highlighted RED with the overlap depth listed
+    below, and a yellow cylinder shows the rocker-pivot bearing clearance.
+    Lives in its own panel (not buried in Direct Edit) so it is always at hand.
+    """
+
+    frame_changed = pyqtSignal()   # toggle or any thickness changed -> re-render
+
+    def __init__(self, parent=None):
+        super().__init__('FRAME / INTERFERENCE CHECK', parent,
+                         header_color='#FFD600')
+        self._frame_chk = QCheckBox('Show frame at real thickness + flag clashes')
+        self._frame_chk.setStyleSheet('QCheckBox { font-weight: bold; }')
+        self._frame_chk.setToolTip(
+            'Draw control arms / pushrod / tie-rod / rocker / ARB at their real '
+            'thickness, plus a bearing-clearance cylinder at the rocker pivot. '
+            'Parts on the same corner that overlap are highlighted RED with the '
+            'overlap depth shown below. The rocker plate is bisected by the '
+            'rocker plane (extrude radius = thickness / 2).')
+        self._frame_chk.toggled.connect(lambda _=False: self.frame_changed.emit())
+        self.add_widget(self._frame_chk)
+
+        self._frame_dim_spins = {}
+
+        def _dim(key, label, default, lo, hi):
+            row = QHBoxLayout(); row.setSpacing(4)
+            row.addWidget(QLabel(label))
+            sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setDecimals(1)
+            sb.setSingleStep(0.5); sb.setValue(default); sb.setSuffix(' mm')
+            sb.valueChanged.connect(lambda _=0.0: self.frame_changed.emit())
+            row.addWidget(sb); row.addStretch(1)
+            self.add_layout(row)
+            self._frame_dim_spins[key] = sb
+
+        _dim('ctrl_arm_od', 'Control-arm tube OD:', 19.0, 3.0, 60.0)
+        _dim('pushrod_od', 'Pushrod / tie-rod OD:', 16.0, 3.0, 50.0)
+        _dim('arb_od', 'ARB / drop-link OD:', 14.0, 3.0, 50.0)
+        _dim('rocker_th', 'Rocker plate thickness:', 8.0, 1.0, 40.0)
+        _dim('bearing_od', 'Rocker-pivot bearing OD:', 38.1, 5.0, 120.0)
+        _dim('bearing_len', 'Bearing length:', 25.4, 3.0, 80.0)
+
+        self._frame_readout = QLabel('—')
+        self._frame_readout.setStyleSheet('color:#FF5252; font-size:10px;'
+                                          ' padding:2px 2px 6px 2px;')
+        self._frame_readout.setWordWrap(True)
+        self.add_widget(self._frame_readout)
+
+    def frame_enabled(self) -> bool:
+        return self._frame_chk.isChecked()
+
+    def frame_dims(self) -> dict:
+        """Frame part thicknesses (mm), keyed for _frame_overlay."""
+        return {k: sb.value() for k, sb in self._frame_dim_spins.items()}
+
+    def set_frame_readout(self, text: str):
+        self._frame_readout.setText(text)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  DIRECT EDIT MODE PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 class DirectEditPanel(CollapsibleSection):
@@ -6152,6 +6229,13 @@ class DirectEditPanel(CollapsibleSection):
     # plane (defined by rocker_pivot + rocker_spring_pt + pushrod_inner).
     # Payload = (axle,) — 'front' or 'rear'.
     snap_axis_to_normal_requested = pyqtSignal(str)
+    # Snap the WHOLE actuation chain coplanar: project pushrod_outer /
+    # spring_chassis_pt / damper ends / ARB drop link onto the rocker plate
+    # plane and snap the rocker pin normal.  Payload = (axle,).
+    snap_actuation_to_plane_requested = pyqtSignal(str)
+    # Set a LENGTH directly (coordinates stay for position).
+    rack_length_changed = pyqtSignal(float)        # mm, inner-pickup tip-to-tip
+    shock_length_changed = pyqtSignal(str, float)  # (axle, mm) mount-to-mount
     # Fired when the plane-tilt axle selector changes, so MainWindow can
     # repopulate the pivot dropdown with the pivots that actually exist on
     # that axle's topology (e.g. a DIRECT axle offers damper endpoints; a
@@ -6443,6 +6527,26 @@ class DirectEditPanel(CollapsibleSection):
         prow4.addWidget(btn_snap, 1)
         self.add_layout(prow4)
 
+        # Snap the whole actuation chain coplanar (pushrod_outer, spring chassis
+        # pt, damper ends, ARB drop link projected onto the rocker plate plane).
+        prow4b = QHBoxLayout(); prow4b.setSpacing(6)
+        btn_snap_act = QPushButton('Snap actuation ⟂ plane')
+        btn_snap_act.setToolTip(
+            'Project every actuation-chain point that should lie in the rocker '
+            'plate plane (pushrod_outer, spring_chassis_pt, damper ends, ARB '
+            'drop-link top) ONTO that plane, and snap the rocker pin normal.\n'
+            'Use after nudging a point off the plane — a bellcrank is a planar '
+            'mechanism, so these points must be coplanar.')
+        btn_snap_act.clicked.connect(self._emit_snap_actuation)
+        btn_snap_act.setStyleSheet("""
+            QPushButton { background:#2a2a2a; color:#FFD600;
+                          border:1px solid #3a3a3a; border-radius:4px;
+                          padding:5px 10px; }
+            QPushButton:hover { background:#3a3a3a; color:#FFEA00; }
+        """)
+        prow4b.addWidget(btn_snap_act, 1)
+        self.add_layout(prow4b)
+
         plane_hint = QLabel(
             'Moves all rocker-plane hardpoints together (pushrod, rocker,\n'
             'spring chassis pt, drop link) so the plane tilts as one rigid\n'
@@ -6522,6 +6626,41 @@ class DirectEditPanel(CollapsibleSection):
                                ' padding:2px 2px 6px 2px;')
         grp_hint.setWordWrap(True)
         self.add_widget(grp_hint)
+
+        # (Frame / interference check moved to its own always-visible
+        #  FrameInterferencePanel so the toggle is never buried here.)
+
+        # ── DIMENSIONS: set a LENGTH directly (coords stay for position) ──
+        self.add_widget(_panel_sep())
+        dhdr = QLabel('DIMENSIONS  (set length, not coordinates)')
+        dhdr.setStyleSheet('color:#FFD600; font-weight:bold; font-size:11px;'
+                           ' padding-top:4px;')
+        self.add_widget(dhdr)
+
+        def _len(label, lo, hi, tip):
+            row = QHBoxLayout(); row.setSpacing(4)
+            lab = QLabel(label); lab.setToolTip(tip); row.addWidget(lab)
+            sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setDecimals(1)
+            sb.setSingleStep(1.0); sb.setSuffix(' mm'); sb.setToolTip(tip)
+            row.addWidget(sb); row.addStretch(1)
+            self.add_layout(row)
+            return sb
+
+        self._rack_len = _len('Rack length (front):', 50.0, 900.0,
+            'Tip-to-tip spacing of the two inner tie-rod pickups. Sets the X of '
+            'tie_rod_inner symmetrically; Y/Z (position) untouched.')
+        self._rack_len.editingFinished.connect(
+            lambda: self.rack_length_changed.emit(self._rack_len.value()))
+        self._shock_len_f = _len('Shock length (front):', 50.0, 600.0,
+            'Mount-to-mount length of the front damper. Moves the chassis end '
+            'along the damper axis; the rocker/spring end stays put.')
+        self._shock_len_f.editingFinished.connect(
+            lambda: self.shock_length_changed.emit('front', self._shock_len_f.value()))
+        self._shock_len_r = _len('Shock length (rear):', 50.0, 600.0,
+            'Mount-to-mount length of the rear damper. Moves the chassis end '
+            'along the damper axis; the rocker/spring end stays put.')
+        self._shock_len_r.editingFinished.connect(
+            lambda: self.shock_length_changed.emit('rear', self._shock_len_r.value()))
 
         # Apply / Discard buttons
         btn_row = QHBoxLayout(); btn_row.setSpacing(6)
@@ -6721,6 +6860,23 @@ class DirectEditPanel(CollapsibleSection):
         currently-chosen axle."""
         axle = self._cmb_plane_axle.currentText().lower()
         self.snap_axis_to_normal_requested.emit(axle)
+
+    def _emit_snap_actuation(self):
+        """Snap the whole actuation chain coplanar on the chosen axle."""
+        self.snap_actuation_to_plane_requested.emit(
+            self._cmb_plane_axle.currentText().lower())
+
+    def set_dimensions(self, rack_mm, shock_f_mm, shock_r_mm):
+        """Populate the length boxes with current geometry (no signal)."""
+        for sb, v in ((self._rack_len, rack_mm),
+                      (self._shock_len_f, shock_f_mm),
+                      (self._shock_len_r, shock_r_mm)):
+            sb.blockSignals(True)
+            if v is not None and v > 0:
+                sb.setValue(float(v)); sb.setEnabled(True)
+            else:
+                sb.setEnabled(False)
+            sb.blockSignals(False)
 
     # ── Internal handlers ────────────────────────────────────────────────
     def _on_corner_toggled(self, corner: str, checked: bool):

@@ -365,8 +365,9 @@ class View3D:
             show=False,
         )
         self._view = self._canvas.central_widget.add_view()
+        self._persp_fov = 40.0   # remembered perspective FOV for the toggle
         self._cam  = scene.TurntableCamera(
-            fov=40, elevation=20, azimuth=-60,
+            fov=self._persp_fov, elevation=20, azimuth=-60,
             scale_factor=2.5, center=(0, 0, 0.2),
             interactive=False,   # we handle mouse manually
         )
@@ -455,6 +456,15 @@ class View3D:
         # 4 corner-damper cylinders (FL, FR, RL, RR) — orange, read as dampers.
         self._htb_coil_meshes = [
             self._new_mesh((0.95, 0.55, 0.10, 0.85)) for _ in range(4)]
+
+        # ── Frame / interference overlay (control arms, ARB, rocker, pushrod
+        # drawn at their real thickness) + rocker-pivot bearing clearance.
+        # All hidden until the user enables the frame in the Direct Editor.
+        self._frame_mesh   = self._new_mesh((0.78, 0.78, 0.80, 0.28))  # parts (grey)
+        self._clash_mesh   = self._new_mesh((0.90, 0.10, 0.10, 0.60))  # interferences (red)
+        self._bearing_mesh = self._new_mesh((0.92, 0.85, 0.20, 0.45))  # bearing clearance (yellow)
+        for _m in (self._frame_mesh, self._clash_mesh, self._bearing_mesh):
+            _m.visible = False
 
         # ── Baseline GHOST overlay ────────────────────────────────────────
         # Grey copy of the linkage frozen at 'Set baseline' time, so the
@@ -1192,6 +1202,41 @@ class View3D:
     def set_ghost_visible(self, visible: bool) -> None:
         self._ghost_vis.visible = bool(visible)
         self._canvas.update()
+
+    # ── Frame / interference / bearing overlay ───────────────────────────
+    def set_perspective(self, on: bool):
+        """Toggle projection: True = perspective (eye view), False =
+        orthographic / parallel (CAD view, no foreshortening)."""
+        try:
+            self._cam.fov = self._persp_fov if on else 0.0
+            self._canvas.update()
+        except Exception:
+            pass
+
+    def _combine_cyls(self, cyls, n=12):
+        """Merge a list of (p0, p1, radius_m) into one (verts, faces) mesh."""
+        VV = []; FF = []; off = 0
+        for p0, p1, r in cyls:
+            v, f = build_cylinder_between(np.asarray(p0, float),
+                                          np.asarray(p1, float), float(r), n=n)
+            VV.append(v); FF.append(np.asarray(f) + off); off += len(v)
+        if not VV:
+            return None, None
+        return (np.concatenate(VV).astype(np.float32),
+                np.concatenate(FF).astype(np.uint32))
+
+    def set_frame_overlay(self, part_cyls, clash_cyls, bearing_cyls, visible):
+        """Show structural parts at thickness (part_cyls), flagged
+        interferences (clash_cyls, red) and rocker-pivot bearing clearance
+        (bearing_cyls, yellow).  Each list holds (p0, p1, radius_m) tubes."""
+        for mesh, cyls in ((self._frame_mesh, part_cyls),
+                           (self._clash_mesh, clash_cyls),
+                           (self._bearing_mesh, bearing_cyls)):
+            v, f = self._combine_cyls(cyls) if (visible and cyls) else (None, None)
+            if v is not None:
+                mesh.set_data(vertices=v, faces=f); mesh.visible = True
+            else:
+                mesh.visible = False
 
     # ── Public dimension setter ─────────────────────────────────────────
     def set_spring_dims(self, spring_od_mm: float, damper_od_mm: float) -> None:

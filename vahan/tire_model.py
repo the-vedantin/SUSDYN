@@ -243,9 +243,26 @@ class TireModel:
         sa, fz, fy, mz, ia = sa[mask_v], fz[mask_v], fy[mask_v], mz[mask_v], ia[mask_v]
 
         # ── Determine grid axes ──────────────────────────────────────────
-        # Camber levels (round to nearest integer)
+        # Camber levels (round to nearest integer).  KEEP ONLY levels with
+        # real data coverage: TTC tests sweep a few discrete inclination
+        # angles (e.g. 0/2/4 deg), and the transition samples between them
+        # round into PHANTOM integer levels (+-1, +-3, -2 ...) holding only
+        # a sliver of points.  Those levels' (sa, fz) cells fail the
+        # >=5-sample cut, get gap-filled as 0.0, and the camber-axis
+        # interpolation then averages real rows against zero rows —
+        # peak_mu(fz, 0.45deg) came out non-monotone garbage (mu 1.57@400N
+        # rising to 2.39@939N) which corrupted utilization and the
+        # understeer gradient in SteadyStateSolver.  A level must hold
+        # >=1% of samples (and >=200 absolute) to be treated as a tested
+        # inclination; stray-sample levels are dropped so interpolation
+        # only ever spans measured rows.
         ia_rounded = np.round(ia).astype(int)
-        self._camber_levels = np.sort(np.unique(ia_rounded)).astype(float)
+        _levels, _counts = np.unique(ia_rounded, return_counts=True)
+        _min_count = max(200, int(0.01 * max(len(ia_rounded), 1)))
+        _good = _counts >= _min_count
+        if _good.sum() >= 2:      # interpolator needs >=2 rows; else keep all
+            _levels = _levels[_good]
+        self._camber_levels = np.sort(_levels).astype(float)
 
         # Slip angle axis
         sa_min = np.floor(sa.min())

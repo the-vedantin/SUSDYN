@@ -1,0 +1,11 @@
+# Keep the knowledge graph scoped to the shippable software only.
+# Mirrors the CLAUDE.md public-repo rule: no TTC/design/binder content.
+BINDER/
+DESIGN_2027/
+configs/
+tire_data/
+external/
+screenshots/
+raw/
+graphify-out/
+.claude/

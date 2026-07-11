@@ -161,6 +161,62 @@ print(f'heave_tbar ONE-T-bar : corner={corner_mode}  one-pt drives heave {h0:.3f
       f'({"live" if htb_heave_live else "DEAD"}) + roll {r0:.0f}->{r1:.0f} '
       f'({"live" if htb_roll_live else "DEAD"})   {"pass" if htb_ok else "UNEXPECTED FAIL"}')
 
+# ── CASTER SIGN: +Y is REARWARD in the model (front axle Y=0, rear at +wb), so
+#    a rearward-leaning kingpin (uca_outer behind lca_outer) is POSITIVE caster.
+#    The metric printed NEGATIVE before the +Y-convention sign fix (kinematics.py).
+print('-' * 64)
+from vahan.kinematics import KinematicMetrics
+_bt = ax(DA.PUSHROD, DM.UCA, AT.BELLCRANK, SC.CORNER)
+win.set_topology(SuspensionTopology(_bt, _bt)); win._rebuild_solvers(0.)
+_stF = win._solvers['FL'].solve(0.)
+casterF = KinematicMetrics(_stF, 'left').caster
+caster_ok = casterF > 0.0
+if not caster_ok:
+    fails += 1
+print(f'caster sign      : front caster {casterF:+.2f} deg (uca_outer rearward of lca)   '
+      f'{"pass" if caster_ok else "UNEXPECTED FAIL (should be POSITIVE)"}')
+
+# ── ARB SWEEP METRICS LIVE: _do_sweep referenced an undefined `label`, silently
+#    NaN-ing arb_angle/arb_drop_travel/arb_mr (NameError eaten by except).  Guard
+#    that a heave sweep on a bellcrank ARB now produces finite ARB metrics.
+win.set_topology(SuspensionTopology(_bt, _bt))
+win._motion_panel._motion = 'heave'; win._run_sweep()
+_amr = np.asarray(win._sweep_results.get('FL', {}).get('arb_mr', []), float)
+_aang = np.asarray(win._sweep_results.get('FL', {}).get('arb_angle', []), float)
+arb_live = np.isfinite(_amr).sum() > 5 and np.isfinite(_aang).sum() > 5
+if not arb_live:
+    fails += 1
+print(f'ARB sweep metrics: arb_mr finite {int(np.isfinite(_amr).sum())}/{len(_amr)}, '
+      f'arb_angle finite {int(np.isfinite(_aang).sum())}/{len(_aang)}   '
+      f'{"pass" if arb_live else "UNEXPECTED FAIL (dead/NaN)"}')
+
+# ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
+#    stray transition samples used to create phantom integer camber rows filled
+#    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly
+#    where the dynamics solver evaluates) came out NON-MONOTONE vs load
+#    (mu 1.57@400N < 2.39@939N) and corrupted utilization + understeer gradient.
+#    Guard: only well-populated camber rows survive, and mu(Fz) at a mid-row
+#    camber is degressive (monotone non-increasing within 2%).
+print('-' * 64)
+try:
+    win._try_autoload_tire()
+except Exception:
+    pass
+_tm = getattr(win, '_tire_model', None)
+if _tm is not None:
+    _fzs = [300, 400, 600, 800, 1000]
+    _mus = [float(_tm.peak_mu(float(f), 0.45)) for f in _fzs]
+    _degr = all(_mus[i+1] <= _mus[i] * 1.02 for i in range(len(_mus) - 1))
+    _lv = _tm.camber_levels() if callable(_tm.camber_levels) else _tm.camber_levels
+    _lv = list(np.asarray(_lv).ravel())
+    if not _degr:
+        fails += 1
+    print(f'tire camber rows : levels={_lv}  mu(300..1000N)@0.45deg='
+          f'{" ".join(f"{m:.2f}" for m in _mus)}  '
+          f'{"pass" if _degr else "UNEXPECTED FAIL (non-degressive: phantom camber rows back)"}')
+else:
+    print('tire camber rows : no TTC file on this machine — skipped (data-dependent check)')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)

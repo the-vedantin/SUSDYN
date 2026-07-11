@@ -50,6 +50,7 @@ from gui.panels import (
     CollapsibleSection, InverseKinematicsPanel, DynamicsPanel, DynamicsOptPanel,
     LoadsPanel, AeroPanel, SkidpadPanel, BrakeCalcPanel,
     VehicleConstantsPanel, AnalysisPlotsPanel, DirectEditPanel,
+    FrameInterferencePanel,
 )
 from gui.plot_dialog import PlotDialog
 from vahan.optimizer import InverseSolver, DesignVar
@@ -2577,17 +2578,7 @@ class MainWindow(QMainWindow):
             # Refresh the direct-edit panel's hp list — include the per-axle
             # hardware so the user can nudge those points too (T-bar, heave
             # bracket, decoupled cradle, ARB etc.).
-            union = list(dict.fromkeys(
-                list(self._front_hp.keys())
-                + list(self._rear_hp.keys())
-                + list(self._front_arb.keys())
-                + list(self._rear_arb.keys())
-                + list(self._front_heave.keys())
-                + list(self._rear_heave.keys())
-                + list(self._front_decoupled.keys())
-                + list(self._rear_decoupled.keys())
-            ))
-            self._direct_edit_panel.set_hp_names(union)
+            self._refresh_hp_names()
             # Filter the plane-tilt pivot dropdown to this topology's pivots
             # (DIRECT -> damper endpoints, pushrod -> rocker/pushrod, etc.).
             self._refresh_plane_pivots()
@@ -3133,6 +3124,7 @@ class MainWindow(QMainWindow):
             pass
         self._last_valid_st.clear()
 
+        self._refresh_hp_names()   # every hardpoint (incl. ARB) editable
         self._rebuild_solvers()
         self._run_sweep()
         self._update_3d()
@@ -3489,6 +3481,14 @@ class MainWindow(QMainWindow):
         self._direct_edit_panel.ghost_toggled.connect(self._on_ghost_toggled)
         self._direct_edit_panel.snap_axis_to_normal_requested.connect(
             self._on_snap_axis_to_normal)
+        self._direct_edit_panel.snap_actuation_to_plane_requested.connect(
+            self._on_snap_actuation_to_plane)
+        # Frame / interference check — its OWN always-visible panel (placed high
+        # in the left sidebar) so the thickness toggle is never buried.
+        self._frame_panel = FrameInterferencePanel()
+        self._frame_panel.frame_changed.connect(self._update_3d)
+        self._direct_edit_panel.rack_length_changed.connect(self._on_rack_length)
+        self._direct_edit_panel.shock_length_changed.connect(self._on_shock_length)
         self._mirror_to_other_axle = False
 
         # Left sidebar (existing controls)
@@ -3497,10 +3497,11 @@ class MainWindow(QMainWindow):
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(4)
         for w in [self._motion_panel, self._steer_panel, self._alignment_panel,
-                  self._car_panel, self._overlay_box, self._graph_panel,
-                  self._front_hp_panel, self._rear_hp_panel, self._values_panel,
-                  self._direct_edit_panel]:
+                  self._car_panel, self._frame_panel, self._overlay_box,
+                  self._graph_panel, self._front_hp_panel, self._rear_hp_panel,
+                  self._values_panel, self._direct_edit_panel]:
             sv.addWidget(w)
+        self._refresh_hp_names()   # list every hardpoint (incl. ARB) at startup
 
         left_scroll = QScrollArea()
         left_scroll.setWidget(sidebar_inner)
@@ -3559,6 +3560,7 @@ class MainWindow(QMainWindow):
         self._motion_panel.position_changed.connect(self._on_position)
         self._steer_panel.steering_changed.connect(self._on_steer)
         self._car_panel.params_changed.connect(self._on_car)
+        self._car_panel.perspective_changed.connect(self.view3d.set_perspective)
         self._front_hp_panel.hp_changed.connect(
             lambda d, cat: self._on_hp(d, 'front', cat))
         self._rear_hp_panel.hp_changed.connect(
@@ -4597,6 +4599,7 @@ class MainWindow(QMainWindow):
                     arb_hp=_arb(lbl),
                     camber_off=_calign(lbl), toe_off=_talign(lbl),
                     is_front=lbl in ('FL', 'FR'),
+                    label=lbl,
                 )
 
             if motion == 'heave':
@@ -4807,7 +4810,7 @@ class MainWindow(QMainWindow):
     _SPRING_KEYS = frozenset({'motion_ratio', 'spring_len', 'rocker_angle'})
 
     def _do_sweep(self, solver, travels, side, arb_hp=None,
-                  camber_off=0., toe_off=0., is_front=True):
+                  camber_off=0., toe_off=0., is_front=True, label=None):
         """
         Sweep over wheel travel positions and record all kinematic metrics.
 
@@ -4877,7 +4880,7 @@ class MainWindow(QMainWindow):
 
                 # ── ARB bell-crank (topology-aware drop-top path) ─────────
                 arb_kwargs = {}
-                if arb_hp is not None:
+                if arb_hp is not None and label is not None:
                     try:
                         dt_w = self._arb_drop_top_world(label, st)
                         if dt_w is not None:
@@ -5410,6 +5413,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)
+            self._frame_overlay(corners_draw)
+            self._update_dimension_readouts()
 
             # ── Roll-centre spheres (axle-level, proper IC intersection) ─────
             def _axle_rc(left_lbl, right_lbl):
@@ -5907,6 +5912,16 @@ class MainWindow(QMainWindow):
             ('heave',     self._rear_heave),
             ('decoupled', self._rear_decoupled),
         ]
+
+    def _refresh_hp_names(self):
+        """Direct-edit hardpoint list = union of EVERY hardpoint dict on both
+        axles (corner + ARB + heave + decoupled) so EVERY point is adjustable.
+        Called on startup, config load, and topology change."""
+        names = []
+        for is_front in (True, False):
+            for _cat, d in self._hp_dicts_for_axle(is_front):
+                names += list(d.keys())
+        self._direct_edit_panel.set_hp_names(list(dict.fromkeys(names)))
 
     def _find_hp_dict(self, hp_name: str, corner: str):
         """Locate which axle dict actually contains `hp_name`.
@@ -6440,6 +6455,261 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f'PLANE TILT  |  {side} axle | {len(plane_targets)} pts rotated '
             f'{deg:+.2f}° about {axis} through {pivot_key}', 0)
+
+    def _on_snap_actuation_to_plane(self, axle: str):
+        """Project the whole actuation chain onto the rocker plate plane.
+
+        Moves pushrod_outer / spring_chassis_pt / damper ends / rocker pin
+        (via _enforce_actuation_coplanar) AND the ARB drop-link top
+        (arb_drop_top) onto the plane, so the bellcrank stays a planar
+        mechanism after manual nudges.  Recorded as ONE undo step.
+        """
+        is_front = axle.lower().startswith('f')
+        hp = self._front_hp if is_front else self._rear_hp
+        arb = self._front_arb if is_front else self._rear_arb
+        need = ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')
+        if not all(k in hp and hp[k] is not None
+                   and np.all(np.isfinite(hp[k])) for k in need):
+            self.statusBar().showMessage(
+                f'SNAP ACTUATION — {axle} axle has no rocker plane '
+                '(direct / decoupled topology?)', 3000)
+            return
+        # Plane normal from the plate (pivot, pushrod_inner, rocker_spring_pt).
+        p0 = np.asarray(hp['rocker_pivot'], float)
+        n = np.cross(np.asarray(hp['pushrod_inner'], float) - p0,
+                     np.asarray(hp['rocker_spring_pt'], float) - p0)
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-9:
+            self.statusBar().showMessage(
+                'SNAP ACTUATION — plate plane degenerate (points colinear)', 4000)
+            return
+        n /= nn
+        # Snapshot every point the snap will move, for one-shot undo.
+        snap = []
+        for k in ('pushrod_outer', 'spring_chassis_pt', 'damper_chassis_pt',
+                  'damper_outer_pt', 'rocker_axis_pt'):
+            if k in hp and hp[k] is not None and np.all(np.isfinite(hp[k])):
+                snap.append({'is_front': is_front, 'category': 'corner',
+                             'hp_name': k, 'prev': np.asarray(hp[k], float).copy()})
+        if 'arb_drop_top' in arb and np.all(np.isfinite(arb['arb_drop_top'])):
+            snap.append({'is_front': is_front, 'category': 'arb',
+                         'hp_name': 'arb_drop_top',
+                         'prev': np.asarray(arb['arb_drop_top'], float).copy()})
+        # Apply: corner chain via the shared enforcer, ARB drop link by hand.
+        self._enforce_actuation_coplanar(hp)
+        if 'arb_drop_top' in arb and np.all(np.isfinite(arb['arb_drop_top'])):
+            P = np.asarray(arb['arb_drop_top'], float)
+            arb['arb_drop_top'] = P - float(np.dot(P - p0, n)) * n
+        # Record undo + refresh.
+        self._edit_history.append(snap)
+        self._redo_stack.clear()
+        if len(self._edit_history) > 200:
+            self._edit_history.pop(0)
+        try:
+            panel = self._front_hp_panel if is_front else self._rear_hp_panel
+            panel.refresh(hp, arb,
+                          self._front_heave if is_front else self._rear_heave,
+                          self._front_decoupled if is_front else self._rear_decoupled)
+        except Exception:
+            pass
+        self._rebuild_solvers()
+        self._update_3d()
+        self._direct_edit_panel.set_edit_count(len(self._edit_history))
+        self.statusBar().showMessage(
+            f'Snapped {len(snap)} actuation point(s) onto the {axle} rocker '
+            'plane.', 4000)
+
+    @staticmethod
+    def _seg_seg_dist(p1, q1, p2, q2):
+        """Minimum distance between two 3-D segments p1-q1 and p2-q2 (metres)."""
+        p1, q1, p2, q2 = (np.asarray(x, float) for x in (p1, q1, p2, q2))
+        d1 = q1 - p1; d2 = q2 - p2; r = p1 - p2
+        a = float(d1 @ d1); e = float(d2 @ d2); f = float(d2 @ r)
+        if a < 1e-12 and e < 1e-12:
+            return float(np.linalg.norm(r))
+        if a < 1e-12:
+            s = 0.0; t = float(np.clip(f / e, 0, 1))
+        else:
+            c = float(d1 @ r)
+            if e < 1e-12:
+                t = 0.0; s = float(np.clip(-c / a, 0, 1))
+            else:
+                b = float(d1 @ d2); den = a * e - b * b
+                s = float(np.clip((b * f - c * e) / den, 0, 1)) if den > 1e-9 else 0.0
+                t = (b * s + f) / e
+                if t < 0:
+                    t = 0.0; s = float(np.clip(-c / a, 0, 1))
+                elif t > 1:
+                    t = 1.0; s = float(np.clip((b - c) / a, 0, 1))
+        return float(np.linalg.norm((p1 + s * d1) - (p2 + t * d2)))
+
+    def _frame_overlay(self, corners_draw):
+        """Draw control arms / pushrod / tie-rod / rocker / ARB at real
+        thickness, flag interferences (red), and show the rocker-pivot bearing
+        clearance cylinder (yellow).  Gated by the Direct Edit 'frame' toggle.
+        Parts are modelled as tubes; interference = segment-segment gap < sum of
+        radii between two different parts on the same corner that don't share a
+        joint.  The rocker plane bisects its tube extrudes (radius = thickness/2)."""
+        panel = self._frame_panel
+        try:
+            if not panel.frame_enabled():
+                self.view3d.set_frame_overlay([], [], [], False)
+                return
+            dims = panel.frame_dims()
+        except Exception:
+            self.view3d.set_frame_overlay([], [], [], False)
+            return
+        r_ctrl = dims.get('ctrl_arm_od', 19.0) / 2000.0
+        r_arb  = dims.get('arb_od', 14.0) / 2000.0
+        r_rock = dims.get('rocker_th', 8.0) / 2000.0
+        r_push = dims.get('pushrod_od', 16.0) / 2000.0
+        r_bear = dims.get('bearing_od', 38.1) / 2000.0
+        bear_len = dims.get('bearing_len', 25.4) / 1000.0
+        part_cyls = []; bearing_cyls = []; segs = []
+        for c in corners_draw:
+            pts = c['pts']; lbl = c['label']
+
+            def add(part, a, b, r):
+                if (a in pts and b in pts and np.all(np.isfinite(pts[a]))
+                        and np.all(np.isfinite(pts[b]))):
+                    p0 = np.asarray(pts[a], float); p1 = np.asarray(pts[b], float)
+                    part_cyls.append((p0, p1, r)); segs.append((lbl, part, p0, p1, r))
+
+            add('UCA', 'uca_front', 'uca_outer', r_ctrl)
+            add('UCA', 'uca_rear', 'uca_outer', r_ctrl)
+            add('LCA', 'lca_front', 'lca_outer', r_ctrl)
+            add('LCA', 'lca_rear', 'lca_outer', r_ctrl)
+            add('pushrod', 'pushrod_inner', 'pushrod_outer', r_push)
+            add('tierod', 'tie_rod_inner', 'tie_rod_outer', r_push)
+            add('rocker', 'rocker_pivot', 'pushrod_inner', r_rock)
+            add('rocker', 'rocker_pivot', 'rocker_spring_pt', r_rock)
+            add('rocker', 'rocker_pivot', 'arb_drop_top', r_rock)
+            dt = pts.get('arb_drop_top'); ae = pts.get('arb_arm_end_world')
+            if dt is not None and ae is not None and np.all(np.isfinite(dt)) and np.all(np.isfinite(ae)):
+                p0 = np.asarray(dt, float); p1 = np.asarray(ae, float)
+                part_cyls.append((p0, p1, r_arb)); segs.append((lbl, 'ARB', p0, p1, r_arb))
+            pv = pts.get('rocker_pivot'); axp = pts.get('rocker_axis_pt')
+            if pv is not None and axp is not None and np.all(np.isfinite(pv)) and np.all(np.isfinite(axp)):
+                pv = np.asarray(pv, float); d = np.asarray(axp, float) - pv
+                n = float(np.linalg.norm(d))
+                if n > 1e-9:
+                    u = d / n
+                    bearing_cyls.append((pv - 0.5 * bear_len * u, pv + 0.5 * bear_len * u, r_bear))
+        # interference: group segments into PARTS; skip part-pairs that share a
+        # joint (they bolt together there, so touching is expected — not a clash).
+        # Report the worst overlap per part-pair on the same corner.
+        parts = {}; ends = {}
+        for lbl, part, a, b, r in segs:
+            k = (lbl, part)
+            parts.setdefault(k, []).append((a, b, r))
+            s = ends.setdefault(k, set())
+            s.add(tuple(np.round(a, 4))); s.add(tuple(np.round(b, 4)))
+        clash_cyls = []; reports = []
+        keys = list(parts)
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                k1, k2 = keys[i], keys[j]
+                if k1[0] != k2[0] or (ends[k1] & ends[k2]):
+                    continue
+                worst = None
+                for a1, b1, r1 in parts[k1]:
+                    for a2, b2, r2 in parts[k2]:
+                        gap = self._seg_seg_dist(a1, b1, a2, b2) - (r1 + r2)
+                        if gap < 0 and (worst is None or gap < worst[0]):
+                            worst = (gap, a1, b1, r1, a2, b2, r2)
+                if worst:
+                    g, a1, b1, r1, a2, b2, r2 = worst
+                    clash_cyls += [(a1, b1, r1), (a2, b2, r2)]
+                    reports.append(f"{k1[0]} {k1[1]}↔{k2[1]}: overlap {(-g)*1000:.1f}mm")
+        self.view3d.set_frame_overlay(part_cyls, clash_cyls, bearing_cyls, True)
+        try:
+            panel.set_frame_readout('No interference' if not reports
+                                    else '  |  '.join(reports[:6]))
+        except Exception:
+            pass
+
+    def _shock_ends(self, hp):
+        """(fixed_end_key, moving_chassis_key) for the damper, or (None, None)."""
+        if 'rocker_spring_pt' in hp and 'spring_chassis_pt' in hp:
+            return 'rocker_spring_pt', 'spring_chassis_pt'
+        if 'damper_outer_pt' in hp and 'damper_chassis_pt' in hp:
+            return 'damper_outer_pt', 'damper_chassis_pt'
+        return None, None
+
+    def _update_dimension_readouts(self):
+        """Populate the panel's rack length + front/rear shock length boxes
+        from the current geometry."""
+        rack = None
+        if 'tie_rod_inner' in self._front_hp:
+            rack = abs(float(self._front_hp['tie_rod_inner'][0])) * 2000.0
+
+        def shock(hp):
+            fk, mk = self._shock_ends(hp)
+            if fk is None:
+                return None
+            return float(np.linalg.norm(np.asarray(hp[mk], float)
+                                        - np.asarray(hp[fk], float))) * 1000.0
+        try:
+            self._direct_edit_panel.set_dimensions(
+                rack, shock(self._front_hp), shock(self._rear_hp))
+        except Exception:
+            pass
+
+    def _commit_dim_edit(self, is_front, category, name, prev):
+        """Record a one-point length edit for undo + refresh panels/solver/3D."""
+        self._edit_history.append([{'is_front': is_front, 'category': category,
+                                    'hp_name': name, 'prev': prev}])
+        self._redo_stack.clear()
+        if len(self._edit_history) > 200:
+            self._edit_history.pop(0)
+        try:
+            panel = self._front_hp_panel if is_front else self._rear_hp_panel
+            panel.refresh(self._front_hp if is_front else self._rear_hp,
+                          self._front_arb if is_front else self._rear_arb,
+                          self._front_heave if is_front else self._rear_heave,
+                          self._front_decoupled if is_front else self._rear_decoupled)
+        except Exception:
+            pass
+        self._rebuild_solvers()
+        self._update_3d()
+        self._direct_edit_panel.set_edit_count(len(self._edit_history))
+
+    def _on_rack_length(self, length_mm: float):
+        """Front rack length (tip-to-tip inner tie-rod pickups): set
+        tie_rod_inner X to +/- length/2; Y and Z (position) untouched."""
+        hp = self._front_hp
+        if 'tie_rod_inner' not in hp:
+            return
+        cur = np.asarray(hp['tie_rod_inner'], float)
+        if abs(abs(cur[0]) * 2000.0 - length_mm) < 0.05:
+            return
+        new = cur.copy()
+        new[0] = (length_mm / 2000.0) * (1.0 if cur[0] >= 0 else -1.0)
+        hp['tie_rod_inner'] = new
+        self._commit_dim_edit(True, 'corner', 'tie_rod_inner', cur)
+        self.statusBar().showMessage(
+            f'Front rack length set to {length_mm:.1f} mm '
+            f'(tie_rod_inner X = {new[0]*1000:.1f} mm).', 4000)
+
+    def _on_shock_length(self, axle: str, length_mm: float):
+        """Damper mount-to-mount length: move the chassis end along the damper
+        axis; the rocker/spring end stays put.  Position is unchanged."""
+        is_front = axle.lower().startswith('f')
+        hp = self._front_hp if is_front else self._rear_hp
+        fk, mk = self._shock_ends(hp)
+        if fk is None:
+            self.statusBar().showMessage(
+                f'SHOCK LENGTH — {axle} axle has no recognised damper ends', 3000)
+            return
+        fixed = np.asarray(hp[fk], float); mov = np.asarray(hp[mk], float)
+        d = mov - fixed; n = float(np.linalg.norm(d))
+        if n < 1e-9 or abs(n * 1000.0 - length_mm) < 0.05:
+            return
+        hp[mk] = fixed + (length_mm / 1000.0) * (d / n)
+        self._commit_dim_edit(is_front, 'corner', mk, mov)
+        self.statusBar().showMessage(
+            f'{axle.capitalize()} shock length set to {length_mm:.1f} mm '
+            f'({mk} moved along the damper axis).', 4000)
 
     def _on_snap_axis_to_normal(self, axle: str):
         """Recompute rocker_axis_pt = rocker_pivot + L · n_hat where n_hat

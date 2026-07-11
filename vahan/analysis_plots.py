@@ -1181,19 +1181,25 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
     ax_min = np.full_like(ay_arr, float("nan"))
     mu_default = 1.6
 
+    def _mu_at(k, Fz_k):
+        """Per-tyre mu from the solver's ACTUAL tire (split-tire aware, camber-0
+        row, solver's belt->track scale).  The old lookup read a nonexistent
+        `tire_model` attribute (the solver stores `_tire`) and called
+        peak_mu with one argument (it takes fz, camber) — both silently fell
+        back to mu_default=1.6, so the whole figure ignored the TTC data."""
+        try:
+            t = steady_solver._tire_for(k)
+            return float(t.peak_mu(Fz_k, 0.0)) * getattr(steady_solver, '_mu_scale', 1.0)
+        except Exception:
+            return mu_default
+
     def tyre_util_max(result):
         umax = 0.0
         for k in result.Fz:
             Fz_k = float(result.Fz[k])
             if Fz_k <= 0:
                 continue
-            mu = mu_default
-            try:
-                tm = getattr(steady_solver, "tire_model", None)
-                if tm and hasattr(tm, "peak_mu"):
-                    mu = float(tm.peak_mu(Fz_k))
-            except Exception:
-                pass
+            mu = _mu_at(k, Fz_k)
             Fx_k = float(result.Fx.get(k, 0.0)) if hasattr(result, "Fx") else 0.0
             Fy_k = float(result.Fy.get(k, 0.0)) if hasattr(result, "Fy") else 0.0
             util = (Fx_k**2 + Fy_k**2) / max((mu * Fz_k) ** 2, 1e-6)
@@ -1252,42 +1258,48 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
     # ----- Right: per-tyre friction circles -----
     corners = ["FL", "FR", "RL", "RR"]
     corner_colors = {"FL": _BLUE, "FR": _TEAL, "RL": _RED, "RR": _YELLOW}
+    # Two encodings, kept separate so the legend can distinguish them:
+    #   COLOR  = corner (FL/FR/RL/RR)
+    #   MARKER = load case (the old code labeled every case with FL's color,
+    #            so the legend showed four identical dots).
     cases = {
-        "1g cornering":    (1.0, 0.0),
-        "1g braking":      (0.0, -1.0),
-        "1g accel":        (0.0, +1.0),
-        "0.7g+0.7g":       (0.7, +0.7),
+        "1g cornering":    (1.0, 0.0,  "o"),
+        "1g braking":      (0.0, -1.0, "s"),
+        "1g accel":        (0.0, +1.0, "^"),
+        "0.7g+0.7g":       (0.7, +0.7, "D"),
     }
     for k in corners:
         circle = plt.Circle((0, 0), 1.0, fill=False,
                              color=corner_colors[k], lw=1.0, alpha=0.4)
         ax_fc.add_patch(circle)
 
-    for case_name, (ay, ax_long) in cases.items():
+    for case_name, (ay, ax_long, mk) in cases.items():
         try:
             r = steady_solver.solve(lateral_g=ay, longitudinal_g=ax_long)
             for k in corners:
                 Fz_k = float(r.Fz.get(k, 0))
                 if Fz_k <= 1:
                     continue
-                mu = mu_default
-                try:
-                    tm = getattr(steady_solver, "tire_model", None)
-                    if tm and hasattr(tm, "peak_mu"):
-                        mu = float(tm.peak_mu(Fz_k))
-                except Exception:
-                    pass
+                mu = _mu_at(k, Fz_k)
                 Fy_k = float(r.Fy.get(k, 0)) if hasattr(r, "Fy") else 0
                 Fx_k = float(r.Fx.get(k, 0)) if hasattr(r, "Fx") else 0
                 x_norm = Fy_k / (mu * Fz_k + 1e-6)
                 y_norm = Fx_k / (mu * Fz_k + 1e-6)
-                lbl = f"{case_name}" if k == "FL" else None
-                ax_fc.scatter(x_norm, y_norm,
+                ax_fc.scatter(x_norm, y_norm, marker=mk,
                                 color=corner_colors[k], s=60, alpha=0.7,
-                                edgecolors=_WHITE, linewidths=0.5,
-                                label=lbl)
+                                edgecolors=_WHITE, linewidths=0.5)
         except Exception:
             continue
+
+    # Composite legend: corner colors + case markers (grey proxies)
+    from matplotlib.lines import Line2D
+    proxies  = [Line2D([0], [0], marker='o', ls='', color=corner_colors[k],
+                       label=k) for k in corners]
+    proxies += [Line2D([0], [0], marker=mk, ls='', color=_TICK,
+                       label=case_name)
+                for case_name, (_, _, mk) in cases.items()]
+    ax_fc.legend(handles=proxies, facecolor=_PANEL_BG, labelcolor=_TEXT,
+                  edgecolor=_GRID, fontsize=7, loc="lower right", ncols=2)
 
     ax_fc.set_xlabel("Fy / (mu * Fz)  -- normalised lateral", fontsize=10)
     ax_fc.set_ylabel("Fx / (mu * Fz)  -- normalised longitudinal", fontsize=10)
@@ -1298,11 +1310,6 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
     ax_fc.set_aspect("equal", "box")
     ax_fc.set_xlim(-1.3, 1.3)
     ax_fc.set_ylim(-1.3, 1.3)
-    handles, labels = ax_fc.get_legend_handles_labels()
-    if handles:
-        ax_fc.legend(handles, labels, facecolor=_PANEL_BG,
-                       labelcolor=_TEXT, edgecolor=_GRID,
-                       fontsize=7.5, loc="lower right")
 
     fig.tight_layout()
     return fig
