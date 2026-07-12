@@ -22,6 +22,7 @@ class _Card(QFrame):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet('QFrame{background:#101018;border:1px solid #333;border-radius:6px;}'
                            'QFrame:hover{border:1px solid #E8A000;}')
+        self.setFixedWidth(460)   # cards must not stretch across wide monitors
         lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6)
         png = os.path.join(cdir, 'card.png')
         pic = QLabel()
@@ -183,8 +184,10 @@ class CityPage(QWidget):
             cards.sort(key=lambda cm: cm[1].get(key, -9), reverse=True)
         else:
             cards.sort(key=lambda cm: cm[1].get('id', ''))
-        for i, (cdir, m) in enumerate(cards[:120]):
-            grid.addWidget(_Card(cdir, m, self._open_detail), i // 3, i % 3)
+        ncols = max(2, self._scroll.viewport().width() // 480) if self._scroll.viewport().width() > 0 else 3
+        for i, (cdir, m) in enumerate(cards[:150]):
+            grid.addWidget(_Card(cdir, m, self._open_detail), i // ncols, i % ncols)
+        grid.setColumnStretch(ncols, 1)   # slack column absorbs leftover width
         self._scroll.setWidget(inner)
         self._status.setText('%d designs shown from %s' % (len(cards[:120]), self._run_dir or '-'))
 

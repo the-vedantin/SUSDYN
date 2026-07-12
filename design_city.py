@@ -532,15 +532,31 @@ def lap_filter(out_dir, top_n=8):
 
 def full_report(cand_dir, base_config=None):
     """Binder-style figure set for ONE shortlisted candidate (on demand from
-    the GUI).  Writes report_*.png next to the card."""
+    the GUI).  Sheets: kinematics, dynamics, MODEL VIEWS, G-G, tire util,
+    aero DF-required, transient step/ramp steer, MMD."""
     _worker_init(os.path.join(cand_dir, 'config.vahan'))
     np = _W['np']; w = _W['w']
+    import inspect
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     BLUE='#0057B8'; RED='#D62828'; OCHRE='#E8A000'; BLACK='#222222'
+    C4={'FL':BLUE,'FR':RED,'RL':OCHRE,'RR':BLACK}
     plt.rcParams.update({'figure.dpi': 130, 'font.size': 8, 'axes.grid': True,
                          'grid.alpha': 0.3, 'figure.autolayout': True})
+    def lightify(fig):
+        fig.patch.set_facecolor('white')
+        for a in fig.get_axes():
+            a.set_facecolor('white')
+            for sp in a.spines.values(): sp.set_color('#888888')
+            a.tick_params(colors='#333333')
+            a.xaxis.label.set_color('#222222'); a.yaxis.label.set_color('#222222')
+            a.title.set_color('#222222')
+            leg = a.get_legend()
+            if leg:
+                leg.get_frame().set_facecolor('#f4f4f4')
+                for tx in leg.get_texts(): tx.set_color('#222222')
+        return fig
     ss = w._build_dynamics_solver(); v = ss._veh
     t = np.linspace(-0.028, 0.028, 41)
     kin = {}
@@ -549,7 +565,8 @@ def full_report(cand_dir, base_config=None):
         kin[lbl] = w._do_sweep(w._solvers[lbl], t, 'left', arb_hp=src,
                                is_front=lbl[0] == 'F', label=lbl)
     x = t * 1000
-    def fig1():
+
+    def fig_kin():
         fig, axs = plt.subplots(2, 3, figsize=(11, 6))
         panels = [('toe', 'bump steer (deg)'), ('camber', 'camber (deg)'),
                   ('caster', 'caster (deg)'), ('scrub', 'scrub (mm)'),
@@ -559,22 +576,200 @@ def full_report(cand_dir, base_config=None):
                 ax.plot(x, kin[lbl][k], color=c, label=lbl)
             ax.set_title(ttl, fontsize=8); ax.legend(fontsize=6); ax.tick_params(labelsize=6)
         fig.savefig(os.path.join(cand_dir, 'report_kinematics.png')); plt.close(fig)
-    def fig2():
+
+    def fig_dyn():
         sw = ss.sweep_lateral_g((0.0, 1.9), 21)
         fig, axs = plt.subplots(2, 2, figsize=(9, 6))
         g = sw['lateral_g']
         axs[0,0].plot(g, sw['roll_angle_deg'], color=BLUE); axs[0,0].set_title('roll (deg) vs g', fontsize=8)
         axs[0,1].plot(g, sw['understeer_gradient_deg'], color=RED); axs[0,1].axhline(0, ls='--', lw=0.7, color=BLACK)
-        axs[0,1].set_title('understeer gradient (deg)', fontsize=8)
-        for cn, cc in (('FL', BLUE), ('FR', RED), ('RL', OCHRE), ('RR', BLACK)):
-            axs[1,0].plot(g, sw['Fz_%s' % cn], color=cc, label=cn)
+        axs[0,1].set_title('understeer gradient (deg/g)', fontsize=8)
+        for cn in ('FL','FR','RL','RR'):
+            axs[1,0].plot(g, sw['Fz_%s' % cn], color=C4[cn], label=cn)
         axs[1,0].set_title('per-corner Fz (N)', fontsize=8); axs[1,0].legend(fontsize=6)
         ef = np.asarray(sw['elastic_lt_front_N']); gf = np.asarray(sw['geometric_lt_front_N'])
         axs[1,1].stackplot(g, ef, gf, colors=[BLUE, RED], labels=['elastic', 'geometric'])
         axs[1,1].set_title('front LT paths (N)', fontsize=8); axs[1,1].legend(fontsize=6)
         for a in axs.ravel(): a.tick_params(labelsize=6)
         fig.savefig(os.path.join(cand_dir, 'report_dynamics.png')); plt.close(fig)
-    fig1(); fig2()
+
+    def _segments(lbl):
+        """All drawable segments for one corner incl. rocker, spring, ARB.
+        The corner SOLVERS already return correct per-side coordinates; only
+        the chassis-side DICT points (rocker/spring/ARB, stored left-side)
+        need the X flip for right corners."""
+        st = w._solvers[lbl].solve(0.)
+        hp = w._front_hp if lbl[0] == 'F' else w._rear_hp
+        arb = w._front_arb if lbl[0] == 'F' else w._rear_arb
+        flip = np.array([-1, 1, 1]) if lbl in ('FR', 'RR') else np.array([1, 1, 1])
+        S = []
+        def seg(a, b, f=1):
+            if a is None or b is None: return
+            fa = flip if f else np.array([1, 1, 1])
+            S.append((np.asarray(a) * fa, np.asarray(b) * fa))
+        for a, b in (('uca_front','uca_outer'),('uca_rear','uca_outer'),
+                     ('lca_front','lca_outer'),('lca_rear','lca_outer'),
+                     ('uca_outer','lca_outer'),('pushrod_inner','pushrod_outer'),
+                     ('tie_rod_inner','tie_rod_outer')):
+            seg(getattr(st, a, None), getattr(st, b, None), f=0)   # solver: already sided
+        seg(hp.get('rocker_pivot'), hp.get('rocker_spring_pt'))
+        seg(hp.get('rocker_spring_pt'), hp.get('spring_chassis_pt'))       # coilover
+        try:
+            seg(arb.get('arb_pivot'), arb.get('arb_arm_end'))
+            seg(arb.get('arb_arm_end'), arb.get('arb_drop_top'))
+        except Exception: pass
+        return S, np.asarray(st.wheel_center)
+
+    def fig_model():
+        fig = plt.figure(figsize=(11, 8))
+        ax3 = fig.add_subplot(221, projection='3d')
+        axf = fig.add_subplot(222); axs_ = fig.add_subplot(223); axt = fig.add_subplot(224)
+        allpts = []
+        for lbl in ('FL', 'FR', 'RL', 'RR'):
+            try: S, wc = _segments(lbl)
+            except Exception: continue
+            c = C4[lbl]
+            for a, b in S:
+                a = a * 1000; b = b * 1000
+                allpts += [a, b]
+                ax3.plot([a[0], b[0]], [a[1], b[1]], [a[2], b[2]], color=c, lw=1.1)
+                axf.plot([a[0], b[0]], [a[2], b[2]], color=c, lw=0.9)
+                axs_.plot([a[1], b[1]], [a[2], b[2]], color=c, lw=0.9)
+                axt.plot([a[0], b[0]], [a[1], b[1]], color=c, lw=0.9)
+            wcm = wc * 1000    # solver wheel_center is already correctly sided
+            th = np.linspace(0, 2*np.pi, 36); r = v.tire_radius_m * 1000
+            axf.plot(wcm[0]+0*th, wcm[2]+r*np.sin(th), color=c, lw=0.5, alpha=0.5)
+            axs_.plot(wcm[1]+r*np.cos(th), wcm[2]+r*np.sin(th), color=c, lw=0.5, alpha=0.5)
+        P = np.asarray(allpts)
+        if len(P):   # EQUAL aspect so the iso is not morphed
+            rng = P.max(0) - P.min(0)
+            ax3.set_box_aspect(tuple(np.maximum(rng, 1)))
+        ax3.set_title('iso (equal aspect)', fontsize=8); ax3.view_init(20, -55)
+        axf.set_title('front view XZ', fontsize=8); axf.set_aspect('equal')
+        axs_.set_title('side view YZ', fontsize=8); axs_.set_aspect('equal')
+        axt.set_title('top view XY', fontsize=8); axt.set_aspect('equal')
+        fig.suptitle('model: wishbones/pushrod/tie/rocker/coilover/ARB (design position)', fontsize=9)
+        fig.savefig(os.path.join(cand_dir, 'report_model.png')); plt.close(fig)
+
+    def axle_util(r):
+        out = {}
+        for ax_, (a, b) in (('F', ('FL','FR')), ('R', ('RL','RR'))):
+            dem = abs(r.Fy[a]) + abs(r.Fy[b]); cap = 0.
+            for cn in (a, b):
+                fz = max(r.Fz[cn], 0.)
+                tm_ = ss._tire_for(cn)
+                fr = tm_.fz_range() if callable(tm_.fz_range) else tm_.fz_range
+                lo = float(np.asarray(fr).ravel()[0])
+                cap += float(tm_.peak_mu(max(fz, lo), abs(r.camber.get(cn, 0.)))) * ss._mu_scale * fz
+            out[ax_] = dem / max(cap, 1.)
+        return out
+
+    def fig_gg():
+        fig, ax = plt.subplots(figsize=(5.5, 5))
+        lons = np.linspace(-1.5, 1.1, 12); lats = []
+        for lon in lons:
+            lo_, hi_ = 0.2, 2.6
+            for _ in range(9):
+                mid = (lo_ + hi_) / 2
+                try:
+                    u = axle_util(ss.solve(mid, float(lon)))
+                    lo_, hi_ = (mid, hi_) if max(u.values()) < 1.0 else (lo_, mid)
+                except Exception: hi_ = mid
+            lats.append(lo_)
+        lats = np.asarray(lats)
+        ax.plot(lats, lons, color=BLUE); ax.plot(-lats, lons, color=BLUE)
+        ax.axhline(0, color=BLACK, lw=0.5); ax.axvline(0, color=BLACK, lw=0.5)
+        ax.set_xlabel('lateral g'); ax.set_ylabel('longitudinal g (+accel)')
+        ax.set_title('G-G envelope (axle-aggregate limit, no aero)', fontsize=9)
+        fig.savefig(os.path.join(cand_dir, 'report_gg.png')); plt.close(fig)
+
+    def fig_tireutil():
+        import vahan.analysis_plots as ap
+        try:
+            f = ap.plot_friction_circle(ss, max_ay_g=1.9)
+            lightify(f).savefig(os.path.join(cand_dir, 'report_tireutil.png')); plt.close(f)
+        except Exception as e:
+            print('tireutil FAIL', e)
+
+    def fig_aero():
+        from vahan.dynamics import AeroDownforceSolver
+        aero = AeroDownforceSolver(ss)
+        fig, axs = plt.subplots(1, 2, figsize=(9, 3.6))
+        for tgt, c in ((0.85, BLUE), (0.95, RED)):
+            gs = np.linspace(1.5, 2.4, 13); tot = []; fshare = []
+            for g in gs:
+                try:
+                    ar = aero.solve(float(g), target_util=tgt)
+                    df = ar.downforce if isinstance(ar.downforce, dict) else {}
+                    s = sum(df.values()); tot.append(s)
+                    fshare.append(100*(df.get('FL',0)+df.get('FR',0))/s if s > 1 else float('nan'))
+                except Exception:
+                    tot.append(float('nan')); fshare.append(float('nan'))
+            axs[0].plot(gs, tot, color=c, marker='o', ms=3, label='target util %.2f' % tgt)
+            axs[1].plot(gs, fshare, color=c, marker='o', ms=3, label='target util %.2f' % tgt)
+        axs[0].set_title('downforce REQUIRED vs lateral g (N)', fontsize=8)
+        axs[0].set_xlabel('lateral g'); axs[0].legend(fontsize=6)
+        axs[1].set_title('required DF front share (%)', fontsize=8)
+        axs[1].set_xlabel('lateral g'); axs[1].axhline(46, ls='--', lw=0.7, color=BLACK); axs[1].legend(fontsize=6)
+        fig.savefig(os.path.join(cand_dir, 'report_aero.png')); plt.close(fig)
+
+    def fig_transient():
+        try:
+            from vahan.transient import (TransientSolver, TransientInputs,
+                                          TransientParams, SteeringProfile)
+            mF = v.sprung_mass_kg
+            Ixx = mF * (v.roll_gyradius_track_frac * (v.front_track_m + v.rear_track_m) / 2) ** 2
+            Izz = v.yaw_inertia_factor * v.total_mass_kg * v.cg_to_front_axle_m * v.cg_to_rear_axle_m
+            k_roll = v.roll_stiffness_total_Npm_rad
+            zeta = 0.5   # NO shock dyno data — assumed ratio, same flag as the binder
+            c_phi = 2 * zeta * (k_roll * Ixx) ** 0.5
+            tp = TransientParams(sprung_roll_inertia=Ixx, yaw_inertia=Izz,
+                                 roll_damping_Nms_rad=c_phi)
+            try: sg = w._build_steering_geometry()
+            except Exception: sg = None
+            sol = TransientSolver(v, _W['w']._tire_model, corner_solvers=w._solvers,
+                                  params=tp, steering_geometry=sg)
+            vx = 12.0
+            steer_rad = np.radians(6.0)   # ~6 deg road-wheel step (moderate, sub-limit at 12 m/s)
+            profiles = {'step': SteeringProfile.step(0.5, steer_rad),
+                        'ramp': SteeringProfile.ramp(0.5, 2.5, steer_rad)}
+            fig, axs = plt.subplots(2, 3, figsize=(11, 6))
+            for row, kind in enumerate(('step', 'ramp')):
+                try:
+                    res = sol.simulate(TransientInputs(v_x_target_ms=vx,
+                                                       steering=profiles[kind], duration_s=4.0))
+                    tt = np.asarray(res.t)
+                    axs[row,0].plot(tt, np.degrees(np.asarray(res.yaw_rate)), color=BLUE)
+                    axs[row,0].set_title('%s steer: yaw rate (deg/s)' % kind, fontsize=8)
+                    axs[row,1].plot(tt, np.asarray(res.ay)/9.80665, color=RED)
+                    axs[row,1].set_title('lateral g', fontsize=8)
+                    axs[row,2].plot(tt, np.degrees(np.asarray(res.roll)), color=OCHRE, label='roll (deg)')
+                    axs[row,2].plot(tt, np.degrees(np.asarray(res.steer)), color=BLACK, lw=0.8,
+                                    label='road-wheel steer (deg)')
+                    axs[row,2].set_title('roll + input', fontsize=8); axs[row,2].legend(fontsize=6)
+                except Exception as e:
+                    axs[row,0].text(0.05, 0.5, '%s FAIL %s' % (kind, str(e)[:60]), fontsize=7)
+            for a in axs.ravel(): a.tick_params(labelsize=6); a.set_xlabel('t (s)', fontsize=7)
+            fig.suptitle('transient steering response @ %.0f m/s — damping ASSUMED zeta=0.5 (no dyno data)' % vx,
+                         fontsize=9)
+            fig.savefig(os.path.join(cand_dir, 'report_transient.png')); plt.close(fig)
+        except Exception as e:
+            print('transient FAIL:', e)
+
+    def fig_mmd():
+        import vahan.analysis_plots as ap
+        try:
+            wf = v.cg_to_rear_axle_m / v.wheelbase_m
+            f = ap.plot_mmd(_W['w']._tire_model, v.total_mass_kg, wf, v.wheelbase_m,
+                            v.cg_height_m, v.front_track_m, v.rear_track_m,
+                            roll_stiffness_front_Npm_rad=v.roll_stiffness_front_Npm_rad,
+                            roll_stiffness_rear_Npm_rad=v.roll_stiffness_rear_Npm_rad)
+            lightify(f).savefig(os.path.join(cand_dir, 'report_mmd.png')); plt.close(f)
+        except Exception as e:
+            print('mmd FAIL', e)
+
+    fig_kin(); fig_dyn(); fig_model(); fig_gg(); fig_tireutil(); fig_aero()
+    fig_transient(); fig_mmd()
     print('report figures written ->', cand_dir)
 
 
