@@ -23,27 +23,53 @@ limits (inner-tire sub-data-floor artifact).
 """
 import os, sys, json, argparse, random, itertools, traceback
 
-GENES = [
-    # name,                lo,     hi,    kind
-    ('spring_F_lbfin',     150.0,  300.0, 'step25'),
-    ('spring_R_lbfin',     175.0,  325.0, 'step25'),
-    ('lever_scale_F',      0.70,   1.60,  'float'),   # ARB lever length scale (rate ~ 1/A^2.5)
-    ('lever_scale_R',      0.60,   1.60,  'float'),
-    ('static_camber_F',   -2.5,    0.0,   'float'),
-    ('static_camber_R',   -2.5,    0.0,   'float'),
-    ('uca_in_dz_F_mm',   -15.0,   15.0,   'float'),   # front upper inboard plane height (RC knob)
-    ('uca_in_dz_R_mm',   -15.0,   15.0,   'float'),
-    ('lca_in_dz_F_mm',   -10.0,   10.0,   'float'),
-    ('lca_in_dz_R_mm',   -10.0,   10.0,   'float'),
-    ('tie_in_dz_mm',      -6.0,    6.0,   'float'),   # front bump-steer knob
-    # v2 widening — outboard + actuation geometry (camber gain, KPI, caster, MR)
-    ('uca_out_dz_F_mm',  -10.0,   10.0,   'float'),   # front camber-gain / KPI knob
-    ('uca_out_dz_R_mm',  -10.0,   10.0,   'float'),
-    ('uca_out_dy_F_mm',   -8.0,    8.0,   'float'),   # front caster knob (+Y rearward = +caster)
-    ('push_out_scale_F',   0.90,   1.10,  'float'),   # pushrod outer along-arm position (MR knob)
-    ('push_out_scale_R',   0.90,   1.10,  'float'),
-    ('rear_toe_dz_mm',    -5.0,    5.0,   'float'),   # rear bump-steer/roll-steer knob
-]
+# ── GENOME v3: EVERY persistable knob ────────────────────────────────────────
+# Per-point XYZ deltas for every suspension hardpoint on both axles, plus
+# structured group moves (track, wheelbase), ARB tube + pickup + lever, setup
+# (springs/alignment), and vehicle-level (final drive, CG height).  Diff ramp
+# settings are EXCLUDED: they do not round-trip through the .vahan schema, so
+# a candidate could not reproduce its own numbers on load.
+_PT_BOUNDS = {   # per-axis delta bounds (mm) by hardpoint
+    'uca_front': 12., 'uca_rear': 12., 'uca_outer': 8.,
+    'lca_front': 12., 'lca_rear': 12., 'lca_outer': 8.,
+    'tie_rod_inner': 8., 'tie_rod_outer': 8.,
+    'pushrod_inner': 8., 'pushrod_outer': 8.,
+    'rocker_pivot': 6., 'rocker_spring_pt': 6., 'spring_chassis_pt': 10.,
+}
+
+def _build_genes():
+    g = [
+        # setup + vehicle
+        ('spring_F_lbfin',   150.0, 325.0, 'step25'),
+        ('spring_R_lbfin',   150.0, 325.0, 'step25'),
+        ('static_camber_F',   -3.0,   0.0, 'float'),
+        ('static_camber_R',   -3.0,   0.0, 'float'),
+        ('static_toe_F',      -0.3,   0.3, 'float'),
+        ('static_toe_R',      -0.3,   0.3, 'float'),
+        ('final_drive_ratio', 10.0,  14.0, 'float'),
+        ('cg_z_mm',          255.0, 285.0, 'float'),
+        # ARB: lever length, tube OD + wall, drop-top pickup height (ARB-MR knob)
+        ('lever_scale_F',      0.70,  1.60, 'float'),
+        ('lever_scale_R',      0.60,  1.60, 'float'),
+        ('arb_od_F_mm',       10.0,  17.0, 'float'),
+        ('arb_od_R_mm',       10.0,  17.0, 'float'),
+        ('arb_wall_F_mm',      1.2,   2.4, 'float'),
+        ('arb_wall_R_mm',      1.2,   2.4, 'float'),
+        ('arb_droptop_dz_F',  -8.0,   8.0, 'float'),
+        ('arb_droptop_dz_R',  -8.0,   8.0, 'float'),
+        # structured geometry
+        ('track_dx_F_mm',    -40.0,  40.0, 'float'),   # outboard group lateral shift (half-track)
+        ('track_dx_R_mm',    -40.0,  40.0, 'float'),
+        ('wheelbase_dy_mm',  -25.0,  25.0, 'float'),   # whole rear corner group shift
+    ]
+    # every hardpoint coordinate, both axles
+    for ax in ('F', 'R'):
+        for pt, b in _PT_BOUNDS.items():
+            for i, c in enumerate('xyz'):
+                g.append(('hp_%s_%s_%s' % (ax, pt, c), -b, b, 'float'))
+    return g
+
+GENES = _build_genes()
 
 ISLANDS = {   # objective personalities ("buildings"); weights over normalized metrics
     'grip':      dict(gmax=3.0, margin=0.5, feel=0.5, endur=0.5),
@@ -71,11 +97,16 @@ def lhs_genomes(n, rng):
             out[i][gname] = _quant(gname, lo + (hi - lo) * (c + rng.random()) / n)
     return out
 
-def mutate(g, rng, scale=0.25):
+def mutate(g, rng, scale=0.25, k=None):
+    """SPARSE mutation: with ~100 genes, perturbing half of them per child is
+    a random walk; touching a Poisson-few keeps offspring near the parent."""
     out = dict(g)
-    for gname, lo, hi, kind in GENES:
-        if rng.random() < 0.45:
-            out[gname] = _quant(gname, out[gname] + rng.gauss(0, scale * (hi - lo)))
+    names = [n for n, *_ in GENES]
+    if k is None:
+        k = max(1, min(len(names), int(rng.expovariate(1 / 5.0)) + 1))
+    for gname in rng.sample(names, k):
+        lo, hi, kind = next((l, h, kk) for n, l, h, kk in GENES if n == gname)
+        out[gname] = _quant(gname, out[gname] + rng.gauss(0, scale * (hi - lo)))
     return out
 
 def blend(a, b, rng):
@@ -100,7 +131,8 @@ def _worker_init(base_config):
         front_hp={k: np.asarray(v).copy() for k, v in w._front_hp.items()},
         rear_hp={k: np.asarray(v).copy() for k, v in w._rear_hp.items()},
         front_arb=copy.deepcopy(w._front_arb), rear_arb=copy.deepcopy(w._rear_arb),
-        alignment=dict(w._alignment), dyn_state=w._dynamics_panel.get_state())
+        alignment=dict(w._alignment), dyn_state=w._dynamics_panel.get_state(),
+        car=dict(w._car))
 
 def _apply(genome):
     np = _W['np']; w = _W['w']; base = _W['base']
@@ -109,51 +141,61 @@ def _apply(genome):
     for k, v in base['rear_hp'].items():  w._rear_hp[k] = v.copy()
     w._front_arb = copy.deepcopy(base['front_arb']); w._rear_arb = copy.deepcopy(base['rear_arb'])
     w._alignment.update(base['alignment'])
-    st = dict(base['dyn_state'])
-    st['spring_front_lbfin'] = genome['spring_F_lbfin']
-    st['spring_rear_lbfin'] = genome['spring_R_lbfin']
-    w._dynamics_panel.set_state(st)
-    w._alignment['front_camber_deg'] = genome['static_camber_F']
-    w._alignment['rear_camber_deg'] = genome['static_camber_R']
-    # hardpoint deltas (m)
-    for hp, key, dz in (('front_hp', 'uca_front', genome['uca_in_dz_F_mm']),
-                        ('front_hp', 'uca_rear',  genome['uca_in_dz_F_mm']),
-                        ('rear_hp',  'uca_front', genome['uca_in_dz_R_mm']),
-                        ('rear_hp',  'uca_rear',  genome['uca_in_dz_R_mm']),
-                        ('front_hp', 'lca_front', genome['lca_in_dz_F_mm']),
-                        ('front_hp', 'lca_rear',  genome['lca_in_dz_F_mm']),
-                        ('rear_hp',  'lca_front', genome['lca_in_dz_R_mm']),
-                        ('rear_hp',  'lca_rear',  genome['lca_in_dz_R_mm']),
-                        ('front_hp', 'tie_rod_inner', genome['tie_in_dz_mm']),
-                        ('front_hp', 'uca_outer', genome['uca_out_dz_F_mm']),
-                        ('rear_hp',  'uca_outer', genome['uca_out_dz_R_mm']),
-                        ('rear_hp',  'tie_rod_inner', genome['rear_toe_dz_mm'])):
-        d = getattr(w, '_' + hp)
-        if key in d: d[key] = d[key] + np.array([0, 0, dz / 1000.0])
-    # caster knob: front upper BJ fore/aft (+Y rearward = +caster)
-    if 'uca_outer' in w._front_hp:
-        w._front_hp['uca_outer'] = w._front_hp['uca_outer'] + np.array(
-            [0, genome['uca_out_dy_F_mm'] / 1000.0, 0])
-    # MR knob: slide pushrod outer along its arm (anchor = the CLOSER outer BJ,
-    # so it works for both UCA- and LCA-mounted pushrods), then re-enforce
-    # rocker-plane coplanarity if the host provides it (the corner solver
-    # requires actuation points on the rocker plane).
-    for hp, s in (('_front_hp', genome['push_out_scale_F']),
-                  ('_rear_hp',  genome['push_out_scale_R'])):
-        d = getattr(w, hp)
-        if 'pushrod_outer' in d and 'lca_outer' in d and 'uca_outer' in d:
-            po = d['pushrod_outer']
-            anchor = d['lca_outer'] if (np.linalg.norm(po - d['lca_outer'])
-                                        <= np.linalg.norm(po - d['uca_outer'])) else d['uca_outer']
-            d['pushrod_outer'] = anchor + s * (po - anchor)
+    if 'car' not in base: base['car'] = dict(w._car)
+    w._car.update(base['car'])
+
+    OUTBOARD = ('uca_outer', 'lca_outer', 'tie_rod_outer', 'pushrod_outer', 'wheel_center')
+    # 1) structured group moves: track (outboard group X) + wheelbase (rear group Y)
+    for axd, gk, tk in ((w._front_hp, 'track_dx_F_mm', 'track_f_mm'),
+                        (w._rear_hp, 'track_dx_R_mm', 'track_r_mm')):
+        dx = genome[gk] / 1000.0
+        for pt in OUTBOARD:
+            if pt in axd: axd[pt] = axd[pt] + np.array([dx, 0, 0])
+        w._car[tk] = base['car'][tk] + 2 * genome[gk]
+    dy = genome['wheelbase_dy_mm'] / 1000.0
+    for pt in list(w._rear_hp.keys()):
+        w._rear_hp[pt] = w._rear_hp[pt] + np.array([0, dy, 0])
+    for arbk in ('arb_pivot', 'arb_arm_end', 'arb_drop_top'):
+        w._rear_arb[arbk] = np.asarray(w._rear_arb[arbk]) + np.array([0, dy, 0])
+    w._car['wheelbase_mm'] = base['car']['wheelbase_mm'] + genome['wheelbase_dy_mm']
+    w._car['axle_spacing_mm'] = w._car['wheelbase_mm']
+
+    # 2) every-hardpoint per-axis deltas; rocker_pivot delta also translates
+    #    rocker_axis_pt (rigid rocker translation, axis direction preserved)
+    for ax, axd in (('F', w._front_hp), ('R', w._rear_hp)):
+        for pt in _PT_BOUNDS:
+            d = np.array([genome['hp_%s_%s_%s' % (ax, pt, c)] for c in 'xyz']) / 1000.0
+            if pt in axd:
+                axd[pt] = axd[pt] + d
+                if pt == 'rocker_pivot' and 'rocker_axis_pt' in axd:
+                    axd['rocker_axis_pt'] = axd['rocker_axis_pt'] + d
     try:
         w._enforce_actuation_coplanar()
     except Exception:
         pass
-    # ARB lever scales
-    for arb, s in ((w._front_arb, genome['lever_scale_F']), (w._rear_arb, genome['lever_scale_R'])):
+
+    # 3) ARB: lever length, drop-top pickup height (ARB-MR knob)
+    for arb, ls, dz in ((w._front_arb, genome['lever_scale_F'], genome['arb_droptop_dz_F']),
+                        (w._rear_arb, genome['lever_scale_R'], genome['arb_droptop_dz_R'])):
         piv = np.asarray(arb['arb_pivot']); tip = np.asarray(arb['arb_arm_end'])
-        arb['arb_arm_end'] = piv + s * (tip - piv)
+        arb['arb_arm_end'] = piv + ls * (tip - piv)
+        arb['arb_drop_top'] = np.asarray(arb['arb_drop_top']) + np.array([0, 0, dz / 1000.0])
+
+    # 4) setup + vehicle knobs through their real storage
+    st = dict(base['dyn_state'])
+    st['spring_front_lbfin'] = genome['spring_F_lbfin']
+    st['spring_rear_lbfin'] = genome['spring_R_lbfin']
+    st['arb_OD_f_mm'] = genome['arb_od_F_mm']
+    st['arb_ID_f_mm'] = max(genome['arb_od_F_mm'] - 2 * genome['arb_wall_F_mm'], 0.0)
+    st['arb_OD_r_mm'] = genome['arb_od_R_mm']
+    st['arb_ID_r_mm'] = max(genome['arb_od_R_mm'] - 2 * genome['arb_wall_R_mm'], 0.0)
+    st['final_drive_ratio'] = genome['final_drive_ratio']
+    w._dynamics_panel.set_state(st)
+    w._alignment['front_camber_deg'] = genome['static_camber_F']
+    w._alignment['rear_camber_deg'] = genome['static_camber_R']
+    w._alignment['front_toe_deg'] = genome['static_toe_F']
+    w._alignment['rear_toe_deg'] = genome['static_toe_R']
+    w._car['cg_z_mm'] = genome['cg_z_mm']
     w._rebuild_solvers(0.)
 
 def _axle_util(ss, r):
@@ -236,6 +278,16 @@ def evaluate(args):
         if M['bump_steer_F'] > 0.30 or M['bump_steer_R'] > 0.25: pen += 1.5
         if M['roll_deg_g'] > 1.3: pen += 1.0
         if abs(M['scrub_F']) > 30: pen += 0.8
+        # rules guards (genome can now move track/wheelbase/caster)
+        wb = w._car.get('wheelbase_mm', 1537.)
+        tf = w._car.get('track_f_mm', 1117.6); tr_ = w._car.get('track_r_mm', 1117.6)
+        M['wheelbase_mm'] = wb; M['track_f_mm'] = tf; M['track_r_mm'] = tr_
+        if wb < 1525.: pen += 5.
+        if min(tf, tr_) / max(tf, tr_) < 0.75: pen += 5.
+        if M['caster_F'] < 0.5: pen += 1.5     # keep self-centering positive
+        ssf = min(tf, tr_) / (2. * w._car.get('cg_z_mm', 270.))
+        M['SSF'] = ssf
+        if ssf < 1.8: pen += 3.               # rollover margin guard (tilt 1.7g + margin)
         feel = 1.0 - min(M['bump_steer_F']/0.3, 1) * 0.5 - min(abs(M['scrub_F'])/30, 1) * 0.5
         endur = 1.0 - min(max(M['rc_F'], M['rc_R'], 0)/80, 1)*0.5 - min(M['roll_deg_g']/1.5, 1)*0.5
         M['scores'] = dict(gmax=(M['gmax']-1.6)/0.6, margin=min(max(M['margin'],0)/0.12,1.2),
@@ -374,14 +426,22 @@ def run_city(out_dir, base_config, seed_configs, islands, pop, gens, workers, se
     os.makedirs(out_dir, exist_ok=True)
     isl_names = list(ISLANDS.keys())[:islands]
     # founders (LHS from scratch) + lineage (mutations of seeds -> baseline genome = all-neutral)
-    neutral = dict(spring_F_lbfin=200., spring_R_lbfin=250., lever_scale_F=1.0, lever_scale_R=1.0,
-                   static_camber_F=-0.8, static_camber_R=-0.7, uca_in_dz_F_mm=0., uca_in_dz_R_mm=0.,
-                   lca_in_dz_F_mm=0., lca_in_dz_R_mm=0., tie_in_dz_mm=0.,
-                   uca_out_dz_F_mm=0., uca_out_dz_R_mm=0., uca_out_dy_F_mm=0.,
-                   push_out_scale_F=1.0, push_out_scale_R=1.0, rear_toe_dz_mm=0.)
+    neutral = {n: 0.0 for n, *_ in GENES}
+    neutral.update(spring_F_lbfin=200., spring_R_lbfin=250., static_camber_F=-0.8,
+                   static_camber_R=-0.7, final_drive_ratio=12.59, cg_z_mm=270.,
+                   lever_scale_F=1.0, lever_scale_R=1.0,
+                   arb_od_F_mm=12.7, arb_od_R_mm=12.7, arb_wall_F_mm=1.525, arb_wall_R_mm=1.525)
+    def temper(g):
+        """Founders: full-range on setup genes, half-range on geometry genes —
+        a uniform 100-D corner sample is almost always an unbuildable car."""
+        out = dict(g)
+        for n, lo, hi, k in GENES:
+            if n.startswith(('hp_', 'track_', 'wheelbase_')):
+                out[n] = _quant(n, neutral[n] + 0.5 * (g[n] - neutral[n]))
+        return out
     pops = {}
     for i, nm in enumerate(isl_names):
-        founders = lhs_genomes(pop // 2, rng)                       # from-scratch set
+        founders = [temper(g) for g in lhs_genomes(pop // 2, rng)]  # from-scratch set
         lineage = [mutate(neutral, rng, 0.12) for _ in range(pop - len(founders))]  # iterating set
         pops[nm] = founders + lineage
     pool = mp_.Pool(workers, initializer=_worker_init, initargs=(base_config,))
