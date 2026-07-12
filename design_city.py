@@ -36,6 +36,13 @@ GENES = [
     ('lca_in_dz_F_mm',   -10.0,   10.0,   'float'),
     ('lca_in_dz_R_mm',   -10.0,   10.0,   'float'),
     ('tie_in_dz_mm',      -6.0,    6.0,   'float'),   # front bump-steer knob
+    # v2 widening — outboard + actuation geometry (camber gain, KPI, caster, MR)
+    ('uca_out_dz_F_mm',  -10.0,   10.0,   'float'),   # front camber-gain / KPI knob
+    ('uca_out_dz_R_mm',  -10.0,   10.0,   'float'),
+    ('uca_out_dy_F_mm',   -8.0,    8.0,   'float'),   # front caster knob (+Y rearward = +caster)
+    ('push_out_scale_F',   0.90,   1.10,  'float'),   # pushrod outer along-arm position (MR knob)
+    ('push_out_scale_R',   0.90,   1.10,  'float'),
+    ('rear_toe_dz_mm',    -5.0,    5.0,   'float'),   # rear bump-steer/roll-steer knob
 ]
 
 ISLANDS = {   # objective personalities ("buildings"); weights over normalized metrics
@@ -117,9 +124,32 @@ def _apply(genome):
                         ('front_hp', 'lca_rear',  genome['lca_in_dz_F_mm']),
                         ('rear_hp',  'lca_front', genome['lca_in_dz_R_mm']),
                         ('rear_hp',  'lca_rear',  genome['lca_in_dz_R_mm']),
-                        ('front_hp', 'tie_rod_inner', genome['tie_in_dz_mm'])):
+                        ('front_hp', 'tie_rod_inner', genome['tie_in_dz_mm']),
+                        ('front_hp', 'uca_outer', genome['uca_out_dz_F_mm']),
+                        ('rear_hp',  'uca_outer', genome['uca_out_dz_R_mm']),
+                        ('rear_hp',  'tie_rod_inner', genome['rear_toe_dz_mm'])):
         d = getattr(w, '_' + hp)
         if key in d: d[key] = d[key] + np.array([0, 0, dz / 1000.0])
+    # caster knob: front upper BJ fore/aft (+Y rearward = +caster)
+    if 'uca_outer' in w._front_hp:
+        w._front_hp['uca_outer'] = w._front_hp['uca_outer'] + np.array(
+            [0, genome['uca_out_dy_F_mm'] / 1000.0, 0])
+    # MR knob: slide pushrod outer along its arm (anchor = the CLOSER outer BJ,
+    # so it works for both UCA- and LCA-mounted pushrods), then re-enforce
+    # rocker-plane coplanarity if the host provides it (the corner solver
+    # requires actuation points on the rocker plane).
+    for hp, s in (('_front_hp', genome['push_out_scale_F']),
+                  ('_rear_hp',  genome['push_out_scale_R'])):
+        d = getattr(w, hp)
+        if 'pushrod_outer' in d and 'lca_outer' in d and 'uca_outer' in d:
+            po = d['pushrod_outer']
+            anchor = d['lca_outer'] if (np.linalg.norm(po - d['lca_outer'])
+                                        <= np.linalg.norm(po - d['uca_outer'])) else d['uca_outer']
+            d['pushrod_outer'] = anchor + s * (po - anchor)
+    try:
+        w._enforce_actuation_coplanar()
+    except Exception:
+        pass
     # ARB lever scales
     for arb, s in ((w._front_arb, genome['lever_scale_F']), (w._rear_arb, genome['lever_scale_R'])):
         piv = np.asarray(arb['arb_pivot']); tip = np.asarray(arb['arb_arm_end'])
@@ -330,9 +360,12 @@ def fitness(M, weights):
     s = M['scores']
     return sum(weights[k] * s[k] for k in weights) - M['penalty']
 
-def dominates(a, b):
-    ka = (a['scores']['gmax'], a['scores']['margin'], a['scores']['feel'], a['scores']['endur'])
-    kb = (b['scores']['gmax'], b['scores']['margin'], b['scores']['feel'], b['scores']['endur'])
+def dominates(a, b, eps=0.03):
+    """Epsilon-dominance: scores are compared on an eps grid so the archive
+    stays a SHORT list of meaningfully-different designs (plain 4-objective
+    dominance kept ~90% of candidates — useless as a shortlist)."""
+    q = lambda s: tuple(round(s[k] / eps) for k in ('gmax', 'margin', 'feel', 'endur'))
+    ka, kb = q(a['scores']), q(b['scores'])
     return all(x >= y for x, y in zip(ka, kb)) and any(x > y for x, y in zip(ka, kb))
 
 def run_city(out_dir, base_config, seed_configs, islands, pop, gens, workers, seed=7):
@@ -343,7 +376,9 @@ def run_city(out_dir, base_config, seed_configs, islands, pop, gens, workers, se
     # founders (LHS from scratch) + lineage (mutations of seeds -> baseline genome = all-neutral)
     neutral = dict(spring_F_lbfin=200., spring_R_lbfin=250., lever_scale_F=1.0, lever_scale_R=1.0,
                    static_camber_F=-0.8, static_camber_R=-0.7, uca_in_dz_F_mm=0., uca_in_dz_R_mm=0.,
-                   lca_in_dz_F_mm=0., lca_in_dz_R_mm=0., tie_in_dz_mm=0.)
+                   lca_in_dz_F_mm=0., lca_in_dz_R_mm=0., tie_in_dz_mm=0.,
+                   uca_out_dz_F_mm=0., uca_out_dz_R_mm=0., uca_out_dy_F_mm=0.,
+                   push_out_scale_F=1.0, push_out_scale_R=1.0, rear_toe_dz_mm=0.)
     pops = {}
     for i, nm in enumerate(isl_names):
         founders = lhs_genomes(pop // 2, rng)                       # from-scratch set
@@ -392,6 +427,97 @@ def run_city(out_dir, base_config, seed_configs, islands, pop, gens, workers, se
     print('CITY DONE: %d Pareto survivors -> %s' % (len(archive), out_dir))
     return archive
 
+
+def lap_filter(out_dir, top_n=8):
+    """Final-stage product check: run the external lap sim on the best archive
+    members (per-island fitness leaders + overall) and write lap_s into their
+    metrics + city.json.  ~10-15 s per candidate, so archive-only by design."""
+    import subprocess
+    cj = os.path.join(out_dir, 'city.json')
+    city = json.load(open(cj))
+    arch = city.get('archive_metrics', [])
+    picks = {}
+    for nm, wts in ISLANDS.items():
+        ok = [m for m in arch if m.get('ok')]
+        if ok:
+            best = max(ok, key=lambda m: fitness(m, wts))
+            picks[best['id']] = best
+    for m in sorted([m for m in arch if m.get('ok')],
+                    key=lambda m: m.get('gmax', 0), reverse=True)[:top_n]:
+        picks[m['id']] = m
+    print('lap filter on %d candidates' % len(picks))
+    for cid, m in picks.items():
+        cfg = os.path.join(out_dir, cid, 'config.vahan')
+        if not os.path.exists(cfg): continue
+        try:
+            r = subprocess.run([sys.executable, 'DESIGN_2027/scripts/run_roselap.py', cfg],
+                               capture_output=True, text=True, timeout=300,
+                               env=dict(os.environ, QT_QPA_PLATFORM='offscreen'))
+            out = (r.stdout or '') + (r.stderr or '')
+            lap = None
+            for tok in out.replace('|', ' ').split():
+                pass
+            import re
+            mm = re.search(r'LAP\s+([0-9.]+)\s*s', out)
+            if mm: lap = float(mm.group(1))
+            m['lap_s'] = lap
+            mj = os.path.join(out_dir, cid, 'metrics.json')
+            mfull = json.load(open(mj)); mfull['lap_s'] = lap
+            json.dump(mfull, open(mj, 'w'), indent=1, default=str)
+            print('  %s -> lap %s s' % (cid, lap))
+        except Exception as e:
+            print('  %s lap FAIL %s' % (cid, str(e)[:80]))
+    json.dump(city, open(cj, 'w'), indent=1, default=str)
+
+
+def full_report(cand_dir, base_config=None):
+    """Binder-style figure set for ONE shortlisted candidate (on demand from
+    the GUI).  Writes report_*.png next to the card."""
+    _worker_init(os.path.join(cand_dir, 'config.vahan'))
+    np = _W['np']; w = _W['w']
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    BLUE='#0057B8'; RED='#D62828'; OCHRE='#E8A000'; BLACK='#222222'
+    plt.rcParams.update({'figure.dpi': 130, 'font.size': 8, 'axes.grid': True,
+                         'grid.alpha': 0.3, 'figure.autolayout': True})
+    ss = w._build_dynamics_solver(); v = ss._veh
+    t = np.linspace(-0.028, 0.028, 41)
+    kin = {}
+    for lbl in ('FL', 'RL'):
+        src = w._front_arb if lbl[0] == 'F' else w._rear_arb
+        kin[lbl] = w._do_sweep(w._solvers[lbl], t, 'left', arb_hp=src,
+                               is_front=lbl[0] == 'F', label=lbl)
+    x = t * 1000
+    def fig1():
+        fig, axs = plt.subplots(2, 3, figsize=(11, 6))
+        panels = [('toe', 'bump steer (deg)'), ('camber', 'camber (deg)'),
+                  ('caster', 'caster (deg)'), ('scrub', 'scrub (mm)'),
+                  ('motion_ratio', 'motion ratio'), ('rc_height', 'RC height (mm)')]
+        for ax, (k, ttl) in zip(axs.ravel(), panels):
+            for lbl, c in (('FL', BLUE), ('RL', RED)):
+                ax.plot(x, kin[lbl][k], color=c, label=lbl)
+            ax.set_title(ttl, fontsize=8); ax.legend(fontsize=6); ax.tick_params(labelsize=6)
+        fig.savefig(os.path.join(cand_dir, 'report_kinematics.png')); plt.close(fig)
+    def fig2():
+        sw = ss.sweep_lateral_g((0.0, 1.9), 21)
+        fig, axs = plt.subplots(2, 2, figsize=(9, 6))
+        g = sw['lateral_g']
+        axs[0,0].plot(g, sw['roll_angle_deg'], color=BLUE); axs[0,0].set_title('roll (deg) vs g', fontsize=8)
+        axs[0,1].plot(g, sw['understeer_gradient_deg'], color=RED); axs[0,1].axhline(0, ls='--', lw=0.7, color=BLACK)
+        axs[0,1].set_title('understeer gradient (deg)', fontsize=8)
+        for cn, cc in (('FL', BLUE), ('FR', RED), ('RL', OCHRE), ('RR', BLACK)):
+            axs[1,0].plot(g, sw['Fz_%s' % cn], color=cc, label=cn)
+        axs[1,0].set_title('per-corner Fz (N)', fontsize=8); axs[1,0].legend(fontsize=6)
+        ef = np.asarray(sw['elastic_lt_front_N']); gf = np.asarray(sw['geometric_lt_front_N'])
+        axs[1,1].stackplot(g, ef, gf, colors=[BLUE, RED], labels=['elastic', 'geometric'])
+        axs[1,1].set_title('front LT paths (N)', fontsize=8); axs[1,1].legend(fontsize=6)
+        for a in axs.ravel(): a.tick_params(labelsize=6)
+        fig.savefig(os.path.join(cand_dir, 'report_dynamics.png')); plt.close(fig)
+    fig1(); fig2()
+    print('report figures written ->', cand_dir)
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default='designs_city/run1')
@@ -401,5 +527,12 @@ if __name__ == '__main__':
     ap.add_argument('--gens', type=int, default=4)
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--seed', type=int, default=7)
+    ap.add_argument('--lap-top', type=int, default=0, help='after evolution, lap-sim the top N archive members')
+    ap.add_argument('--report', default=None, help='generate full report figures for one candidate dir and exit')
     a = ap.parse_args()
-    run_city(a.out, a.base, [], a.islands, a.pop, a.gens, a.workers, a.seed)
+    if a.report:
+        full_report(a.report)
+    else:
+        run_city(a.out, a.base, [], a.islands, a.pop, a.gens, a.workers, a.seed)
+        if a.lap_top > 0:
+            lap_filter(a.out, a.lap_top)

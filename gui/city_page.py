@@ -51,11 +51,13 @@ class _Detail(QDialog):
         # graphs full size
         sc = QScrollArea(); sc.setWidgetResizable(True)
         inner = QWidget(); il = QVBoxLayout(inner)
-        png = os.path.join(cdir, 'card.png')
-        if os.path.exists(png):
-            lbl = QLabel(); lbl.setPixmap(QPixmap(png).scaledToWidth(
-                900, Qt.TransformationMode.SmoothTransformation))
-            il.addWidget(lbl)
+        self._cdir = cdir; self._img_layout = il
+        for png in ([os.path.join(cdir, 'card.png')] +
+                    sorted(glob.glob(os.path.join(cdir, 'report_*.png')))):
+            if os.path.exists(png):
+                lbl = QLabel(); lbl.setPixmap(QPixmap(png).scaledToWidth(
+                    900, Qt.TransformationMode.SmoothTransformation))
+                il.addWidget(lbl)
         # metrics table
         tbl = QTableWidget()
         rows = [(k, v) for k, v in sorted(meta.items())
@@ -77,9 +79,25 @@ class _Detail(QDialog):
         openb = QPushButton('Open in Vahan (load this design)')
         openb.clicked.connect(self._open_in_vahan)
         bt.addWidget(openb)
+        repb = QPushButton('Generate full report')
+        repb.clicked.connect(self._gen_report)
+        bt.addWidget(repb)
         close = QPushButton('Close'); close.clicked.connect(self.accept)
         bt.addWidget(close)
         lay.addLayout(bt)
+
+    def _gen_report(self):
+        try:
+            r = subprocess.run([sys.executable, 'design_city.py', '--report', self._cdir],
+                               capture_output=True, text=True, timeout=300, cwd=os.getcwd())
+            for png in sorted(glob.glob(os.path.join(self._cdir, 'report_*.png'))):
+                lbl = QLabel(); lbl.setPixmap(QPixmap(png).scaledToWidth(
+                    900, Qt.TransformationMode.SmoothTransformation))
+                self._img_layout.addWidget(lbl)
+            if r.returncode != 0:
+                QMessageBox.warning(self, 'Report', (r.stderr or 'failed')[-400:])
+        except Exception as e:
+            QMessageBox.warning(self, 'Report failed', str(e))
 
     def _open_in_vahan(self):
         try:
