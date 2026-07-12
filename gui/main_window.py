@@ -2187,6 +2187,9 @@ class MainWindow(QMainWindow):
         lap_act = pm.addAction('Laptime')
         lap_act.setShortcut('Ctrl+2')
         lap_act.triggered.connect(lambda: self._switch_page(1))
+        city_act = pm.addAction('Design City')
+        city_act.setShortcut('Ctrl+3')
+        city_act.triggered.connect(lambda: self._switch_page(2))
 
         vm = mb.addMenu('View')
         hp_act = vm.addAction('All Hardpoints…')
@@ -3370,9 +3373,9 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _switch_page(self, idx: int):
-        """Page menu: 0 = Suspension, 1 = Laptime.  The Laptime page is built
-        lazily on first use (matplotlib canvas + track load)."""
-        if idx == 1 and self._pages.count() < 2:
+        """Page menu: 0 = Suspension, 1 = Laptime, 2 = Design City.  Pages 1
+        and 2 are built lazily on first use."""
+        if idx >= 1 and self._pages.count() < 2:
             try:
                 from gui.laptime_page import LaptimePage
                 self._laptime_page = LaptimePage(self)
@@ -3381,10 +3384,19 @@ class MainWindow(QMainWindow):
                 import traceback; traceback.print_exc()
                 self.statusBar().showMessage(f'Laptime page failed: {e}', 8000)
                 return
+        if idx >= 2 and self._pages.count() < 3:
+            try:
+                from gui.city_page import CityPage
+                self._city_page = CityPage(self)
+                self._pages.addWidget(self._city_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Design City page failed: {e}', 8000)
+                return
         if idx < self._pages.count():
             self._pages.setCurrentIndex(idx)
             self.statusBar().showMessage(
-                ('Suspension', 'Laptime')[idx] + ' page', 2000)
+                ('Suspension', 'Laptime', 'Design City')[idx] + ' page', 2000)
 
     def _build_ui(self):
         self._build_menu()

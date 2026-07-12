@@ -52,3 +52,6 @@ graphify-out/
 # It was untracked but NOT ignored — a public-repo push hazard — so ignore it
 # to match the rule. Remove this line if you deliberately publish a de-identified binder.
 BINDER/
+
+# Design-city population outputs (generated, design data not software)
+designs_city/
