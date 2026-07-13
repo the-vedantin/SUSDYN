@@ -480,6 +480,83 @@ def run_city(out_dir, base_config, seed_configs, islands, pop, gens, workers, se
     return archive
 
 
+def _rescore_one(args):
+    """Re-derive the DYNAMICS metrics of one existing candidate from its own
+    config file (tire-model/criterion fixes change limit-zone numbers, e.g.
+    the 2026-07-12 marginal-slope extrapolation).  Kinematic metrics are
+    unaffected by tire changes but the card is redrawn so its utilization
+    curve and number strip match."""
+    cand_dir = args
+    np = _W['np']; w = _W['w']
+    mj = os.path.join(cand_dir, 'metrics.json')
+    try:
+        M = json.load(open(mj))
+        w._load_project_from_path(os.path.join(cand_dir, 'config.vahan'))
+        w._rebuild_solvers(0.)
+        ss = w._build_dynamics_solver()
+        t = np.linspace(-0.028, 0.028, 29)
+        kin = {}
+        for lbl in ('FL', 'RL'):
+            src = w._front_arb if lbl[0] == 'F' else w._rear_arb
+            kin[lbl] = w._do_sweep(w._solvers[lbl], t, 'left', arb_hp=src,
+                                   is_front=lbl[0] == 'F', label=lbl)
+        r10 = ss.solve(1.0)
+        fa = r10.elastic_lt_front_N + r10.geometric_lt_front_N + r10.unsprung_lt_front_N
+        re_ = r10.elastic_lt_rear_N + r10.geometric_lt_rear_N + r10.unsprung_lt_rear_N
+        M['LLTD_F'] = 100 * fa / max(fa + re_, 1.)
+        M['roll_deg_g'] = r10.roll_angle_deg
+        lo_, hi_ = 0.5, 3.2
+        for _ in range(14):
+            mid = (lo_ + hi_) / 2
+            try:
+                u = ss.axle_utilization(ss.solve(mid))
+                lo_, hi_ = (mid, hi_) if max(u.values()) < 1.0 else (lo_, mid)
+            except Exception:
+                hi_ = mid
+        M['gmax'] = lo_
+        r15 = ss.solve(min(1.5, lo_ * 0.9)); u15 = ss.axle_utilization(r15)
+        M['margin'] = u15['R'] - u15['F']
+        M['first_axle'] = 'REAR' if M['margin'] > 0 else 'FRONT'
+        M['minFz_15'] = float(min(r15.Fz.values()))
+        M['scores'] = dict(gmax=(M['gmax'] - 1.6) / 0.6,
+                           margin=min(max(M['margin'], 0) / 0.12, 1.2),
+                           feel=M.get('scores', {}).get('feel', 0.5),
+                           endur=M.get('scores', {}).get('endur', 0.5))
+        M['rescored_v3_tire'] = True
+        _card(kin, ss, M, os.path.join(cand_dir, 'card.png'), np)
+        json.dump(M, open(mj, 'w'), indent=1, default=str)
+        return M
+    except Exception as e:
+        return {'id': os.path.basename(cand_dir), 'ok': False,
+                'error': 'rescore: %s' % str(e)[:150]}
+
+
+def rescore_run(run_dir, workers=5, base_config='configs/2027_v11_(raised_arb_free_springs).vahan'):
+    import multiprocessing as mp_
+    import glob as glob_
+    cands = sorted(os.path.dirname(p) for p in
+                   glob_.glob(os.path.join(run_dir, '*', 'metrics.json')))
+    if not cands:
+        print('no candidates in', run_dir); return
+    pool = mp_.Pool(workers, initializer=_worker_init, initargs=(base_config,))
+    res = pool.map(_rescore_one, cands)
+    pool.close(); pool.join()
+    ok = [m for m in res if m.get('ok')]
+    # rebuild the archive with the fresh scores
+    archive = []
+    for m in ok:
+        if m.get('penalty', 0) >= 5: continue
+        if not any(dominates(a, m) for a in archive):
+            archive = [a for a in archive if not dominates(m, a)] + [m]
+    cj = os.path.join(run_dir, 'city.json')
+    city = json.load(open(cj)) if os.path.exists(cj) else {}
+    city['archive'] = [m['id'] for m in archive]
+    city['archive_metrics'] = archive
+    city['rescored_v3_tire'] = True
+    json.dump(city, open(cj, 'w'), indent=1, default=str)
+    print('RESCORED %s: %d/%d ok, archive %d' % (run_dir, len(ok), len(res), len(archive)))
+
+
 def lap_filter(out_dir, top_n=8):
     """Final-stage product check: run the external lap sim on the best archive
     members (per-island fitness leaders + overall) and write lap_s into their
@@ -766,8 +843,11 @@ if __name__ == '__main__':
     ap.add_argument('--seed', type=int, default=7)
     ap.add_argument('--lap-top', type=int, default=0, help='after evolution, lap-sim the top N archive members')
     ap.add_argument('--report', default=None, help='generate full report figures for one candidate dir and exit')
+    ap.add_argument('--rescore', default=None, help='re-derive dynamics metrics of an existing run dir and exit')
     a = ap.parse_args()
-    if a.report:
+    if a.rescore:
+        rescore_run(a.rescore, workers=a.workers, base_config=a.base)
+    elif a.report:
         full_report(a.report)
     else:
         run_city(a.out, a.base, [], a.islands, a.pop, a.gens, a.workers, a.seed)
