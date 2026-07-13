@@ -199,18 +199,10 @@ def _apply(genome):
     w._rebuild_solvers(0.)
 
 def _axle_util(ss, r):
-    np = _W['np']; out = {}
-    for ax, (a, b) in (('F', ('FL', 'FR')), ('R', ('RL', 'RR'))):
-        dem = abs(r.Fy[a]) + abs(r.Fy[b]); cap = 0.
-        for c in (a, b):
-            fz = max(r.Fz[c], 0.)
-            t = ss._tire_for(c)
-            fr = t.fz_range() if callable(t.fz_range) else t.fz_range
-            lo = float(np.asarray(fr).ravel()[0])
-            mu = float(t.peak_mu(max(fz, lo), abs(r.camber.get(c, 0.)))) * ss._mu_scale
-            cap += mu * fz
-        out[ax] = dem / max(cap, 1.)
-    return out
+    """SINGLE MODEL: delegate to the canonical criterion in the solver.
+    (This used to be a local reimplementation — the exact duplicate-model
+    creep that let the aero solver ship a different limit metric.)"""
+    return ss.axle_utilization(r)
 
 def evaluate(args):
     """Full Thorough/Faults/Interference pipeline on one genome."""
@@ -652,17 +644,7 @@ def full_report(cand_dir, base_config=None):
         fig.savefig(os.path.join(cand_dir, 'report_model.png')); plt.close(fig)
 
     def axle_util(r):
-        out = {}
-        for ax_, (a, b) in (('F', ('FL','FR')), ('R', ('RL','RR'))):
-            dem = abs(r.Fy[a]) + abs(r.Fy[b]); cap = 0.
-            for cn in (a, b):
-                fz = max(r.Fz[cn], 0.)
-                tm_ = ss._tire_for(cn)
-                fr = tm_.fz_range() if callable(tm_.fz_range) else tm_.fz_range
-                lo = float(np.asarray(fr).ravel()[0])
-                cap += float(tm_.peak_mu(max(fz, lo), abs(r.camber.get(cn, 0.)))) * ss._mu_scale * fz
-            out[ax_] = dem / max(cap, 1.)
-        return out
+        return ss.axle_utilization(r)   # SINGLE MODEL: canonical criterion
 
     def fig_gg():
         fig, ax = plt.subplots(figsize=(5.5, 5))

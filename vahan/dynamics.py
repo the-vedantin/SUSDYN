@@ -1849,6 +1849,41 @@ class SteadyStateSolver:
 
     # ── Internals ────────────────────────────────────────────────────────
 
+    def axle_utilization(self, result: 'SteadyStateResult') -> dict:
+        """CANONICAL grip-limit criterion: per-AXLE aggregate utilization.
+
+            util_axle = (sum of demanded planar tire force on the axle)
+                        / (sum of mu(Fz, camber) * mu_scale * Fz on the axle)
+
+        Per-corner MAX utilization is NOT a limit criterion: at high lateral g
+        the unloaded inner tire sits below the tire-data floor where its
+        utilization is an interpolation artifact (2026-07-11 refuter finding
+        — it produced fake grip 'collapses' and a 6 kN downforce-required
+        plateau).  An axle with an LSD works as a pair, so the pair budget is
+        the physical limit.  Uses the SAME floor-clamped, belt->track-scaled
+        mu path as the solve() grip budget so every consumer (G-G, aero
+        solver, design-city, reports) shares ONE definition — the single-model
+        rule applied to the limit metric itself.
+        """
+        out = {}
+        for ax, pair in (('F', ('FL', 'FR')), ('R', ('RL', 'RR'))):
+            dem = 0.0
+            cap = 0.0
+            for c in pair:
+                fy = abs(float(result.Fy.get(c, 0.0))) if result.Fy else 0.0
+                fx = abs(float(result.Fx.get(c, 0.0))) if result.Fx else 0.0
+                dem += float(np.hypot(fy, fx))
+                fz = max(float(result.Fz.get(c, 0.0)), 0.0)
+                tire = self._tire_for(c)
+                if tire is None:
+                    continue
+                fz_lo = float(np.asarray(tire.fz_range).ravel()[0])
+                mu = float(tire.peak_mu(max(fz, fz_lo),
+                                        abs(result.camber.get(c, 0.0))))
+                cap += mu * self._mu_scale * fz
+            out[ax] = dem / max(cap, 1e-6)
+        return out
+
     def _clamp_and_renormalize_fz(self, Fz: dict, W_total: float) -> dict:
         """
         Enforce physically plausible normal loads (no tension on the ground).
@@ -2648,70 +2683,76 @@ class AeroDownforceSolver:
               target_util: float = 0.80,
               max_total_downforce_N: float = 12000.0,
               max_iter: int = 60) -> AeroResult:
+        """Downforce required per AXLE to bring the axle-aggregate utilization
+        down to ``target_util`` at the given g-state.
 
-        tire = self._ss._tire
-        if tire is None:
+        REWRITTEN 2026-07-12 after the '6 kN cap gang' finding.  The old
+        implementation had three defects that produced a 6000 N plateau:
+        (1) it targeted PER-CORNER utilization, so the unloaded inner tire
+        (below the tire-data floor = interpolation-artifact zone) demanded
+        infinite help and slammed each corner into its 3000 N cap;
+        (2) it used RAW belt mu with no belt->track scale, disagreeing with
+        the steady-state solver's own grip budget inside one tool;
+        (3) it sized downforce per individual corner — a wing cannot push on
+        one wheel; aero loads an axle symmetrically.
+        Now: per-axle bisection on symmetric axle downforce, judged by the
+        canonical SteadyStateSolver.axle_utilization (mu-scaled), with the
+        steady state RE-SOLVED at each step so load transfer and camber react
+        to the added load.
+        """
+        ss = self._ss
+        if ss._tire is None:
             raise ValueError('Tire model required for aero solver')
-
-        D_cap = float(max(max_total_downforce_N, 100.0)) / 4.0
-        base = self._ss.solve(lateral_g, longitudinal_g)
-        fz_data_min = float(tire.fz_range[0])
-
-        def _grip(fz_n, cam):
-            fz_n = max(float(fz_n), 0.01)
-            mu = float(tire.peak_mu(max(fz_n, fz_data_min), cam))
-            return mu * fz_n
 
         result = AeroResult(lateral_g=lateral_g,
                             longitudinal_g=longitudinal_g,
                             target_util=target_util)
+        D_axle_cap = float(max(max_total_downforce_N, 100.0)) / 2.0
+        pair = {'F': ('FL', 'FR'), 'R': ('RL', 'RR')}
 
+        def aero_fz(dF, dR):
+            return {'FL': dF / 2, 'FR': dF / 2, 'RL': dR / 2, 'RR': dR / 2}
+
+        base = ss.solve(lateral_g, longitudinal_g)
+        u0 = ss.axle_utilization(base)
+        need = {'F': 0.0, 'R': 0.0}
+        for ax in ('F', 'R'):
+            if u0[ax] <= target_util + 1e-9:
+                continue
+            # feasibility at the cap first
+            def _u_at(d):
+                r = ss.solve(lateral_g, longitudinal_g,
+                             aero_Fz=aero_fz(d if ax == 'F' else need['F'],
+                                             d if ax == 'R' else need['R']))
+                return ss.axle_utilization(r)[ax]
+            if _u_at(D_axle_cap) > target_util:
+                need[ax] = D_axle_cap
+                result.capped.extend(pair[ax])
+                continue
+            lo, hi = 0.0, D_axle_cap
+            for _ in range(max_iter):
+                mid = 0.5 * (lo + hi)
+                if _u_at(mid) <= target_util:
+                    hi = mid
+                else:
+                    lo = mid
+                if hi - lo < 20.0:      # N — aero packages aren't built to 0.1 N
+                    break
+            need[ax] = hi
+
+        # final combined state for reporting (per-corner utils are DISPLAY
+        # values; the limit criterion is the axle aggregate)
+        final = ss.solve(lateral_g, longitudinal_g,
+                         aero_Fz=aero_fz(need['F'], need['R']))
         for lbl in ('FL', 'FR', 'RL', 'RR'):
-            fz0 = base.Fz.get(lbl, 0.0)
-            cam = abs(base.camber.get(lbl, 0.0))
-            fy_d = abs(base.Fy.get(lbl, 0.0))
-            fx_d = abs(base.Fx.get(lbl, 0.0))
-            demand = np.sqrt(fy_d ** 2 + fx_d ** 2)
+            result.downforce[lbl] = need[lbl[0]] / 2.0
+            result.utilization_aero[lbl] = float(final.utilization.get(lbl, 0.0))
 
-            base_grip = _grip(fz0, cam)
-            base_util = demand / base_grip if base_grip > 0 else 1e9
-
-            if base_util <= target_util + 1e-9:
-                dFz = 0.0
-            else:
-                lo, hi = 0.0, D_cap
-                for _ in range(max_iter):
-                    mid = 0.5 * (lo + hi)
-                    g = _grip(fz0 + mid, cam)
-                    u = demand / g if g > 0 else 1e9
-                    if u <= target_util:
-                        hi = mid
-                    else:
-                        lo = mid
-                    if hi - lo < 0.1:
-                        break
-                dFz = hi
-
-            result.downforce[lbl] = dFz
-            fz_new = max(fz0 + dFz, 0.01)
-            g_after = _grip(fz_new, cam)
-            result.utilization_aero[lbl] = demand / g_after if g_after > 0 else 1e9
-            if result.utilization_aero[lbl] > target_util + 0.02:
-                result.capped.append(lbl)
-
-        # Axle-level: size to the worse corner per axle
-        front_need = max(result.downforce.get('FL', 0),
-                         result.downforce.get('FR', 0))
-        rear_need  = max(result.downforce.get('RL', 0),
-                         result.downforce.get('RR', 0))
-        total = front_need + rear_need
-
-        result.front_axle_need_N = front_need
-        result.rear_axle_need_N  = rear_need
-        result.total_downforce_N = total
+        result.front_axle_need_N = need['F']
+        result.rear_axle_need_N = need['R']
+        result.total_downforce_N = need['F'] + need['R']
         result.rear_aero_bias_pct = (
-            rear_need / total * 100.0) if total > 0 else 50.0
-
+            need['R'] / result.total_downforce_N * 100.0) if result.total_downforce_N > 0 else 50.0
         return result
 
     def sweep(self, g_range: np.ndarray,

@@ -420,21 +420,29 @@ class TireModel:
         mu = np.where(fz > 1.0, peak / np.maximum(fz, 1.0), 0.0)
         over = fz > fz_max
         if np.any(over):
-            mu_at_max = float(self.peak_Fy(fz_max, camber_deg)) / fz_max
-            # local mu(Fz) slope at the edge of the data (last grid segment)
-            slope = 0.0
-            if len(self._fz_axis) >= 2:
-                f_prev = float(self._fz_axis[-2])
-                mu_prev = float(self.peak_Fy(f_prev, camber_deg)) / f_prev
-                slope = (mu_at_max - mu_prev) / max(fz_max - f_prev, 1e-6)
-                slope = min(slope, 0.0)        # mu never RISES beyond data
-            mu_lin = mu_at_max + slope * (fz - fz_max)
-            mu_lin = np.maximum(mu_lin, 0.3)   # rubber sliding-friction floor
-            # grip-force ceiling: Fy never exceeds the peak measured force
-            Fy_peak = float(np.max([self.peak_Fy(f, camber_deg)
-                                    for f in self._fz_axis]))
-            mu_cap = Fy_peak / np.maximum(fz, 1.0)
-            mu = np.where(over, np.minimum(mu_lin, mu_cap), mu)
+            # MARGINAL-SLOPE extrapolation (2026-07-12, replaces the hard
+            # grip-FORCE ceiling).  History of this guard, because it keeps
+            # oscillating: v1 floored mu at a constant -> grip force RE-ROSE
+            # with load ("more load -> more grip", unphysical).  v2 capped
+            # grip force at the max measured Fy -> ZERO marginal grip beyond
+            # the data ceiling, so added load (aero!) bought nothing and the
+            # aero-required solver slammed into its cap (the 6 kN plateau).
+            # Both extremes are wrong: measured load sensitivity means
+            # DIMINISHING marginal grip, not zero and not constant mu.
+            # v3: continue Fy_peak(Fz) beyond the ceiling at the MEASURED
+            # marginal slope of the top ~40% of the load grid (robust secant
+            # on the smoothed peak grid), held constant.  mu then decays
+            # hyperbolically toward that slope — load sensitivity preserved,
+            # no zero-cliff, no runaway.  Floor mu at 0.3 (sliding rubber).
+            fy_at_max = float(self.peak_Fy(fz_max, camber_deg))
+            i_lo = max(0, int(0.6 * (len(self._fz_axis) - 1)))
+            f_lo = float(self._fz_axis[i_lo])
+            fy_lo = float(self.peak_Fy(f_lo, camber_deg))
+            m_top = (fy_at_max - fy_lo) / max(fz_max - f_lo, 1e-6)
+            m_top = float(np.clip(m_top, 0.0, fy_at_max / fz_max))
+            fy_ext = fy_at_max + m_top * (fz - fz_max)
+            mu_ext = np.maximum(fy_ext / np.maximum(fz, 1.0), 0.3)
+            mu = np.where(over, mu_ext, mu)
         return mu.squeeze()
 
     def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0):

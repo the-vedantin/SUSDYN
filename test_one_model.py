@@ -217,6 +217,44 @@ if _tm is not None:
 else:
     print('tire camber rows : no TTC file on this machine — skipped (data-dependent check)')
 
+# ── AERO SOLVER SANITY ('6 kN cap gang', 2026-07-12): the old aero solver
+#    targeted PER-CORNER utilization with unscaled belt mu, so past the grip
+#    limit the artifact-pinned inner tires slammed every corner into its
+#    3000 N cap -> a fake 6000 N downforce-required plateau.  Guard: at
+#    (mechanical limit + 0.1 g) the required downforce is finite, sane
+#    (< 2000 N), NOT the cap signature; below the limit it is exactly 0.
+#    Also guards that the canonical axle_utilization criterion exists.
+print('-' * 64)
+if _tm is not None:
+    try:
+        _ss = win._build_dynamics_solver()
+        _r10 = _ss.solve(1.0)
+        _au = _ss.axle_utilization(_r10)
+        au_ok = all(0.0 < _au[k] < 2.0 for k in ('F', 'R'))
+        _lo, _hi = 0.5, 3.0
+        for _ in range(12):
+            _mid = (_lo + _hi) / 2
+            try:
+                _u = _ss.axle_utilization(_ss.solve(_mid))
+                _lo, _hi = (_mid, _hi) if max(_u.values()) < 1.0 else (_lo, _mid)
+            except Exception:
+                _hi = _mid
+        from vahan.dynamics import AeroDownforceSolver
+        _aero = AeroDownforceSolver(_ss)
+        _below = _aero.solve(max(_lo - 0.2, 0.3), target_util=1.0).total_downforce_N
+        _above = _aero.solve(_lo + 0.1, target_util=1.0).total_downforce_N
+        aero_ok = (au_ok and _below == 0.0 and 0.0 < _above < 2000.0)
+        if not aero_ok:
+            fails += 1
+        print(f'aero DF sanity   : axle_util F/R={_au["F"]:.2f}/{_au["R"]:.2f}  gmax~{_lo:.2f}  '
+              f'DF(below)={_below:.0f}N DF(limit+0.1g)={_above:.0f}N   '
+              f'{"pass" if aero_ok else "UNEXPECTED FAIL (cap-gang regression)"}')
+    except Exception as _e:
+        fails += 1
+        print(f'aero DF sanity   : UNEXPECTED FAIL ({_e})')
+else:
+    print('aero DF sanity   : no TTC file — skipped')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)
