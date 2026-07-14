@@ -72,10 +72,12 @@ def _build_genes():
 GENES = _build_genes()
 
 ISLANDS = {   # objective personalities ("buildings"); weights over normalized metrics
-    'grip':      dict(gmax=3.0, margin=0.5, feel=0.5, endur=0.5),
-    'rotation':  dict(gmax=1.0, margin=3.0, feel=0.5, endur=0.5),
-    'endurance': dict(gmax=1.0, margin=0.8, feel=0.5, endur=3.0),
-    'balanced':  dict(gmax=1.5, margin=1.5, feel=1.5, endur=1.0),
+    # 'aero' score = balance CONSISTENCY under the prospective 350 N package
+    # at weight-split CoP: a car whose rear-first character survives aero.
+    'grip':      dict(gmax=3.0, margin=0.5, feel=0.5, endur=0.5, aero=0.5),
+    'rotation':  dict(gmax=1.0, margin=3.0, feel=0.5, endur=0.5, aero=1.0),
+    'endurance': dict(gmax=1.0, margin=0.8, feel=0.5, endur=3.0, aero=1.0),
+    'balanced':  dict(gmax=1.5, margin=1.5, feel=1.5, endur=1.0, aero=1.5),
 }
 
 def _quant(name, val):
@@ -253,6 +255,22 @@ def evaluate(args):
         M['margin'] = u15['R'] - u15['F']
         M['first_axle'] = 'REAR' if M['margin'] > 0 else 'FRONT'
         M['minFz_15'] = float(min(r15.Fz.values()))
+        # AERO CASE: prospective 350 N package at weight-split CoP (honest band
+        # centre — the neutral point is not determinable from the tire data).
+        wfrac = v.front_weight_fraction
+        AF = {'FL': 350*wfrac/2, 'FR': 350*wfrac/2, 'RL': 350*(1-wfrac)/2, 'RR': 350*(1-wfrac)/2}
+        la, ha = 0.5, 3.4
+        for _ in range(12):
+            mid = (la + ha) / 2
+            try:
+                u = _axle_util(ss, ss.solve(mid, aero_Fz=AF))
+                la, ha = (mid, ha) if max(u.values()) < 1.0 else (la, mid)
+            except Exception:
+                ha = mid
+        M['gmax_aero'] = la
+        ua = _axle_util(ss, ss.solve(min(1.5, la * 0.9), aero_Fz=AF))
+        M['margin_aero'] = ua['R'] - ua['F']
+        M['first_axle_aero'] = 'REAR' if M['margin_aero'] > 0 else 'FRONT'
         # frequencies + sag
         mF = v.sprung_mass_kg * v.front_weight_fraction / 2
         mR = v.sprung_mass_kg * v.rear_weight_fraction / 2
@@ -282,8 +300,14 @@ def evaluate(args):
         if ssf < 1.8: pen += 3.               # rollover margin guard (tilt 1.7g + margin)
         feel = 1.0 - min(M['bump_steer_F']/0.3, 1) * 0.5 - min(abs(M['scrub_F'])/30, 1) * 0.5
         endur = 1.0 - min(max(M['rc_F'], M['rc_R'], 0)/80, 1)*0.5 - min(M['roll_deg_g']/1.5, 1)*0.5
+        # aero score: character survives the package (rear-first held, margin
+        # shift small); a flip to FRONT-first under aero is aero-induced push.
+        if M['first_axle_aero'] == 'FRONT' and M['first_axle'] == 'REAR':
+            pen += 1.5
+        aero_sc = (1.0 - min(abs(M['margin_aero'] - M['margin'])/0.05, 1) * 0.5
+                   + (0.5 if M['first_axle_aero'] == 'REAR' else 0.0))
         M['scores'] = dict(gmax=(M['gmax']-1.6)/0.6, margin=min(max(M['margin'],0)/0.12,1.2),
-                           feel=feel, endur=endur)
+                           feel=feel, endur=endur, aero=aero_sc)
         M['penalty'] = pen
         # write artifacts
         cdir = os.path.join(out_dir, cand_id); os.makedirs(cdir, exist_ok=True)
@@ -402,13 +426,15 @@ def _card(kin, ss, M, path, np):
 def fitness(M, weights):
     if not M.get('ok'): return -99.
     s = M['scores']
-    return sum(weights[k] * s[k] for k in weights) - M['penalty']
+    return sum(w * s.get(k, 0.5) for k, w in weights.items()) - M['penalty']
 
 def dominates(a, b, eps=0.03):
     """Epsilon-dominance: scores are compared on an eps grid so the archive
-    stays a SHORT list of meaningfully-different designs (plain 4-objective
-    dominance kept ~90% of candidates — useless as a shortlist)."""
-    q = lambda s: tuple(round(s[k] / eps) for k in ('gmax', 'margin', 'feel', 'endur'))
+    stays a SHORT list of meaningfully-different designs (plain multi-objective
+    dominance kept ~90% of candidates — useless as a shortlist).  .get(...,0.5)
+    keeps pre-aero-era archives loadable."""
+    KEYS = ('gmax', 'margin', 'feel', 'endur', 'aero')
+    q = lambda s: tuple(round(s.get(k, 0.5) / eps) for k in KEYS)
     ka, kb = q(a['scores']), q(b['scores'])
     return all(x >= y for x, y in zip(ka, kb)) and any(x > y for x, y in zip(ka, kb))
 
@@ -724,22 +750,30 @@ def full_report(cand_dir, base_config=None):
         return ss.axle_utilization(r)   # SINGLE MODEL: canonical criterion
 
     def fig_gg():
+        """Paired envelopes: mechanical AND with the prospective 350 N package
+        at weight-split CoP — the aero/non-aero flagship comparison."""
         fig, ax = plt.subplots(figsize=(5.5, 5))
-        lons = np.linspace(-1.5, 1.1, 12); lats = []
-        for lon in lons:
-            lo_, hi_ = 0.2, 2.6
-            for _ in range(9):
-                mid = (lo_ + hi_) / 2
-                try:
-                    u = axle_util(ss.solve(mid, float(lon)))
-                    lo_, hi_ = (mid, hi_) if max(u.values()) < 1.0 else (lo_, mid)
-                except Exception: hi_ = mid
-            lats.append(lo_)
-        lats = np.asarray(lats)
-        ax.plot(lats, lons, color=BLUE); ax.plot(-lats, lons, color=BLUE)
+        wfrac = v.front_weight_fraction
+        AF = {'FL': 350*wfrac/2, 'FR': 350*wfrac/2,
+              'RL': 350*(1-wfrac)/2, 'RR': 350*(1-wfrac)/2}
+        for tag, af, c in (('mechanical', None, BLUE), ('with 350 N aero', AF, RED)):
+            lons = np.linspace(-1.5, 1.1, 12); lats = []
+            for lon in lons:
+                lo_, hi_ = 0.2, 3.2
+                for _ in range(9):
+                    mid = (lo_ + hi_) / 2
+                    try:
+                        u = axle_util(ss.solve(mid, float(lon), aero_Fz=af))
+                        lo_, hi_ = (mid, hi_) if max(u.values()) < 1.0 else (lo_, mid)
+                    except Exception: hi_ = mid
+                lats.append(lo_)
+            lats = np.asarray(lats)
+            ax.plot(lats, lons, color=c, label=tag); ax.plot(-lats, lons, color=c)
         ax.axhline(0, color=BLACK, lw=0.5); ax.axvline(0, color=BLACK, lw=0.5)
         ax.set_xlabel('lateral g'); ax.set_ylabel('longitudinal g (+accel)')
-        ax.set_title('G-G envelope (axle-aggregate limit, no aero)', fontsize=9)
+        ax.set_title('G-G envelope — mechanical vs 350 N aero (weight-split CoP)\n'
+                     'axle-aggregate limit; >1139 N zone = extrapolation band', fontsize=8)
+        ax.legend(fontsize=7)
         fig.savefig(os.path.join(cand_dir, 'report_gg.png')); plt.close(fig)
 
     def fig_tireutil():
