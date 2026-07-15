@@ -251,10 +251,20 @@ def evaluate(args):
             except Exception:
                 hi_ = mid
         M['gmax'] = lo_
-        r15 = ss.solve(min(1.5, lo_ * 0.9)); u15 = _axle_util(ss, r15)
-        M['margin'] = u15['R'] - u15['F']
-        M['first_axle'] = 'REAR' if M['margin'] > 0 else 'FRONT'
+        # TERMINAL balance = which axle saturates FIRST at the actual limit
+        # (the oversteer philosophy is about limit behaviour).  The champion
+        # pipeline (2026-07-12) caught that sampling at a fixed 1.5 g mislabels
+        # cars that rotate in the linear range but understeer at the limit, so
+        # first_axle is now determined AT the limit; margin_15 keeps the
+        # linear-range rotation signal separately.
+        ulim = _axle_util(ss, ss.solve(lo_ * 0.999))
+        M['margin_limit'] = ulim['R'] - ulim['F']
+        M['first_axle'] = 'REAR' if M['margin_limit'] > 0 else 'FRONT'
+        r15 = ss.solve(1.5); u15 = _axle_util(ss, r15)
+        M['margin'] = u15['R'] - u15['F']          # 1.5 g = linear-range rotation
         M['minFz_15'] = float(min(r15.Fz.values()))
+        if M['first_axle'] == 'FRONT':
+            pen += 1.0                              # terminal understeer violates the oversteer goal
         # AERO CASE: prospective 350 N package at weight-split CoP (honest band
         # centre — the neutral point is not determinable from the tire data).
         wfrac = v.front_weight_fraction
@@ -268,9 +278,11 @@ def evaluate(args):
             except Exception:
                 ha = mid
         M['gmax_aero'] = la
-        ua = _axle_util(ss, ss.solve(min(1.5, la * 0.9), aero_Fz=AF))
-        M['margin_aero'] = ua['R'] - ua['F']
-        M['first_axle_aero'] = 'REAR' if M['margin_aero'] > 0 else 'FRONT'
+        ualim = _axle_util(ss, ss.solve(la * 0.999, aero_Fz=AF))
+        M['margin_aero_limit'] = ualim['R'] - ualim['F']
+        M['first_axle_aero'] = 'REAR' if M['margin_aero_limit'] > 0 else 'FRONT'
+        ua15 = _axle_util(ss, ss.solve(1.5, aero_Fz=AF))
+        M['margin_aero'] = ua15['R'] - ua15['F']
         # frequencies + sag
         mF = v.sprung_mass_kg * v.front_weight_fraction / 2
         mR = v.sprung_mass_kg * v.rear_weight_fraction / 2
@@ -540,9 +552,11 @@ def _rescore_one(args):
             except Exception:
                 hi_ = mid
         M['gmax'] = lo_
-        r15 = ss.solve(min(1.5, lo_ * 0.9)); u15 = ss.axle_utilization(r15)
+        ulim = ss.axle_utilization(ss.solve(lo_ * 0.999))
+        M['margin_limit'] = ulim['R'] - ulim['F']
+        M['first_axle'] = 'REAR' if M['margin_limit'] > 0 else 'FRONT'
+        r15 = ss.solve(1.5); u15 = ss.axle_utilization(r15)
         M['margin'] = u15['R'] - u15['F']
-        M['first_axle'] = 'REAR' if M['margin'] > 0 else 'FRONT'
         M['minFz_15'] = float(min(r15.Fz.values()))
         M['scores'] = dict(gmax=(M['gmax'] - 1.6) / 0.6,
                            margin=min(max(M['margin'], 0) / 0.12, 1.2),
