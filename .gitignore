@@ -55,3 +55,6 @@ BINDER/
 
 # Design-city population outputs (generated, design data not software)
 designs_city/
+
+# Local launcher (machine-specific interpreter path)
+run.bat

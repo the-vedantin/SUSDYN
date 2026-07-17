@@ -74,10 +74,14 @@ GENES = _build_genes()
 ISLANDS = {   # objective personalities ("buildings"); weights over normalized metrics
     # 'aero' score = balance CONSISTENCY under the prospective 350 N package
     # at weight-split CoP: a car whose rear-first character survives aero.
-    'grip':      dict(gmax=3.0, margin=0.5, feel=0.5, endur=0.5, aero=0.5),
-    'rotation':  dict(gmax=1.0, margin=3.0, feel=0.5, endur=0.5, aero=1.0),
-    'endurance': dict(gmax=1.0, margin=0.8, feel=0.5, endur=3.0, aero=1.0),
-    'balanced':  dict(gmax=1.5, margin=1.5, feel=1.5, endur=1.0, aero=1.5),
+    # 'loads' score = pushrod force amplification (force-transfer quality);
+    # the city trades it against motion ratio/springs, which a post-hoc
+    # local optimizer cannot (MR pinned by spring sizing).
+    'grip':      dict(gmax=3.0, margin=0.5, feel=0.5, endur=0.5, aero=0.5, loads=0.5),
+    'rotation':  dict(gmax=1.0, margin=3.0, feel=0.5, endur=0.5, aero=1.0, loads=0.5),
+    'endurance': dict(gmax=1.0, margin=0.8, feel=0.5, endur=3.0, aero=1.0, loads=1.0),
+    'balanced':  dict(gmax=1.5, margin=1.5, feel=1.5, endur=1.0, aero=1.5, loads=1.0),
+    'loads':     dict(gmax=1.0, margin=0.8, feel=1.0, endur=0.5, aero=0.5, loads=3.0),
 }
 
 def _quant(name, val):
@@ -292,6 +296,19 @@ def evaluate(args):
         M['dsag_R'] = float(mR*9.80665/v.ride_rate_rear_Npm*1000*v.motion_ratio_rear)
         # interference (quick: RL + FL at 3 travels, key pairs)
         M['clearance_mm'] = _clearance(w, np)
+        # FORCE TRANSFER (loads): true pushrod force amplification per axle
+        # (virtual work; includes both off-tangency and attachment radius).
+        # This is where the loads optimum is actually reachable — the city
+        # has springs free, so it can trade motion ratio against member
+        # loads; a local post-optimizer with MR pinned cannot (2026-07-13).
+        try:
+            from vahan.force_opt import force_amplification
+            M['amp_F'] = float(np.nanmean([force_amplification(w, 'FL', z)
+                                           for z in (-0.02, 0.0, 0.02)]))
+            M['amp_R'] = float(np.nanmean([force_amplification(w, 'RL', z)
+                                           for z in (-0.02, 0.0, 0.02)]))
+        except Exception:
+            M['amp_F'] = M['amp_R'] = float('nan')
         M['ok'] = all(np.isfinite([M['gmax'], M['margin'], M['LLTD_F'], M['bump_steer_F']]))
         # scores (normalized 0..1-ish) + penalties
         pen = 0.
@@ -318,8 +335,13 @@ def evaluate(args):
             pen += 1.5
         aero_sc = (1.0 - min(abs(M['margin_aero'] - M['margin'])/0.05, 1) * 0.5
                    + (0.5 if M['first_axle_aero'] == 'REAR' else 0.0))
+        # loads score: lower pushrod force amplification = lighter members,
+        # less compliance. Normalized around the champion-era baseline
+        # (F 1.7 / R 1.5); nan-safe for legacy candidates.
+        amps = [a for a in (M.get('amp_F'), M.get('amp_R')) if a and np.isfinite(a)]
+        loads_sc = 1.0 - min(max((np.mean(amps) - 1.2) / 0.8, 0), 1.2) if amps else 0.5
         M['scores'] = dict(gmax=(M['gmax']-1.6)/0.6, margin=min(max(M['margin'],0)/0.12,1.2),
-                           feel=feel, endur=endur, aero=aero_sc)
+                           feel=feel, endur=endur, aero=aero_sc, loads=loads_sc)
         M['penalty'] = pen
         # write artifacts
         cdir = os.path.join(out_dir, cand_id); os.makedirs(cdir, exist_ok=True)
@@ -445,7 +467,7 @@ def dominates(a, b, eps=0.03):
     stays a SHORT list of meaningfully-different designs (plain multi-objective
     dominance kept ~90% of candidates — useless as a shortlist).  .get(...,0.5)
     keeps pre-aero-era archives loadable."""
-    KEYS = ('gmax', 'margin', 'feel', 'endur', 'aero')
+    KEYS = ('gmax', 'margin', 'feel', 'endur', 'aero', 'loads')
     q = lambda s: tuple(round(s.get(k, 0.5) / eps) for k in KEYS)
     ka, kb = q(a['scores']), q(b['scores'])
     return all(x >= y for x, y in zip(ka, kb)) and any(x > y for x, y in zip(ka, kb))

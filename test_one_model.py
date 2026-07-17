@@ -255,6 +255,23 @@ if _tm is not None:
 else:
     print('aero DF sanity   : no TTC file — skipped')
 
+# ── FORCE-TRANSFER METRICS (vahan/force_opt.py): pushrod off-tangency and
+#    the virtual-work force amplification must be finite and sane on the
+#    default car (guards the loads objective used by design_city).
+print('-' * 64)
+try:
+    from vahan.force_opt import tangency_deg, force_amplification
+    _th = tangency_deg(win, 'FL', 0.0)
+    _am = force_amplification(win, 'FL', 0.0)
+    ft_ok = (np.isfinite(_th) and 0.0 <= _th < 90.0 and np.isfinite(_am) and 0.5 < _am < 5.0)
+    if not ft_ok:
+        fails += 1
+    print(f'force transfer   : FL off-tangency {_th:.1f} deg, F_pr/F_wheel {_am:.2f}   '
+          f'{"pass" if ft_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'force transfer   : UNEXPECTED FAIL ({_e})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)
