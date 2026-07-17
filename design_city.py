@@ -296,6 +296,38 @@ def evaluate(args):
         M['dsag_R'] = float(mR*9.80665/v.ride_rate_rear_Npm*1000*v.motion_ratio_rear)
         # interference (quick: RL + FL at 3 travels, key pairs)
         M['clearance_mm'] = _clearance(w, np)
+        # NARNIA GUARD (user catch 2026-07-13): a near-zero RC reached via
+        # near-parallel arms makes the axle roll centre ILL-DEFINED — its
+        # height churns tens of mm and its lateral position wanders metres
+        # during roll, so the geometric/elastic split is inconsistent
+        # mid-corner (v12 champion: 73 mm height / 7.3 m lateral vs v11's
+        # 2.8 mm / 0.5 m).  Measure axle-RC migration over +-1.5 deg roll.
+        try:
+            from gui.main_window import _intersect_2d
+            th_ = w._front_hp['wheel_center'][0]
+            for axname, (L_, R_) in (('F', ('FL', 'FR')), ('R', ('RL', 'RR'))):
+                zs = []
+                for adeg in (-1.5, 0.0, 1.5):
+                    tv = float(np.sin(np.radians(adeg)) * th_)
+                    try:
+                        sL = w._solvers[L_].solve(tv); sR = w._solvers[R_].solve(-tv)
+                    except Exception:
+                        continue
+                    def icfv(s):
+                        u_in = np.array([(s.uca_front[0]+s.uca_rear[0])/2, (s.uca_front[2]+s.uca_rear[2])/2])
+                        l_in = np.array([(s.lca_front[0]+s.lca_rear[0])/2, (s.lca_front[2]+s.lca_rear[2])/2])
+                        return _intersect_2d(u_in, np.array([s.uca_outer[0], s.uca_outer[2]]),
+                                             l_in, np.array([s.lca_outer[0], s.lca_outer[2]]))
+                    iL, iR = icfv(sL), icfv(sR)
+                    if iL is None or iR is None:
+                        continue
+                    p = _intersect_2d(iL, np.array([sL.wheel_center[0], 0.]),
+                                      iR, np.array([sR.wheel_center[0], 0.]))
+                    if p is not None:
+                        zs.append(float(p[1]) * 1000)
+                M['rc_mig_%s_mm' % axname] = (max(zs) - min(zs)) if len(zs) >= 2 else float('nan')
+        except Exception:
+            M['rc_mig_F_mm'] = M['rc_mig_R_mm'] = float('nan')
         # FORCE TRANSFER (loads): true pushrod force amplification per axle
         # (virtual work; includes both off-tangency and attachment radius).
         # This is where the loads optimum is actually reachable — the city
@@ -327,6 +359,15 @@ def evaluate(args):
         ssf = min(tf, tr_) / (2. * w._car.get('cg_z_mm', 270.))
         M['SSF'] = ssf
         if ssf < 1.8: pen += 3.               # rollover margin guard (tilt 1.7g + margin)
+        # narnia guard: ill-defined RC = inconsistent mid-corner balance
+        for axn in ('F', 'R'):
+            mig = M.get('rc_mig_%s_mm' % axn, float('nan'))
+            if not np.isfinite(mig):
+                pen += 2.0                    # RC unresolvable at roll = worse
+            elif mig > 12.0:
+                pen += min(2.0 + (mig - 12.0) / 20.0, 5.0)
+        # RC below ground reverses the geometric path — flag, don't design on it
+        if M.get('rc_F', 0) < -5 or M.get('rc_R', 0) < -5: pen += 1.5
         feel = 1.0 - min(M['bump_steer_F']/0.3, 1) * 0.5 - min(abs(M['scrub_F'])/30, 1) * 0.5
         endur = 1.0 - min(max(M['rc_F'], M['rc_R'], 0)/80, 1)*0.5 - min(M['roll_deg_g']/1.5, 1)*0.5
         # aero score: character survives the package (rear-first held, margin
