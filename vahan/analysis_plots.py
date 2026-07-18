@@ -801,19 +801,33 @@ def plot_mmd(
         N = l_f * (Fy_FL + Fy_FR) - l_r * (Fy_RL + Fy_RR)
         return Ay, N
 
-    betas = np.linspace(*beta_range_deg, beta_n)
+    # Isoline VALUES stay at the user's chosen spacing (beta_n / delta_n
+    # lines), but each line is SAMPLED densely along its sweep axis so the
+    # curves are smooth instead of kinked polylines through the coarse grid.
+    line_n = 41
+    betas  = np.linspace(*beta_range_deg, beta_n)
     deltas = np.linspace(*delta_range_deg, delta_n)
-    Ay_grid = np.zeros((beta_n, delta_n)); N_grid = np.zeros_like(Ay_grid)
+    betas_dense  = np.linspace(*beta_range_deg, line_n)
+    deltas_dense = np.linspace(*delta_range_deg, line_n)
+
+    # constant-β lines: sweep δ densely
+    Ay_b = np.zeros((beta_n, line_n)); N_b = np.zeros_like(Ay_b)
     for i, b in enumerate(betas):
+        for j, d in enumerate(deltas_dense):
+            Ay_b[i, j], N_b[i, j] = compute_state(b, d)
+    # constant-δ lines: sweep β densely
+    Ay_d = np.zeros((line_n, delta_n)); N_d = np.zeros_like(Ay_d)
+    for i, b in enumerate(betas_dense):
         for j, d in enumerate(deltas):
-            ay, n = compute_state(b, d)
-            Ay_grid[i, j] = ay; N_grid[i, j] = n
+            Ay_d[i, j], N_d[i, j] = compute_state(b, d)
 
     # ── dN/dβ at trim (β=0, δ=0): directional stability slope ──────────────
-    mid_b = beta_n // 2; mid_d = delta_n // 2
-    if mid_b > 0 and mid_b < beta_n - 1:
-        dN_db = ((N_grid[mid_b + 1, mid_d] - N_grid[mid_b - 1, mid_d]) /
-                 (betas[mid_b + 1] - betas[mid_b - 1]))   # N·m / deg
+    # Use the dense constant-δ=0 line for a fine central difference.
+    mid_d = delta_n // 2
+    mid_b = line_n // 2
+    if 0 < mid_b < line_n - 1:
+        dN_db = ((N_d[mid_b + 1, mid_d] - N_d[mid_b - 1, mid_d]) /
+                 (betas_dense[mid_b + 1] - betas_dense[mid_b - 1]))  # N·m / deg
     else:
         dN_db = float('nan')
     stable = dN_db < 0 if np.isfinite(dN_db) else None
@@ -823,23 +837,26 @@ def plot_mmd(
     for i, b in enumerate(betas):
         lw = 2.2 if b == 0 else 1.2
         alpha = 1.0 if b == 0 else 0.75
-        ax.plot(Ay_grid[i, :], N_grid[i, :], color=_BLUE, lw=lw, alpha=alpha)
+        ax.plot(Ay_b[i, :], N_b[i, :], color=_BLUE, lw=lw, alpha=alpha,
+                label=f'β={b:.0f}°')
         if abs(b) % 4 < 0.1:
-            ax.text(Ay_grid[i, -1] + 0.02, N_grid[i, -1], f'β={b:.0f}°',
+            ax.text(Ay_b[i, -1] + 0.02, N_b[i, -1], f'β={b:.0f}°',
                     color=_BLUE, fontsize=8, va='center')
     # Constant δ — dashed red
     for j, d in enumerate(deltas):
         lw = 2.2 if d == 0 else 1.2
         alpha = 1.0 if d == 0 else 0.75
-        ax.plot(Ay_grid[:, j], N_grid[:, j], color=_RED, lw=lw, alpha=alpha, ls='--')
+        ax.plot(Ay_d[:, j], N_d[:, j], color=_RED, lw=lw, alpha=alpha, ls='--',
+                label=f'δ={d:.0f}°')
         if abs(d) % 8 < 0.1 and d != 0:
-            ax.text(Ay_grid[-1, j], N_grid[-1, j] + 50, f'δ={d:.0f}°',
+            ax.text(Ay_d[-1, j], N_d[-1, j] + 50, f'δ={d:.0f}°',
                     color=_RED, fontsize=8, ha='center')
 
     ax.axhline(0, color=_TICK, lw=0.8)
     ax.axvline(0, color=_TICK, lw=0.8)
     # Trim point marker
-    ax.plot(Ay_grid[mid_b, mid_d], N_grid[mid_b, mid_d], 'o',
+    ay_trim, n_trim = compute_state(0.0, 0.0)
+    trim_handle, = ax.plot(ay_trim, n_trim, 'o',
             color=_YELLOW, markersize=11, markeredgecolor=_WHITE,
             label='Trim point (β=0, δ=0)')
 
@@ -849,8 +866,10 @@ def plot_mmd(
         f'Milliken Moment Diagram — Pure Cornering  |  '
         f'{velocity_mps * 3.6:.0f} km/h  ({velocity_mps / 0.44704:.0f} mph)',
         fontsize=11, color=_TEXT)
-    ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID,
-              fontsize=9, loc='lower left')
+    # Only the trim point in the legend — the isolines are labelled for the
+    # hover readout, not the legend (20 entries would swamp it).
+    ax.legend(handles=[trim_handle], facecolor=_PANEL_BG, labelcolor=_TEXT,
+              edgecolor=_GRID, fontsize=9, loc='lower left')
 
     # ── Legend box (top-left) ───────────────────────────────────────────────
     ax.text(0.02, 0.98,

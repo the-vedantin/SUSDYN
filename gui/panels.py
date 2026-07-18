@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QListWidget,
     QListWidgetItem, QComboBox, QPushButton, QCheckBox,
     QSizePolicy, QScrollArea, QFrame, QToolButton, QAbstractItemView,
-    QDialog, QDialogButtonBox, QFileDialog, QApplication,
+    QDialog, QDialogButtonBox, QFileDialog, QApplication, QLineEdit,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -2347,6 +2347,26 @@ class DynamicsPanel(CollapsibleSection):
         btn_row.addWidget(self._tire_btn)
         self.add_layout(btn_row)
 
+        # ── Friction-circle options (feeds the Tire / Grip Plots popup) ────
+        # User-settable vertical loads for the friction-circle panel, plus an
+        # optional 3D view (Fy-Fx circles stacked over the Fz range).
+        fc_row = QHBoxLayout()
+        fc_row.addWidget(QLabel('Friction circle Fz (N):'))
+        self._fc_fz_edit = QLineEdit('300, 650, 1000')
+        self._fc_fz_edit.setToolTip(
+            'Comma-separated vertical loads (N) — one friction circle is '
+            'drawn per load. Leave blank for automatic levels from the '
+            'tire data range.')
+        self._fc_fz_edit.setMaximumWidth(140)
+        fc_row.addWidget(self._fc_fz_edit)
+        self._fc_3d_chk = QCheckBox('3D')
+        self._fc_3d_chk.setToolTip(
+            'Draw the friction circle as a 3D surface: lateral force x '
+            'longitudinal force stacked over vertical load.')
+        fc_row.addWidget(self._fc_3d_chk)
+        fc_row.addStretch(1)
+        self.add_layout(fc_row)
+
         # ── Apply Aero toggle ────────────────────────────────────────────
         aero_row = QHBoxLayout()
         self._apply_aero_btn = QPushButton('Apply Aero')
@@ -3699,6 +3719,20 @@ class DynamicsPanel(CollapsibleSection):
                  + self._us_front.value()
                  + self._us_rear.value())
         self._total_mass_lbl.setText(f'{total:.2f} kg')
+
+    def tire_plot_inputs(self) -> dict:
+        """Friction-circle options for the Tire / Grip Plots popup:
+        user Fz levels (N) or None for automatic, and the 3D toggle."""
+        fz_levels = None
+        try:
+            txt = self._fc_fz_edit.text().strip()
+            if txt:
+                vals = [float(t) for t in txt.replace(';', ',').split(',')
+                        if t.strip()]
+                fz_levels = [v for v in vals if v > 0] or None
+        except Exception:
+            fz_levels = None
+        return dict(fz_levels=fz_levels, fc_3d=self._fc_3d_chk.isChecked())
 
     def _refresh_wheel_power(self):
         """Show wheel power = engine power × drivetrain efficiency."""

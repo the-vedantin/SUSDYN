@@ -1323,7 +1323,8 @@ class CurvesCanvas(FigureCanvas):
         self.draw()
 
     # ── Tire / grip characterization ─────────────────────────────────────
-    def plot_tire_grip(self, tire, result=None, camber_deg: float = 0.0):
+    def plot_tire_grip(self, tire, result=None, camber_deg: float = 0.0,
+                       fc_fz_levels=None, fc_3d: bool = False):
         """Tire characterization + friction-circle view (2×2):
           • Lateral force Fy vs slip angle (a family at several Fz)
           • Cornering stiffness Cα vs normal load
@@ -1409,40 +1410,89 @@ class CurvesCanvas(FigureCanvas):
                      transform=ax3.transAxes, ha='center', va='center',
                      color='#777777', fontsize=8)
 
-        # (4) Friction circle (operating point vs grip envelope, normalised)
-        ax4 = self.fig.add_subplot(2, 2, 4)
-        _style(ax4, 'Fx / (μ·Fz)   long.', 'Fy / (μ·Fz)   lateral',
-               'Friction Circle (per corner)')
+        # (4) Friction circle in FORCE (N): one circle per vertical load.
+        # Radius = the tire's peak lateral force at that load (friction-circle
+        # assumption mu_x = mu_y, same as the solver).  Loads are either the
+        # user's list (fc_fz_levels) or the automatic fz_levels above.
+        # fc_3d stacks the circles over the tire's full load range instead.
+        circle_fz = list(fc_fz_levels) if fc_fz_levels else [float(f) for f in fz_levels]
         th = np.linspace(0, 2 * np.pi, 120)
-        ax4.plot(np.cos(th), np.sin(th), color='#B0BEC5', lw=1.0, ls='--', alpha=0.7)
-        ax4.axhline(0, color='#222222', lw=0.6); ax4.axvline(0, color='#222222', lw=0.6)
-        ax4.set_xlim(-1.25, 1.25); ax4.set_ylim(-1.25, 1.25)
-        ax4.set_aspect('equal', adjustable='box')
-        plotted = False
-        if result is not None:
-            CC = dict(CORNER_PLOT_COLORS)
-            for c in ('FL', 'FR', 'RL', 'RR'):
-                try:
-                    fz = float(getattr(result, 'Fz', {}).get(c, 0.0))
-                    fy = float(getattr(result, 'Fy', {}).get(c, 0.0))
-                    fx = float(getattr(result, 'Fx', {}).get(c, 0.0))
-                    cam = float(getattr(result, 'camber', {}).get(c, 0.0))
-                    if fz <= 1.0:
+
+        def _peak_force(fzv):
+            try:
+                return abs(float(tire.peak_Fy(max(float(fzv), 10.0))))
+            except Exception:
+                return abs(float(tire.peak_mu(max(float(fzv), 10.0),
+                                              camber_deg))) * max(float(fzv), 10.0)
+
+        if fc_3d:
+            ax4 = self.fig.add_subplot(2, 2, 4, projection='3d')
+            ax4.set_facecolor('#080808')
+            fz_span = np.linspace(max(fz_lo * 0.4, 50.0), fz_hi * 1.05, 26)
+            R = np.array([_peak_force(f) for f in fz_span])
+            TH, FZg = np.meshgrid(th, fz_span)
+            Rg = np.repeat(R[:, None], len(th), axis=1)
+            ax4.plot_surface(Rg * np.cos(TH), Rg * np.sin(TH), FZg,
+                             color='#4FC3F7', alpha=0.25, linewidth=0)
+            for fzv, col in zip(circle_fz, LOAD_COLS):
+                r = _peak_force(fzv)
+                ax4.plot(r * np.cos(th), r * np.sin(th), fzv, color=col,
+                         lw=2.0, label=f'{fzv:.0f} N')
+            if result is not None:
+                CC = dict(CORNER_PLOT_COLORS)
+                for c in ('FL', 'FR', 'RL', 'RR'):
+                    try:
+                        fz = float(getattr(result, 'Fz', {}).get(c, 0.0))
+                        fy = float(getattr(result, 'Fy', {}).get(c, 0.0))
+                        fx = float(getattr(result, 'Fx', {}).get(c, 0.0))
+                        if fz > 1.0:
+                            ax4.scatter([fy], [fx], [fz], s=45,
+                                        color=CC.get(c, '#ffffff'),
+                                        edgecolor='black', lw=0.5)
+                    except Exception:
                         continue
-                    mu = float(tire.peak_mu(fz, cam))
-                    cap = mu * fz
-                    if cap <= 1.0:
-                        continue
-                    ax4.scatter(fx / cap, fy / cap, s=45, color=CC.get(c, '#ffffff'),
-                                edgecolor='black', lw=0.5, zorder=5, label=c)
-                    plotted = True
-                except Exception:
-                    continue
-        if plotted:
-            _legend(ax4, loc='upper right')
+            ax4.set_xlabel('Fy lat (N)', color='#888888', fontsize=7)
+            ax4.set_ylabel('Fx long (N)', color='#888888', fontsize=7)
+            ax4.set_zlabel('Fz load (N)', color='#888888', fontsize=7)
+            ax4.set_title('Friction Circle vs Vertical Load (3D)',
+                          color='#cccccc', fontsize=9)
+            ax4.tick_params(colors='#777777', labelsize=6)
+            _legend(ax4, loc='upper right', title='Fz', title_fontsize=7)
         else:
-            ax4.text(0, -1.45, 'solve dynamics for an operating point',
-                     ha='center', va='top', color='#777777', fontsize=7)
+            ax4 = self.fig.add_subplot(2, 2, 4)
+            _style(ax4, 'Longitudinal force Fx (N)', 'Lateral force Fy (N)',
+                   'Friction Circle vs Vertical Load')
+            r_max = 1.0
+            for fzv, col in zip(circle_fz, LOAD_COLS):
+                r = _peak_force(fzv)
+                r_max = max(r_max, r)
+                ax4.plot(r * np.cos(th), r * np.sin(th), color=col, lw=1.8,
+                         label=f'Fz {fzv:.0f} N → {r:.0f} N')
+            ax4.axhline(0, color='#222222', lw=0.6)
+            ax4.axvline(0, color='#222222', lw=0.6)
+            plotted = False
+            if result is not None:
+                CC = dict(CORNER_PLOT_COLORS)
+                for c in ('FL', 'FR', 'RL', 'RR'):
+                    try:
+                        fz = float(getattr(result, 'Fz', {}).get(c, 0.0))
+                        fy = float(getattr(result, 'Fy', {}).get(c, 0.0))
+                        fx = float(getattr(result, 'Fx', {}).get(c, 0.0))
+                        if fz <= 1.0:
+                            continue
+                        ax4.scatter(fx, fy, s=45, color=CC.get(c, '#ffffff'),
+                                    edgecolor='black', lw=0.5, zorder=5,
+                                    label=c)
+                        plotted = True
+                    except Exception:
+                        continue
+            lim = r_max * 1.15
+            ax4.set_xlim(-lim, lim); ax4.set_ylim(-lim, lim)
+            ax4.set_aspect('equal', adjustable='box')
+            _legend(ax4, loc='upper right')
+            if not plotted:
+                ax4.text(0, -lim * 1.1, 'solve dynamics for operating points',
+                         ha='center', va='top', color='#777777', fontsize=7)
 
         self.fig.subplots_adjust(hspace=0.55, wspace=0.38,
                                  left=0.10, right=0.97, top=0.90, bottom=0.11)
@@ -8003,7 +8053,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 result = None
             cam = float(self._alignment.get('front_camber_deg', 0.0))
-            self.curves.plot_tire_grip(tire, result, camber_deg=cam)
+            fc = self._dynamics_panel.tire_plot_inputs()
+            self.curves.plot_tire_grip(tire, result, camber_deg=cam,
+                                       fc_fz_levels=fc['fz_levels'],
+                                       fc_3d=fc['fc_3d'])
             self.statusBar().showMessage(
                 f'Tire / grip plots  —  model: {getattr(tire, "tire_id", "tire")}', 5000)
         except Exception as e:
@@ -8175,7 +8228,9 @@ class MainWindow(QMainWindow):
             sr = getattr(self._dynamics_panel, '_cached_steer_ratio', 0.0)
             max_hw = getattr(self._dynamics_panel, '_cached_max_hw_deg', 0.0)
             hp_w = self._dynamics_panel._power_hp.value() * 745.7
-            mass = self._dynamics_panel._total_mass.value()
+            mass = (self._dynamics_panel._sprung_mass.value()
+                    + self._dynamics_panel._us_front.value()
+                    + self._dynamics_panel._us_rear.value())
             self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
                                      turn_radius_m=turn_r, wheelbase_m=wb,
                                      steer_ratio=sr, max_hw_deg=max_hw,
@@ -8191,7 +8246,9 @@ class MainWindow(QMainWindow):
             sr = getattr(self._dynamics_panel, '_cached_steer_ratio', 0.0)
             max_hw = getattr(self._dynamics_panel, '_cached_max_hw_deg', 0.0)
             hp_w = self._dynamics_panel._power_hp.value() * 745.7
-            mass = self._dynamics_panel._total_mass.value()
+            mass = (self._dynamics_panel._sprung_mass.value()
+                    + self._dynamics_panel._us_front.value()
+                    + self._dynamics_panel._us_rear.value())
             self.curves.plot_dynamics(sweep, graphs=graphs, corners=corners,
                                      turn_radius_m=turn_r, wheelbase_m=wb,
                                      steer_ratio=sr, max_hw_deg=max_hw,
@@ -8368,6 +8425,8 @@ class MainWindow(QMainWindow):
     def _show_plot(self, fig, title):
         """Open fig in a PlotDialog popup."""
         dlg = PlotDialog(self, fig, title=title)
+        # Value-readout on hover, same machinery as the kinematics canvas.
+        dlg.hover = HoverAnnotator(dlg.canvas)
         dlg.show()
         # Keep a reference so Qt doesn't gc it
         if not hasattr(self, '_open_plot_dialogs'):
