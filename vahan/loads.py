@@ -84,6 +84,7 @@ class ComponentLoads:
     bearing_inner_H: float = 0.0
     bearing_outer_V: float = 0.0
     bearing_outer_H: float = 0.0
+    bearing_axial_N: float = 0.0   # lateral thrust on the bearing pair (= Fy)
 
     # ── Caliper mounting bolt loads (V=up+, H=fwd+) ──────────────
     caliper_upper_V: float = 0.0
@@ -184,10 +185,27 @@ def compute_corner_loads(
     r_cp   = cp     - lca_o
 
     # ── Applied force at contact patch ──────────────────────────────
-    F_app = np.array([Fx, Fy, Fz])
+    # FRAME: hardpoint coordinates are x = LATERAL, y = LONGITUDINAL,
+    # z = up.  Fy (lateral tire force) therefore goes on x and Fx
+    # (longitudinal) on y — the old [Fx, Fy, Fz] ordering applied the
+    # braking force sideways and the cornering force fore-aft, which
+    # broke left/right mirror symmetry under pure braking.
+    # Sign: in steady cornering every tire's lateral force points toward
+    # the turn centre; with the convention that positive lateral
+    # acceleration has the LEFT (+x) side as the outside, that direction
+    # is −x for all four corners.
+    F_app = np.array([-Fy, Fx, Fz])
 
-    # Brake torque as moment about wheel spin axis
+    # Brake torque as a moment on the upright.  Both wheels spin in the SAME
+    # world sense (rolling forward: omega ~ +x for +y travel), so the brake
+    # reaction torque on the upright is the same world vector on BOTH sides.
+    # The state's spin_axis points outboard (flips sign left/right) — using
+    # it raw gave the right-hand corners a wrong-signed brake moment and a
+    # fake left/right asymmetry under pure braking.  Rectify to the
+    # consistent world handedness (+x component positive).
     spin = _normalize(np.asarray(state.spin_axis, dtype=float))
+    if spin[0] < 0.0:
+        spin = -spin
     M_brake = brake_torque * spin
 
     # ── Build 6×6 system: A @ forces = b ────────────────────────────
@@ -217,6 +235,13 @@ def compute_corner_loads(
         forces, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         residual = np.linalg.norm(A @ forces - b)
 
+    # Sign convention repair: with u pointing inboard->outboard and
+    # A·f = -F_app, a POSITIVE solved f pushes the upright outboard, i.e.
+    # the member is in COMPRESSION.  The documented (and reported)
+    # convention is positive = TENSION, so negate here.  Physical check:
+    # a pure-bump case must put the pushrod in compression (negative).
+    forces = -forces
+
     result.uca_front_N = float(forces[0])
     result.uca_rear_N  = float(forces[1])
     result.lca_front_N = float(forces[2])
@@ -226,23 +251,21 @@ def compute_corner_loads(
     result.residual    = float(residual)
 
     # ── Ball joint resultants in V (Z, up+) and H (Y, fwd+) ────────
-    # UCA: vector sum of both arm forces at the outer ball joint
-    F_uca_vec = forces[0] * u[0] + forces[1] * u[1]
+    # Force ON the upright from a member with tension T along û(in->out)
+    # is −T·û.  (forces[] are tension-positive after the repair above.)
+    F_uca_vec = -(forces[0] * u[0] + forces[1] * u[1])
     result.uca_bj_V = float(F_uca_vec[2])   # Z = vertical
     result.uca_bj_H = float(F_uca_vec[1])   # Y = longitudinal
 
-    # LCA: vector sum of both arm forces at the outer ball joint
-    F_lca_vec = forces[2] * u[2] + forces[3] * u[3]
+    F_lca_vec = -(forces[2] * u[2] + forces[3] * u[3])
     result.lca_bj_V = float(F_lca_vec[2])
     result.lca_bj_H = float(F_lca_vec[1])
 
-    # Tie rod: single link force decomposed
-    F_tr_vec = forces[4] * u[4]
+    F_tr_vec = -(forces[4] * u[4])
     result.tierod_bj_V = float(F_tr_vec[2])
     result.tierod_bj_H = float(F_tr_vec[1])
 
-    # Pushrod: single link force decomposed
-    F_push_vec = forces[5] * u[5]
+    F_push_vec = -(forces[5] * u[5])
     result.pushrod_bj_V = float(F_push_vec[2])
     result.pushrod_bj_H = float(F_push_vec[1])
 
@@ -289,6 +312,7 @@ def _compute_bearing_loads(result: ComponentLoads, bp: BrakeParams,
 
     Fz = result.Fz_N
     Fx = result.Fx_N
+    Fy = result.Fy_N
     T  = result.brake_torque_Nm
 
     # ── Brake friction on disc (tangential, acts on the hub) ─────
@@ -302,11 +326,23 @@ def _compute_bearing_loads(result: ComponentLoads, bp: BrakeParams,
     total_V = Fz + F_fric_V
     total_H = Fx + F_fric_H
 
-    # Simple beam: moment about inner bearing → outer bearing force
-    result.bearing_outer_V = float(total_V * d / l1)
-    result.bearing_inner_V = float(total_V * (l1 - d) / l1)
+    # ── Overturning moment from the LATERAL force ────────────────
+    # Fy acts at the contact patch, one tire radius BELOW the spindle
+    # axis: M = Fy·R_tire about the car's longitudinal axis.  Reacted as
+    # a VERTICAL couple across the bearing spacing — in hard cornering
+    # this term DOMINATES the bearing radial loads.  Fy itself is the
+    # axial (thrust) load on the bearing pair.
+    M_over = Fy * wheel_radius_m          # N·m
+    dV_over = M_over / l1                 # vertical couple magnitude
+
+    # Simple beam: moment about inner bearing → outer bearing force,
+    # plus the overturning couple (+ on the outboard row, − inboard for
+    # a laterally-loaded outside wheel).
+    result.bearing_outer_V = float(total_V * d / l1 + dV_over)
+    result.bearing_inner_V = float(total_V * (l1 - d) / l1 - dV_over)
     result.bearing_outer_H = float(total_H * d / l1)
     result.bearing_inner_H = float(total_H * (l1 - d) / l1)
+    result.bearing_axial_N = float(Fy)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
