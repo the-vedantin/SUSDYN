@@ -834,23 +834,26 @@ def plot_mmd(
 
     fig, ax = _styled_fig(figsize=(10, 8))
     # Constant β — solid blue
+    # Label only the extreme isolines so tip labels never crowd/overprint.
+    b_lab = {betas.min(), betas.max()}
+    d_lab = {deltas.min(), deltas.max()}
     for i, b in enumerate(betas):
         lw = 2.2 if b == 0 else 1.2
         alpha = 1.0 if b == 0 else 0.75
         ax.plot(Ay_b[i, :], N_b[i, :], color=_BLUE, lw=lw, alpha=alpha,
                 label=f'β={b:.0f}°')
-        if abs(b) % 4 < 0.1:
-            ax.text(Ay_b[i, -1] + 0.02, N_b[i, -1], f'β={b:.0f}°',
-                    color=_BLUE, fontsize=8, va='center')
+        if b in b_lab:
+            ax.text(Ay_b[i, -1] + 0.03, N_b[i, -1], f'β={b:.0f}°',
+                    color=_BLUE, fontsize=8, va='center', ha='left')
     # Constant δ — dashed red
     for j, d in enumerate(deltas):
         lw = 2.2 if d == 0 else 1.2
         alpha = 1.0 if d == 0 else 0.75
         ax.plot(Ay_d[:, j], N_d[:, j], color=_RED, lw=lw, alpha=alpha, ls='--',
                 label=f'δ={d:.0f}°')
-        if abs(d) % 8 < 0.1 and d != 0:
-            ax.text(Ay_d[-1, j], N_d[-1, j] + 50, f'δ={d:.0f}°',
-                    color=_RED, fontsize=8, ha='center')
+        if d in d_lab:
+            ax.text(Ay_d[-1, j], N_d[-1, j] + 60, f'δ={d:.0f}°',
+                    color=_RED, fontsize=8, ha='center', va='bottom')
 
     ax.axhline(0, color=_TICK, lw=0.8)
     ax.axvline(0, color=_TICK, lw=0.8)
@@ -873,8 +876,8 @@ def plot_mmd(
 
     # ── Legend box (top-left) ───────────────────────────────────────────────
     ax.text(0.02, 0.98,
-            'Solid blue:   constant β (sweep δ)\n'
-            'Dashed red:  constant δ (sweep β)\n'
+            'Solid line:   constant β (sweep δ)\n'
+            'Dashed line:  constant δ (sweep β)\n'
             'Equilibrium turn → on the A_y axis (N = 0)\n'
             'Max grip   → outermost reach in A_y',
             transform=ax.transAxes, ha='left', va='top',
@@ -1274,23 +1277,35 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
     ax_gg.set_xlim(-max_ay_g*1.1, max_ay_g*1.1)
     ax_gg.set_ylim(-max_ay_g*1.1, max_ay_g*1.1)
 
-    # ----- Right: per-tyre friction circles -----
+    # ----- Right: per-tyre friction circles IN FORCE (newtons) -----
+    # Circle radius = mu(Fz)*Fz at that corner's load in the case — the actual
+    # grip budget in N.  Operating point = the actual (Fy, Fx) in N.
+    #   COLOR  = corner (FL/FR/RL/RR)
+    #   MARKER = load case
     corners = ["FL", "FR", "RL", "RR"]
     corner_colors = {"FL": _BLUE, "FR": _TEAL, "RL": _RED, "RR": _YELLOW}
-    # Two encodings, kept separate so the legend can distinguish them:
-    #   COLOR  = corner (FL/FR/RL/RR)
-    #   MARKER = load case (the old code labeled every case with FL's color,
-    #            so the legend showed four identical dots).
     cases = {
         "1g cornering":    (1.0, 0.0,  "o"),
         "1g braking":      (0.0, -1.0, "s"),
         "1g accel":        (0.0, +1.0, "^"),
         "0.7g+0.7g":       (0.7, +0.7, "D"),
     }
-    for k in corners:
-        circle = plt.Circle((0, 0), 1.0, fill=False,
-                             color=corner_colors[k], lw=1.0, alpha=0.4)
-        ax_fc.add_patch(circle)
+    r_max = 1.0
+    # Draw the grip-budget circles at the 1g-cornering loads (one per corner —
+    # the most-referenced case) so the plot shows real newton radii.
+    try:
+        r_ref = steady_solver.solve(lateral_g=1.0, longitudinal_g=0.0)
+        for k in corners:
+            Fz_k = float(r_ref.Fz.get(k, 0))
+            if Fz_k <= 1:
+                continue
+            cap = _mu_at(k, Fz_k) * Fz_k
+            r_max = max(r_max, cap)
+            circle = plt.Circle((0, 0), cap, fill=False,
+                                color=corner_colors[k], lw=1.2, alpha=0.55)
+            ax_fc.add_patch(circle)
+    except Exception:
+        pass
 
     for case_name, (ay, ax_long, mk) in cases.items():
         try:
@@ -1299,13 +1314,11 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
                 Fz_k = float(r.Fz.get(k, 0))
                 if Fz_k <= 1:
                     continue
-                mu = _mu_at(k, Fz_k)
                 Fy_k = float(r.Fy.get(k, 0)) if hasattr(r, "Fy") else 0
                 Fx_k = float(r.Fx.get(k, 0)) if hasattr(r, "Fx") else 0
-                x_norm = Fy_k / (mu * Fz_k + 1e-6)
-                y_norm = Fx_k / (mu * Fz_k + 1e-6)
-                ax_fc.scatter(x_norm, y_norm, marker=mk,
-                                color=corner_colors[k], s=60, alpha=0.7,
+                r_max = max(r_max, abs(Fy_k), abs(Fx_k))
+                ax_fc.scatter(Fy_k, Fx_k, marker=mk,
+                                color=corner_colors[k], s=60, alpha=0.75,
                                 edgecolors=_WHITE, linewidths=0.5)
         except Exception:
             continue
@@ -1320,15 +1333,16 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
     ax_fc.legend(handles=proxies, facecolor=_PANEL_BG, labelcolor=_TEXT,
                   edgecolor=_GRID, fontsize=7, loc="lower right", ncols=2)
 
-    ax_fc.set_xlabel("Fy / (mu * Fz)  -- normalised lateral", fontsize=10)
-    ax_fc.set_ylabel("Fx / (mu * Fz)  -- normalised longitudinal", fontsize=10)
-    ax_fc.set_title("Per-Tyre Friction Circles + Operating Points",
-                     fontsize=10, color=_TEXT)
+    ax_fc.set_xlabel("Lateral force Fy (N)", fontsize=10)
+    ax_fc.set_ylabel("Longitudinal force Fx (N)", fontsize=10)
+    ax_fc.set_title("Per-Tyre Friction Circles (N) — circle = grip budget "
+                    "mu(Fz)·Fz at 1 g", fontsize=10, color=_TEXT)
     ax_fc.axhline(0, color=_TICK, lw=0.5, alpha=0.5)
     ax_fc.axvline(0, color=_TICK, lw=0.5, alpha=0.5)
     ax_fc.set_aspect("equal", "box")
-    ax_fc.set_xlim(-1.3, 1.3)
-    ax_fc.set_ylim(-1.3, 1.3)
+    lim = r_max * 1.15
+    ax_fc.set_xlim(-lim, lim)
+    ax_fc.set_ylim(-lim, lim)
 
     fig.tight_layout()
     return fig
