@@ -297,12 +297,13 @@ def plot_rc_vs_body_roll(steady_solver, max_lat_g: float = 2.0) -> Figure:
                  fontsize=10, color=_TEXT)
     ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=9,
               loc='best')
-    ax.text(0.02, 0.02,
-            f'At {op_max:.2f}° body roll:  Front Δ = {rc_f_at_max - rc_f[0]:+.2f} mm,  '
-            f'Rear Δ = {rc_r_at_max - rc_r[0]:+.2f} mm',
-            transform=ax.transAxes, ha='left', va='bottom', fontsize=9, color=_TEXT,
+    # Below the axes so the note can never occlude the RC curves.
+    ax.text(0.5, -0.16,
+            f'At {op_max:.2f}° body roll:  front RC height change '
+            f'{rc_f_at_max - rc_f[0]:+.2f} mm,  rear {rc_r_at_max - rc_r[0]:+.2f} mm',
+            transform=ax.transAxes, ha='center', va='top', fontsize=9, color=_TEXT,
             bbox=dict(facecolor=_PANEL_BG, edgecolor=_GRID))
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
     return fig
 
 
@@ -632,12 +633,20 @@ def plot_ackermann_fz_fy(
     # ── Iso-slip-angle lines (tire capability background) ───────────
     fz_range = np.linspace(50, 1500, 80)
     sa_levels = [2, 4, 6, 8, 10, 12]
+    # Dodge the edge labels: near the top the iso-lines converge (saturated
+    # tire), so stacked labels would overprint.  Skip a label if it would sit
+    # within 3% of the previous one's height.
+    _placed_y = []
     for sa in sa_levels:
         fy_line = np.array([abs(float(tire_model.Fy(sa, fz, 0.0)))
                             for fz in fz_range])
         ax.plot(fz_range, fy_line, color=_TICK, lw=0.8, alpha=0.35)
-        ax.text(fz_range[-1] + 15, fy_line[-1], f'α={sa}°',
-                fontsize=7, color=_TICK, va='center', alpha=0.6)
+        y_end = float(fy_line[-1])
+        span = max(abs(float(np.nanmax(fy_line))), 1.0)
+        if all(abs(y_end - yp) > 0.03 * span for yp in _placed_y):
+            ax.text(fz_range[-1] + 15, y_end, f'α={sa}°',
+                    fontsize=7, color=_TICK, va='center', alpha=0.6)
+            _placed_y.append(y_end)
 
     # Peak-Fy envelope
     peak_fy = np.array([abs(float(tire_model.peak_Fy(fz, 0.0)))
