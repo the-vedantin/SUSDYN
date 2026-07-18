@@ -1428,16 +1428,36 @@ class CurvesCanvas(FigureCanvas):
         if fc_3d:
             ax4 = self.fig.add_subplot(2, 2, 4, projection='3d')
             ax4.set_facecolor('#080808')
-            fz_span = np.linspace(max(fz_lo * 0.4, 50.0), fz_hi * 1.05, 26)
+            # MATLAB-style shaded surface: fine mesh, colour = grip force
+            # radius at that load ('hot' colormap — black->red->yellow->white,
+            # colourblind-safe), light-source shading for depth.
+            from matplotlib.colors import Normalize
+            import matplotlib.cm as _cm
+            th_f = np.linspace(0, 2 * np.pi, 121)
+            fz_span = np.linspace(max(fz_lo * 0.4, 50.0), fz_hi * 1.05, 90)
             R = np.array([_peak_force(f) for f in fz_span])
-            TH, FZg = np.meshgrid(th, fz_span)
-            Rg = np.repeat(R[:, None], len(th), axis=1)
-            ax4.plot_surface(Rg * np.cos(TH), Rg * np.sin(TH), FZg,
-                             color='#4FC3F7', alpha=0.25, linewidth=0)
-            for fzv, col in zip(circle_fz, LOAD_COLS):
+            TH, FZg = np.meshgrid(th_f, fz_span)
+            Rg = np.repeat(R[:, None], len(th_f), axis=1)
+            Xs, Ys = Rg * np.cos(TH), Rg * np.sin(TH)
+            norm = Normalize(vmin=float(R.min()), vmax=float(R.max()))
+            cmap = _cm.get_cmap('hot')
+            face = cmap(norm(Rg))
+            # light from the upper-left: modulate brightness by the surface
+            # normal (radial for a cone) against the light azimuth
+            bright = 0.55 + 0.45 * np.clip(np.cos(TH - np.radians(135)), 0, 1)
+            face[..., :3] *= bright[..., None]
+            surf = ax4.plot_surface(Xs, Ys, FZg, facecolors=face,
+                                    rstride=1, cstride=1, linewidth=0,
+                                    antialiased=True, shade=False)
+            m = _cm.ScalarMappable(cmap=cmap, norm=norm)
+            m.set_array(Rg)
+            cb = self.fig.colorbar(m, ax=ax4, shrink=0.55, pad=0.10)
+            cb.set_label('grip force μ(Fz)·Fz  (N)', color='#888888', fontsize=7)
+            cb.ax.tick_params(colors='#777777', labelsize=6)
+            for fzv, col in zip(circle_fz, ['#FFFFFF', '#4FC3F7', '#B0BEC5']):
                 r = _peak_force(fzv)
                 ax4.plot(r * np.cos(th), r * np.sin(th), fzv, color=col,
-                         lw=2.0, label=f'{fzv:.0f} N')
+                         lw=1.8, label=f'{fzv:.0f} N')
             if result is not None:
                 CC = dict(CORNER_PLOT_COLORS)
                 for c in ('FL', 'FR', 'RL', 'RR'):
@@ -1457,7 +1477,8 @@ class CurvesCanvas(FigureCanvas):
             ax4.set_title('Friction Circle vs Vertical Load (3D)',
                           color='#cccccc', fontsize=9)
             ax4.tick_params(colors='#777777', labelsize=6)
-            _legend(ax4, loc='upper right', title='Fz', title_fontsize=7)
+            _legend(ax4, loc='upper left', bbox_to_anchor=(-0.05, 1.0),
+                    title='Fz', title_fontsize=7)
         else:
             ax4 = self.fig.add_subplot(2, 2, 4)
             _style(ax4, 'Longitudinal force Fx (N)', 'Lateral force Fy (N)',
