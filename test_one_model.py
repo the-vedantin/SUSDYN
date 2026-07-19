@@ -190,6 +190,34 @@ print(f'ARB sweep metrics: arb_mr finite {int(np.isfinite(_amr).sum())}/{len(_am
       f'arb_angle finite {int(np.isfinite(_aang).sum())}/{len(_aang)}   '
       f'{"pass" if arb_live else "UNEXPECTED FAIL (dead/NaN)"}')
 
+# ── SKIDPAD/TRANSIENT ARB FRESHNESS: _on_skidpad_simulate consumed
+#    get_params() WITHOUT refreshing the kinematically-derived ARB geometry
+#    (arm/half/MR), so the transient sim could run on a STALE bar after
+#    hardpoint edits (found by the v18 cross-check fleet, 2026-07-19).
+#    Guard: the shared refresh helper exists, the skidpad handler calls it,
+#    and an ARB hardpoint move changes the refreshed get_params() rate.
+import inspect
+win.set_topology(SuspensionTopology(_bt, _bt)); win._rebuild_solvers(0.)
+win._refresh_arb_geometry_into_panel()
+_r0 = float(win._dynamics_panel.get_params()['arb_rate_front_Npm'])
+# perturb the ARM END (arm length feeds the rate formula directly; a tab
+# move can make the bellcrank solve fail -> refresh guard skips -> false DEAD)
+_ae_save = np.asarray(win._front_arb['arb_arm_end'], float).copy()
+win._front_arb['arb_arm_end'] = _ae_save + np.array([0.0, 0.0, 0.010])
+win._refresh_arb_geometry_into_panel()
+_r1 = float(win._dynamics_panel.get_params()['arb_rate_front_Npm'])
+win._front_arb['arb_arm_end'] = _ae_save
+win._refresh_arb_geometry_into_panel()
+_src_ok = ('refresh_arb_geometry_into_panel'
+           in inspect.getsource(type(win)._on_skidpad_simulate))
+_fresh_ok = _r0 > 0 and abs(_r1 - _r0) > 1.0
+skid_ok = _src_ok and _fresh_ok
+if not skid_ok:
+    fails += 1
+print(f'skidpad ARB fresh: handler refreshes={_src_ok}  rate responds '
+      f'{_r0:.0f}->{_r1:.0f} N/m ({"live" if _fresh_ok else "DEAD"})   '
+      f'{"pass" if skid_ok else "UNEXPECTED FAIL"}')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly

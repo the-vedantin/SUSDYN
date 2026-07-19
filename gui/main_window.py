@@ -7871,6 +7871,17 @@ class MainWindow(QMainWindow):
     #  DYNAMICS
     # ==========================================================================
 
+    def _refresh_arb_geometry_into_panel(self) -> None:
+        """Push kinematically-derived ARB geometry (arm/half/MR) into the
+        dynamics panel so its ARB wheel-rate calculation reflects the model
+        as it is NOW.  Every path that consumes get_params() for anything
+        ARB-dependent (steady dynamics, transient/skidpad, loads, report)
+        must call this first — ONE MODEL."""
+        arb_F = self._compute_arb_geometry_from_kinematics('F')
+        arb_R = self._compute_arb_geometry_from_kinematics('R')
+        if arb_F is not None and arb_R is not None:
+            self._dynamics_panel.set_derived_arb_geometry(arb_F, arb_R)
+
     def _build_dynamics_solver(self) -> SteadyStateSolver:
         """Build a SteadyStateSolver from current GUI state.
 
@@ -7886,10 +7897,7 @@ class MainWindow(QMainWindow):
         # Done BEFORE get_params() so the panel's wheel-rate calculation
         # uses fresh arm length / half-length / MR values straight from the
         # kinematic model, not stale spinbox numbers.
-        arb_F = self._compute_arb_geometry_from_kinematics('F')
-        arb_R = self._compute_arb_geometry_from_kinematics('R')
-        if arb_F is not None and arb_R is not None:
-            self._dynamics_panel.set_derived_arb_geometry(arb_F, arb_R)
+        self._refresh_arb_geometry_into_panel()
 
         dyn_params = self._dynamics_panel.get_params()
         car = self._car
@@ -8913,6 +8921,11 @@ class MainWindow(QMainWindow):
             self._skidpad_panel.set_status('Simulating...')
 
             # ── Build VehicleParams the same way the dynamics panel does ─
+            # Refresh the kinematically-derived ARB geometry FIRST — without
+            # this, get_params() computes the ARB wheel rates from whatever
+            # arm/half/MR was pushed last (stale after hardpoint edits), and
+            # the transient sim runs on a different bar than the model has.
+            self._refresh_arb_geometry_into_panel()
             dyn_params = self._dynamics_panel.get_params()
             car = self._car
             dyn_params['front_track_m'] = car['track_f_mm'] / 1000
