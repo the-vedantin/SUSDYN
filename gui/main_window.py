@@ -5514,6 +5514,7 @@ class MainWindow(QMainWindow):
             # ── Rear driveshaft / differential package (rear-only, RWD) ──────
             # Build from the LIVE solved rear wheel_center + spin_axis carried
             # in corners_draw (ONE MODEL), so the shafts move with the uprights.
+            _pkg = None
             try:
                 import types as _types
                 from vahan.driveshaft import package as _ds_package
@@ -5527,6 +5528,44 @@ class MainWindow(QMainWindow):
                         if len(_rear_states) == 2 else None)
                 self.view3d.set_driveshaft_package(
                     _pkg, show=self._car.get('show_driveshaft', True))
+            except Exception:
+                pass
+
+            # ── View mode (normal / load / interference) + clash highlight ───
+            try:
+                from vahan.interference import clashes as _clashfn
+                _mode = self._car.get('view_mode', 'normal')
+                self.view3d.set_view_mode(_mode)
+                _clash_segs = []
+                if _mode == 'interference' and _pkg is not None:
+                    _TR = 0.008
+                    _dr = 0.5 * float(self._car.get('driveshaft_dia_mm', 25.4)) / 1000.0
+                    for c in corners_draw:
+                        if c['label'] not in ('RL', 'RR'):
+                            continue
+                        pp = c['pts']
+                        if not all(k in pp for k in ('uca_front', 'lca_front',
+                                                     'pushrod_inner', 'tie_rod_inner')):
+                            continue
+                        def _P(k):
+                            return np.asarray(pp[k], float)
+                        mem = [
+                            {'name': 'upper arm front', 'a': _P('uca_front'), 'b': _P('uca_outer'), 'r': _TR},
+                            {'name': 'upper arm rear',  'a': _P('uca_rear'),  'b': _P('uca_outer'), 'r': _TR},
+                            {'name': 'lower arm front', 'a': _P('lca_front'), 'b': _P('lca_outer'), 'r': _TR},
+                            {'name': 'lower arm rear',  'a': _P('lca_rear'),  'b': _P('lca_outer'), 'r': _TR},
+                            {'name': 'tie / toe rod',   'a': _P('tie_rod_inner'),  'b': _P('tie_rod_outer'), 'r': _TR},
+                            {'name': 'pushrod',         'a': _P('pushrod_outer'), 'b': _P('pushrod_inner'), 'r': _TR},
+                        ]
+                        _seg = _pkg.get(c['label'])
+                        if _seg is not None:
+                            mem.append({'name': 'driveshaft', 'a': np.asarray(_seg['inner'], float),
+                                        'b': np.asarray(_seg['outer'], float), 'r': _dr})
+                        _byn = {m['name']: (m['a'], m['b']) for m in mem}
+                        for cl in _clashfn(mem):
+                            _clash_segs.append(_byn[cl['a']])
+                            _clash_segs.append(_byn[cl['b']])
+                self.view3d.set_clashes(_clash_segs)
             except Exception:
                 pass
             self._frame_overlay(corners_draw)

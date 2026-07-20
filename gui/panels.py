@@ -563,6 +563,7 @@ class CarParamsPanel(CollapsibleSection):
             'driveshaft_dia_mm':     self._ds_dia.value(),
             'show_driveshaft':       self._show_driveshaft.isChecked(),
             'show_shock_thickness':  self._show_shock_thick.isChecked(),
+            'view_mode':             self._view_mode_combo.currentText().lower(),
         }
 
     def _build(self):
@@ -641,6 +642,22 @@ class CarParamsPanel(CollapsibleSection):
             'parts line up / clear each other without depth distortion.')
         self._chk_perspective.toggled.connect(self.perspective_changed.emit)
         self.add_widget(self._chk_perspective)
+
+        # View mode dropdown (grouped with the perspective / ground toggles).
+        vm_row = QHBoxLayout()
+        vm_row.addWidget(QLabel('View mode:'))
+        self._view_mode_combo = QComboBox()
+        self._view_mode_combo.addItems(['Normal', 'Load', 'Interference'])
+        self._view_mode_combo.setToolTip(
+            'Normal: standard view.\n'
+            'Load: desaturate the links so force vectors read clearly.\n'
+            'Interference: show part thicknesses and HIGHLIGHT any members '
+            'that clash (e.g. driveshaft vs pushrod) in red.')
+        self._view_mode_combo.currentTextChanged.connect(
+            lambda _: self.params_changed.emit(self.get_params()))
+        vm_row.addWidget(self._view_mode_combo)
+        vm_row.addStretch(1)
+        self.add_layout(vm_row)
 
         # Rear driveshaft package + shock-thickness view toggles (render only)
         self._show_driveshaft = QCheckBox('Show rear driveshaft / diff package')
@@ -738,6 +755,10 @@ class CarParamsPanel(CollapsibleSection):
                 chk.blockSignals(True)
                 chk.setChecked(bool(d[key]))
                 chk.blockSignals(False)
+        if 'view_mode' in d:
+            self._view_mode_combo.blockSignals(True)
+            self._view_mode_combo.setCurrentText(str(d['view_mode']).capitalize())
+            self._view_mode_combo.blockSignals(False)
         if 'track_pushes_inboard' in d:
             self._chk_track_inboard.blockSignals(True)
             self._chk_track_inboard.setChecked(bool(d['track_pushes_inboard']))

@@ -386,6 +386,17 @@ class View3D:
             connect='segments', width=2.5,
             parent=self._view.scene,
         )
+        # Clash highlight (Interference mode): fat warning-red segments over any
+        # members that interfere.  Empty until set_clashes() is called.
+        self._clash_vis = scene.Line(
+            pos=np.zeros((2, 3), np.float32),
+            color=(0.95, 0.15, 0.15, 1.0),
+            connect='segments', width=7.0, antialias=True,
+            parent=self._view.scene,
+        )
+        # View mode: 'normal' | 'load' (desaturate links) | 'interference'
+        # (desaturate + show all thicknesses + highlight clashes).
+        self._view_mode = 'normal'
         self._markers = scene.Markers(parent=self._view.scene)
         self._markers.set_data(
             pos=np.zeros((1, 3), np.float32),
@@ -902,9 +913,14 @@ class View3D:
         # upload lines
         if link_pos:
             self._last_link_pos = np.array(link_pos, np.float32)
-            self._links_vis.set_data(
-                pos=self._last_link_pos,
-                color=np.array(link_col, np.float32))
+            lc = np.array(link_col, np.float32)
+            if self._view_mode in ('load', 'interference') and len(lc):
+                # desaturate the wireframe links so overlaid force vectors /
+                # clash highlights read clearly on top of a pale skeleton.
+                grey = np.array([0.78, 0.78, 0.80, 1.0], np.float32)
+                lc = lc * 0.30 + grey * 0.70
+                lc[:, 3] = 0.55
+            self._links_vis.set_data(pos=self._last_link_pos, color=lc)
 
         # upload markers
         if mk_pos:
@@ -1260,6 +1276,28 @@ class View3D:
             self._spring_od_m = max(0.001, float(spring_od_mm) / 1000.0)
             self._damper_od_m = max(0.001, float(damper_od_mm) / 1000.0)
         except (TypeError, ValueError):
+            pass
+
+    def set_view_mode(self, mode: str) -> None:
+        """Set the 3D view mode: 'normal', 'load' or 'interference'.
+
+        The next update_scene() re-colours accordingly (load/interference
+        desaturate the wireframe links so overlaid vectors / clash highlights
+        stand out).  Interference mode is also where set_clashes() draws.
+        """
+        self._view_mode = mode if mode in ('normal', 'load', 'interference') else 'normal'
+
+    def set_clashes(self, segments) -> None:
+        """Highlight interfering members: segments = list of (p0, p1) world
+        points (metres).  Empty / None clears the highlight."""
+        try:
+            self._clash_count = len(segments) if segments else 0
+            if segments:
+                pos = np.array([p for seg in segments for p in seg], np.float32)
+                self._clash_vis.set_data(pos=pos, color=(0.95, 0.15, 0.15, 1.0))
+            else:
+                self._clash_vis.set_data(pos=np.zeros((2, 3), np.float32))
+        except Exception:
             pass
 
     def set_driveshaft_package(self, pkg, show: bool = True) -> None:
