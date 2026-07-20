@@ -294,6 +294,28 @@ print(f'driveshaft pkg   : offset0 asym {_p0["length_asymmetry_mm"]:.1f} mm, '
       f'RL len {_p0["RL"]["length_mm"]:.0f} mm, inputs={_ds_keys}   '
       f'{"pass" if _ds_ok else "UNEXPECTED FAIL"}')
 
+# ── INTERFERENCE (clash) ENGINE: capsule-vs-capsule distance drives the 3D
+#    Interference view mode + the driveshaft/pushrod packaging check.  Verify it
+#    flags a real overlap, ignores a designed joint, and passes clear members.
+from vahan.interference import clashes as _clashes
+_caps = [
+    {'name': 'x', 'a': [0, 0, 0],     'b': [1, 0, 0],   'r': 0.01},
+    {'name': 'y', 'a': [0.5, 0.005, 0], 'b': [0.5, 0.5, 0], 'r': 0.01},  # crosses x -> overlap
+    {'name': 'z', 'a': [0, 0.9, 0],   'b': [1, 0.9, 0], 'r': 0.01},      # parallel, far -> clear
+    {'name': 'lower arm rear', 'a': [0, 0, 0], 'b': [0.3, 0, 0], 'r': 0.01},
+    {'name': 'pushrod', 'a': [0.1, 0.001, 0], 'b': [0.1, 0.4, 0], 'r': 0.01},  # overlaps 'lower arm rear'
+]
+_cl = _clashes(_caps, margin_mm=1.0)
+_names = {frozenset({d['a'], d['b']}) for d in _cl}
+_int_ok = (frozenset({'x', 'y'}) in _names            # real overlap flagged
+           and frozenset({'pushrod', 'lower arm rear'}) not in _names  # designed joint skipped
+           and all(d['gap_mm'] < 1.0 for d in _cl))
+if not _int_ok:
+    fails += 1
+print(f'interference     : {len(_cl)} clash(es) {[(d["a"],d["b"],d["gap_mm"]) for d in _cl]}; '
+      f'real-overlap flagged + pushrod/LCA joint skipped={_int_ok}   '
+      f'{"pass" if _int_ok else "UNEXPECTED FAIL"}')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly
