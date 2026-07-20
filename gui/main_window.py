@@ -3150,9 +3150,9 @@ class MainWindow(QMainWindow):
         car_data.setdefault('diff_long_mm', car_data.get('wheelbase_mm', 1537.))
         car_data.setdefault('diff_vert_mm', 150.)
         car_data.setdefault('diff_lateral_offset_mm', 0.)
-        car_data.setdefault('diff_housing_width_mm', 180.)
+        car_data.setdefault('diff_housing_width_mm', 292.1)   # inboard pivot spacing
         car_data.setdefault('tripod_od_mm', 90.)
-        car_data.setdefault('driveshaft_dia_mm', 25.)
+        car_data.setdefault('driveshaft_dia_mm', 25.4)
         car_data.setdefault('show_driveshaft', True)
         car_data.setdefault('show_shock_thickness', True)
         self._car.update(car_data)

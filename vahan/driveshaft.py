@@ -21,8 +21,12 @@ ONE MODEL: the OUTBOARD end of each half-shaft is the LIVE solved wheel_center
 """
 import numpy as np
 
-# Small axial stub from the diff housing face out to the tripod joint centre.
-STUB_M = 0.015
+# diff_housing_width_mm now carries the INBOARD SHAFT PIVOT SPACING directly
+# (tripod-centre to tripod-centre), because that is what the user measures on
+# the car ("the inboard drive shaft pivot points are 11.5 in apart").  So the
+# tripods sit at +/- spacing/2 from the diff centre (no extra stub).  The diff
+# BODY is drawn shorter than this span in view3d.
+STUB_M = 0.0
 
 
 def _mm(car, key, default):
@@ -30,16 +34,23 @@ def _mm(car, key, default):
 
 
 def diff_center_m(car) -> np.ndarray:
-    """Differential centre in world metres from the car dict."""
+    """Differential centre in world metres from the car dict.
+
+    +x is the LEFT side of the car (RL/FL sit on +x), so a positive
+    diff_lateral_offset_mm shifts the diff toward the LEFT.
+    """
     return np.array([_mm(car, 'diff_lateral_offset_mm', 0.0),
                      _mm(car, 'diff_long_mm', 1537.0),
                      _mm(car, 'diff_vert_mm', 150.0)], float)
 
 
 def tripod_inners_m(car) -> dict:
-    """Left (+x, feeds RL) and right (-x, feeds RR) tripod joint centres."""
+    """Left (+x, feeds RL) and right (-x, feeds RR) tripod joint centres.
+
+    Placed at +/- half the inboard pivot spacing from the diff centre.
+    """
     c = diff_center_m(car)
-    half = 0.5 * _mm(car, 'diff_housing_width_mm', 180.0) + STUB_M
+    half = 0.5 * _mm(car, 'diff_housing_width_mm', 292.1) + STUB_M
     return {'L': c + np.array([+half, 0.0, 0.0]),
             'R': c + np.array([-half, 0.0, 0.0])}
 

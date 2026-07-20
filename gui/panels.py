@@ -606,14 +606,14 @@ class CarParamsPanel(CollapsibleSection):
                                dec=1, step=5); r += 1
         self._diff_vert  = row('Diff vert (Z, height):',   0,  1e6,  150, ' mm', r,
                                dec=1, step=5); r += 1
-        self._diff_offset = row('Diff lateral offset:',  -1e6, 1e6,    0, ' mm', r,
-                               dec=1, step=1); r += 1
-        self._diff_hw    = row('Diff housing width:',      1, 1000,  180, ' mm', r,
+        self._diff_offset = row('Diff lateral offset (+ = left):', -1e6, 1e6, 57.15,
+                               ' mm', r, dec=2, step=1); r += 1
+        self._diff_hw    = row('Inboard pivot spacing:',   1, 1000, 292.1, ' mm', r,
                                dec=1, step=5); r += 1
         self._tripod_od  = row('Tripod OD (placeholder):', 1, 1000,   90, ' mm', r,
                                dec=1, step=1); r += 1
-        self._ds_dia     = row('Driveshaft dia (placeholder):', 1, 300, 25, ' mm', r,
-                               dec=1, step=1); r += 1
+        self._ds_dia     = row('Driveshaft OD:',           1, 300, 25.4, ' mm', r,
+                               dec=2, step=1); r += 1
         self.add_layout(g)
 
         # Info: axle spacing vs wheelbase
@@ -707,9 +707,9 @@ class CarParamsPanel(CollapsibleSection):
         d.setdefault('diff_long_mm', 1537.)
         d.setdefault('diff_vert_mm', 150.)
         d.setdefault('diff_lateral_offset_mm', 0.)
-        d.setdefault('diff_housing_width_mm', 180.)
+        d.setdefault('diff_housing_width_mm', 292.1)   # inboard pivot spacing
         d.setdefault('tripod_od_mm', 90.)
-        d.setdefault('driveshaft_dia_mm', 25.)
+        d.setdefault('driveshaft_dia_mm', 25.4)
         # backward compat: old files have cg_height_mm → map to cg_z_mm
         if 'cg_height_mm' in d and 'cg_z_mm' not in d:
             d['cg_z_mm'] = d.pop('cg_height_mm')

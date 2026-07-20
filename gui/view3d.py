@@ -1280,13 +1280,15 @@ class View3D:
                 _clear(m)
             return
         c = np.asarray(pkg['diff_center'], float)
-        hw = float(pkg['housing_width_mm']) / 1000.0
+        span = float(pkg['housing_width_mm']) / 1000.0   # inboard pivot spacing
         shaft_r = 0.5 * float(pkg['shaft_dia_mm']) / 1000.0
         tri_r = 0.5 * float(pkg['tripod_od_mm']) / 1000.0
-        diff_r = max(0.30 * hw, 0.02)         # diff body radial size (visual)
-        # diff body: cylinder along the lateral (X) axis spanning the housing
-        dv, df = build_cylinder_between(c + np.array([-hw / 2, 0, 0]),
-                                        c + np.array([hw / 2, 0, 0]), diff_r, n=20)
+        body_w = 0.55 * span                  # diff BODY is shorter than the span
+        diff_r = max(0.14 * span, 0.03)       # diff body radial size (visual)
+        # diff body: cylinder along the lateral (X) axis, centred, shorter than
+        # the tripod-to-tripod span (the tripods bridge out to +/- span/2).
+        dv, df = build_cylinder_between(c + np.array([-body_w / 2, 0, 0]),
+                                        c + np.array([body_w / 2, 0, 0]), diff_r, n=20)
         self._diff_mesh.set_data(vertices=dv, faces=df)
         for i, corner in enumerate(('RL', 'RR')):
             seg = pkg.get(corner)
