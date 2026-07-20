@@ -3698,6 +3698,7 @@ class MainWindow(QMainWindow):
         self._aero_panel.sweep_requested.connect(self._on_aero_sweep)
         self._dynamics_panel.apply_aero_toggled.connect(self._on_apply_aero_toggle)
         self._loads_panel.loads_requested.connect(self._on_compute_loads)
+        self._loads_panel.wheel_package_requested.connect(self._open_wheel_package)
         self._brake_calc_panel.compute_requested.connect(self._on_compute_brakes)
         # Analysis & validation plots
         self._analysis_plots_panel.brake_capacity_requested.connect(self._on_plot_brake_capacity)
@@ -8391,6 +8392,24 @@ class MainWindow(QMainWindow):
     # ==========================================================================
     #  COMPONENT LOADS
     # ==========================================================================
+
+    def _open_wheel_package(self):
+        """Open the Seward-style Wheel Package Load Analysis (upright + arms)."""
+        try:
+            from gui import wheel_package
+            old = getattr(self, '_wpkg_dialog', None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            self._wpkg_dialog = wheel_package.build_dialog(self)
+            self._wpkg_dialog.show()
+            self._wpkg_dialog.raise_()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.statusBar().showMessage(f'Wheel package error: {e}', 5000)
 
     def _on_compute_loads(self):
         """Compute component forces for all 4 corners at current dynamics state."""

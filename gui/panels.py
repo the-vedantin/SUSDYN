@@ -4165,6 +4165,7 @@ class LoadsPanel(CollapsibleSection):
     caliper bolt force output with V/H decomposition.
     """
     loads_requested = pyqtSignal()   # emitted when user clicks Compute
+    wheel_package_requested = pyqtSignal()   # opens the Wheel Package Load Analysis
 
     def __init__(self):
         super().__init__('Component Loads', header_color='#E53935')
@@ -4245,6 +4246,19 @@ class LoadsPanel(CollapsibleSection):
             'QPushButton:hover { background: #B22222; }')
         self._compute_btn.clicked.connect(lambda: self.loads_requested.emit())
         self.add_widget(self._compute_btn)
+
+        # ── Wheel Package Load Analysis (Seward-style upright + arms) ──
+        self._wpkg_btn = QPushButton('Wheel Package Load Analysis...')
+        self._wpkg_btn.setToolTip(
+            'Open the Seward-style wheel-package analysis: the UPRIGHT free body '
+            '(bearings + caliper + ball-joint loads, component or resultant '
+            'vectors) and the CONTROL-ARM axial forces, per case and corner.')
+        self._wpkg_btn.setStyleSheet(
+            'QPushButton { background: #37474F; color: white; padding: 6px 16px; '
+            'border-radius: 3px; font-weight: bold; }'
+            'QPushButton:hover { background: #455A64; }')
+        self._wpkg_btn.clicked.connect(lambda: self.wheel_package_requested.emit())
+        self.add_widget(self._wpkg_btn)
 
         # ── Status ───────────────────────────────────────────────────
         self._loads_status = QLabel('')
