@@ -241,6 +241,31 @@ print(f'blade-section ARB : tube-arm {_rb0:.0f} -> 25.4x3.0 blade {_rb1:.0f} N/m
       f'({"softens" if blade_ok else "NO EFFECT"})   '
       f'{"pass" if blade_ok else "UNEXPECTED FAIL"}')
 
+# ── RIM-FIT ENVELOPE (feature 2026-07-19, user-flagged hard constraint):
+#    the kingpin ball joints + tie-rod end must fit inside the wheel rim
+#    (radial from the spin axis <= the rim clear radius), else the upright
+#    cannot be built.  Guard the KinematicMetrics.rim_fit check itself: it
+#    must PASS a joint at the rim centre and FLAG one pushed outside.
+from vahan.kinematics import KinematicMetrics as _KM
+win.set_topology(SuspensionTopology(_bt, _bt)); win._rebuild_solvers(0.)
+_stf = win._solvers['FL'].solve(0.)
+_rf = _KM(_stf, 'left').rim_fit()          # 9.5 in default clear circle
+_km = _KM(_stf, 'left')
+_ubj_r = _km.joint_rim_radius('uca_outer') * 1000
+# synthesize an out-of-rim joint: push uca_outer radially far from the axle
+import copy as _copy
+_bad = _copy.copy(_stf)
+_wc = np.asarray(_stf.wheel_center, float)
+_bad.uca_outer = list(_wc + np.array([0.0, 0.0, 0.20]))   # 200 mm above axis
+_bad_fit = _KM(_bad, 'left').rim_fit()['fits']
+rim_ok = bool(_rf['fits']) and (_bad_fit is False)
+if not rim_ok:
+    fails += 1
+print(f'rim-fit envelope : UBJ radial {_ubj_r:.0f} mm, clear '
+      f'{_rf["clear_radius_m"]*1000:.0f} mm, design fits={_rf["fits"]}, '
+      f'out-of-rim flagged={not _bad_fit}   '
+      f'{"pass" if rim_ok else "UNEXPECTED FAIL"}')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly

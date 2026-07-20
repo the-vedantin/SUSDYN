@@ -194,6 +194,46 @@ class KinematicMetrics:
         rc = _intersect_2d(ic, cp, cl_a, cl_b)
         return float(rc[1]) if rc is not None else float(ic[1])
 
+    # ── rim-fit envelope ─────────────────────────────────────────────────────
+    #  The kingpin ball joints (and tie-rod end) must physically fit inside
+    #  the wheel rim, else the upright cannot be built.  Each joint's radial
+    #  distance from the wheel spin axis must stay within the rim's clear
+    #  inner radius.  A hard packaging constraint — flagged here so the
+    #  design tooling can never quietly violate it.
+
+    def _spin_axis(self) -> np.ndarray:
+        ax = np.asarray(getattr(self._s, 'spin_axis', None)
+                        if getattr(self._s, 'spin_axis', None) is not None
+                        else [1.0, 0.0, 0.0], float)
+        n = np.linalg.norm(ax)
+        return ax / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+    def joint_rim_radius(self, joint: str) -> float:
+        """Radial distance (m) of a hardpoint from the wheel spin axis —
+        i.e. how far out in the rim it sits.  `joint` is a SolvedState
+        attribute name (e.g. 'uca_outer', 'lca_outer', 'tr_outer')."""
+        p = np.asarray(getattr(self._s, joint), float)
+        wc = np.asarray(self._s.wheel_center, float)
+        ax = self._spin_axis()
+        d = p - wc
+        return float(np.linalg.norm(d - np.dot(d, ax) * ax))
+
+    def rim_fit(self, rim_clear_diameter_m: float = 9.5 * 0.0254) -> dict:
+        """Check the outboard joints against the rim clear circle.
+        Default = a 9.5 in clear circle (fits inside a 10 in rim)."""
+        r_max = rim_clear_diameter_m / 2.0
+        out = {}
+        worst = 0.0
+        for j in ('uca_outer', 'lca_outer', 'tr_outer'):
+            try:
+                r = self.joint_rim_radius(j)
+            except Exception:
+                continue
+            out[j] = r
+            worst = max(worst, r)
+        return {'radii_m': out, 'worst_m': worst,
+                'clear_radius_m': r_max, 'fits': worst <= r_max}
+
     # ── spring / rocker ──────────────────────────────────────────────────────
 
     @property
