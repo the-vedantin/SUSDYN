@@ -3144,6 +3144,17 @@ class MainWindow(QMainWindow):
         car_data.setdefault('damper_od_mm', 50.0)
         # Track-change behaviour (added with the inboard-pickup option).
         car_data.setdefault('track_pushes_inboard', False)
+        # Rear driveshaft / differential packaging (added 2026-07; rear-only).
+        # Diff default on the rear axle line, mid-height, centreline; tripod/
+        # shaft dims are placeholders until real numbers land.
+        car_data.setdefault('diff_long_mm', car_data.get('wheelbase_mm', 1537.))
+        car_data.setdefault('diff_vert_mm', 150.)
+        car_data.setdefault('diff_lateral_offset_mm', 0.)
+        car_data.setdefault('diff_housing_width_mm', 180.)
+        car_data.setdefault('tripod_od_mm', 90.)
+        car_data.setdefault('driveshaft_dia_mm', 25.)
+        car_data.setdefault('show_driveshaft', True)
+        car_data.setdefault('show_shock_thickness', True)
         self._car.update(car_data)
         self._steer.update(data.get('steer', {}))
         self._alignment.update(data.get('alignment', {}))

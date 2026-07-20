@@ -552,6 +552,17 @@ class CarParamsPanel(CollapsibleSection):
             'spring_od_mm':          self._spring_od.value(),
             'damper_od_mm':          self._damper_od.value(),
             'track_pushes_inboard':  self._chk_track_inboard.isChecked(),
+            # Rear driveshaft / differential packaging (view + interference only,
+            # NOT a dynamics quantity — kept out of VehicleParams).  Placeholder
+            # tripod/shaft dims; user overwrites with real numbers.
+            'diff_long_mm':          self._diff_long.value(),
+            'diff_vert_mm':          self._diff_vert.value(),
+            'diff_lateral_offset_mm': self._diff_offset.value(),
+            'diff_housing_width_mm': self._diff_hw.value(),
+            'tripod_od_mm':          self._tripod_od.value(),
+            'driveshaft_dia_mm':     self._ds_dia.value(),
+            'show_driveshaft':       self._show_driveshaft.isChecked(),
+            'show_shock_thickness':  self._show_shock_thick.isChecked(),
         }
 
     def _build(self):
@@ -587,6 +598,22 @@ class CarParamsPanel(CollapsibleSection):
                                dec=1, step=1); r += 1
         self._damper_od  = row('Damper OD:',             1,   300,   50, ' mm', r,
                                dec=1, step=1); r += 1
+        # Rear driveshaft / differential packaging (rear-only, RWD).  Diff
+        # default sits on the rear axle line, mid-height, on the centreline.
+        # "Effective spacing" = diff HOUSING WIDTH (tripod centres at the
+        # housing faces + a small stub).  Tripod OD / shaft dia are PLACEHOLDERS.
+        self._diff_long  = row('Diff long (Y, fore-aft):', 0,  1e6, 1537, ' mm', r,
+                               dec=1, step=5); r += 1
+        self._diff_vert  = row('Diff vert (Z, height):',   0,  1e6,  150, ' mm', r,
+                               dec=1, step=5); r += 1
+        self._diff_offset = row('Diff lateral offset:',  -1e6, 1e6,    0, ' mm', r,
+                               dec=1, step=1); r += 1
+        self._diff_hw    = row('Diff housing width:',      1, 1000,  180, ' mm', r,
+                               dec=1, step=5); r += 1
+        self._tripod_od  = row('Tripod OD (placeholder):', 1, 1000,   90, ' mm', r,
+                               dec=1, step=1); r += 1
+        self._ds_dia     = row('Driveshaft dia (placeholder):', 1, 300, 25, ' mm', r,
+                               dec=1, step=1); r += 1
         self.add_layout(g)
 
         # Info: axle spacing vs wheelbase
@@ -614,6 +641,26 @@ class CarParamsPanel(CollapsibleSection):
             'parts line up / clear each other without depth distortion.')
         self._chk_perspective.toggled.connect(self.perspective_changed.emit)
         self.add_widget(self._chk_perspective)
+
+        # Rear driveshaft package + shock-thickness view toggles (render only)
+        self._show_driveshaft = QCheckBox('Show rear driveshaft / diff package')
+        self._show_driveshaft.setChecked(True)
+        self._show_driveshaft.setToolTip(
+            'Draw the rear differential body, tripods and driveshafts (with '
+            'thickness) so you can check packaging and interference and move '
+            'the diff. Rear-only (RWD).')
+        self._show_driveshaft.stateChanged.connect(
+            lambda _: self.params_changed.emit(self.get_params()))
+        self.add_widget(self._show_driveshaft)
+
+        self._show_shock_thick = QCheckBox('Show shock thickness (spring/damper OD)')
+        self._show_shock_thick.setChecked(True)
+        self._show_shock_thick.setToolTip(
+            'ON: springs/dampers drawn as solid cylinders at their OD.\n'
+            'OFF: drawn as thin lines (declutter / see behind them).')
+        self._show_shock_thick.stateChanged.connect(
+            lambda _: self.params_changed.emit(self.get_params()))
+        self.add_widget(self._show_shock_thick)
 
         # Track-width behaviour: by default only the OUTBOARD pickups
         # (uca_outer, lca_outer, tie_rod_outer, wheel_center, pushrod_outer)
@@ -649,7 +696,20 @@ class CarParamsPanel(CollapsibleSection):
             'rack_length_mm': self._rack_len,
             'spring_od_mm':   self._spring_od,
             'damper_od_mm':   self._damper_od,
+            'diff_long_mm':   self._diff_long,
+            'diff_vert_mm':   self._diff_vert,
+            'diff_lateral_offset_mm': self._diff_offset,
+            'diff_housing_width_mm':  self._diff_hw,
+            'tripod_od_mm':   self._tripod_od,
+            'driveshaft_dia_mm': self._ds_dia,
         }
+        # back-compat: older files have no diff/driveshaft block → defaults
+        d.setdefault('diff_long_mm', 1537.)
+        d.setdefault('diff_vert_mm', 150.)
+        d.setdefault('diff_lateral_offset_mm', 0.)
+        d.setdefault('diff_housing_width_mm', 180.)
+        d.setdefault('tripod_od_mm', 90.)
+        d.setdefault('driveshaft_dia_mm', 25.)
         # backward compat: old files have cg_height_mm → map to cg_z_mm
         if 'cg_height_mm' in d and 'cg_z_mm' not in d:
             d['cg_z_mm'] = d.pop('cg_height_mm')
@@ -672,6 +732,12 @@ class CarParamsPanel(CollapsibleSection):
             self._show_ground.blockSignals(True)
             self._show_ground.setChecked(d['show_ground'])
             self._show_ground.blockSignals(False)
+        for key, chk in (('show_driveshaft', self._show_driveshaft),
+                         ('show_shock_thickness', self._show_shock_thick)):
+            if key in d:
+                chk.blockSignals(True)
+                chk.setChecked(bool(d[key]))
+                chk.blockSignals(False)
         if 'track_pushes_inboard' in d:
             self._chk_track_inboard.blockSignals(True)
             self._chk_track_inboard.setChecked(bool(d['track_pushes_inboard']))

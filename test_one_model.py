@@ -270,6 +270,30 @@ print(f'rim-fit envelope : input {_rim_mm:.0f} mm dia, UBJ radial {_ubj_r:.0f} m
       f'out-of-rim flagged={not _bad_fit}   '
       f'{"pass" if rim_ok else "UNEXPECTED FAIL"}')
 
+# ── REAR DRIVESHAFT PACKAGE (user 2026-07-20): diff/tripod/shaft geometry from
+#    the car-dict inputs, bound to the LIVE solved wheel_center (ONE MODEL).  A
+#    lateral offset must make the two half-shafts UNEQUAL by ~2x the offset, and
+#    the packaging inputs must round-trip through the car panel.
+from vahan.driveshaft import package as _dpkg
+_rear = {'RL': win._solvers['RL'].solve(0.), 'RR': win._solvers['RR'].solve(0.)}
+_carc = dict(win._car); _carc['diff_lateral_offset_mm'] = 0.0
+_p0 = _dpkg(_carc, _rear)
+_carc['diff_lateral_offset_mm'] = 40.0
+_p40 = _dpkg(_carc, _rear)
+_gp = win._car_panel.get_params()
+_ds_keys = all(k in _gp for k in ('diff_long_mm', 'diff_lateral_offset_mm',
+               'diff_housing_width_mm', 'tripod_od_mm', 'driveshaft_dia_mm',
+               'show_driveshaft', 'show_shock_thickness'))
+_ds_ok = (_ds_keys and _p0['length_asymmetry_mm'] < 1.0
+          and abs(_p40['length_asymmetry_mm'] - 80.0) < 8.0
+          and _p0['RL']['length_mm'] > 50.0)
+if not _ds_ok:
+    fails += 1
+print(f'driveshaft pkg   : offset0 asym {_p0["length_asymmetry_mm"]:.1f} mm, '
+      f'offset40 asym {_p40["length_asymmetry_mm"]:.1f} mm (~80), '
+      f'RL len {_p0["RL"]["length_mm"]:.0f} mm, inputs={_ds_keys}   '
+      f'{"pass" if _ds_ok else "UNEXPECTED FAIL"}')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly
