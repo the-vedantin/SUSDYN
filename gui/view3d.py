@@ -405,6 +405,16 @@ class View3D:
         self._spring_od_m = 0.063
         self._damper_od_m = 0.050
 
+        # ── Rear driveshaft / differential package ───────────────────────
+        # Diff body (mid-grey), two tripods (yellow), two half-shafts (light
+        # grey).  Colourblind-safe (grey/white/yellow — no red/green pairing).
+        # Populated by set_driveshaft_package(); empty until then.
+        self._diff_mesh = self._new_mesh((0.55, 0.55, 0.58, 0.90))
+        self._driveshaft_meshes = [self._new_mesh((0.82, 0.82, 0.85, 0.92))
+                                   for _ in range(2)]   # RL, RR
+        self._tripod_meshes = [self._new_mesh((0.95, 0.85, 0.25, 0.95))
+                               for _ in range(2)]       # RL, RR
+
         # ── Decoupled (twin-bellcrank) visuals ───────────────────────────
         # Per axle (front + rear) we render:
         #   * LEFT bellcrank plate    →  self._cradle_meshes
@@ -1251,6 +1261,48 @@ class View3D:
             self._damper_od_m = max(0.001, float(damper_od_mm) / 1000.0)
         except (TypeError, ValueError):
             pass
+
+    def set_driveshaft_package(self, pkg, show: bool = True) -> None:
+        """Draw the rear diff body, tripods and half-shafts as thick cylinders.
+
+        pkg: the dict from vahan.driveshaft.package(car, rear_states) (or None).
+        Each half-shaft's OUTER end is the LIVE solved wheel_center carried in
+        pkg, so the shafts move with the uprights every travel step (ONE MODEL).
+        show=False (or pkg None) clears them.  Cylinders give real thickness so
+        interference against the arms / chassis is visible.
+        """
+        def _clear(m):
+            m.set_data(vertices=np.zeros((3, 3), np.float32),
+                       faces=np.array([[0, 1, 2]], np.uint32))
+        if not pkg or not show:
+            _clear(self._diff_mesh)
+            for m in self._driveshaft_meshes + self._tripod_meshes:
+                _clear(m)
+            return
+        c = np.asarray(pkg['diff_center'], float)
+        hw = float(pkg['housing_width_mm']) / 1000.0
+        shaft_r = 0.5 * float(pkg['shaft_dia_mm']) / 1000.0
+        tri_r = 0.5 * float(pkg['tripod_od_mm']) / 1000.0
+        diff_r = max(0.30 * hw, 0.02)         # diff body radial size (visual)
+        # diff body: cylinder along the lateral (X) axis spanning the housing
+        dv, df = build_cylinder_between(c + np.array([-hw / 2, 0, 0]),
+                                        c + np.array([hw / 2, 0, 0]), diff_r, n=20)
+        self._diff_mesh.set_data(vertices=dv, faces=df)
+        for i, corner in enumerate(('RL', 'RR')):
+            seg = pkg.get(corner)
+            if not seg:
+                _clear(self._driveshaft_meshes[i]); _clear(self._tripod_meshes[i])
+                continue
+            inner = np.asarray(seg['inner'], float)
+            outer = np.asarray(seg['outer'], float)
+            axis = np.asarray(seg['axis'], float)
+            sv, sf = build_cylinder_between(inner, outer, shaft_r, n=16)
+            self._driveshaft_meshes[i].set_data(vertices=sv, faces=sf)
+            # tripod = stubby cylinder at the inner (diff) end, along the shaft
+            t = float(pkg['tripod_od_mm']) / 1000.0
+            tv, tf = build_cylinder_between(inner - axis * 0.5 * t,
+                                            inner + axis * 0.5 * t, tri_r, n=16)
+            self._tripod_meshes[i].set_data(vertices=tv, faces=tf)
 
     # ── internal ─────────────────────────────────────────────────────────────
 

@@ -5500,13 +5500,35 @@ class MainWindow(QMainWindow):
             self.view3d.toggle_ground(self._car.get('show_ground', True))
             # Push current spring / damper OD (mm) into the renderer so the
             # cylinder mesh next built in update_scene uses the latest value.
+            # When the shock-thickness view toggle is OFF, draw them as thin
+            # (~2 mm) cylinders so they read as lines and declutter the view.
             try:
+                _thick = self._car.get('show_shock_thickness', True)
                 self.view3d.set_spring_dims(
-                    self._car.get('spring_od_mm', 63.0),
-                    self._car.get('damper_od_mm', 50.0))
+                    self._car.get('spring_od_mm', 63.0) if _thick else 2.0,
+                    self._car.get('damper_od_mm', 50.0) if _thick else 2.0)
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)
+
+            # ── Rear driveshaft / differential package (rear-only, RWD) ──────
+            # Build from the LIVE solved rear wheel_center + spin_axis carried
+            # in corners_draw (ONE MODEL), so the shafts move with the uprights.
+            try:
+                import types as _types
+                from vahan.driveshaft import package as _ds_package
+                _rear_states = {
+                    c['label']: _types.SimpleNamespace(
+                        wheel_center=c['pts']['wheel_center'],
+                        spin_axis=c['spin_axis'])
+                    for c in corners_draw if c['label'] in ('RL', 'RR')
+                    and 'wheel_center' in c['pts']}
+                _pkg = (_ds_package(self._car, _rear_states)
+                        if len(_rear_states) == 2 else None)
+                self.view3d.set_driveshaft_package(
+                    _pkg, show=self._car.get('show_driveshaft', True))
+            except Exception:
+                pass
             self._frame_overlay(corners_draw)
             self._update_dimension_readouts()
 
