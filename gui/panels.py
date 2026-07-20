@@ -2242,6 +2242,12 @@ class DynamicsPanel(CollapsibleSection):
         self._final_ratio     = prow('Final drive ratio:',0.01,1e6, 12.59, ':1',   pr, dec=2, step=0.1); pr += 1
         self._drivetrain_eff  = prow('Drivetrain eff:',   0.01,1.0,  0.92, '',     pr, dec=2, step=0.01); pr += 1
         self._tire_radius     = prow('Tire radius:',    0.1,1e6,   203,    ' mm', pr, dec=0, step=1); pr += 1
+        self._rim_clear_dia   = prow('Rim clear dia:',  0.1,1e6,   241.3,  ' mm', pr, dec=1, step=1); pr += 1
+        self._rim_clear_dia.setToolTip(
+            'Clear inner diameter of the wheel rim (interference envelope).\n'
+            'The kingpin ball joints + tie-rod end must fit within this circle\n'
+            'about the wheel spin axis or the upright cannot be built.\n'
+            'Default 241.3 mm = 9.5 in clear inside a 10 in rim.')
         self._turn_radius     = prow('Turn radius:',   0.01,1e6,    10.0,  ' m',  pr, dec=1, step=0.5); pr += 1
         self.add_layout(pw)
 
@@ -2930,6 +2936,12 @@ class DynamicsPanel(CollapsibleSection):
             f"MR {r['mr']:.3f}"
         )
 
+    def rim_clear_diameter_m(self) -> float:
+        """Wheel-rim clear inner diameter (m) — the interference envelope the
+        kingpin ball joints + tie-rod end must fit inside.  A packaging input,
+        kept OUT of get_params()/VehicleParams (that is dynamics only)."""
+        return float(self._rim_clear_dia.value()) / 1000.0
+
     def get_params(self) -> dict:
         """Return dynamics parameters dict for VehicleParams construction.
 
@@ -3063,6 +3075,7 @@ class DynamicsPanel(CollapsibleSection):
             'powertrain_type':       str(self._powertrain_type.currentText()),
             'peak_torque_Nm':        float(self._peak_torque.value()),
             'tire_radius_mm':        float(self._tire_radius.value()),
+            'rim_clear_dia_mm':      float(self._rim_clear_dia.value()),
             'turn_radius_m':         float(self._turn_radius.value()),
             'drivetrain':          self._drivetrain.currentText(),
             # Solve / sweep setpoints
@@ -3129,7 +3142,7 @@ class DynamicsPanel(CollapsibleSection):
             self._arb_G, self._arb_E,
             self._power_hp, self._engine_rpm,
             self._final_ratio, self._drivetrain_eff, self._peak_torque,
-            self._tire_radius, self._turn_radius,
+            self._tire_radius, self._rim_clear_dia, self._turn_radius,
             self._lat_g, self._lon_g, self._g_min, self._g_max,
             self._drivetrain, self._sweep_lat_cb, self._sweep_lon_cb,
             self._apply_aero_btn,
@@ -3198,6 +3211,7 @@ class DynamicsPanel(CollapsibleSection):
                 if idx >= 0:
                     self._powertrain_type.setCurrentIndex(idx)
             _set_spin(self._tire_radius,     'tire_radius_mm')
+            _set_spin(self._rim_clear_dia,   'rim_clear_dia_mm')
             _set_spin(self._turn_radius,     'turn_radius_m')
             _set_spin(self._lat_g,           'lateral_g')
             _set_spin(self._lon_g,           'longitudinal_g')

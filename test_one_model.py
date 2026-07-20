@@ -249,7 +249,11 @@ print(f'blade-section ARB : tube-arm {_rb0:.0f} -> 25.4x3.0 blade {_rb1:.0f} N/m
 from vahan.kinematics import KinematicMetrics as _KM
 win.set_topology(SuspensionTopology(_bt, _bt)); win._rebuild_solvers(0.)
 _stf = win._solvers['FL'].solve(0.)
-_rf = _KM(_stf, 'left').rim_fit()          # 9.5 in default clear circle
+# rim clear diameter is now a PANEL INPUT (user 2026-07-20) — the check must
+# read it, and get_params must round-trip it.
+_rim_m = win._dynamics_panel.rim_clear_diameter_m()   # panel input, 9.5 in default
+_rim_mm = _rim_m * 1000.0
+_rf = _KM(_stf, 'left').rim_fit(_rim_m)
 _km = _KM(_stf, 'left')
 _ubj_r = _km.joint_rim_radius('uca_outer') * 1000
 # synthesize an out-of-rim joint: push uca_outer radially far from the axle
@@ -257,12 +261,12 @@ import copy as _copy
 _bad = _copy.copy(_stf)
 _wc = np.asarray(_stf.wheel_center, float)
 _bad.uca_outer = list(_wc + np.array([0.0, 0.0, 0.20]))   # 200 mm above axis
-_bad_fit = _KM(_bad, 'left').rim_fit()['fits']
-rim_ok = bool(_rf['fits']) and (_bad_fit is False)
+_bad_fit = _KM(_bad, "left").rim_fit(_rim_m)["fits"]
+rim_ok = (_rim_mm > 1.0) and bool(_rf['fits']) and (_bad_fit is False)
 if not rim_ok:
     fails += 1
-print(f'rim-fit envelope : UBJ radial {_ubj_r:.0f} mm, clear '
-      f'{_rf["clear_radius_m"]*1000:.0f} mm, design fits={_rf["fits"]}, '
+print(f'rim-fit envelope : input {_rim_mm:.0f} mm dia, UBJ radial {_ubj_r:.0f} mm, '
+      f'clear {_rf["clear_radius_m"]*1000:.0f} mm, design fits={_rf["fits"]}, '
       f'out-of-rim flagged={not _bad_fit}   '
       f'{"pass" if rim_ok else "UNEXPECTED FAIL"}')
 
