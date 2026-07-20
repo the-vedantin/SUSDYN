@@ -218,6 +218,29 @@ print(f'skidpad ARB fresh: handler refreshes={_src_ok}  rate responds '
       f'{_r0:.0f}->{_r1:.0f} N/m ({"live" if _fresh_ok else "DEAD"})   '
       f'{"pass" if skid_ok else "UNEXPECTED FAIL"}')
 
+# ── BLADE-SECTION ARB ARM (feature 2026-07-19): a flat-leaf blade's
+#    weak-axis bending replaces the tube-section arm stiffness when
+#    blade w and t are both set.  Guard: setting a thin blade SOFTENS the
+#    computed wheel rate vs the legacy tube-arm model, and w or t = 0
+#    restores the legacy value exactly.
+_bw0 = win._dynamics_panel._arb_blade_w_f.value()
+_bt0 = win._dynamics_panel._arb_blade_t_f.value()
+win._dynamics_panel._arb_blade_w_f.setValue(0.0)
+win._dynamics_panel._arb_blade_t_f.setValue(0.0)
+win._refresh_arb_geometry_into_panel()
+_rb0 = float(win._dynamics_panel.get_params()['arb_rate_front_Npm'])
+win._dynamics_panel._arb_blade_w_f.setValue(25.4)
+win._dynamics_panel._arb_blade_t_f.setValue(3.0)
+_rb1 = float(win._dynamics_panel.get_params()['arb_rate_front_Npm'])
+win._dynamics_panel._arb_blade_w_f.setValue(_bw0)
+win._dynamics_panel._arb_blade_t_f.setValue(_bt0)
+blade_ok = _rb0 > 0 and 0 < _rb1 < _rb0
+if not blade_ok:
+    fails += 1
+print(f'blade-section ARB : tube-arm {_rb0:.0f} -> 25.4x3.0 blade {_rb1:.0f} N/m '
+      f'({"softens" if blade_ok else "NO EFFECT"})   '
+      f'{"pass" if blade_ok else "UNEXPECTED FAIL"}')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly

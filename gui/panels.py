@@ -2166,6 +2166,20 @@ class DynamicsPanel(CollapsibleSection):
         self._arb_ID_r = row('ARB R bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=2, step=0.1);  r += 1
         self._arb_G    = row('Bar G (shear):', 1, 1e9, 79300.0, ' N/mm²', r, dec=0, step=500);  r += 1
         self._arb_E    = row('Bar E (Young):', 1, 1e9, 207000.0,' N/mm²', r, dec=0, step=500);  r += 1
+        # Blade-type ARB arms: a flat leaf whose WEAK-AXIS bending is the
+        # dominant series compliance (and the trackside adjuster).  w or t
+        # = 0 keeps the legacy model (arm bends with the BAR tube section).
+        self._arb_blade_w_f = row('ARB F blade width:', 0.0, 1e6, 0.0, ' mm', r, dec=1, step=0.5); r += 1
+        self._arb_blade_t_f = row('ARB F blade thick:', 0.0, 1e6, 0.0, ' mm', r, dec=2, step=0.1); r += 1
+        self._arb_blade_w_r = row('ARB R blade width:', 0.0, 1e6, 0.0, ' mm', r, dec=1, step=0.5); r += 1
+        self._arb_blade_t_r = row('ARB R blade thick:', 0.0, 1e6, 0.0, ' mm', r, dec=2, step=0.1); r += 1
+        for _bw in (self._arb_blade_w_f, self._arb_blade_w_r):
+            _bw.setToolTip('Blade (bar arm) flat width.\n0 = legacy model: '
+                           'the arm bends with the bar tube section.')
+        for _bt in (self._arb_blade_t_f, self._arb_blade_t_r):
+            _bt.setToolTip('Blade (bar arm) flat thickness — the WEAK axis.\n'
+                           'Arm bending stiffness = 3·E·(w·t³/12)/A³ when '
+                           'both w and t > 0.\n0 = legacy tube-section arm.')
         # ID = 0 ⇒ solid bar.  Any ID ≥ OD collapses the cross-section
         # to a zero-wall tube → wheel rate = 0 (caught in get_params).
         self._arb_ID_f.setToolTip(
@@ -2752,7 +2766,9 @@ class DynamicsPanel(CollapsibleSection):
     def _compute_arb_wheel_rate_Npm(OD_mm: float, ID_mm: float,
                                     L_half_mm: float, A_mm: float,
                                     MR: float, G_Npmm2: float,
-                                    E_Npmm2: float) -> float:
+                                    E_Npmm2: float,
+                                    blade_w_mm: float = 0.0,
+                                    blade_t_mm: float = 0.0) -> float:
         """Wheel-rate contribution of one anti-roll bar (N/m).
 
         Hollow-shaft form — the area moments scale with (OD⁴−ID⁴) so a
@@ -2783,8 +2799,16 @@ class DynamicsPanel(CollapsibleSection):
         D4 = OD ** 4 - ID ** 4             # mm⁴ (positive by check above)
         J = math.pi * D4 / 32.0            # mm⁴
         I = math.pi * D4 / 64.0            # mm⁴
+        # Blade-type arm: a flat leaf bending about its WEAK axis is the
+        # arm's series compliance (and the trackside stiffness adjuster).
+        # w or t = 0 → legacy model (arm bends with the bar tube section).
+        bw = max(0.0, float(blade_w_mm)); bt = max(0.0, float(blade_t_mm))
+        if bw > 0.0 and bt > 0.0:
+            I_arm = bw * bt ** 3 / 12.0    # mm⁴ (weak axis)
+        else:
+            I_arm = I
         K_t = G * J / (A * A * L)          # N/mm at arm tip (torsion bar)
-        K_a = 3.0 * E * I / (A * A * A)    # N/mm at arm tip (arm bending)
+        K_a = 3.0 * E * I_arm / (A * A * A)  # N/mm at arm tip (arm bending)
         if K_t > 0.0 and K_a > 0.0:
             K_arb = (K_t * K_a) / (K_t + K_a)
         else:
@@ -2926,14 +2950,18 @@ class DynamicsPanel(CollapsibleSection):
             L_half_mm=f_geom['half_length_mm'],
             A_mm=f_geom['arm_length_mm'],
             MR=f_geom['mr'],
-            G_Npmm2=G, E_Npmm2=E)
+            G_Npmm2=G, E_Npmm2=E,
+            blade_w_mm=self._arb_blade_w_f.value(),
+            blade_t_mm=self._arb_blade_t_f.value())
         arb_r_Npm = self._compute_arb_wheel_rate_Npm(
             OD_mm=self._arb_OD_r.value(),
             ID_mm=self._arb_ID_r.value(),
             L_half_mm=r_geom['half_length_mm'],
             A_mm=r_geom['arm_length_mm'],
             MR=r_geom['mr'],
-            G_Npmm2=G, E_Npmm2=E)
+            G_Npmm2=G, E_Npmm2=E,
+            blade_w_mm=self._arb_blade_w_r.value(),
+            blade_t_mm=self._arb_blade_t_r.value())
         params = {
             # total_mass_kg is now DERIVED from the three below — no longer
             # an independent input.  VehicleParams computes it as a @property.
@@ -3019,6 +3047,10 @@ class DynamicsPanel(CollapsibleSection):
             'arb_ID_f_mm':         float(self._arb_ID_f.value()),
             'arb_OD_r_mm':         float(self._arb_OD_r.value()),
             'arb_ID_r_mm':         float(self._arb_ID_r.value()),
+            'arb_blade_w_f_mm':    float(self._arb_blade_w_f.value()),
+            'arb_blade_t_f_mm':    float(self._arb_blade_t_f.value()),
+            'arb_blade_w_r_mm':    float(self._arb_blade_w_r.value()),
+            'arb_blade_t_r_mm':    float(self._arb_blade_t_r.value()),
             'arb_G_Npmm2':         float(self._arb_G.value()),
             'arb_E_Npmm2':         float(self._arb_E.value()),
             # Powertrain — primary_ratio + sprocket_* are obsolete (collapsed
@@ -3136,6 +3168,10 @@ class DynamicsPanel(CollapsibleSection):
                 self._arb_ID_r.setValue(0.0)
             _set_spin(self._arb_ID_f,        'arb_ID_f_mm')
             _set_spin(self._arb_ID_r,        'arb_ID_r_mm')
+            _set_spin(self._arb_blade_w_f,   'arb_blade_w_f_mm')
+            _set_spin(self._arb_blade_t_f,   'arb_blade_t_f_mm')
+            _set_spin(self._arb_blade_w_r,   'arb_blade_w_r_mm')
+            _set_spin(self._arb_blade_t_r,   'arb_blade_t_r_mm')
             _set_spin(self._arb_G,           'arb_G_Npmm2')
             _set_spin(self._arb_E,           'arb_E_Npmm2')
             _set_spin(self._power_hp,        'power_hp')
