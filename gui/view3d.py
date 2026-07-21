@@ -967,14 +967,14 @@ class View3D:
                     rv, rf = build_cylinder_between(
                         wcv - s * self._rotor_hw, wcv + s * self._rotor_hw, rr, n=32)
                     self._rotor_meshes[ci].set_data(vertices=rv, faces=rf)
-                    # caliper: GP200 body ~97.8 mm tangential x 27.9 mm radial
-                    # (mount height) x ~40 mm axial, straddling the rotor edge at
-                    # the top (12 o'clock default).
-                    up = np.array([0, 0, 1.0]) - np.dot([0, 0, 1.0], s) * s
-                    up = up / max(np.linalg.norm(up), 1e-9)
-                    tan = np.cross(s, up)
-                    cal_c = wcv + up * (rr - 0.006)
-                    cv, cf = build_box(cal_c, s, up, tan,
+                    # caliper: GP200 body ~97.8 mm long x 27.9 mm mount height x
+                    # ~40 mm axial, straddling the rotor edge on the SIDE
+                    # (fore-aft / trailing, not the top).
+                    rad = np.array([0, 1.0, 0]) - np.dot([0, 1.0, 0], s) * s
+                    rad = rad / max(np.linalg.norm(rad), 1e-9)   # rearward in wheel plane
+                    tan = np.cross(s, rad)
+                    cal_c = wcv + rad * (rr - 0.006)
+                    cv, cf = build_box(cal_c, s, rad, tan,
                                        half_ax=0.020, half_rad=0.0140, half_tan=0.0489)
                     self._caliper_meshes[ci].set_data(vertices=cv, faces=cf)
                 else:
