@@ -5236,6 +5236,92 @@ class MainWindow(QMainWindow):
             all_corner_values[label] = corner_vals
         return corners_draw, all_corner_values
 
+    def build_load_view(self, view3d, corner_label, lat_g, lon_g, vec_mode='resultant'):
+        """Drive a (possibly SEPARATE) View3D into Load mode from the ONE solved
+        model — used by the embedded Loads-page 3-D view so inputs -> table ->
+        picture all read one model.  `corner_label` None => all four corners
+        (exit isolation).  Mirrors the Load-mode setup inside _update_3d but
+        targets the passed view3d instead of self.view3d, and holds a static
+        design-ride pose (the load "case" is the g-vector, not a kinematic sweep).
+        """
+        if not self._solvers:
+            return
+        cp = self._car
+        try:
+            view3d.set_tire_params(
+                outer_r=cp['tire_outer_dia_mm'] / 2000.,
+                rim_r=cp['tire_rim_dia_mm'] / 2000.,
+                half_w=cp['tire_width_mm'] / 2000.,
+            )
+        except Exception:
+            pass
+        travels = {lbl: 0.0 for lbl in ('FL', 'FR', 'RL', 'RR')}
+        corners_draw, _ = self._assemble_corners_draw(travels, 0.0)
+        if not corners_draw:
+            return
+        try:
+            _thick = cp.get('show_shock_thickness', True)
+            view3d.set_spring_dims(
+                cp.get('spring_od_mm', 63.0) if _thick else 2.0,
+                cp.get('damper_od_mm', 50.0) if _thick else 2.0)
+        except Exception:
+            pass
+        try:
+            view3d.set_view_mode('load')
+            view3d.sync_view_controls(view_mode='load')
+            view3d.set_isolate_corner(corner_label)     # None => all corners
+            view3d.set_brakes(cp.get('show_brakes', True))
+            view3d.set_brake_dims(cp.get('rotor_dia_mm', 240.0))
+        except Exception:
+            pass
+        # ARB/springs are hidden on isolation (update_scene honours isolate); the
+        # isolated load picture is about the corner force vectors, so arb_segs=[].
+        view3d.update_scene(corners_draw, [])
+        # rear driveshaft / diff package (RWD) — same build as _update_3d
+        try:
+            import types as _types
+            from vahan.driveshaft import package as _ds_package
+            _rear_states = {
+                c['label']: _types.SimpleNamespace(
+                    wheel_center=c['pts']['wheel_center'],
+                    spin_axis=c['spin_axis'])
+                for c in corners_draw if c['label'] in ('RL', 'RR')
+                and 'wheel_center' in c['pts']}
+            _pkg = (_ds_package(cp, _rear_states)
+                    if len(_rear_states) == 2 else None)
+            _only = corner_label if corner_label in ('RL', 'RR') else None
+            _show_ds = (cp.get('show_driveshaft', True)
+                        and (corner_label is None or corner_label in ('RL', 'RR')))
+            view3d.set_driveshaft_package(_pkg, show=_show_ds, only=_only)
+        except Exception:
+            pass
+        # force-vector arrows (feed hover) — from the SAME solved model
+        try:
+            from gui.wheel_package import load_arrows
+            view3d.set_load_vectors(
+                load_arrows(self, lat_g, lon_g, mode=vec_mode, only_corner=corner_label))
+        except Exception:
+            view3d.set_load_vectors([])
+        # Frame the camera on a corner CHANGE only (don't fight manual orbit):
+        # zoom onto the isolated wheel, or the whole car for 'all corners'.
+        try:
+            if getattr(view3d, '_load_framed_corner', '__unset__') != corner_label:
+                if corner_label:
+                    wc = next((c['pts']['wheel_center'] for c in corners_draw
+                               if c['label'] == corner_label
+                               and 'wheel_center' in c['pts']), None)
+                    if wc is not None:
+                        view3d.set_camera_center((float(wc[0]), float(wc[1]), float(wc[2])))
+                        view3d._cam.scale_factor = 0.65
+                else:
+                    wb_half = cp['axle_spacing_mm'] / 2000.
+                    view3d.set_camera_center((0., wb_half, 0.2))
+                    view3d._cam.scale_factor = 2.6
+                view3d._canvas.update()
+                view3d._load_framed_corner = corner_label
+        except Exception:
+            pass
+
     def _update_3d(self):
         if not self._solvers:
             return
