@@ -2261,6 +2261,9 @@ class MainWindow(QMainWindow):
         city_act = pm.addAction('Design City')
         city_act.setShortcut('Ctrl+3')
         city_act.triggered.connect(lambda: self._switch_page(2))
+        loads_act = pm.addAction('Loads')
+        loads_act.setShortcut('Ctrl+4')
+        loads_act.triggered.connect(lambda: self._switch_page(3))
 
         vm = mb.addMenu('View')
         hp_act = vm.addAction('All Hardpoints…')
@@ -3484,10 +3487,19 @@ class MainWindow(QMainWindow):
                 import traceback; traceback.print_exc()
                 self.statusBar().showMessage(f'Design City page failed: {e}', 8000)
                 return
+        if idx >= 3 and self._pages.count() < 4:
+            try:
+                from gui.loads_page import LoadsPage
+                self._loads_page = LoadsPage(self)
+                self._pages.addWidget(self._loads_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Loads page failed: {e}', 8000)
+                return
         if idx < self._pages.count():
             self._pages.setCurrentIndex(idx)
             self.statusBar().showMessage(
-                ('Suspension', 'Laptime', 'Design City')[idx] + ' page', 2000)
+                ('Suspension', 'Laptime', 'Design City', 'Loads')[idx] + ' page', 2000)
 
     def _build_ui(self):
         self._build_menu()
