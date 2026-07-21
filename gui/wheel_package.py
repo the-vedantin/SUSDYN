@@ -150,12 +150,16 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             #   bolt line, l5 = bolt (lug) spacing.
             _bp = bp_f if lbl[0] == 'F' else bp_r
             R_pad = max(float(_bp.pad_radius_mm) / 1000.0, 0.03)
-            l4 = max(float(getattr(_bp, 'caliper_l4_mm', 25.0)) / 1000.0, 0.0)
+            # Mount geometry comes from the caliper DRAWING (see BrakeParams):
+            # the bolt line sits at D1 = rotor_dia/2 - mount height, and l4 is
+            # derived from it, not typed.  The old code put the bolts at
+            # R_pad - 25 mm, which is 23 mm inboard of where they actually are.
+            bolt_r = max(float(_bp.bolt_line_radius_mm) / 1000.0, 0.02)
+            l4 = max(float(_bp.caliper_l4_mm) / 1000.0, 0.0)
             l5 = max(float(_bp.caliper_bolt_spacing_mm) / 1000.0, 0.01)
             F_brake = bt / R_pad
             V_brake = 0.5 * F_brake                             # shared tangential (both lugs)
             H_brake = F_brake * l4 / l5                         # couple (opposite on the lugs)
-            bolt_r = max(R_pad - l4, 0.02)
             s = float(np.sign(bt))
             for sgn in (+1.0, -1.0):
                 pos = wc + r_hat * bolt_r + t_hat * (sgn * 0.5 * l5)

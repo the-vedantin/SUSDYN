@@ -529,6 +529,9 @@ class View3D:
         # 0.25 in rotor width; rotor radius is a user input (<= 11 in max dia).
         self._rotor_r = 0.120
         self._rotor_hw = 0.5 * 0.25 * 0.0254        # 0.25 in / 2 = 3.175 mm
+        # Caliper placement, kept in step with the LOAD model (see set_brake_dims).
+        self._caliper_bolt_r = self._rotor_r - 0.0279   # drawing D1
+        self._caliper_angle_deg = 45.0
         # (mesh, base_rgba) for every SOLID car part — greyed in Load /
         # Interference mode so only the force vectors keep colour.
         self._car_meshes = (
@@ -1060,13 +1063,22 @@ class View3D:
                     rv, rf = build_cylinder_between(
                         wcv - s * self._rotor_hw, wcv + s * self._rotor_hw, rr, n=32)
                     self._rotor_meshes[ci].set_data(vertices=rv, faces=rf)
-                    # caliper: GP200 body ~97.8 mm long x 27.9 mm mount height x
-                    # ~40 mm axial, straddling the rotor edge on the SIDE
-                    # (fore-aft / trailing, not the top).
-                    rad = np.array([0, 1.0, 0]) - np.dot([0, 1.0, 0], s) * s
-                    rad = rad / max(np.linalg.norm(rad), 1e-9)   # rearward in wheel plane
+                    # caliper body, placed at the SAME angle and the SAME bolt-line
+                    # radius the LOAD model uses.  This used to be hardcoded
+                    # rearward at rr-6 mm and ignored caliper_angle_deg entirely,
+                    # so the drawn caliper and the caliper load arrows sat in two
+                    # different places (114 mm vs 69 mm radius, 90 deg apart).
+                    vup = np.array([0, 0, 1.0]) - np.dot([0, 0, 1.0], s) * s
+                    vup = vup / max(np.linalg.norm(vup), 1e-9)
+                    fwd = np.array([0, 1.0, 0]) - np.dot([0, 1.0, 0], s) * s
+                    fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
+                    phi = np.radians(float(self._caliper_angle_deg))
+                    rad = vup * np.cos(phi) + fwd * np.sin(phi)   # radial to caliper
+                    rad = rad / max(np.linalg.norm(rad), 1e-9)
                     tan = np.cross(s, rad)
-                    cal_c = wcv + rad * (rr - 0.006)
+                    # Body centred just outboard of the bolt line, straddling the
+                    # disc: drawing mount height sets how far below the OD it sits.
+                    cal_c = wcv + rad * (self._caliper_bolt_r + 0.014)
                     cv, cf = build_box(cal_c, s, rad, tan,
                                        half_ax=0.020, half_rad=0.0140, half_tan=0.0489)
                     self._caliper_meshes[ci].set_data(vertices=cv, faces=cf)
@@ -1604,12 +1616,31 @@ class View3D:
         """Show/hide the brake rotors + calipers in the 3-D view."""
         self._show_brakes = bool(show)
 
-    def set_brake_dims(self, rotor_dia_mm) -> None:
-        """Rotor diameter (mm); rotor thickness stays the GP200's 0.25 in."""
+    def set_brake_dims(self, rotor_dia_mm, mount_height_mm=None,
+                       caliper_angle_deg=None) -> None:
+        """Rotor diameter (mm); rotor thickness stays the GP200's 0.25 in.
+
+        mount_height_mm and caliper_angle_deg place the caliper BODY exactly where
+        the load model places the caliper LOADS — the drawing's bolt line sits
+        mount_height below the disc OD, at caliper_angle_deg around the disc.
+        """
         try:
             self._rotor_r = max(0.02, float(rotor_dia_mm) / 2.0 / 1000.0)
         except (TypeError, ValueError):
             pass
+        if mount_height_mm is not None:
+            try:
+                self._caliper_bolt_r = max(
+                    0.01, self._rotor_r - float(mount_height_mm) / 1000.0)
+            except (TypeError, ValueError):
+                pass
+        else:
+            self._caliper_bolt_r = max(0.01, self._rotor_r - 0.0279)
+        if caliper_angle_deg is not None:
+            try:
+                self._caliper_angle_deg = float(caliper_angle_deg)
+            except (TypeError, ValueError):
+                pass
 
     def set_isolate_corner(self, lbl) -> None:
         """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by

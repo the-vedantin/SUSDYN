@@ -5330,7 +5330,14 @@ class MainWindow(QMainWindow):
             view3d.sync_view_controls(view_mode='load')
             view3d.set_isolate_corner(corner_label)     # None => all corners
             view3d.set_brakes(cp.get('show_brakes', True))
-            view3d.set_brake_dims(cp.get('rotor_dia_mm', 240.0))
+            view3d.set_brake_dims(
+                cp.get('rotor_dia_mm', 240.0),
+                # keep the drawn caliper on the SAME bolt line and angle the load
+                # model uses, or the picture contradicts the arrows
+                mount_height_mm=getattr(self._loads_panel.get_brake_params_front(),
+                                        'caliper_mount_height_mm', 27.9),
+                caliper_angle_deg=getattr(self._loads_panel.get_upright_params(),
+                                          'caliper_angle_deg', 45.0))
         except Exception:
             pass
         # Draw the ARB structure too (the user wants it on the Loads page, not
@@ -5712,7 +5719,14 @@ class MainWindow(QMainWindow):
                 self.view3d.set_view_mode(self._car.get('view_mode', 'normal'))
                 self.view3d.set_isolate_corner(self._car.get('wheel_pkg_corner'))
                 self.view3d.set_brakes(self._car.get('show_brakes', True))
-                self.view3d.set_brake_dims(self._car.get('rotor_dia_mm', 240.0))
+                self.view3d.set_brake_dims(
+                self._car.get('rotor_dia_mm', 240.0),
+                # keep the drawn caliper on the SAME bolt line and angle the load
+                # model uses, or the picture contradicts the arrows
+                mount_height_mm=getattr(self._loads_panel.get_brake_params_front(),
+                                        'caliper_mount_height_mm', 27.9),
+                caliper_angle_deg=getattr(self._loads_panel.get_upright_params(),
+                                          'caliper_angle_deg', 45.0))
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)

@@ -443,6 +443,35 @@ except Exception as _e:
     fails += 1
     print(f'caliper one model: UNEXPECTED FAIL ({_e})')
 
+# ── CALIPER MOUNT matches the caliper DRAWING, and the drawn caliper sits where
+#    the load arrows do.  Three different answers used to coexist: loads at
+#    R_pad-25 = 69.4 mm, the render hardcoded rearward at R_rotor-6 = 114 mm
+#    ignoring the angle input, and the drawing's D1 = R_rotor-27.9 = 92.1 mm.
+print('-' * 64)
+try:
+    from vahan.loads import BrakeParams as _BP
+    _t = _BP(rotor_dia_mm=254.0)          # drawing table row: 10.00 in disc
+    _d1_in = _t.bolt_line_radius_mm / 25.4
+    _a_in = _t.bolt_circle_radius_mm / 25.4
+    _bpf3 = win._loads_panel.get_brake_params_front()
+    _identity = abs(_bpf3.bolt_line_radius_mm + _bpf3.caliper_l4_mm
+                    - _bpf3.pad_radius_mm) < 1e-6
+    _v3 = win.view3d
+    win._update_3d()
+    _render_r = float(getattr(_v3, '_caliper_bolt_r', 0.0)) * 1000.0
+    _render_ok = abs(_render_r - _bpf3.bolt_line_radius_mm) < 0.5
+    cal_ok = (abs(_d1_in - 3.90) < 0.02 and abs(_a_in - 4.07) < 0.02
+              and _identity and _render_ok)
+    if not cal_ok:
+        fails += 1
+    print(f'caliper mount geo : 10in disc D1 {_d1_in:.2f}in (3.90) A {_a_in:.2f}in '
+          f'(4.07), l3+l4=R_pad {_identity}, render r {_render_r:.1f} vs '
+          f'loads {_bpf3.bolt_line_radius_mm:.1f} mm   '
+          f'{"pass" if cal_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'caliper mount geo : UNEXPECTED FAIL ({_e})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)

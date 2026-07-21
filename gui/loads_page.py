@@ -101,7 +101,7 @@ class LoadsPage(QWidget):
         # These set F_brake = T/R_pad, V_brake = F_brake/2, H_brake = F_brake*l4/l5.
         _bd = self._brk_dict_read()
         self._pad_radius = _mkspin(10, 400, _bd.get('pad_radius', 94.4), ' mm', 1, 2)
-        self._pad_l4     = _mkspin(0, 300, _bd.get('pad_offset', 25.0), ' mm', 1, 2)
+        self._mount_h    = _mkspin(0, 300, _bd.get('mount_height', 27.9), ' mm', 1, 1)
         self._bolt_l5    = _mkspin(1, 400, _bd.get('bolt_spacing', 60.0), ' mm', 1, 2)
         _grid = QGridLayout(); _grid.setContentsMargins(0, 0, 0, 0); _grid.setSpacing(4)
         for r, (lab, wdg) in enumerate((('Bearing spacing  l1', self._brg_spacing),
@@ -109,12 +109,12 @@ class LoadsPage(QWidget):
                                         ('Caliper mount angle', self._cal_angle),
                                         ('Rotor diameter', self._rotor_dia),
                                         ('Pad radius  R_pad', self._pad_radius),
-                                        ('Pad offset  l4', self._pad_l4),
+                                        ('Caliper mount height', self._mount_h),
                                         ('Bolt spacing  l5', self._bolt_l5))):
             _grid.addWidget(QLabel(lab), r, 0); _grid.addWidget(wdg, r, 1)
         left.addLayout(_grid)
         for _w in (self._brg_spacing, self._cp_offset, self._cal_angle, self._rotor_dia,
-                   self._pad_radius, self._pad_l4, self._bolt_l5):
+                   self._pad_radius, self._mount_h, self._bolt_l5):
             _w.valueChanged.connect(self._on_geom)
 
         self._note = QLabel('Hover any force arrow in the 3-D view to read its load.\n\n'
@@ -220,14 +220,14 @@ class LoadsPage(QWidget):
         if not ds:
             return {}
         d = ds[0]
-        return {k: d[k].value() for k in ('pad_radius', 'pad_offset', 'bolt_spacing')
+        return {k: d[k].value() for k in ('pad_radius', 'mount_height', 'bolt_spacing', 'rotor_dia')
                 if k in d}
 
     def _sync_brk_inputs(self):
         """Reload the caliper-geometry spinboxes from the selected axle."""
         d = self._brk_dict_read()
         for key, w in (('pad_radius', getattr(self, '_pad_radius', None)),
-                       ('pad_offset', getattr(self, '_pad_l4', None)),
+                       ('mount_height', getattr(self, '_mount_h', None)),
                        ('bolt_spacing', getattr(self, '_bolt_l5', None))):
             if key in d and w is not None:
                 w.blockSignals(True); w.setValue(d[key]); w.blockSignals(False)
@@ -251,7 +251,7 @@ class LoadsPage(QWidget):
         # caliper geometry -> the LoadsPanel brake widgets for the selected axle
         for d in self._brk_dicts():
             for key, src in (('pad_radius', self._pad_radius),
-                             ('pad_offset', self._pad_l4),
+                             ('mount_height', self._mount_h),
                              ('bolt_spacing', self._bolt_l5)):
                 w = d.get(key)
                 if w is not None:

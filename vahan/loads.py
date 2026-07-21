@@ -30,9 +30,42 @@ class BrakeParams:
     piston_area_mm2: float = 793.5  # per caliper (1.23 in²)
     pad_radius_mm: float = 94.4     # effective radius from wheel center
     num_pistons: int = 1            # pistons per caliper side
-    caliper_bolt_spacing_mm: float = 60.0  # l5: spacing between the two mounting bolts
-    caliper_l4_mm: float = 25.0     # l4: pad centre-of-area offset from the bolt LINE
-                                    # (Seward Fig 6.15 — sets the H_brake couple)
+    # ── Caliper MOUNT geometry, straight off the caliper drawing ──────────
+    # Wilwood GP200-style radial mount.  On the drawing these are:
+    #   MOUNT CENTER   2.38 in (60.5 mm)  -> caliper_bolt_spacing_mm  (l5)
+    #   MOUNT HEIGHT   1.10 in (27.9 mm)  -> caliper_mount_height_mm
+    #   MOUNT OFFSET   0.86 in (21.8 mm)  -> caliper_mount_offset_mm
+    # and the drawing's own D1 = (disc diameter / 2) - MOUNT HEIGHT is the radius
+    # from the wheel centre to the bolt LINE.  So the mount position is not a free
+    # parameter: give it the rotor and these three numbers and it is determined.
+    rotor_dia_mm: float = 240.0             # the disc this caliper is mounted to
+    caliper_bolt_spacing_mm: float = 60.5   # l5: spacing between the two mount bolts
+    caliper_mount_height_mm: float = 27.9   # bolt line BELOW the disc OD
+    caliper_mount_offset_mm: float = 21.8   # bolt plane offset from the disc face
+
+    @property
+    def bolt_line_radius_mm(self) -> float:
+        """l3 — radius from the wheel centre to the caliper bolt line (drawing D1)."""
+        return max(0.5 * float(self.rotor_dia_mm) - self.caliper_mount_height_mm, 1.0)
+
+    @property
+    def bolt_circle_radius_mm(self) -> float:
+        """The drawing's tabulated 'A' — each bolt sits half the spacing off the
+        radial centre line, so A = sqrt(D1^2 + (l5/2)^2).  Reproduces the table:
+        10.00 in disc -> D1 3.90 in, A 4.07 in."""
+        return float(np.hypot(self.bolt_line_radius_mm,
+                              0.5 * self.caliper_bolt_spacing_mm))
+
+    @property
+    def caliper_l4_mm(self) -> float:
+        """l4 — pad centre of area offset from the bolt line (Seward Fig 6.15).
+
+        DERIVED, never typed.  Seward's own force balance is
+        F_brake = W_long * R_r / (l3 + l4), and F_brake = brake_torque / R_pad,
+        so l3 + l4 = R_pad identically.  With l3 fixed by the drawing, l4 follows.
+        It used to be a free input defaulting to 25 mm, which contradicted both the
+        drawing and that identity, and put the bolts 23 mm from where they sit."""
+        return max(self.pad_radius_mm - self.bolt_line_radius_mm, 0.0)
 
 
 @dataclass
@@ -367,7 +400,7 @@ def _compute_caliper_bolt_loads(result: ComponentLoads, bp: BrakeParams,
     T = result.brake_torque_Nm
     r_pad = bp.pad_radius_mm / 1000.0
     s = bp.caliper_bolt_spacing_mm / 1000.0          # l5, bolt (lug) spacing
-    l4 = max(float(getattr(bp, 'caliper_l4_mm', 25.0)) / 1000.0, 0.0)
+    l4 = max(float(bp.caliper_l4_mm) / 1000.0, 0.0)   # derived from the drawing
     theta = np.radians(up.caliper_angle_deg)
 
     if r_pad < 0.001 or s < 0.001 or T < 1e-6:

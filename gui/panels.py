@@ -4211,16 +4211,56 @@ class LoadsPanel(CollapsibleSection):
         s['num_pistons'] = _spin(1, 99, 1, '', dec=0, step=1)
         g.addWidget(s['num_pistons'], r, 3)
 
+        # ── CALIPER MOUNT geometry, straight off the caliper drawing ──────
+        # Wilwood GP200-style radial mount.  These three numbers plus the rotor
+        # diameter FIX where the caliper sits — the drawing's own
+        #   D1 = disc_dia/2 - MOUNT HEIGHT   (radius to the bolt line)
+        #   A  = sqrt(D1^2 + (MOUNT CENTER/2)^2)   (bolt circle radius)
+        # Seward's l4 (pad centre offset from the bolt line) is then DERIVED, not
+        # typed: l3 + l4 = R_pad identically.  It used to be a free 25 mm input,
+        # which put the bolt line 23 mm from where the drawing puts it.
         r += 1
-        g.addWidget(QLabel('Bolt spacing:'), r, 0)
-        s['bolt_spacing'] = _spin(0.1, 1e6, 60, ' mm', dec=1, step=5)
-        g.addWidget(s['bolt_spacing'], r, 1)
-        # Seward l4: pad centre-of-area offset from the caliper bolt LINE — the
-        # lever that turns F_brake into the equal-and-opposite HORIZONTAL couple
-        # H_brake = F_brake * l4 / l5 at the two mounting lugs (Fig 6.15).
-        g.addWidget(QLabel('Pad offset l4:'), r, 2)
-        s['pad_offset'] = _spin(0.0, 1e6, 25.0, ' mm', dec=1, step=2)
-        g.addWidget(s['pad_offset'], r, 3)
+        g.addWidget(QLabel('Rotor dia:'), r, 0)
+        s['rotor_dia'] = _spin(1, 1e6, 240.0, ' mm', dec=1, step=5)
+        g.addWidget(s['rotor_dia'], r, 1)
+        g.addWidget(QLabel('Mount centre l5:'), r, 2)
+        s['bolt_spacing'] = _spin(0.1, 1e6, 60.5, ' mm', dec=1, step=5)
+        g.addWidget(s['bolt_spacing'], r, 3)
+
+        r += 1
+        g.addWidget(QLabel('Mount height:'), r, 0)
+        s['mount_height'] = _spin(0.0, 1e6, 27.9, ' mm', dec=1, step=1)
+        s['mount_height'].setToolTip(
+            'Drawing MOUNT HEIGHT — the caliper bolt line sits this far BELOW the '
+            'disc outside diameter. Bolt-line radius D1 = rotor_dia/2 - this.')
+        g.addWidget(s['mount_height'], r, 1)
+        g.addWidget(QLabel('Mount offset:'), r, 2)
+        s['mount_offset'] = _spin(0.0, 1e6, 21.8, ' mm', dec=1, step=1)
+        s['mount_offset'].setToolTip(
+            'Drawing MOUNT OFFSET — lateral offset of the bolt plane from the '
+            'disc face.')
+        g.addWidget(s['mount_offset'], r, 3)
+
+        # Read-out of what the drawing dimensions imply, so a wrong entry is
+        # visible immediately instead of only showing up in the load numbers.
+        r += 1
+        s['_mount_readout'] = QLabel('')
+        s['_mount_readout'].setStyleSheet('color:#888; font-size:11px;')
+        g.addWidget(s['_mount_readout'], r, 0, 1, 4)
+
+        def _upd_readout():
+            from vahan.loads import BrakeParams
+            bp = BrakeParams(pad_radius_mm=s['pad_radius'].value(),
+                             rotor_dia_mm=s['rotor_dia'].value(),
+                             caliper_bolt_spacing_mm=s['bolt_spacing'].value(),
+                             caliper_mount_height_mm=s['mount_height'].value())
+            s['_mount_readout'].setText(
+                f'bolt line D1 {bp.bolt_line_radius_mm:.1f} mm · bolt circle A '
+                f'{bp.bolt_circle_radius_mm:.1f} mm · derived pad offset l4 '
+                f'{bp.caliper_l4_mm:.1f} mm')
+        for _k in ('pad_radius', 'rotor_dia', 'bolt_spacing', 'mount_height'):
+            s[_k].valueChanged.connect(lambda *_a: _upd_readout())
+        _upd_readout()
 
         return g, s
 
@@ -4294,7 +4334,14 @@ class LoadsPanel(CollapsibleSection):
             pad_radius_mm=d['pad_radius'].value(),
             num_pistons=int(d['num_pistons'].value()),
             caliper_bolt_spacing_mm=d['bolt_spacing'].value(),
-            caliper_l4_mm=d['pad_offset'].value() if 'pad_offset' in d else 25.0,
+            # Caliper MOUNT geometry off the caliper drawing.  l4 is NOT passed:
+            # it is derived from the rotor and the mount height (l3 + l4 = R_pad),
+            # so the bolt line cannot be set to something the drawing contradicts.
+            rotor_dia_mm=(d['rotor_dia'].value() if 'rotor_dia' in d else 240.0),
+            caliper_mount_height_mm=(d['mount_height'].value()
+                                     if 'mount_height' in d else 27.9),
+            caliper_mount_offset_mm=(d['mount_offset'].value()
+                                     if 'mount_offset' in d else 21.8),
         )
 
     def get_brake_params_front(self):
