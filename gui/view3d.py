@@ -453,6 +453,7 @@ class View3D:
             connect='segments', width=3.0, antialias=True,
             parent=self._view.scene)
         self._loadvec_count = 0
+        self._loadvec_snap = []          # [(tip_world, label)] for Load-mode hover
         # Corner isolation (wheel-package view): draw only this corner, or all.
         self._isolate = None
         self._markers = scene.Markers(parent=self._view.scene)
@@ -699,6 +700,14 @@ class View3D:
             Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._watermark.adjustSize()
         self._watermark.raise_()
+
+        # Load-mode hover tooltip (shows the load at the arrow under the cursor)
+        self._load_tooltip = QLabel('', parent=n)
+        self._load_tooltip.setStyleSheet(
+            'color:#f4f4f6;background:rgba(18,18,22,225);border:1px solid #555;'
+            'border-radius:4px;padding:3px 7px;font:12px "Segoe UI";')
+        self._load_tooltip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._load_tooltip.hide()
 
         # position in top-right; will be repositioned on resize
         self._orig_resize = n.resizeEvent
@@ -1524,12 +1533,15 @@ class View3D:
         """
         try:
             self._loadvec_count = len(arrows) if arrows else 0
+            self._loadvec_snap = []          # [(tip_world, label)] for hover
             if not arrows:
                 self._loadvec_vis.set_data(pos=np.zeros((2, 3), np.float32))
                 return
             segs = []; cols = []
-            for p, tip, c in arrows:
-                p = np.asarray(p, float); tip = np.asarray(tip, float)
+            for a in arrows:
+                p = np.asarray(a[0], float); tip = np.asarray(a[1], float); c = a[2]
+                lab = a[3] if len(a) > 3 else ''
+                self._loadvec_snap.append((tip.copy(), lab))
                 segs += [p, tip]; cols += [c, c]
                 d = tip - p; L = float(np.linalg.norm(d))
                 if L < 1e-6:
@@ -1628,8 +1640,36 @@ class View3D:
         except Exception:
             pass
 
+    def _hover_load(self, qpos):
+        """Show the load label of the force-arrow nearest the cursor (Load mode)."""
+        try:
+            tr = self._view.get_transform('scene', 'canvas')
+            best_lab, best_d2 = None, 22 ** 2
+            for tip, lab in self._loadvec_snap:
+                m = tr.map([float(tip[0]), float(tip[1]), float(tip[2]), 1.0])
+                if m[3] <= 0:
+                    continue
+                sx, sy = m[0] / m[3], m[1] / m[3]
+                d2 = (qpos.x() - sx) ** 2 + (qpos.y() - sy) ** 2
+                if d2 < best_d2:
+                    best_d2, best_lab = d2, lab
+            if best_lab:
+                self._load_tooltip.setText(best_lab); self._load_tooltip.adjustSize()
+                self._load_tooltip.move(qpos.x() + 14, qpos.y() + 10)
+                self._load_tooltip.show(); self._load_tooltip.raise_()
+            else:
+                self._load_tooltip.hide()
+        except Exception:
+            self._load_tooltip.hide()
+
     def _qt_move(self, event):
         try:
+            # Load-mode hover: read the force at the arrow under the cursor.
+            if (event.buttons() == Qt.MouseButton.NoButton
+                    and self._view_mode == 'load' and self._loadvec_snap):
+                self._hover_load(event.pos())
+            elif self._load_tooltip.isVisible():
+                self._load_tooltip.hide()
             if self._mouse_last is None:
                 return
             cur = event.pos()

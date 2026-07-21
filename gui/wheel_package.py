@@ -42,82 +42,174 @@ def _u(st, a, b):
     return v / max(np.linalg.norm(v), 1e-9)
 
 
-# Colours for the dark 3-D view (colourblind-safe: white/red/amber/grey).
-_C_TEN = (0.92, 0.92, 0.96, 1.0)   # tension (white)
-_C_COMP = (0.95, 0.25, 0.25, 1.0)  # compression (red)
-_C_UP = (0.66, 0.66, 0.72, 1.0)    # upright / ball-joint (grey)
-_C_RX = (0.95, 0.72, 0.12, 1.0)    # ground / caliper reaction (amber)
+# Colours by LOAD CATEGORY (colourblind-safe: white/red/amber/grey-white).
+# The category is what the user asked to keep distinct.
+_C_TEN = (0.92, 0.92, 0.96, 1.0)   # CHASSIS reaction, tension (white)
+_C_COMP = (0.95, 0.25, 0.25, 1.0)  # CHASSIS reaction, compression (red)
+_C_UP = (0.95, 0.72, 0.12, 1.0)    # UPRIGHT (ball joints, bearings, caliper) amber
+_C_RK = (0.80, 0.82, 0.92, 1.0)    # ROCKER / ARB (grey-white, distinct from grey car)
 
 
-def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
-    """Force-vector arrows for the 3-D Load mode.
+def _load_items(win, lat_g, lon_g, only_corner=None):
+    """Every load in the wheel package, as (point, force_vec, rgba, label).
 
-    Returns a list of (p_world, tip_world, rgba).  mode='resultant' draws one
-    arrow per load point along the true force direction; mode='components'
-    splits each into lateral(X)/fore-aft(Y)/vertical(Z) arrows.  only_corner
-    isolates a single corner (for the wheel-package view).
+    Categories the user asked to keep separate:
+      CHASSIS  = the reaction each control-arm/tie/pushrod pushes into its
+                 INBOARD frame pickup (tension -> pulls the chassis outboard).
+      UPRIGHT  = the loads the UPRIGHT carries: the two ball joints, the two
+                 wheel BEARINGS (radial + the outer bearing's axial), the brake
+                 CALIPER lugs, and the tyre contact patch (Seward Ch.6).
+      ROCKER/ARB = the bellcrank free body (pushrod, spring, ARB drop-link -
+                 all AXIAL - and the only moment reaction, at the rocker PIVOT).
     """
     loads, veh, up, res = compute_case(win, lat_g, lon_g)
     corners = [only_corner] if only_corner else ['FL', 'FR', 'RL', 'RR']
-    items = []          # (p, vec, rgba)
+    items = []
     for lbl in corners:
         c = loads.get(lbl)
         if c is None:
             continue
         st = win._solvers[lbl].solve(0.)
-        # control-arm member axial forces at their inboard pickups
-        for ik, ok, attr in (('uca_front', 'uca_outer', 'uca_front_N'),
-                             ('uca_rear', 'uca_outer', 'uca_rear_N'),
-                             ('lca_front', 'lca_outer', 'lca_front_N'),
-                             ('lca_rear', 'lca_outer', 'lca_rear_N'),
-                             ('tr_inner', 'tr_outer', 'tierod_N'),
-                             ('pushrod_inner', 'pushrod_outer', 'pushrod_N')):
+        wc = np.asarray(st.wheel_center, float)
+        spin = np.asarray(st.spin_axis, float)
+        spin = spin / max(np.linalg.norm(spin), 1e-9)
+
+        # ── CHASSIS: reaction at each inboard pickup (force ON the frame) ──
+        MEM = (('uca_front', 'uca_outer', 'uca_front_N', 'upper arm front'),
+               ('uca_rear', 'uca_outer', 'uca_rear_N', 'upper arm rear'),
+               ('lca_front', 'lca_outer', 'lca_front_N', 'lower arm front'),
+               ('lca_rear', 'lca_outer', 'lca_rear_N', 'lower arm rear'),
+               ('tr_inner', 'tr_outer', 'tierod_N', 'tie / toe rod'),
+               ('pushrod_inner', 'pushrod_outer', 'pushrod_N', 'pushrod'))
+        for ik, ok, attr, nm in MEM:
             F = float(getattr(c, attr))
-            u = _u(st, ik, ok)
+            u = _u(st, ik, ok)                       # inboard -> outboard
             p = np.asarray(getattr(st, ik), float)
-            items.append((p, F * u, _C_TEN if F >= 0 else _C_COMP))
-        # upright ball-joint resultants + contact patch + caliper
+            tag = 'tension' if F >= 0 else 'compression'
+            items.append((p, F * u, _C_TEN if F >= 0 else _C_COMP,
+                          f'{lbl} CHASSIS · {nm} pickup · {abs(F):,.0f} N {tag} '
+                          f'(the frame is {"pulled outboard" if F >= 0 else "pushed inboard"})'))
+
+        # ── UPRIGHT: ball joints (resultant of the arm legs) ──
         R_uca = -(c.uca_front_N * _u(st, 'uca_front', 'uca_outer')
                   + c.uca_rear_N * _u(st, 'uca_rear', 'uca_outer'))
         R_lca = -(c.lca_front_N * _u(st, 'lca_front', 'lca_outer')
                   + c.lca_rear_N * _u(st, 'lca_rear', 'lca_outer'))
         R_tie = -(c.tierod_N * _u(st, 'tr_inner', 'tr_outer'))
-        items.append((np.asarray(st.uca_outer, float), R_uca, _C_UP))
-        items.append((np.asarray(st.lca_outer, float), R_lca, _C_UP))
-        items.append((np.asarray(st.tr_outer, float), R_tie, _C_UP))
-        wc = np.asarray(st.wheel_center, float)
+        for pt, v, nm in ((st.uca_outer, R_uca, 'upper ball joint'),
+                          (st.lca_outer, R_lca, 'lower ball joint'),
+                          (st.tr_outer, R_tie, 'tie / toe ball joint')):
+            items.append((np.asarray(pt, float), v, _C_UP,
+                          f'{lbl} UPRIGHT · {nm} · {np.linalg.norm(v):,.0f} N'))
+
+        # ── UPRIGHT: wheel BEARINGS (radial + axial), along the spin axis ──
+        try:
+            l2 = float(up.cp_offset_mm) / 1000.0
+            l1 = float(up.bearing_spacing_mm) / 1000.0
+            p_out = wc - spin * l2                    # inboard of the hub
+            p_in = wc - spin * (l2 + l1)
+            radial_out = np.array([0.0, float(c.bearing_outer_H), float(c.bearing_outer_V)])
+            radial_in = np.array([0.0, float(c.bearing_inner_H), float(c.bearing_inner_V)])
+            items.append((p_out, radial_out, _C_UP,
+                          f'{lbl} UPRIGHT · outer bearing RADIAL · {np.linalg.norm(radial_out):,.0f} N'))
+            items.append((p_in, radial_in, _C_UP,
+                          f'{lbl} UPRIGHT · inner bearing RADIAL · {np.linalg.norm(radial_in):,.0f} N'))
+            ax = float(c.bearing_axial_N)
+            if abs(ax) > 1.0:                          # only the OUTER bearing takes axial
+                items.append((p_out, ax * spin, _C_UP,
+                              f'{lbl} UPRIGHT · outer bearing AXIAL · {abs(ax):,.0f} N'))
+        except Exception:
+            pass
+
+        # ── UPRIGHT: brake CALIPER lugs (react the rotor torque) ──
+        bt = float(getattr(c, 'brake_torque_Nm', 0.0))
+        if abs(bt) > 1.0:
+            up_rad = np.array([0, 1.0, 0]) - np.dot([0, 1.0, 0], spin) * spin
+            up_rad = up_rad / max(np.linalg.norm(up_rad), 1e-9)
+            tan = np.cross(spin, up_rad)
+            rrad = 0.5 * float(win._car.get('rotor_dia_mm', 240.0)) / 1000.0
+            lug_F = 0.5 * bt / max(rrad, 1e-3)         # each of two lugs
+            for s2 in (0.03, -0.03):
+                cp = wc + up_rad * (rrad - 0.006) + tan * s2
+                items.append((cp, np.sign(bt) * lug_F * tan, _C_UP,
+                              f'{lbl} UPRIGHT · caliper lug · {lug_F:,.0f} N (x2, torque {bt:,.0f} Nm)'))
+
+        # ── UPRIGHT / TYRE: contact-patch load into the hub ──
         patch = np.array([wc[0], wc[1], 0.0])
         Fpatch = np.array([float(res.Fy.get(lbl, 0.0)),
                            float(res.Fx.get(lbl, 0.0)),
                            float(res.Fz.get(lbl, 0.0))])
-        items.append((patch, Fpatch, _C_RX))
-        bt = float(getattr(c, 'brake_torque_Nm', 0.0))
-        if abs(bt) > 1.0:
-            side = 1.0 if wc[0] >= 0 else -1.0
-            rrad = 0.62 * float(veh.tire_radius_m)
-            cal_pt = wc + np.array([-side * 0.03, 0.0, rrad])
-            items.append((cal_pt, np.array([0.0, np.sign(bt) * abs(bt) / rrad, 0.0]), _C_RX))
+        items.append((patch, Fpatch, _C_UP,
+                      f'{lbl} TYRE · contact patch into hub · {np.linalg.norm(Fpatch):,.0f} N'))
+
+        # ── ROCKER / ARB free body: pushrod, spring, ARB drop-link (axial),
+        #    and the rocker PIVOT reaction (the only moment reaction) ──
+        try:
+            arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
+            hp = win._front_hp if lbl[0] == 'F' else win._rear_hp
+            P = np.asarray(st.rocker_pivot, float)
+            mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else 1.0
+            axis = (np.asarray(hp['rocker_axis_pt'], float)
+                    - np.asarray(hp['rocker_pivot'], float)) * mir
+            axis = axis / max(np.linalg.norm(axis), 1e-9)
+            pi = np.asarray(st.pushrod_inner, float); po = np.asarray(st.pushrod_outer, float)
+            u_push = (po - pi) / max(np.linalg.norm(po - pi), 1e-9)
+            F_push = float(c.pushrod_N) * u_push
+            sp = np.asarray(st.rocker_spring_pt, float); sc = np.asarray(st.spring_chassis_pt, float)
+            u_sp = (sc - sp) / max(np.linalg.norm(sc - sp), 1e-9)
+            F_spr = -float(c.spring_force_N) * u_sp
+            dt = win._arb_drop_top_world(lbl, st)
+            ae = np.asarray(arb['arb_arm_end'], float)
+            if lbl in ('FR', 'RR'):
+                ae = ae * np.array([-1.0, 1.0, 1.0])
+            u_arb = (ae - dt) / max(np.linalg.norm(ae - dt), 1e-9)
+            m0 = (np.cross(pi - P, F_push) + np.cross(sp - P, F_spr)) @ axis
+            lever = np.cross(dt - P, u_arb) @ axis
+            F_arb = (-m0 / lever if abs(lever) > 1e-9 else 0.0) * u_arb
+            F_pivot = -(F_push + F_spr + F_arb)
+            for pt, v, nm in ((pi, F_push, 'ROCKER · pushrod force'),
+                              (sp, F_spr, 'ROCKER · spring force'),
+                              (sc, -F_spr, 'CHASSIS · spring mount'),
+                              (dt, F_arb, 'ARB · drop-link (axial)'),
+                              (ae, -F_arb, 'ARB · arm end (axial)'),
+                              (P, F_pivot, 'ROCKER · PIVOT reaction (moment)')):
+                if np.linalg.norm(v) < 1.0 or not np.all(np.isfinite(pt)):
+                    continue
+                col = _C_TEN if nm.startswith('CHASSIS') else _C_RK
+                items.append((np.asarray(pt, float), v, col,
+                              f'{lbl} {nm} · {np.linalg.norm(v):,.0f} N'))
+        except Exception:
+            pass
+    return items
+
+
+def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
+    """Force-vector arrows for Load mode.  Returns (p, tip, rgba, label).
+    mode='resultant' = one arrow per load in the true direction; 'components'
+    = split into lateral(X)/fore-aft(Y)/vertical(Z)."""
+    items = _load_items(win, lat_g, lon_g, only_corner)
     if not items:
         return []
-    fmax = max(float(np.linalg.norm(v)) for _, v, _ in items) or 1.0
+    fmax = max(float(np.linalg.norm(v)) for _, v, _, _ in items) or 1.0
     SC = 0.14 / fmax
-    MINL = 0.028
+    MINL = 0.026
+    AX = ('lateral', 'fore-aft', 'vertical')
     arrows = []
-    for p, v, col in items:
+    for p, v, col, lab in items:
         if mode == 'components':
-            for ax in range(3):
-                comp = float(v[ax])
+            for a in range(3):
+                comp = float(v[a])
                 if abs(comp) < 1.0:
                     continue
-                d = np.zeros(3); d[ax] = comp
+                d = np.zeros(3); d[a] = np.sign(comp)
                 L = max(abs(comp) * SC, MINL)
-                arrows.append((p, p + np.sign(comp) * (np.abs(d) / max(abs(comp), 1e-9)) * L, col))
+                arrows.append((p, p + d * L, col, f'{lab.split(" · ")[0]} · {AX[a]} {comp:+,.0f} N'))
         else:
             mag = float(np.linalg.norm(v))
             if mag < 1.0:
                 continue
             L = max(mag * SC, MINL)
-            arrows.append((p, p + (v / mag) * L, col))
+            arrows.append((p, p + (v / mag) * L, col, lab))
     return arrows
 
 
