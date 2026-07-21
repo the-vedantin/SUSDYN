@@ -39,6 +39,7 @@ class BrakeParams:
     # from the wheel centre to the bolt LINE.  So the mount position is not a free
     # parameter: give it the rotor and these three numbers and it is determined.
     rotor_dia_mm: float = 240.0             # the disc this caliper is mounted to
+    rotor_thickness_mm: float = 6.35        # disc width (0.25 in) — thermal mass, not torque
     caliper_bolt_spacing_mm: float = 60.5   # l5: spacing between the two mount bolts
     caliper_mount_height_mm: float = 27.9   # bolt line BELOW the disc OD
     caliper_mount_offset_mm: float = 21.8   # bolt plane offset from the disc face

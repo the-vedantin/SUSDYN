@@ -1626,7 +1626,8 @@ class View3D:
         self._show_brakes = bool(show)
 
     def set_brake_dims(self, rotor_dia_mm, mount_height_mm=None,
-                       caliper_angle_deg=None, vertical_mounts=None) -> None:
+                       caliper_angle_deg=None, vertical_mounts=None,
+                       rotor_thickness_mm=None) -> None:
         """Rotor diameter (mm); rotor thickness stays the GP200's 0.25 in.
 
         mount_height_mm and caliper_angle_deg place the caliper BODY exactly where
@@ -1652,6 +1653,11 @@ class View3D:
                 pass
         if vertical_mounts is not None:
             self._caliper_vertical_mounts = bool(vertical_mounts)
+        if rotor_thickness_mm is not None:
+            try:
+                self._rotor_hw = max(0.0005, 0.5 * float(rotor_thickness_mm) / 1000.0)
+            except (TypeError, ValueError):
+                pass
 
     def set_isolate_corner(self, lbl) -> None:
         """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by

@@ -4241,6 +4241,14 @@ class LoadsPanel(CollapsibleSection):
             'disc face.')
         g.addWidget(s['mount_offset'], r, 3)
 
+        r += 1
+        g.addWidget(QLabel('Rotor thickness:'), r, 0)
+        s['rotor_thickness'] = _spin(0.5, 100.0, 6.35, ' mm', dec=2, step=1)
+        s['rotor_thickness'].setToolTip(
+            'Disc width. Does NOT change lockup torque or line pressure — it sets '
+            'thermal mass, so a thicker rotor runs proportionally cooler per stop.')
+        g.addWidget(s['rotor_thickness'], r, 1)
+
         # Read-out of what the drawing dimensions imply, so a wrong entry is
         # visible immediately instead of only showing up in the load numbers.
         r += 1
@@ -4352,6 +4360,8 @@ class LoadsPanel(CollapsibleSection):
             # it is derived from the rotor and the mount height (l3 + l4 = R_pad),
             # so the bolt line cannot be set to something the drawing contradicts.
             rotor_dia_mm=(d['rotor_dia'].value() if 'rotor_dia' in d else 240.0),
+            rotor_thickness_mm=(d['rotor_thickness'].value()
+                                if 'rotor_thickness' in d else 6.35),
             caliper_mount_height_mm=(d['mount_height'].value()
                                      if 'mount_height' in d else 27.9),
             caliper_mount_offset_mm=(d['mount_offset'].value()

@@ -5339,7 +5339,9 @@ class MainWindow(QMainWindow):
                 caliper_angle_deg=getattr(self._loads_panel.get_upright_params(),
                                           'caliper_angle_deg', 45.0),
                 vertical_mounts=getattr(self._loads_panel.get_upright_params(),
-                                        'caliper_vertical_mounts', True))
+                                        'caliper_vertical_mounts', True),
+                rotor_thickness_mm=getattr(self._loads_panel.get_brake_params_front(),
+                                           'rotor_thickness_mm', 6.35))
         except Exception:
             pass
         # Draw the ARB structure too (the user wants it on the Loads page, not
@@ -5730,7 +5732,9 @@ class MainWindow(QMainWindow):
                 caliper_angle_deg=getattr(self._loads_panel.get_upright_params(),
                                           'caliper_angle_deg', 45.0),
                 vertical_mounts=getattr(self._loads_panel.get_upright_params(),
-                                        'caliper_vertical_mounts', True))
+                                        'caliper_vertical_mounts', True),
+                rotor_thickness_mm=getattr(self._loads_panel.get_brake_params_front(),
+                                           'rotor_thickness_mm', 6.35))
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)
