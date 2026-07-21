@@ -492,6 +492,18 @@ class View3D:
         # 0.25 in rotor width; rotor radius is a user input (<= 11 in max dia).
         self._rotor_r = 0.120
         self._rotor_hw = 0.5 * 0.25 * 0.0254        # 0.25 in / 2 = 3.175 mm
+        # (mesh, base_rgba) for every SOLID car part — greyed in Load /
+        # Interference mode so only the force vectors keep colour.
+        self._car_meshes = (
+            [(m, (0.18, 0.18, 0.18, 0.6)) for m in self._tire_meshes]
+            + [(m, (0.50, 0.40, 0.30, 0.30)) for m in self._upright_meshes]
+            + [(m, (0.85, 0.70, 0.12, 0.75)) for m in self._rocker_meshes]
+            + [(m, (0.75, 0.75, 0.78, 0.70)) for m in self._spring_meshes]
+            + [(self._diff_mesh, (0.55, 0.55, 0.58, 0.90))]
+            + [(m, (0.82, 0.82, 0.85, 0.92)) for m in self._driveshaft_meshes]
+            + [(m, (0.95, 0.85, 0.25, 0.95)) for m in self._tripod_meshes]
+            + [(m, (0.32, 0.32, 0.35, 0.85)) for m in self._rotor_meshes]
+            + [(m, (0.62, 0.64, 0.68, 0.95)) for m in self._caliper_meshes])
 
         # ── Decoupled (twin-bellcrank) visuals ───────────────────────────
         # Per axle (front + rear) we render:
@@ -1065,6 +1077,15 @@ class View3D:
             mc[:, 3] = 0.55
         self._member_mesh.set_data(vertices=mv, faces=mf, vertex_colors=mc)
 
+        # ── desaturate every solid car part in Load / Interference mode so
+        #    ONLY the force vectors / clash highlights keep colour ──────────
+        _des = self._view_mode in ('load', 'interference')
+        for _m, _base in self._car_meshes:
+            try:
+                _m.color = (0.5, 0.5, 0.52, 0.30) if _des else _base
+            except Exception:
+                pass
+
         # upload markers
         if mk_pos:
             self._markers.set_data(
@@ -1072,14 +1093,18 @@ class View3D:
                 face_color=np.array(mk_col, np.float32),
                 size=9, edge_width=0)
 
-        # ARB
-        if arb_segs:
+        # ARB — hidden when a single corner is isolated; desaturated in
+        # Load / Interference mode.
+        if arb_segs and not self._isolate:
             ap = np.array([p for seg in arb_segs for p in seg], np.float32)
             self._last_arb_pos = ap
-            self._arb_vis.set_data(pos=ap, color=(0.90, 0.80, 0.10, 1.0))
+            _acol = ((0.55, 0.55, 0.57, 0.35)
+                     if self._view_mode in ('load', 'interference')
+                     else (0.90, 0.80, 0.10, 1.0))
+            self._arb_vis.set_data(pos=ap, color=_acol)
         else:
             self._last_arb_pos = None
-            self._arb_vis.set_data(pos=np.zeros((2,3), np.float32))
+            self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
 
         # ── Spring / damper cylinders (per corner) ───────────────────────
         # Draw a translucent cylinder of the user-set OD between
@@ -1524,14 +1549,15 @@ class View3D:
         except Exception:
             pass
 
-    def set_driveshaft_package(self, pkg, show: bool = True) -> None:
+    def set_driveshaft_package(self, pkg, show: bool = True, only=None) -> None:
         """Draw the rear diff body, tripods and half-shafts as thick cylinders.
 
         pkg: the dict from vahan.driveshaft.package(car, rear_states) (or None).
         Each half-shaft's OUTER end is the LIVE solved wheel_center carried in
         pkg, so the shafts move with the uprights every travel step (ONE MODEL).
-        show=False (or pkg None) clears them.  Cylinders give real thickness so
-        interference against the arms / chassis is visible.
+        show=False (or pkg None) clears them.  only='RL'/'RR' draws just that
+        corner's shaft + tripod and hides the (shared) diff body — for the
+        isolated wheel-package view.
         """
         def _clear(m):
             m.set_data(vertices=np.zeros((3, 3), np.float32),
@@ -1547,14 +1573,15 @@ class View3D:
         tri_r = 0.5 * float(pkg['tripod_od_mm']) / 1000.0
         body_w = 0.55 * span                  # diff BODY is shorter than the span
         diff_r = max(0.14 * span, 0.03)       # diff body radial size (visual)
-        # diff body: cylinder along the lateral (X) axis, centred, shorter than
-        # the tripod-to-tripod span (the tripods bridge out to +/- span/2).
-        dv, df = build_cylinder_between(c + np.array([-body_w / 2, 0, 0]),
-                                        c + np.array([body_w / 2, 0, 0]), diff_r, n=20)
-        self._diff_mesh.set_data(vertices=dv, faces=df)
+        if only:                              # isolating one corner → no diff body
+            _clear(self._diff_mesh)
+        else:
+            dv, df = build_cylinder_between(c + np.array([-body_w / 2, 0, 0]),
+                                            c + np.array([body_w / 2, 0, 0]), diff_r, n=20)
+            self._diff_mesh.set_data(vertices=dv, faces=df)
         for i, corner in enumerate(('RL', 'RR')):
             seg = pkg.get(corner)
-            if not seg:
+            if not seg or (only and corner != only):
                 _clear(self._driveshaft_meshes[i]); _clear(self._tripod_meshes[i])
                 continue
             inner = np.asarray(seg['inner'], float)

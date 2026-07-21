@@ -5547,9 +5547,10 @@ class MainWindow(QMainWindow):
                 _pkg = (_ds_package(self._car, _rear_states)
                         if len(_rear_states) == 2 else None)
                 _iso = self._car.get('wheel_pkg_corner')
+                _only = _iso if _iso in ('RL', 'RR') else None
                 _show_ds = (self._car.get('show_driveshaft', True)
                             and (_iso is None or _iso in ('RL', 'RR')))
-                self.view3d.set_driveshaft_package(_pkg, show=_show_ds)
+                self.view3d.set_driveshaft_package(_pkg, show=_show_ds, only=_only)
             except Exception:
                 pass
 
