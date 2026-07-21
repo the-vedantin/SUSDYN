@@ -59,6 +59,85 @@ def _u(st, a, b):
     return v / max(np.linalg.norm(v), 1e-9)
 
 
+# Colours for the dark 3-D view (colourblind-safe: white/red/amber/grey).
+_C_TEN = (0.92, 0.92, 0.96, 1.0)   # tension (white)
+_C_COMP = (0.95, 0.25, 0.25, 1.0)  # compression (red)
+_C_UP = (0.66, 0.66, 0.72, 1.0)    # upright / ball-joint (grey)
+_C_RX = (0.95, 0.72, 0.12, 1.0)    # ground / caliper reaction (amber)
+
+
+def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
+    """Force-vector arrows for the 3-D Load mode.
+
+    Returns a list of (p_world, tip_world, rgba).  mode='resultant' draws one
+    arrow per load point along the true force direction; mode='components'
+    splits each into lateral(X)/fore-aft(Y)/vertical(Z) arrows.  only_corner
+    isolates a single corner (for the wheel-package view).
+    """
+    loads, veh, up, res = compute_case(win, lat_g, lon_g)
+    corners = [only_corner] if only_corner else ['FL', 'FR', 'RL', 'RR']
+    items = []          # (p, vec, rgba)
+    for lbl in corners:
+        c = loads.get(lbl)
+        if c is None:
+            continue
+        st = win._solvers[lbl].solve(0.)
+        # control-arm member axial forces at their inboard pickups
+        for ik, ok, attr in (('uca_front', 'uca_outer', 'uca_front_N'),
+                             ('uca_rear', 'uca_outer', 'uca_rear_N'),
+                             ('lca_front', 'lca_outer', 'lca_front_N'),
+                             ('lca_rear', 'lca_outer', 'lca_rear_N'),
+                             ('tr_inner', 'tr_outer', 'tierod_N'),
+                             ('pushrod_inner', 'pushrod_outer', 'pushrod_N')):
+            F = float(getattr(c, attr))
+            u = _u(st, ik, ok)
+            p = np.asarray(getattr(st, ik), float)
+            items.append((p, F * u, _C_TEN if F >= 0 else _C_COMP))
+        # upright ball-joint resultants + contact patch + caliper
+        R_uca = -(c.uca_front_N * _u(st, 'uca_front', 'uca_outer')
+                  + c.uca_rear_N * _u(st, 'uca_rear', 'uca_outer'))
+        R_lca = -(c.lca_front_N * _u(st, 'lca_front', 'lca_outer')
+                  + c.lca_rear_N * _u(st, 'lca_rear', 'lca_outer'))
+        R_tie = -(c.tierod_N * _u(st, 'tr_inner', 'tr_outer'))
+        items.append((np.asarray(st.uca_outer, float), R_uca, _C_UP))
+        items.append((np.asarray(st.lca_outer, float), R_lca, _C_UP))
+        items.append((np.asarray(st.tr_outer, float), R_tie, _C_UP))
+        wc = np.asarray(st.wheel_center, float)
+        patch = np.array([wc[0], wc[1], 0.0])
+        Fpatch = np.array([float(res.Fy.get(lbl, 0.0)),
+                           float(res.Fx.get(lbl, 0.0)),
+                           float(res.Fz.get(lbl, 0.0))])
+        items.append((patch, Fpatch, _C_RX))
+        bt = float(getattr(c, 'brake_torque_Nm', 0.0))
+        if abs(bt) > 1.0:
+            side = 1.0 if wc[0] >= 0 else -1.0
+            rrad = 0.62 * float(veh.tire_radius_m)
+            cal_pt = wc + np.array([-side * 0.03, 0.0, rrad])
+            items.append((cal_pt, np.array([0.0, np.sign(bt) * abs(bt) / rrad, 0.0]), _C_RX))
+    if not items:
+        return []
+    fmax = max(float(np.linalg.norm(v)) for _, v, _ in items) or 1.0
+    SC = 0.14 / fmax
+    MINL = 0.028
+    arrows = []
+    for p, v, col in items:
+        if mode == 'components':
+            for ax in range(3):
+                comp = float(v[ax])
+                if abs(comp) < 1.0:
+                    continue
+                d = np.zeros(3); d[ax] = comp
+                L = max(abs(comp) * SC, MINL)
+                arrows.append((p, p + np.sign(comp) * (np.abs(d) / max(abs(comp), 1e-9)) * L, col))
+        else:
+            mag = float(np.linalg.norm(v))
+            if mag < 1.0:
+                continue
+            L = max(mag * SC, MINL)
+            arrows.append((p, p + (v / mag) * L, col))
+    return arrows
+
+
 def _iso(p, ctr, az=-0.98, el=0.42):
     x, y, z = p[0] - ctr[0], p[1] - ctr[1], p[2] - ctr[2]
     x1 = x * np.cos(az) - y * np.sin(az)

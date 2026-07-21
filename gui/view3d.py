@@ -397,6 +397,14 @@ class View3D:
         # View mode: 'normal' | 'load' (desaturate links) | 'interference'
         # (desaturate + show all thicknesses + highlight clashes).
         self._view_mode = 'normal'
+        # Load-mode force vectors: coloured arrows at the load points (shaft +
+        # 3-D arrowhead barbs).  Populated by set_load_vectors().
+        self._loadvec_vis = scene.Line(
+            pos=np.zeros((2, 3), np.float32),
+            color=np.ones((2, 4), np.float32),
+            connect='segments', width=3.0, antialias=True,
+            parent=self._view.scene)
+        self._loadvec_count = 0
         self._markers = scene.Markers(parent=self._view.scene)
         self._markers.set_data(
             pos=np.zeros((1, 3), np.float32),
@@ -1297,6 +1305,40 @@ class View3D:
                 self._clash_vis.set_data(pos=pos, color=(0.95, 0.15, 0.15, 1.0))
             else:
                 self._clash_vis.set_data(pos=np.zeros((2, 3), np.float32))
+        except Exception:
+            pass
+
+    def set_load_vectors(self, arrows) -> None:
+        """Draw force-vector arrows in Load mode.
+
+        arrows: list of (p, tip, rgba) world-point pairs + colour.  Each is a
+        shaft plus a 4-barb 3-D arrowhead so the direction reads from any angle.
+        Empty / None clears them.
+        """
+        try:
+            self._loadvec_count = len(arrows) if arrows else 0
+            if not arrows:
+                self._loadvec_vis.set_data(pos=np.zeros((2, 3), np.float32))
+                return
+            segs = []; cols = []
+            for p, tip, c in arrows:
+                p = np.asarray(p, float); tip = np.asarray(tip, float)
+                segs += [p, tip]; cols += [c, c]
+                d = tip - p; L = float(np.linalg.norm(d))
+                if L < 1e-6:
+                    continue
+                u = d / L
+                perp = np.cross(u, [0, 0, 1.0])
+                if np.linalg.norm(perp) < 1e-6:
+                    perp = np.cross(u, [0, 1.0, 0])
+                perp = perp / np.linalg.norm(perp)
+                perp2 = np.cross(u, perp)
+                hl = min(0.02, 0.32 * L)
+                for pp in (perp, -perp, perp2, -perp2):
+                    barb = tip - u * hl + pp * hl * 0.55
+                    segs += [tip, barb]; cols += [c, c]
+            self._loadvec_vis.set_data(pos=np.array(segs, np.float32),
+                                       color=np.array(cols, np.float32))
         except Exception:
             pass
 

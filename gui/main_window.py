@@ -5569,6 +5569,21 @@ class MainWindow(QMainWindow):
                 self.view3d.set_clashes(_clash_segs)
             except Exception:
                 pass
+
+            # ── Load mode: force-vector arrows at the load points ────────────
+            try:
+                if self._car.get('view_mode', 'normal') == 'load':
+                    from gui.wheel_package import load_arrows
+                    lat_g = self._dynamics_panel._lat_g.value()
+                    lon_g = self._dynamics_panel._lon_g.value()
+                    vm = self._car.get('load_vec_mode', 'resultant')
+                    only = self._car.get('wheel_pkg_corner') or None
+                    self.view3d.set_load_vectors(
+                        load_arrows(self, lat_g, lon_g, mode=vm, only_corner=only))
+                else:
+                    self.view3d.set_load_vectors([])
+            except Exception:
+                self.view3d.set_load_vectors([])
             self._frame_overlay(corners_draw)
             self._update_dimension_readouts()
 
