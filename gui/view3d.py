@@ -1651,7 +1651,12 @@ class View3D:
     def _hover_load(self, qpos):
         """Show the load label of the force-arrow nearest the cursor (Load mode)."""
         try:
-            tr = self._view.get_transform('scene', 'canvas')
+            # scene -> canvas pixels THROUGH the camera.  NOTE: the ViewBox's own
+            # get_transform('scene','canvas') sits ABOVE the camera and returns the
+            # raw world metres (identity, w=1) — every tip then lands at pixel ~0,0
+            # (top-left corner) so the tooltip only lit there.  node_transform from
+            # the scene node to the canvas scene walks through the camera projection.
+            tr = self._view.scene.node_transform(self._canvas.scene)
             best_lab, best_d2 = None, 22 ** 2
             for tip, lab in self._loadvec_snap:
                 m = tr.map([float(tip[0]), float(tip[1]), float(tip[2]), 1.0])
@@ -1856,7 +1861,9 @@ class View3D:
         if not self._hp_snap or not self._on_pick_cb:
             return
         try:
-            tr = self._view.get_transform('scene', 'canvas')
+            # Same camera-aware transform as _hover_load (the plain ViewBox
+            # get_transform excludes the camera → picking only worked at pixel 0,0).
+            tr = self._view.scene.node_transform(self._canvas.scene)
             best_name, best_corner, best_d2 = None, None, 30**2
             for name, pos3d, corner_label in self._hp_snap:
                 p4 = np.array([pos3d[0], pos3d[1], pos3d[2], 1.0], float)
