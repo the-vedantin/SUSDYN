@@ -30,7 +30,9 @@ class BrakeParams:
     piston_area_mm2: float = 793.5  # per caliper (1.23 in²)
     pad_radius_mm: float = 94.4     # effective radius from wheel center
     num_pistons: int = 1            # pistons per caliper side
-    caliper_bolt_spacing_mm: float = 60.0  # vertical distance between two mounting bolts
+    caliper_bolt_spacing_mm: float = 60.0  # l5: spacing between the two mounting bolts
+    caliper_l4_mm: float = 25.0     # l4: pad centre-of-area offset from the bolt LINE
+                                    # (Seward Fig 6.15 — sets the H_brake couple)
 
 
 @dataclass

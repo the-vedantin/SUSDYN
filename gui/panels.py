@@ -4215,6 +4215,12 @@ class LoadsPanel(CollapsibleSection):
         g.addWidget(QLabel('Bolt spacing:'), r, 0)
         s['bolt_spacing'] = _spin(0.1, 1e6, 60, ' mm', dec=1, step=5)
         g.addWidget(s['bolt_spacing'], r, 1)
+        # Seward l4: pad centre-of-area offset from the caliper bolt LINE — the
+        # lever that turns F_brake into the equal-and-opposite HORIZONTAL couple
+        # H_brake = F_brake * l4 / l5 at the two mounting lugs (Fig 6.15).
+        g.addWidget(QLabel('Pad offset l4:'), r, 2)
+        s['pad_offset'] = _spin(0.0, 1e6, 25.0, ' mm', dec=1, step=2)
+        g.addWidget(s['pad_offset'], r, 3)
 
         return g, s
 
@@ -4288,6 +4294,7 @@ class LoadsPanel(CollapsibleSection):
             pad_radius_mm=d['pad_radius'].value(),
             num_pistons=int(d['num_pistons'].value()),
             caliper_bolt_spacing_mm=d['bolt_spacing'].value(),
+            caliper_l4_mm=d['pad_offset'].value() if 'pad_offset' in d else 25.0,
         )
 
     def get_brake_params_front(self):

@@ -34,7 +34,10 @@ def compute_case(win, lat_g, lon_g):
         upright_params_f=up, upright_params_r=up, wheel_radius_m=veh.tire_radius_m,
         motion_ratio_f=veh.motion_ratio_front, motion_ratio_r=veh.motion_ratio_rear,
         cradle_solvers=cradle, heave_tbar_solvers=htb)
-    return loads, veh, up, result
+    # bp_f/bp_r carry the Seward caliper geometry (pad radius R_pad, bolt spacing
+    # l5, pad offset l4); `solver` carries the tyre models for the aligning
+    # moment Mz.  Returned so the load view uses the SAME objects (one model).
+    return loads, veh, up, result, bp_f, bp_r, solver
 
 
 def _u(st, a, b):
@@ -65,7 +68,7 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
       ROCKER/ARB = the bellcrank free body (pushrod, spring, ARB drop-link -
                  all AXIAL - and the only moment reaction, at the rocker PIVOT).
     """
-    loads, veh, up, res = compute_case(win, lat_g, lon_g)
+    loads, veh, up, res, bp_f, bp_r, dyn = compute_case(win, lat_g, lon_g)
     corners = [only_corner] if only_corner else ['FL', 'FR', 'RL', 'RR']
     items = []
     for lbl in corners:
@@ -142,9 +145,13 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             phi = np.radians(float(getattr(up, 'caliper_angle_deg', 45.0)))
             r_hat = vup * np.cos(phi) + fwd * np.sin(phi)       # radial to the caliper
             t_hat = np.cross(spin, r_hat); t_hat /= max(np.linalg.norm(t_hat), 1e-9)
-            R_pad = max(0.5 * float(win._car.get('rotor_dia_mm', 240.0)) / 1000.0 - 0.015, 0.03)
-            l4 = float(getattr(up, 'caliper_l4_mm', 22.0)) / 1000.0   # pad-centre to bolt line
-            l5 = max(float(getattr(up, 'caliper_l5_mm', 50.0)) / 1000.0, 0.01)  # lug spacing
+            # Seward geometry, straight off the brake params (front/rear):
+            #   R_pad = pad centre-of-area radius, l4 = pad-centre offset from the
+            #   bolt line, l5 = bolt (lug) spacing.
+            _bp = bp_f if lbl[0] == 'F' else bp_r
+            R_pad = max(float(_bp.pad_radius_mm) / 1000.0, 0.03)
+            l4 = max(float(getattr(_bp, 'caliper_l4_mm', 25.0)) / 1000.0, 0.0)
+            l5 = max(float(_bp.caliper_bolt_spacing_mm) / 1000.0, 0.01)
             F_brake = bt / R_pad
             V_brake = 0.5 * F_brake                             # shared tangential (both lugs)
             H_brake = F_brake * l4 / l5                         # couple (opposite on the lugs)
@@ -184,6 +191,39 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
         if abs(M_ot) > 1.0:
             items.append((wc, M_ot * fwd, _C_MOM,
                           f'{lbl} BEARINGS · overturning moment · {abs(M_ot):,.0f} N·m'))
+
+        # ── STEERING (kingpin) moment: the contact-patch force system taken about
+        #    the steering axis through the two ball joints.  This is the torque the
+        #    steering rack / toe link has to react (scrub radius + trail effects).
+        try:
+            kp_a = np.asarray(st.lca_outer, float)
+            kp_b = np.asarray(st.uca_outer, float)
+            k = kp_b - kp_a
+            k = k / max(np.linalg.norm(k), 1e-9)
+            M_kp = float(np.dot(k, np.cross(patch - kp_a, Fpatch)))
+            if abs(M_kp) > 1.0:
+                items.append((kp_a, M_kp * k, _C_MOM,
+                              f'{lbl} STEERING · moment about kingpin axis · '
+                              f'{abs(M_kp):,.0f} N·m'))
+        except Exception:
+            pass
+
+        # ── TYRE self-aligning torque Mz (about the vertical), straight from the
+        #    tyre model: back out the slip angle that produces this Fy at this Fz
+        #    and camber, then read the tyre's Mz there.
+        try:
+            _tm = getattr(dyn, '_tire' if lbl[0] == 'F' else '_tire_rear', None)
+            if _tm is not None:
+                _cam = float(res.camber.get(lbl, 0.0))
+                _Fz = float(res.Fz.get(lbl, 0.0))
+                _sa = _tm.slip_angle_for_Fy(Fy, _Fz, _cam)
+                _mz = float(_tm.Mz(_sa, _Fz, _cam))
+                if abs(_mz) > 1.0:
+                    items.append((patch, np.array([0.0, 0.0, _mz]), _C_MOM,
+                                  f'{lbl} TYRE · self-aligning torque Mz · '
+                                  f'{abs(_mz):,.0f} N·m'))
+        except Exception:
+            pass
 
         # ── ROCKER / ARB free body: pushrod, spring, ARB drop-link (axial),
         #    and the rocker PIVOT reaction (the only moment reaction) ──
