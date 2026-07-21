@@ -334,6 +334,32 @@ def build_box(center, u_ax, u_rad, u_tan, half_ax, half_rad, half_tan):
     return verts, faces
 
 
+def build_prism(poly, half_t):
+    """Extrude a coplanar polygon (list of >=3 3-D verts) by +/-half_t along its
+    own normal into a solid PLATE (two faces + side walls).  Used for the
+    bellcrank/rocker, which is a flat machined PLATE, not a tube."""
+    poly = np.asarray(poly, float)
+    n = len(poly)
+    if n < 3:
+        return (np.zeros((3, 3), np.float32), np.array([[0, 1, 2]], np.uint32))
+    nz = np.cross(poly[1] - poly[0], poly[2] - poly[0])
+    ln = np.linalg.norm(nz)
+    nz = nz / ln if ln > 1e-12 else np.array([0.0, 0.0, 1.0])
+    front = poly + nz * half_t
+    back = poly - nz * half_t
+    verts = np.vstack([front, back]).astype(np.float32)   # 0..n-1 front, n..2n-1 back
+    faces = []
+    for i in range(1, n - 1):                 # front face fan
+        faces.append([0, i, i + 1])
+    for i in range(1, n - 1):                 # back face fan (reversed)
+        faces.append([n, n + i + 1, n + i])
+    for i in range(n):                        # side walls
+        j = (i + 1) % n
+        faces.append([i, n + i, n + j])
+        faces.append([i, n + j, j])
+    return verts, np.array(faces, np.uint32)
+
+
 def _tube_segments(segs, radius, n=10):
     """Merge a list of (p0, p1, rgba) into one (verts, faces, vertex_colors)
     mesh of solid cylinders — used to give the suspension members real 3-D
@@ -437,6 +463,7 @@ class View3D:
         self._member_r_thin = 0.0006    # ~1 mm wisps (thickness OFF → reads as lines)
         self._member_r = self._member_r_full
         self._thick_on  = True          # navcube "Thickness" toggle state
+        self._rocker_half_t = 0.003     # bellcrank = 6 mm flat PLATE (extruded, not tubed)
         # ARB drawn as a SOLID TUBE too (was a thin line).
         self._arb_mesh = scene.Mesh(
             vertices=np.zeros((3, 3), np.float32),
@@ -475,7 +502,7 @@ class View3D:
         # Per-corner meshes (4 corners max)
         self._tire_meshes    = [self._new_mesh((0.18, 0.18, 0.18, 0.6)) for _ in range(4)]
         self._upright_meshes = [self._new_mesh((0.50, 0.40, 0.30, 0.30)) for _ in range(4)]
-        self._rocker_meshes  = [self._new_mesh((0.85, 0.70, 0.12, 0.75)) for _ in range(4)]
+        self._rocker_meshes  = [self._new_mesh((0.85, 0.70, 0.12, 1.0)) for _ in range(4)]
         # Spring / damper cylinder per corner — radius set via set_spring_dims
         self._spring_meshes  = [self._new_mesh((0.75, 0.75, 0.78, 0.70)) for _ in range(4)]
         # Outside diameters in METRES.  Defaults match the wizard defaults
@@ -507,7 +534,7 @@ class View3D:
         self._car_meshes = (
             [(m, (0.18, 0.18, 0.18, 0.6)) for m in self._tire_meshes]
             + [(m, (0.50, 0.40, 0.30, 0.30)) for m in self._upright_meshes]
-            + [(m, (0.85, 0.70, 0.12, 0.75)) for m in self._rocker_meshes]
+            + [(m, (0.85, 0.70, 0.12, 1.0)) for m in self._rocker_meshes]
             + [(m, (0.75, 0.75, 0.78, 0.70)) for m in self._spring_meshes]
             + [(self._diff_mesh, (0.55, 0.55, 0.58, 0.90))]
             + [(m, (0.82, 0.82, 0.85, 0.92)) for m in self._driveshaft_meshes]
@@ -992,19 +1019,16 @@ class View3D:
                     vertices=np.zeros((3, 3), np.float32),
                     faces=np.array([[0, 1, 2]], np.uint32))
             elif _have(rk4) and _rocker_has_spread:
-                rv = np.array([pts[k] for k in rk4], np.float32)
-                # fan from pivot: tri0=(0,1,2), tri1=(0,2,3)
-                self._rocker_meshes[ci].set_data(
-                    vertices=rv, faces=np.array([[0,1,2],[0,2,3]], np.uint32))
-                for pa2, pb2 in [(rk4[0],rk4[1]),(rk4[1],rk4[2]),
-                                 (rk4[2],rk4[3]),(rk4[3],rk4[0])]:
-                    member_segs.append((pts[pa2], pts[pb2], (0.85, 0.70, 0.12, 1.0)))
+                # bellcrank = flat PLATE: extrude the quad by the plate thickness
+                # (a machined plate, not a tube frame).  Thin the plate with the
+                # thickness toggle so it reads as an outline when OFF.
+                _ht = self._rocker_half_t if self._thick_on else 0.0004
+                rv, rf = build_prism([pts[k] for k in rk4], _ht)
+                self._rocker_meshes[ci].set_data(vertices=rv, faces=rf)
             elif _have(rk3):
-                rv = np.array([pts[k] for k in rk3], np.float32)
-                self._rocker_meshes[ci].set_data(
-                    vertices=rv, faces=np.array([[0,1,2]], np.uint32))
-                for pa2, pb2 in [(rk3[0],rk3[1]),(rk3[1],rk3[2]),(rk3[2],rk3[0])]:
-                    member_segs.append((pts[pa2], pts[pb2], (0.85, 0.70, 0.12, 1.0)))
+                _ht = self._rocker_half_t if self._thick_on else 0.0004
+                rv, rf = build_prism([pts[k] for k in rk3], _ht)
+                self._rocker_meshes[ci].set_data(vertices=rv, faces=rf)
             else:
                 # No valid per-corner rocker (DECOUPLED — pushrod goes to the
                 # shared cradle — or missing/NaN rocker points).  Clear the

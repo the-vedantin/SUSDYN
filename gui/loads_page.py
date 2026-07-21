@@ -13,7 +13,8 @@ all read the SAME solved model (ONE MODEL).
 import numpy as np
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QComboBox,
                              QRadioButton, QButtonGroup, QPushButton, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QAbstractItemView, QSplitter)
+                             QTableWidgetItem, QHeaderView, QAbstractItemView, QSplitter,
+                             QDoubleSpinBox, QGridLayout)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
@@ -63,6 +64,37 @@ class LoadsPage(QWidget):
         self._res.setChecked(True)
         bg = QButtonGroup(self); bg.addButton(self._res); bg.addButton(self._comp)
         left.addWidget(self._res); left.addWidget(self._comp)
+
+        # ── UPRIGHT / BRAKE geometry — inputs live HERE on the Loads page (not
+        #    the dynamics panel).  They write back to the same stores the model
+        #    already reads (LoadsPanel UprightParams + car rotor dia) so there is
+        #    ONE model.  These drive the wheel-bearing and brake-caliper loads
+        #    (Seward Ch.6): bearing spacing/offset = the (l1+l2)/l1 lever;
+        #    caliper mount angle = where the caliper sits around the disc.
+        left.addWidget(hdr('UPRIGHT / BRAKE GEOMETRY'))
+        _lp = getattr(self._main, '_loads_panel', None)
+        def _mkspin(lo, hi, val, suffix, dec, step):
+            s = QDoubleSpinBox(); s.setRange(lo, hi); s.setDecimals(dec)
+            s.setSingleStep(step); s.setSuffix(suffix); s.setValue(float(val))
+            s.setStyleSheet('QDoubleSpinBox{background:#1e1e24;border:1px solid #444;'
+                            'border-radius:3px;padding:2px 4px;}')
+            return s
+        _bs = getattr(_lp, '_brg_spacing', None); _co = getattr(_lp, '_cp_offset', None)
+        _ca = getattr(_lp, '_cal_angle', None)
+        self._brg_spacing = _mkspin(1, 500, _bs.value() if _bs else 50.0, ' mm', 1, 2)
+        self._cp_offset   = _mkspin(0, 500, _co.value() if _co else 30.0, ' mm', 1, 2)
+        self._cal_angle   = _mkspin(0, 360, _ca.value() if _ca else 45.0, ' °', 0, 5)
+        self._rotor_dia   = _mkspin(80, 400, float(self._main._car.get('rotor_dia_mm', 240.)), ' mm', 0, 5)
+        _grid = QGridLayout(); _grid.setContentsMargins(0, 0, 0, 0); _grid.setSpacing(4)
+        for r, (lab, wdg) in enumerate((('Bearing spacing', self._brg_spacing),
+                                        ('Bearing offset', self._cp_offset),
+                                        ('Caliper mount angle', self._cal_angle),
+                                        ('Rotor diameter', self._rotor_dia))):
+            _grid.addWidget(QLabel(lab), r, 0); _grid.addWidget(wdg, r, 1)
+        left.addLayout(_grid)
+        for _w in (self._brg_spacing, self._cp_offset, self._cal_angle, self._rotor_dia):
+            _w.valueChanged.connect(self._on_geom)
+
         self._note = QLabel('Hover any force arrow in the 3-D view to read its load.\n\n'
                             'CHASSIS = reaction into the frame pickups (tension pulls it '
                             'outboard).\nUPRIGHT = ball joints, wheel bearings (radial + axial), '
@@ -126,6 +158,27 @@ class LoadsPage(QWidget):
             self._v3d = None
 
     def _on_input(self, *_):
+        self.refresh()
+
+    def _on_geom(self, *_):
+        """Bearing/caliper/rotor geometry changed on the Loads page → write back
+        into the SAME stores the load model reads (LoadsPanel UprightParams +
+        car rotor dia) so there is no second model, then recompute."""
+        lp = getattr(self._main, '_loads_panel', None)
+        if lp is not None:
+            for src, name in ((self._brg_spacing, '_brg_spacing'),
+                              (self._cp_offset, '_cp_offset'),
+                              (self._cal_angle, '_cal_angle')):
+                dst = getattr(lp, name, None)
+                if dst is not None:
+                    dst.blockSignals(True); dst.setValue(src.value()); dst.blockSignals(False)
+        try:
+            self._main._car['rotor_dia_mm'] = float(self._rotor_dia.value())
+            cp = getattr(getattr(self._main, '_car_panel', None), '_rotor_dia', None)
+            if cp is not None:
+                cp.blockSignals(True); cp.setValue(float(self._rotor_dia.value())); cp.blockSignals(False)
+        except Exception:
+            pass
         self.refresh()
 
     def refresh(self, *_):

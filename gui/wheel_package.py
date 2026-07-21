@@ -123,18 +123,38 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
         except Exception:
             pass
 
-        # ── UPRIGHT: brake CALIPER lugs (react the rotor torque) ──
+        # ── UPRIGHT: brake CALIPER mount lugs (Seward Ch.6, Fig 6.15) ──
+        # The single tangential pad-friction force F_brake = brake_torque / R_pad
+        # is reacted at the TWO mounting lugs as BOTH a shared tangential force
+        # V_brake = F_brake/2 (same direction on both lugs) AND a horizontal
+        # COUPLE H_brake = F_brake·l4/l5 (equal-and-opposite on the two lugs),
+        # because the pad centre-of-area is offset l4 from the bolt line.  The
+        # OLD code applied only the tangential force and dropped H_brake — that
+        # was the "no horizontal caliper force" bug.  The caliper MOUNT ANGLE
+        # (up.caliper_angle_deg) sets where it sits around the disc.
         bt = float(getattr(c, 'brake_torque_Nm', 0.0))
         if abs(bt) > 1.0:
-            up_rad = np.array([0, 1.0, 0]) - np.dot([0, 1.0, 0], spin) * spin
-            up_rad = up_rad / max(np.linalg.norm(up_rad), 1e-9)
-            tan = np.cross(spin, up_rad)
-            rrad = 0.5 * float(win._car.get('rotor_dia_mm', 240.0)) / 1000.0
-            lug_F = 0.5 * bt / max(rrad, 1e-3)         # each of two lugs
-            for s2 in (0.03, -0.03):
-                cp = wc + up_rad * (rrad - 0.006) + tan * s2
-                items.append((cp, np.sign(bt) * lug_F * tan, _C_CAL,
-                              f'{lbl} CALIPER · mount lug · {lug_F:,.0f} N (x2, brake torque {bt:,.0f} Nm)'))
+            vup = np.array([0., 0., 1.]) - np.dot([0., 0., 1.], spin) * spin
+            vup = vup / max(np.linalg.norm(vup), 1e-9)          # vertical in wheel plane
+            fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
+            fwd = fwd / max(np.linalg.norm(fwd), 1e-9)          # fore-aft in wheel plane
+            phi = np.radians(float(getattr(up, 'caliper_angle_deg', 45.0)))
+            r_hat = vup * np.cos(phi) + fwd * np.sin(phi)       # radial to the caliper
+            t_hat = np.cross(spin, r_hat); t_hat /= max(np.linalg.norm(t_hat), 1e-9)
+            R_pad = max(0.5 * float(win._car.get('rotor_dia_mm', 240.0)) / 1000.0 - 0.015, 0.03)
+            l4 = float(getattr(up, 'caliper_l4_mm', 22.0)) / 1000.0   # pad-centre to bolt line
+            l5 = max(float(getattr(up, 'caliper_l5_mm', 50.0)) / 1000.0, 0.01)  # lug spacing
+            F_brake = bt / R_pad
+            V_brake = 0.5 * F_brake                             # shared tangential (both lugs)
+            H_brake = F_brake * l4 / l5                         # couple (opposite on the lugs)
+            bolt_r = max(R_pad - l4, 0.02)
+            s = float(np.sign(bt))
+            for sgn in (+1.0, -1.0):
+                pos = wc + r_hat * bolt_r + t_hat * (sgn * 0.5 * l5)
+                F = s * V_brake * t_hat + sgn * H_brake * r_hat
+                items.append((pos, F, _C_CAL,
+                              f'{lbl} CALIPER · mount lug · V {V_brake:,.0f} N + H {H_brake:,.0f} N '
+                              f'(brake torque {bt:,.0f} Nm)'))
 
         # ── UPRIGHT / TYRE: contact-patch load into the hub ──
         patch = np.array([wc[0], wc[1], 0.0])
