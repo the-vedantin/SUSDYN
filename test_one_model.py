@@ -472,6 +472,31 @@ except Exception as _e:
     fails += 1
     print(f'caliper mount geo : UNEXPECTED FAIL ({_e})')
 
+# ── WHEEL BEARINGS: overhung geometry (both bearings INBOARD of the wheel).
+#    cp_offset was overloaded as both the outer-bearing position and the beam
+#    lever; now the near bearing sits bearing_inboard_offset in and the tyre load
+#    is overhung, so the outer bearing carries MORE than the wheel load and the
+#    inner reverses.  Also: the rocker PIVOT reaction is a CHASSIS mount load.
+print('-' * 64)
+try:
+    from gui import wheel_package as _WP3
+    _up = win._loads_panel.get_upright_params()
+    _its = _WP3._load_items(win, 1.5, 0.0, only_corner='FL')
+    _piv = [it for it in _its if 'rocker pivot' in it[3].lower()]
+    _piv_chassis = bool(_piv) and 'CHASSIS' in _piv[0][3]
+    _ld = _WP3.compute_case(win, 1.5, 0.0)[0]['FL']
+    _overhung = _ld.bearing_outer_V * _ld.bearing_inner_V < 0   # opposite signs
+    _has_off = hasattr(_up, 'bearing_inboard_offset_mm')
+    brg_ok = _piv_chassis and _overhung and _has_off
+    if not brg_ok:
+        fails += 1
+    print(f'bearings/pivot   : inboard offset input {_has_off}, overhung '
+          f'(outer {_ld.bearing_outer_V:.0f} / inner {_ld.bearing_inner_V:.0f} N), '
+          f'pivot on chassis {_piv_chassis}   {"pass" if brg_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'bearings/pivot   : UNEXPECTED FAIL ({_e})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)

@@ -71,9 +71,23 @@ class BrakeParams:
 @dataclass
 class UprightParams:
     """Upright/bearing geometry."""
-    bearing_spacing_mm: float = 50.0   # inner-to-outer bearing distance along spindle
-    cp_offset_mm: float = 30.0        # contact patch plane offset from inner bearing (along spindle)
+    bearing_spacing_mm: float = 50.8   # l1: bearing center-to-center along the spindle (2.00 in)
+    # The NEAR (outer) bearing sits this far INBOARD of the wheel centre-line.
+    # Both bearings are inboard of the wheel, so the tyre load is OVERHUNG outboard
+    # of the pair — the outer bearing carries more than the wheel load and the
+    # inner one reacts the other way.  Measured on the outgoing car: 1.55 in.
+    bearing_inboard_offset_mm: float = 39.4   # 1.55 in
+    cp_offset_mm: float = 30.0        # DEPRECATED: was overloaded as both the outer
+                                      # bearing position AND the beam lever; kept so
+                                      # old saved configs still load, no longer used.
     caliper_angle_deg: float = 45.0   # caliper position: degrees from top of disc, CW from outboard view
+
+    @property
+    def cp_to_inner_bearing_mm(self) -> float:
+        """Beam lever d: contact-patch plane (the wheel centre-line) to the INNER
+        (far) bearing.  = near-bearing offset + spacing, since the patch is
+        outboard of both bearings."""
+        return self.bearing_inboard_offset_mm + self.bearing_spacing_mm
 
 
 @dataclass
@@ -338,7 +352,7 @@ def _compute_bearing_loads(result: ComponentLoads, bp: BrakeParams,
     Outputs V (up+) and H (fwd+) at each bearing.
     """
     l1 = up.bearing_spacing_mm / 1000.0   # m (bearing spacing)
-    d  = up.cp_offset_mm / 1000.0         # m (CP offset from inner bearing)
+    d  = up.cp_to_inner_bearing_mm / 1000.0   # m (patch plane -> inner bearing)
     theta = np.radians(up.caliper_angle_deg)
     r_pad = bp.pad_radius_mm / 1000.0     # m
 

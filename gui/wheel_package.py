@@ -110,10 +110,16 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
 
         # ── UPRIGHT: wheel BEARINGS (radial + axial), along the spin axis ──
         try:
-            l2 = float(up.cp_offset_mm) / 1000.0
+            # Both bearings sit INBOARD of the wheel centre-line (the tyre load is
+            # overhung outboard of the pair).  The near/outer bearing is
+            # bearing_inboard_offset in; the far/inner one a spacing further.
+            # This used to reuse cp_offset (30 mm) as the outer-bearing position,
+            # which put the bearing out near the hub face instead of down the
+            # spindle where it lives.
+            off = float(getattr(up, 'bearing_inboard_offset_mm', 39.4)) / 1000.0
             l1 = float(up.bearing_spacing_mm) / 1000.0
-            p_out = wc - spin * l2                    # inboard of the hub
-            p_in = wc - spin * (l2 + l1)
+            p_out = wc - spin * off                   # near (outer) bearing
+            p_in = wc - spin * (off + l1)             # far (inner) bearing
             radial_out = np.array([0.0, float(c.bearing_outer_H), float(c.bearing_outer_V)])
             radial_in = np.array([0.0, float(c.bearing_inner_H), float(c.bearing_inner_V)])
             items.append((p_out, radial_out, _C_UP,
@@ -267,7 +273,11 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
                     (sc, -F_spr, 'CHASSIS · spring mount', _C_TEN),
                     (dt, F_arb, 'ARB · drop-link (axial)', _C_ARB),
                     (ae, -F_arb, 'ARB · arm end (axial)', _C_ARB),
-                    (P, F_pivot, 'ROCKER · PIVOT reaction (moment)', _C_RK)]
+                    # The rocker PIVOT bolts to the chassis, so its reaction is a
+                    # CHASSIS mount load — the frame has to react it.  Coloured as
+                    # a chassis load now (was grey/rocker) so it shows when the
+                    # chassis group is on, per the request.
+                    (P, F_pivot, 'CHASSIS · rocker pivot mount', _C_TEN)]
             if arb_piv is not None:
                 rows.append((arb_piv, F_arb, 'ARB · chassis pivot mount', _C_ARB))
             for pt, v, nm, col in rows:

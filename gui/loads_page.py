@@ -90,10 +90,10 @@ class LoadsPage(QWidget):
             s.setStyleSheet('QDoubleSpinBox{background:#1e1e24;border:1px solid #444;'
                             'border-radius:3px;padding:2px 4px;}')
             return s
-        _bs = getattr(_lp, '_brg_spacing', None); _co = getattr(_lp, '_cp_offset', None)
+        _bs = getattr(_lp, '_brg_spacing', None); _co = getattr(_lp, '_brg_inboard', None)
         _ca = getattr(_lp, '_cal_angle', None)
-        self._brg_spacing = _mkspin(1, 500, _bs.value() if _bs else 50.0, ' mm', 1, 2)
-        self._cp_offset   = _mkspin(0, 500, _co.value() if _co else 30.0, ' mm', 1, 2)
+        self._brg_spacing = _mkspin(1, 500, _bs.value() if _bs else 50.8, ' mm', 1, 2)
+        self._brg_inboard = _mkspin(0, 500, _co.value() if _co else 39.4, ' mm', 1, 2)
         self._cal_angle   = _mkspin(0, 360, _ca.value() if _ca else 45.0, ' °', 0, 5)
         self._rotor_dia   = _mkspin(80, 400, float(self._main._car.get('rotor_dia_mm', 240.)), ' mm', 0, 5)
         # Seward caliper geometry (Fig 6.15): R_pad = pad centre radius,
@@ -105,7 +105,7 @@ class LoadsPage(QWidget):
         self._bolt_l5    = _mkspin(1, 400, _bd.get('bolt_spacing', 60.0), ' mm', 1, 2)
         _grid = QGridLayout(); _grid.setContentsMargins(0, 0, 0, 0); _grid.setSpacing(4)
         for r, (lab, wdg) in enumerate((('Bearing spacing  l1', self._brg_spacing),
-                                        ('Bearing offset  l2', self._cp_offset),
+                                        ('Bearing inboard offset', self._brg_inboard),
                                         ('Caliper mount angle', self._cal_angle),
                                         ('Rotor diameter', self._rotor_dia),
                                         ('Pad radius  R_pad', self._pad_radius),
@@ -113,7 +113,7 @@ class LoadsPage(QWidget):
                                         ('Bolt spacing  l5', self._bolt_l5))):
             _grid.addWidget(QLabel(lab), r, 0); _grid.addWidget(wdg, r, 1)
         left.addLayout(_grid)
-        for _w in (self._brg_spacing, self._cp_offset, self._cal_angle, self._rotor_dia,
+        for _w in (self._brg_spacing, self._brg_inboard, self._cal_angle, self._rotor_dia,
                    self._pad_radius, self._mount_h, self._bolt_l5):
             _w.valueChanged.connect(self._on_geom)
 
@@ -243,7 +243,7 @@ class LoadsPage(QWidget):
         lp = getattr(self._main, '_loads_panel', None)
         if lp is not None:
             for src, name in ((self._brg_spacing, '_brg_spacing'),
-                              (self._cp_offset, '_cp_offset'),
+                              (self._brg_inboard, '_brg_inboard'),
                               (self._cal_angle, '_cal_angle')):
                 dst = getattr(lp, name, None)
                 if dst is not None:

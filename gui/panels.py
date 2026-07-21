@@ -4281,13 +4281,17 @@ class LoadsPanel(CollapsibleSection):
 
         r = 1
         upr.addWidget(QLabel('Bearing spacing:'), r, 0)
-        self._brg_spacing = _spin(0.1, 1e6, 50, ' mm', dec=1, step=5)
+        self._brg_spacing = _spin(0.1, 1e6, 50.8, ' mm', dec=1, step=5)
+        self._brg_spacing.setToolTip('Bearing center-to-center along the spindle '
+                                     '(2.00 in on the outgoing car)')
         upr.addWidget(self._brg_spacing, r, 1)
-        upr.addWidget(QLabel('CP offset:'), r, 2)
-        self._cp_offset = _spin(0, 1e6, 30, ' mm', dec=1, step=5)
-        self._cp_offset.setToolTip(
-            'Contact-patch plane offset from inner bearing along spindle')
-        upr.addWidget(self._cp_offset, r, 3)
+        upr.addWidget(QLabel('Bearing inboard:'), r, 2)
+        self._brg_inboard = _spin(0, 1e6, 39.4, ' mm', dec=1, step=2)
+        self._brg_inboard.setToolTip(
+            'How far the NEAR (outer) bearing sits inboard of the wheel '
+            'centre-line. Both bearings are inboard, so the tyre load is '
+            'overhung. 1.55 in on the outgoing car.')
+        upr.addWidget(self._brg_inboard, r, 3)
 
         r += 1
         upr.addWidget(QLabel('Caliper angle:'), r, 0)
@@ -4354,7 +4358,7 @@ class LoadsPanel(CollapsibleSection):
         from vahan.loads import UprightParams
         return UprightParams(
             bearing_spacing_mm=self._brg_spacing.value(),
-            cp_offset_mm=self._cp_offset.value(),
+            bearing_inboard_offset_mm=self._brg_inboard.value(),
             caliper_angle_deg=self._cal_angle.value(),
         )
 
@@ -4385,9 +4389,9 @@ class LoadsPanel(CollapsibleSection):
         return {
             'brake_front':    self._brake_state(self._brk_f),
             'brake_rear':     self._brake_state(self._brk_r),
-            'bearing_spacing_mm': float(self._brg_spacing.value()),
-            'cp_offset_mm':       float(self._cp_offset.value()),
-            'caliper_angle_deg':  float(self._cal_angle.value()),
+            'bearing_spacing_mm':       float(self._brg_spacing.value()),
+            'bearing_inboard_offset_mm': float(self._brg_inboard.value()),
+            'caliper_angle_deg':        float(self._cal_angle.value()),
         }
 
     def set_state(self, d: dict) -> None:
@@ -4398,9 +4402,9 @@ class LoadsPanel(CollapsibleSection):
         self._apply_brake_state(self._brk_f, d.get('brake_front', {}))
         self._apply_brake_state(self._brk_r, d.get('brake_rear', {}))
         for key, sb in (
-            ('bearing_spacing_mm', self._brg_spacing),
-            ('cp_offset_mm',       self._cp_offset),
-            ('caliper_angle_deg',  self._cal_angle),
+            ('bearing_spacing_mm',       self._brg_spacing),
+            ('bearing_inboard_offset_mm', self._brg_inboard),
+            ('caliper_angle_deg',        self._cal_angle),
         ):
             if key in d:
                 try:
