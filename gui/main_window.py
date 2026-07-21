@@ -5337,7 +5337,9 @@ class MainWindow(QMainWindow):
                 mount_height_mm=getattr(self._loads_panel.get_brake_params_front(),
                                         'caliper_mount_height_mm', 27.9),
                 caliper_angle_deg=getattr(self._loads_panel.get_upright_params(),
-                                          'caliper_angle_deg', 45.0))
+                                          'caliper_angle_deg', 45.0),
+                vertical_mounts=getattr(self._loads_panel.get_upright_params(),
+                                        'caliper_vertical_mounts', True))
         except Exception:
             pass
         # Draw the ARB structure too (the user wants it on the Loads page, not
@@ -5726,7 +5728,9 @@ class MainWindow(QMainWindow):
                 mount_height_mm=getattr(self._loads_panel.get_brake_params_front(),
                                         'caliper_mount_height_mm', 27.9),
                 caliper_angle_deg=getattr(self._loads_panel.get_upright_params(),
-                                          'caliper_angle_deg', 45.0))
+                                          'caliper_angle_deg', 45.0),
+                vertical_mounts=getattr(self._loads_panel.get_upright_params(),
+                                        'caliper_vertical_mounts', True))
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)

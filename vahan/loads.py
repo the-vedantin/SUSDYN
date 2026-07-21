@@ -80,7 +80,12 @@ class UprightParams:
     cp_offset_mm: float = 30.0        # DEPRECATED: was overloaded as both the outer
                                       # bearing position AND the beam lever; kept so
                                       # old saved configs still load, no longer used.
-    caliper_angle_deg: float = 45.0   # caliper position: degrees from top of disc, CW from outboard view
+    caliper_angle_deg: float = 45.0   # manual caliper clock (used only when vertical mounts are OFF)
+    # Clock the caliper so its two mount bolts stack VERTICALLY, on the tie-rod
+    # side of the wheel — the radial points fore-aft, so the lug spacing runs
+    # up-down.  Simplifies the upright (one vertical mounting boss shared with the
+    # steering arm face).  When False, caliper_angle_deg sets the clock instead.
+    caliper_vertical_mounts: bool = True
 
     @property
     def cp_to_inner_bearing_mm(self) -> float:

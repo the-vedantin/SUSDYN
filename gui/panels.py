@@ -4294,11 +4294,21 @@ class LoadsPanel(CollapsibleSection):
         upr.addWidget(self._brg_inboard, r, 3)
 
         r += 1
-        upr.addWidget(QLabel('Caliper angle:'), r, 0)
+        from PyQt6.QtWidgets import QCheckBox
+        self._cal_vert = QCheckBox('Vertical mounts (tie-rod side)')
+        self._cal_vert.setChecked(True)
+        self._cal_vert.setToolTip(
+            'Clock the caliper so its two mount bolts stack VERTICALLY, on the '
+            'tie-rod side of the wheel \u2014 one vertical mounting boss, shared with '
+            'the steering-arm face, simplifies the upright. Uncheck to set the '
+            'clock angle manually.')
+        upr.addWidget(self._cal_vert, r, 0, 1, 2)
+        upr.addWidget(QLabel('Caliper angle:'), r, 2)
         self._cal_angle = _spin(0, 360, 45, '\u00b0', dec=0, step=15)
         self._cal_angle.setToolTip(
-            'Caliper position: degrees from top of disc, CW from outboard view')
-        upr.addWidget(self._cal_angle, r, 1)
+            'Manual caliper clock (degrees from top of disc, CW from outboard '
+            'view) \u2014 used only when vertical mounts is unchecked')
+        upr.addWidget(self._cal_angle, r, 3)
 
         self.add_layout(upr)
 
@@ -4360,6 +4370,7 @@ class LoadsPanel(CollapsibleSection):
             bearing_spacing_mm=self._brg_spacing.value(),
             bearing_inboard_offset_mm=self._brg_inboard.value(),
             caliper_angle_deg=self._cal_angle.value(),
+            caliper_vertical_mounts=self._cal_vert.isChecked(),
         )
 
     # ── Save / load (every input on the panel) ───────────────────────
@@ -4392,6 +4403,7 @@ class LoadsPanel(CollapsibleSection):
             'bearing_spacing_mm':       float(self._brg_spacing.value()),
             'bearing_inboard_offset_mm': float(self._brg_inboard.value()),
             'caliper_angle_deg':        float(self._cal_angle.value()),
+            'caliper_vertical_mounts':  bool(self._cal_vert.isChecked()),
         }
 
     def set_state(self, d: dict) -> None:
@@ -4414,6 +4426,10 @@ class LoadsPanel(CollapsibleSection):
                     pass
                 finally:
                     sb.blockSignals(False)
+        if 'caliper_vertical_mounts' in d:
+            self._cal_vert.blockSignals(True)
+            self._cal_vert.setChecked(bool(d['caliper_vertical_mounts']))
+            self._cal_vert.blockSignals(False)
 
     # ── results popup ────────────────────────────────────────────────
     def show_loads(self, loads: dict, lat_g: float = 0.0, lon_g: float = 0.0):

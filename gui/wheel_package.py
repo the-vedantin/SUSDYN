@@ -148,8 +148,18 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             vup = vup / max(np.linalg.norm(vup), 1e-9)          # vertical in wheel plane
             fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
             fwd = fwd / max(np.linalg.norm(fwd), 1e-9)          # fore-aft in wheel plane
-            phi = np.radians(float(getattr(up, 'caliper_angle_deg', 45.0)))
-            r_hat = vup * np.cos(phi) + fwd * np.sin(phi)       # radial to the caliper
+            # CLOCKING.  With the caliper radial pointing FORE-AFT, the two mount
+            # bolts (spaced along t_hat = spin x r_hat) stack VERTICALLY — one
+            # above the other — which lets the upright carry them on a single
+            # vertical boss.  Clock it to the tie-rod's fore-aft side so the
+            # caliper and the steering arm share the same face of the upright.
+            if bool(getattr(up, 'caliper_vertical_mounts', True)):
+                dy = float(np.asarray(st.tr_outer, float)[1] - wc[1])   # +y = rearward
+                r_hat = np.sign(dy) * fwd if abs(dy) > 1e-6 else -fwd   # toward the tie rod
+            else:
+                phi = np.radians(float(getattr(up, 'caliper_angle_deg', 45.0)))
+                r_hat = vup * np.cos(phi) + fwd * np.sin(phi)   # manual clock angle
+            r_hat = r_hat / max(np.linalg.norm(r_hat), 1e-9)
             t_hat = np.cross(spin, r_hat); t_hat /= max(np.linalg.norm(t_hat), 1e-9)
             # Seward geometry, straight off the brake params (front/rear):
             #   R_pad = pad centre-of-area radius, l4 = pad-centre offset from the

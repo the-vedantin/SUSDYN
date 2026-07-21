@@ -532,6 +532,7 @@ class View3D:
         # Caliper placement, kept in step with the LOAD model (see set_brake_dims).
         self._caliper_bolt_r = self._rotor_r - 0.0279   # drawing D1
         self._caliper_angle_deg = 45.0
+        self._caliper_vertical_mounts = True   # clock to tie-rod side, lugs vertical
         # (mesh, base_rgba) for every SOLID car part — greyed in Load /
         # Interference mode so only the force vectors keep colour.
         self._car_meshes = (
@@ -1072,8 +1073,16 @@ class View3D:
                     vup = vup / max(np.linalg.norm(vup), 1e-9)
                     fwd = np.array([0, 1.0, 0]) - np.dot([0, 1.0, 0], s) * s
                     fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
-                    phi = np.radians(float(self._caliper_angle_deg))
-                    rad = vup * np.cos(phi) + fwd * np.sin(phi)   # radial to caliper
+                    # Match the load model's clocking: when vertical mounts are on,
+                    # the radial points fore-aft toward the tie-rod side so the two
+                    # lugs stack vertically.  tan = spin x rad is then vertical.
+                    if self._caliper_vertical_mounts and 'tie_rod_outer' in pts:
+                        dy = float(np.asarray(pts['tie_rod_outer'], float)[1]
+                                   - np.asarray(wc, float)[1])
+                        rad = (np.sign(dy) * fwd if abs(dy) > 1e-6 else -fwd)
+                    else:
+                        phi = np.radians(float(self._caliper_angle_deg))
+                        rad = vup * np.cos(phi) + fwd * np.sin(phi)
                     rad = rad / max(np.linalg.norm(rad), 1e-9)
                     tan = np.cross(s, rad)
                     # Body centred just outboard of the bolt line, straddling the
@@ -1617,7 +1626,7 @@ class View3D:
         self._show_brakes = bool(show)
 
     def set_brake_dims(self, rotor_dia_mm, mount_height_mm=None,
-                       caliper_angle_deg=None) -> None:
+                       caliper_angle_deg=None, vertical_mounts=None) -> None:
         """Rotor diameter (mm); rotor thickness stays the GP200's 0.25 in.
 
         mount_height_mm and caliper_angle_deg place the caliper BODY exactly where
@@ -1641,6 +1650,8 @@ class View3D:
                 self._caliper_angle_deg = float(caliper_angle_deg)
             except (TypeError, ValueError):
                 pass
+        if vertical_mounts is not None:
+            self._caliper_vertical_mounts = bool(vertical_mounts)
 
     def set_isolate_corner(self, lbl) -> None:
         """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by
