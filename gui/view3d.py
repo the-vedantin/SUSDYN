@@ -1627,7 +1627,13 @@ class View3D:
             self._loadvec_count = len(arrows) if arrows else 0
             self._loadvec_snap = []          # [(tip_world, label)] for hover
             if not arrows:
-                self._loadvec_vis.set_data(pos=np.zeros((2, 3), np.float32))
+                # Reset the COLOUR buffer too.  Setting pos alone left the old
+                # per-vertex colour array in place, so clearing a populated load
+                # view raised "All attributes must have the same size" on the next
+                # draw (832-long colour against a 2-long position).
+                self._loadvec_vis.set_data(
+                    pos=np.zeros((2, 3), np.float32),
+                    color=np.zeros((2, 4), np.float32))
                 return
             segs = []; cols = []
             for a in arrows:

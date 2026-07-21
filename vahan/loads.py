@@ -366,7 +366,8 @@ def _compute_caliper_bolt_loads(result: ComponentLoads, bp: BrakeParams,
     """
     T = result.brake_torque_Nm
     r_pad = bp.pad_radius_mm / 1000.0
-    s = bp.caliper_bolt_spacing_mm / 1000.0
+    s = bp.caliper_bolt_spacing_mm / 1000.0          # l5, bolt (lug) spacing
+    l4 = max(float(getattr(bp, 'caliper_l4_mm', 25.0)) / 1000.0, 0.0)
     theta = np.radians(up.caliper_angle_deg)
 
     if r_pad < 0.001 or s < 0.001 or T < 1e-6:
@@ -382,9 +383,16 @@ def _compute_caliper_bolt_loads(result: ComponentLoads, bp: BrakeParams,
     V_dir = F_cal_V / 2.0
     H_dir = F_cal_H / 2.0
 
-    # 2. Torque couple — brake torque spins caliper forward at top,
-    #    upper bolt pushed fwd, lower bolt pushed rearward
-    H_couple = T / s
+    # 2. Torque couple.  The couple the BOLT PAIR reacts is the moment of the pad
+    #    friction about the BOLT LINE, so the lever is l4 — the offset of the pad
+    #    centre of area from that line (Seward Ch.6 Fig 6.15):
+    #        H_couple = F_friction * l4 / l5
+    #    This used to be T / l5, i.e. the moment about the WHEEL AXLE divided by
+    #    the bolt spacing.  That moment is reacted by the whole upright, not by the
+    #    two bolts, and using it overstated the couple by r_pad / l4 — about 4.3x
+    #    on this car (5,449 N against 1,178 N per bolt at 1.5 g braking).  It also
+    #    disagreed with the Loads-page arrows, which already used Seward.
+    H_couple = F_friction * l4 / s
 
     result.caliper_upper_V = float(V_dir)
     result.caliper_upper_H = float(H_dir + H_couple)

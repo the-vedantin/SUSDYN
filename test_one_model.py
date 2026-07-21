@@ -422,6 +422,27 @@ except Exception as _e:
     fails += 1
     print(f'brake torque     : UNEXPECTED FAIL ({_e})')
 
+# ── ONE CALIPER MODEL: the loads TABLE (vahan/loads.py) and the Loads-page
+#    PICTURE (gui/wheel_package.py) must agree.  They disagreed 4.6x because
+#    loads.py took the friction moment about the WHEEL AXLE (T / l5) instead of
+#    about the BOLT LINE (F * l4 / l5, Seward Ch.6 Fig 6.15).
+print('-' * 64)
+try:
+    from gui import wheel_package as _WP2
+    _ld, _veh2, _up2, _res2, _bpf2, _bpr2, _slv2 = _WP2.compute_case(win, 0.0, -1.5)
+    _cl = _ld['FL']
+    _Fpad = _cl.brake_torque_Nm / (_bpf2.pad_radius_mm / 1000.0)
+    _tbl = abs(_cl.caliper_upper_H - _cl.caliper_lower_H) / 2.0
+    _pic = _Fpad * (_bpf2.caliper_l4_mm / 1000.0) / (_bpf2.caliper_bolt_spacing_mm / 1000.0)
+    cal_ok = _tbl > 1.0 and abs(_tbl - _pic) < max(1.0, 0.01 * _pic)
+    if not cal_ok:
+        fails += 1
+    print(f'caliper one model: table {_tbl:.0f} N vs Seward {_pic:.0f} N per bolt   '
+          f'{"pass" if cal_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'caliper one model: UNEXPECTED FAIL ({_e})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)
