@@ -1149,10 +1149,13 @@ class View3D:
                 size=9, edge_width=0)
 
         # ARB — SOLID TUBE (thickness ON) or a crisp THIN LINE (thickness OFF, so
-        # it doesn't render as a dotted sub-mm tube); hidden when a corner is
-        # isolated, desaturated in Load / Interference mode.
+        # it doesn't render as a dotted sub-mm tube).  Hidden when a corner is
+        # isolated in NORMAL mode, but KEPT in Load / Interference mode (the
+        # loads view wants the ARB structure visible for its force arrows).
         self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
-        if arb_segs and not self._isolate:
+        _arb_show = bool(arb_segs) and (not self._isolate
+                                        or self._view_mode in ('load', 'interference'))
+        if _arb_show:
             ap = np.array([p for seg in arb_segs for p in seg], np.float32)
             self._last_arb_pos = ap
             _acol = ((0.55, 0.55, 0.57, 0.9)

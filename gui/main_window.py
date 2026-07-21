@@ -5333,9 +5333,14 @@ class MainWindow(QMainWindow):
             view3d.set_brake_dims(cp.get('rotor_dia_mm', 240.0))
         except Exception:
             pass
-        # ARB/springs are hidden on isolation (update_scene honours isolate); the
-        # isolated load picture is about the corner force vectors, so arb_segs=[].
-        view3d.update_scene(corners_draw, [])
+        # Draw the ARB structure too (the user wants it on the Loads page, not
+        # just its force arrows).  view3d keeps the ARB visible in Load mode even
+        # when a corner is isolated.
+        try:
+            _arb = self._assemble_arb_segs(corners_draw)
+        except Exception:
+            _arb = []
+        view3d.update_scene(corners_draw, _arb)
         # rear driveshaft / diff package (RWD) — same build as _update_3d
         try:
             import types as _types
@@ -5386,6 +5391,97 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _assemble_arb_segs(self, corners_draw):
+        """ARB linkage segments (torsion bar + levers + drop links) from the
+        live corners_draw.  Shared by _update_3d and build_load_view so the ARB
+        renders on the Loads page too (not just its force arrows)."""
+        flip_x = np.array([-1., 1., 1.])
+        arb_segs = []
+        # The arb_hp dict has different key sets per topology:
+        #   bellcrank   → 'arb_pivot' + 'arb_arm_end' + 'arb_drop_top'
+        #   control-arm → 'arb_pivot' + 'arb_lca_attach'
+        #   t-bar       → 'tbar_base_chassis' + 'tbar_top_node'
+        #                 + 'tbar_arm_end' + 'tbar_drop_top'
+        #   none        → empty dict
+        # The rendering branches accordingly and skips silently on
+        # missing keys (topology mid-implementation).
+        for axle_l, axle_r, arb_hp in [
+            ('FL', 'FR', self._front_arb),
+            ('RL', 'RR', self._rear_arb),
+        ]:
+            if not arb_hp:
+                continue   # NONE topology
+            # HEAVE_TBAR: the roll device IS the ONE heave T-bar, drawn by
+            # the htb_ linkage section below — do NOT also draw the legacy
+            # separate ARB T-bar (it would be a second, redundant bar, and
+            # its drop link reads the now-NaN cradle_link corner rocker).
+            # The heave dict is populated ONLY for HEAVE_TBAR axles.
+            if (self._front_heave if axle_l == 'FL' else self._rear_heave):
+                continue
+            if 'arb_pivot' in arb_hp and 'arb_arm_end' in arb_hp:
+                # ── Bellcrank ARB rendering ──────────────────────────
+                pv_l = arb_hp['arb_pivot'].copy()
+                pv_r = pv_l * flip_x
+                ae_l_design = arb_hp['arb_arm_end'].copy()
+                ae_r_design = ae_l_design * flip_x
+                for c in corners_draw:
+                    dt = c['pts'].get('arb_drop_top')
+                    ae_w = c['pts'].get('arb_arm_end_world')
+                    if c['label'] == axle_l and dt is not None:
+                        ae = ae_w if ae_w is not None else ae_l_design
+                        arb_segs += [(dt, ae), (ae, pv_l)]
+                    if c['label'] == axle_r and dt is not None:
+                        ae = ae_w if ae_w is not None else ae_r_design
+                        arb_segs += [(dt, ae), (ae, pv_r)]
+                arb_segs += [(pv_l, pv_r)]   # torsion bar
+            elif 'arb_pivot' in arb_hp and 'arb_lca_attach' in arb_hp:
+                # ── Control-arm ARB rendering (NO drop link) ─────────
+                pv_l = arb_hp['arb_pivot'].copy()
+                pv_r = pv_l * flip_x
+                lc_l = arb_hp['arb_lca_attach'].copy()
+                lc_r = lc_l * flip_x
+                arb_segs += [
+                    (pv_l, pv_r),    # torsion section
+                    (pv_l, lc_l),    # left arm = lever (no drop link)
+                    (pv_r, lc_r),    # right arm
+                ]
+            elif 'tbar_base_chassis' in arb_hp:
+                # ── T-bar rendering (torsion bar + LIVE levers + LIVE
+                #    drop links) ───────────────────────────────────────
+                # The T-bar DOES have a drop link from each lever tip to
+                # the corner ROCKER (bellcrank).  Render it from the LIVE
+                # solved points so both the lever and its drop link track
+                # the solver under travel — exactly as the bellcrank-ARB
+                # branch above does:
+                #   * lever tip  = arb_arm_end_world  (solved lever pose,
+                #                  rotated about the torsion-bar axis)
+                #   * rocker end = arb_drop_top       (rocker_tbar_drop_pt
+                #                  carried by the rotating rocker)
+                # The default geometry separates tbar_arm_end (lever tip)
+                # from tbar_drop_top (== rocker_tbar_drop_pt) by a real
+                # ~41 mm drop-link rod, so the link renders as a visible
+                # segment and actuates the lever.  The wiring below is
+                # correct for whatever separation the geometry specifies.
+                base = arb_hp['tbar_base_chassis'].copy()
+                top  = arb_hp['tbar_top_node'].copy()
+                ae_l_design = arb_hp['tbar_arm_end'].copy()
+                ae_r_design = ae_l_design * flip_x
+                arb_segs += [(base, top)]   # torsion bar (chassis-fixed)
+                for c in corners_draw:
+                    ae_w = c['pts'].get('arb_arm_end_world')
+                    dt   = c['pts'].get('arb_drop_top')
+                    if c['label'] == axle_l:
+                        ae = ae_w if ae_w is not None else ae_l_design
+                        arb_segs += [(top, ae)]          # left lever (live)
+                        if dt is not None:
+                            arb_segs += [(ae, dt)]       # left drop link (live)
+                    if c['label'] == axle_r:
+                        ae = ae_w if ae_w is not None else ae_r_design
+                        arb_segs += [(top, ae)]          # right lever (live)
+                        if dt is not None:
+                            arb_segs += [(ae, dt)]       # right drop link (live)
+        return arb_segs
+
     def _update_3d(self):
         if not self._solvers:
             return
@@ -5420,90 +5516,7 @@ class MainWindow(QMainWindow):
             #           → arb_pivot (fixed)
             #           arb_pivot_L → arb_pivot_R  (torsion bar, lateral)
             # arb_arm_end_world stored in pts by the bell-crank solve above.
-            arb_segs = []
-            # The arb_hp dict has different key sets per topology:
-            #   bellcrank   → 'arb_pivot' + 'arb_arm_end' + 'arb_drop_top'
-            #   control-arm → 'arb_pivot' + 'arb_lca_attach'
-            #   t-bar       → 'tbar_base_chassis' + 'tbar_top_node'
-            #                 + 'tbar_arm_end' + 'tbar_drop_top'
-            #   none        → empty dict
-            # The rendering branches accordingly and skips silently on
-            # missing keys (topology mid-implementation).
-            for axle_l, axle_r, arb_hp in [
-                ('FL', 'FR', self._front_arb),
-                ('RL', 'RR', self._rear_arb),
-            ]:
-                if not arb_hp:
-                    continue   # NONE topology
-                # HEAVE_TBAR: the roll device IS the ONE heave T-bar, drawn by
-                # the htb_ linkage section below — do NOT also draw the legacy
-                # separate ARB T-bar (it would be a second, redundant bar, and
-                # its drop link reads the now-NaN cradle_link corner rocker).
-                # The heave dict is populated ONLY for HEAVE_TBAR axles.
-                if (self._front_heave if axle_l == 'FL' else self._rear_heave):
-                    continue
-                if 'arb_pivot' in arb_hp and 'arb_arm_end' in arb_hp:
-                    # ── Bellcrank ARB rendering ──────────────────────────
-                    pv_l = arb_hp['arb_pivot'].copy()
-                    pv_r = pv_l * flip_x
-                    ae_l_design = arb_hp['arb_arm_end'].copy()
-                    ae_r_design = ae_l_design * flip_x
-                    for c in corners_draw:
-                        dt = c['pts'].get('arb_drop_top')
-                        ae_w = c['pts'].get('arb_arm_end_world')
-                        if c['label'] == axle_l and dt is not None:
-                            ae = ae_w if ae_w is not None else ae_l_design
-                            arb_segs += [(dt, ae), (ae, pv_l)]
-                        if c['label'] == axle_r and dt is not None:
-                            ae = ae_w if ae_w is not None else ae_r_design
-                            arb_segs += [(dt, ae), (ae, pv_r)]
-                    arb_segs += [(pv_l, pv_r)]   # torsion bar
-                elif 'arb_pivot' in arb_hp and 'arb_lca_attach' in arb_hp:
-                    # ── Control-arm ARB rendering (NO drop link) ─────────
-                    pv_l = arb_hp['arb_pivot'].copy()
-                    pv_r = pv_l * flip_x
-                    lc_l = arb_hp['arb_lca_attach'].copy()
-                    lc_r = lc_l * flip_x
-                    arb_segs += [
-                        (pv_l, pv_r),    # torsion section
-                        (pv_l, lc_l),    # left arm = lever (no drop link)
-                        (pv_r, lc_r),    # right arm
-                    ]
-                elif 'tbar_base_chassis' in arb_hp:
-                    # ── T-bar rendering (torsion bar + LIVE levers + LIVE
-                    #    drop links) ───────────────────────────────────────
-                    # The T-bar DOES have a drop link from each lever tip to
-                    # the corner ROCKER (bellcrank).  Render it from the LIVE
-                    # solved points so both the lever and its drop link track
-                    # the solver under travel — exactly as the bellcrank-ARB
-                    # branch above does:
-                    #   * lever tip  = arb_arm_end_world  (solved lever pose,
-                    #                  rotated about the torsion-bar axis)
-                    #   * rocker end = arb_drop_top       (rocker_tbar_drop_pt
-                    #                  carried by the rotating rocker)
-                    # The default geometry separates tbar_arm_end (lever tip)
-                    # from tbar_drop_top (== rocker_tbar_drop_pt) by a real
-                    # ~41 mm drop-link rod, so the link renders as a visible
-                    # segment and actuates the lever.  The wiring below is
-                    # correct for whatever separation the geometry specifies.
-                    base = arb_hp['tbar_base_chassis'].copy()
-                    top  = arb_hp['tbar_top_node'].copy()
-                    ae_l_design = arb_hp['tbar_arm_end'].copy()
-                    ae_r_design = ae_l_design * flip_x
-                    arb_segs += [(base, top)]   # torsion bar (chassis-fixed)
-                    for c in corners_draw:
-                        ae_w = c['pts'].get('arb_arm_end_world')
-                        dt   = c['pts'].get('arb_drop_top')
-                        if c['label'] == axle_l:
-                            ae = ae_w if ae_w is not None else ae_l_design
-                            arb_segs += [(top, ae)]          # left lever (live)
-                            if dt is not None:
-                                arb_segs += [(ae, dt)]       # left drop link (live)
-                        if c['label'] == axle_r:
-                            ae = ae_w if ae_w is not None else ae_r_design
-                            arb_segs += [(top, ae)]          # right lever (live)
-                            if dt is not None:
-                                arb_segs += [(ae, dt)]       # right drop link (live)
+            arb_segs = self._assemble_arb_segs(corners_draw)
 
             # ── HEAVE-T-BAR: the ONE T-bar mechanism, posed LIVE ───────────
             # The pushrod feeds the htb_ rocker (skewed plane); the rocker drives
