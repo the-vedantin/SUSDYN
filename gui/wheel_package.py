@@ -275,6 +275,25 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
                     continue
                 items.append((np.asarray(pt, float), v, col,
                               f'{lbl} {nm} · {np.linalg.norm(v):,.0f} N'))
+
+            # ── ARB BAR TORSION ────────────────────────────────────────────
+            # The only moment on this car that does NOT act at the wheel.
+            # Everywhere else the links end in spherical joints, which by
+            # definition carry no moment — that is exactly what makes the arms
+            # two-force members.  The anti-roll bar is the exception: it IS a
+            # torsion spring, so the drop-link force acting at the end of the
+            # arm twists the bar about its own axis.  The comment above already
+            # said "the torsion bar carries the moment"; it was just never
+            # emitted, which is why moments appeared only at the wheel.
+            if arb_piv is not None and np.linalg.norm(F_arb) > 1.0:
+                r_arm = np.asarray(ae, float) - arb_piv
+                M_arb = np.cross(r_arm, -F_arb)
+                bar_axis = np.array([1.0, 0.0, 0.0])   # the bar runs laterally
+                T_arb = float(M_arb @ bar_axis)
+                if abs(T_arb) > 1.0:
+                    items.append((arb_piv, T_arb * bar_axis, _C_MOM,
+                                  f'{lbl} ARB · bar TORSION about its own axis '
+                                  f'· {abs(T_arb):,.0f} N·m'))
         except Exception:
             pass
     return items
