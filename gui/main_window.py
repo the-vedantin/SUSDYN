@@ -5076,6 +5076,166 @@ class MainWindow(QMainWindow):
 
         return out
 
+    def _assemble_corners_draw(self, travels, rt_m):
+        """Build the per-corner draw dicts + metrics from the ONE
+        solved model (self._solvers).  Shared by the Suspension 3-D view
+        (_update_3d) and the embedded Loads-page 3-D view (build_load_view)
+        so both read a single geometry -- never a second/hardcoded model.
+        Returns (corners_draw, all_corner_values)."""
+        corners_draw = []
+        all_corner_values = {}
+        hp_dicts     = self._all_corner_hp()
+        flip_x       = np.array([-1., 1., 1.])
+
+        for label in ('FL', 'FR', 'RL', 'RR'):
+            solver = self._solvers.get(label)
+            if not solver:
+                continue
+            t  = travels.get(label, 0.)
+            try:
+                st = solver.solve(float(t))
+            except Exception:
+                try:
+                    st = solver.solve(0.)
+                except Exception:
+                    continue
+
+            # ── spring-limit check: FREEZE at last valid, don't reset ──
+            # DECOUPLED (cradle_link) corners have NO corner spring, so
+            # st.spring_length is intentionally NaN.  Running the freeze on
+            # them would ALWAYS fail the bounds test and substitute a STALE
+            # state left over from a previously-selected pushrod topology
+            # (finite pushrod_inner) — which renders a PHANTOM corner pushrod
+            # line 217 mm off the real cradle pushrod.  Skip the freeze; the
+            # fresh state's NaN pushrod_inner correctly suppresses the corner
+            # pushrod line, and the real pushrod is drawn from the cradle pose.
+            if getattr(solver, '_damper_actuation', None) == 'cradle_link':
+                pass   # keep fresh decoupled state (pushrod_inner = NaN)
+            else:
+                s_min, s_max = self._spring_limits(solver)
+                if s_min <= st.spring_length <= s_max:
+                    self._last_valid_st[label] = st   # cache valid state
+                else:
+                    cached = self._last_valid_st.get(label)
+                    if cached is not None:
+                        st = cached   # freeze at last valid geometry
+                    else:
+                        continue      # no cache yet (startup), skip corner
+
+            hp_d = hp_dicts[label]
+
+            # ── steering visual: show tie_rod_inner at steered position ──
+            is_front = label in ('FL', 'FR')
+            steered_hp_d = self._steered_hp(hp_d, rt_m, is_front)
+            pts = _state_to_pts(st, steered_hp_d)
+
+            # rocker_pivot is chassis-fixed.  For direct-damper topologies
+            # there is no rocker — fall back to damper_chassis_pt so the
+            # downstream rendering code never KeyErrors.
+            if 'rocker_pivot' in hp_d:
+                pts['rocker_pivot'] = hp_d['rocker_pivot']
+            elif 'damper_chassis_pt' in hp_d:
+                pts['rocker_pivot'] = hp_d['damper_chassis_pt']
+
+            # ── arb_drop_top: route via the topology-aware helper ───────
+            # Bellcrank: drop top is on the rocker (rotates with state.rocker_angle)
+            # Control-arm: drop top is on the LCA (sweeps with LCA pose)
+            # T-bar: same kinematic path as bellcrank
+            arb_hp = self._front_arb if is_front else self._rear_arb
+            try:
+                dt_world = self._arb_drop_top_world(label, st)
+                if dt_world is not None:
+                    pts['arb_drop_top'] = dt_world
+                    arb_hp_vis = (arb_hp if label not in ('FR', 'RR')
+                                  else {k: v * flip_x for k, v in arb_hp.items()})
+                    _, ae_world, _ = self._solve_arb_bellcrank(
+                        dt_world, arb_hp_vis)
+                    pts['arb_arm_end_world'] = ae_world
+            except Exception:
+                pass   # if geometry invalid, rocker quad falls back to triangle
+
+            # ── camber visual: rotate spin axis by alignment offset ────────
+            # Equivalent to adding a shim between hub and upright.
+            # Left corners: rotate spin axis around Y by -camber_off_rad
+            # Right corners: rotate by +camber_off_rad
+            # (derived from camber = -arctan2(spin[2], |spin[0]|) * sign)
+            camber_vis = self._alignment.get(
+                'front_camber_deg' if is_front else 'rear_camber_deg', 0.)
+            is_left = label in ('FL', 'RL')
+            rot_rad = np.radians(camber_vis) * (-1. if is_left else 1.)
+            spin_vis = (_rodrigues(st.spin_axis, np.array([0., 1., 0.]), rot_rad)
+                        if abs(rot_rad) > 1e-9 else st.spin_axis)
+
+            corners_draw.append({
+                'pts': pts, 'spin_axis': spin_vis, 'label': label,
+                # Only the keys actually present in this corner's hardpoint
+                # dict are real, editable points.  _state_to_pts injects
+                # derived render points (direct-damper reports pushrod_inner
+                # == damper attach; decoupled feeds a shared cradle) — the
+                # renderer uses those to DRAW geometry but must NOT turn
+                # them into pickable markers (clicking a phantom that isn't
+                # in the edit list selects nothing).
+                'editable': set(hp_d.keys())})
+
+            # Compute metrics for this corner
+            # Two-point solve for MR + kinematic IC: solve at t - δ first.
+            # state_prev is also used by _ic_y/_ic_z to compute the
+            # rigid-body-finite-difference instant centre, which
+            # avoids the asymptotic spikes the static-projection
+            # method produces when the YZ-arm projections happen
+            # to be parallel.
+            side = 'left' if label in ('FL', 'RL') else 'right'
+            _dt = 0.001  # 1mm perturbation
+            t_prev = float(t) - _dt
+            spring_prev = travel_prev = None
+            st_prev = None
+            try:
+                st_prev = solver.solve(t_prev)
+                spring_prev = float(np.sqrt(
+                    (st_prev.rocker_spring_pt[0] - st_prev.spring_chassis_pt[0])**2 +
+                    (st_prev.rocker_spring_pt[1] - st_prev.spring_chassis_pt[1])**2 +
+                    (st_prev.rocker_spring_pt[2] - st_prev.spring_chassis_pt[2])**2))
+                travel_prev = t_prev
+            except Exception:
+                st_prev = None
+            corner_vals = _all_metrics(st, side,
+                spring_prev=spring_prev, travel_prev=travel_prev,
+                state_prev=st_prev,
+                cg_height_m=self._car.get('cg_z_mm', 280.) / 1000.,
+                wheelbase_m=self._car.get('wheelbase_mm', 1537.) / 1000.,
+                front_brake_bias=self._car.get('front_brake_bias_pct', 65.) / 100.,
+                rear_drive_bias=1.0, front_drive_bias=0.0,
+            )
+            # Add alignment offsets
+            cam_key = 'front_camber_deg' if is_front else 'rear_camber_deg'
+            toe_key = 'front_toe_deg' if is_front else 'rear_toe_deg'
+            corner_vals['camber'] = (corner_vals.get('camber', 0.)
+                                     + self._alignment.get(cam_key, 0.))
+            corner_vals['toe']    = (corner_vals.get('toe', 0.)
+                                     + self._alignment.get(toe_key, 0.))
+
+            # ARB metrics for this corner
+            try:
+                pivot  = st.rocker_pivot
+                ax_pt  = pivot + np.array([0., 0.0254, 0.])
+                r_axis = _norm(ax_pt - pivot)
+                arb_d  = arb_hp['arb_drop_top'].copy()
+                if label in ('FR', 'RR'):
+                    arb_d = arb_d * flip_x
+                arm_dt = arb_d - pivot
+                dt_w   = pivot + _rodrigues(arm_dt, r_axis, st.rocker_angle)
+                arb_vis = (arb_hp if label not in ('FR', 'RR')
+                           else {k: v * flip_x for k, v in arb_hp.items()})
+                ang, _, dl_t = self._solve_arb_bellcrank(dt_w, arb_vis)
+                corner_vals['arb_angle'] = float(np.degrees(ang))
+                corner_vals['arb_drop_travel'] = float(dl_t * 1000)
+                corner_vals['arb_mr'] = min(abs(np.degrees(ang) / (float(t) * 1000)), 5.0) if abs(float(t)) > 1e-9 else float('nan')
+            except Exception:
+                pass
+
+            all_corner_values[label] = corner_vals
+        return corners_draw, all_corner_values
+
     def _update_3d(self):
         if not self._solvers:
             return
@@ -5101,158 +5261,8 @@ class MainWindow(QMainWindow):
                 travels = {'FL': pos/1000, 'FR': pos/1000,
                            'RL': -pos/1000, 'RR': -pos/1000}
 
-            corners_draw = []
-            all_corner_values = {}
-            hp_dicts     = self._all_corner_hp()
-            flip_x       = np.array([-1., 1., 1.])
-
-            for label in ('FL', 'FR', 'RL', 'RR'):
-                solver = self._solvers.get(label)
-                if not solver:
-                    continue
-                t  = travels.get(label, 0.)
-                try:
-                    st = solver.solve(float(t))
-                except Exception:
-                    try:
-                        st = solver.solve(0.)
-                    except Exception:
-                        continue
-
-                # ── spring-limit check: FREEZE at last valid, don't reset ──
-                # DECOUPLED (cradle_link) corners have NO corner spring, so
-                # st.spring_length is intentionally NaN.  Running the freeze on
-                # them would ALWAYS fail the bounds test and substitute a STALE
-                # state left over from a previously-selected pushrod topology
-                # (finite pushrod_inner) — which renders a PHANTOM corner pushrod
-                # line 217 mm off the real cradle pushrod.  Skip the freeze; the
-                # fresh state's NaN pushrod_inner correctly suppresses the corner
-                # pushrod line, and the real pushrod is drawn from the cradle pose.
-                if getattr(solver, '_damper_actuation', None) == 'cradle_link':
-                    pass   # keep fresh decoupled state (pushrod_inner = NaN)
-                else:
-                    s_min, s_max = self._spring_limits(solver)
-                    if s_min <= st.spring_length <= s_max:
-                        self._last_valid_st[label] = st   # cache valid state
-                    else:
-                        cached = self._last_valid_st.get(label)
-                        if cached is not None:
-                            st = cached   # freeze at last valid geometry
-                        else:
-                            continue      # no cache yet (startup), skip corner
-
-                hp_d = hp_dicts[label]
-
-                # ── steering visual: show tie_rod_inner at steered position ──
-                is_front = label in ('FL', 'FR')
-                steered_hp_d = self._steered_hp(hp_d, rt_m, is_front)
-                pts = _state_to_pts(st, steered_hp_d)
-
-                # rocker_pivot is chassis-fixed.  For direct-damper topologies
-                # there is no rocker — fall back to damper_chassis_pt so the
-                # downstream rendering code never KeyErrors.
-                if 'rocker_pivot' in hp_d:
-                    pts['rocker_pivot'] = hp_d['rocker_pivot']
-                elif 'damper_chassis_pt' in hp_d:
-                    pts['rocker_pivot'] = hp_d['damper_chassis_pt']
-
-                # ── arb_drop_top: route via the topology-aware helper ───────
-                # Bellcrank: drop top is on the rocker (rotates with state.rocker_angle)
-                # Control-arm: drop top is on the LCA (sweeps with LCA pose)
-                # T-bar: same kinematic path as bellcrank
-                arb_hp = self._front_arb if is_front else self._rear_arb
-                try:
-                    dt_world = self._arb_drop_top_world(label, st)
-                    if dt_world is not None:
-                        pts['arb_drop_top'] = dt_world
-                        arb_hp_vis = (arb_hp if label not in ('FR', 'RR')
-                                      else {k: v * flip_x for k, v in arb_hp.items()})
-                        _, ae_world, _ = self._solve_arb_bellcrank(
-                            dt_world, arb_hp_vis)
-                        pts['arb_arm_end_world'] = ae_world
-                except Exception:
-                    pass   # if geometry invalid, rocker quad falls back to triangle
-
-                # ── camber visual: rotate spin axis by alignment offset ────────
-                # Equivalent to adding a shim between hub and upright.
-                # Left corners: rotate spin axis around Y by -camber_off_rad
-                # Right corners: rotate by +camber_off_rad
-                # (derived from camber = -arctan2(spin[2], |spin[0]|) * sign)
-                camber_vis = self._alignment.get(
-                    'front_camber_deg' if is_front else 'rear_camber_deg', 0.)
-                is_left = label in ('FL', 'RL')
-                rot_rad = np.radians(camber_vis) * (-1. if is_left else 1.)
-                spin_vis = (_rodrigues(st.spin_axis, np.array([0., 1., 0.]), rot_rad)
-                            if abs(rot_rad) > 1e-9 else st.spin_axis)
-
-                corners_draw.append({
-                    'pts': pts, 'spin_axis': spin_vis, 'label': label,
-                    # Only the keys actually present in this corner's hardpoint
-                    # dict are real, editable points.  _state_to_pts injects
-                    # derived render points (direct-damper reports pushrod_inner
-                    # == damper attach; decoupled feeds a shared cradle) — the
-                    # renderer uses those to DRAW geometry but must NOT turn
-                    # them into pickable markers (clicking a phantom that isn't
-                    # in the edit list selects nothing).
-                    'editable': set(hp_d.keys())})
-
-                # Compute metrics for this corner
-                # Two-point solve for MR + kinematic IC: solve at t - δ first.
-                # state_prev is also used by _ic_y/_ic_z to compute the
-                # rigid-body-finite-difference instant centre, which
-                # avoids the asymptotic spikes the static-projection
-                # method produces when the YZ-arm projections happen
-                # to be parallel.
-                side = 'left' if label in ('FL', 'RL') else 'right'
-                _dt = 0.001  # 1mm perturbation
-                t_prev = float(t) - _dt
-                spring_prev = travel_prev = None
-                st_prev = None
-                try:
-                    st_prev = solver.solve(t_prev)
-                    spring_prev = float(np.sqrt(
-                        (st_prev.rocker_spring_pt[0] - st_prev.spring_chassis_pt[0])**2 +
-                        (st_prev.rocker_spring_pt[1] - st_prev.spring_chassis_pt[1])**2 +
-                        (st_prev.rocker_spring_pt[2] - st_prev.spring_chassis_pt[2])**2))
-                    travel_prev = t_prev
-                except Exception:
-                    st_prev = None
-                corner_vals = _all_metrics(st, side,
-                    spring_prev=spring_prev, travel_prev=travel_prev,
-                    state_prev=st_prev,
-                    cg_height_m=self._car.get('cg_z_mm', 280.) / 1000.,
-                    wheelbase_m=self._car.get('wheelbase_mm', 1537.) / 1000.,
-                    front_brake_bias=self._car.get('front_brake_bias_pct', 65.) / 100.,
-                    rear_drive_bias=1.0, front_drive_bias=0.0,
-                )
-                # Add alignment offsets
-                cam_key = 'front_camber_deg' if is_front else 'rear_camber_deg'
-                toe_key = 'front_toe_deg' if is_front else 'rear_toe_deg'
-                corner_vals['camber'] = (corner_vals.get('camber', 0.)
-                                         + self._alignment.get(cam_key, 0.))
-                corner_vals['toe']    = (corner_vals.get('toe', 0.)
-                                         + self._alignment.get(toe_key, 0.))
-
-                # ARB metrics for this corner
-                try:
-                    pivot  = st.rocker_pivot
-                    ax_pt  = pivot + np.array([0., 0.0254, 0.])
-                    r_axis = _norm(ax_pt - pivot)
-                    arb_d  = arb_hp['arb_drop_top'].copy()
-                    if label in ('FR', 'RR'):
-                        arb_d = arb_d * flip_x
-                    arm_dt = arb_d - pivot
-                    dt_w   = pivot + _rodrigues(arm_dt, r_axis, st.rocker_angle)
-                    arb_vis = (arb_hp if label not in ('FR', 'RR')
-                               else {k: v * flip_x for k, v in arb_hp.items()})
-                    ang, _, dl_t = self._solve_arb_bellcrank(dt_w, arb_vis)
-                    corner_vals['arb_angle'] = float(np.degrees(ang))
-                    corner_vals['arb_drop_travel'] = float(dl_t * 1000)
-                    corner_vals['arb_mr'] = min(abs(np.degrees(ang) / (float(t) * 1000)), 5.0) if abs(float(t)) > 1e-9 else float('nan')
-                except Exception:
-                    pass
-
-                all_corner_values[label] = corner_vals
+            corners_draw, all_corner_values = self._assemble_corners_draw(travels, rt_m)
+            flip_x = np.array([-1., 1., 1.])
 
             # ── ARB visual ────────────────────────────────────────────────────
             # Topology: arb_drop_top (on rocker, moving)
