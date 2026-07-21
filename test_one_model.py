@@ -487,12 +487,24 @@ try:
     _ld = _WP3.compute_case(win, 1.5, 0.0)[0]['FL']
     _overhung = _ld.bearing_outer_V * _ld.bearing_inner_V < 0   # opposite signs
     _has_off = hasattr(_up, 'bearing_inboard_offset_mm')
-    brg_ok = _piv_chassis and _overhung and _has_off
+    # Bearings must land INBOARD (toward the centreline) on BOTH lateral sides —
+    # the spin axis is not mirrored, so a naive `wc - spin*off` flipped one side.
+    _inb_ok = True
+    for _lbl in ('FL', 'FR', 'RL', 'RR'):
+        _st = win._solvers[_lbl].solve(0.)
+        _wcx = float(np.asarray(_st.wheel_center, float)[0])
+        for _it in _WP3._load_items(win, 1.5, 0.0, only_corner=_lbl):
+            if 'bearing' in _it[3].lower() and 'RADIAL' in _it[3]:
+                _px = float(np.asarray(_it[0], float)[0])
+                if abs(_px) >= abs(_wcx):          # not closer to the centreline
+                    _inb_ok = False
+    brg_ok = _piv_chassis and _overhung and _has_off and _inb_ok
     if not brg_ok:
         fails += 1
     print(f'bearings/pivot   : inboard offset input {_has_off}, overhung '
           f'(outer {_ld.bearing_outer_V:.0f} / inner {_ld.bearing_inner_V:.0f} N), '
-          f'pivot on chassis {_piv_chassis}   {"pass" if brg_ok else "UNEXPECTED FAIL"}')
+          f'inboard both sides {_inb_ok}, pivot on chassis {_piv_chassis}   '
+          f'{"pass" if brg_ok else "UNEXPECTED FAIL"}')
 except Exception as _e:
     fails += 1
     print(f'bearings/pivot   : UNEXPECTED FAIL ({_e})')

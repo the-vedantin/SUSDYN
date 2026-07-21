@@ -118,8 +118,15 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             # spindle where it lives.
             off = float(getattr(up, 'bearing_inboard_offset_mm', 39.4)) / 1000.0
             l1 = float(up.bearing_spacing_mm) / 1000.0
-            p_out = wc - spin * off                   # near (outer) bearing
-            p_in = wc - spin * (off + l1)             # far (inner) bearing
+            # INBOARD unit vector along the spindle: toward the car centreline
+            # (x = 0).  The spin axis is NOT mirrored left-to-right — it points +x
+            # on BOTH sides — so `wc - spin*off` moved inboard on one side and
+            # OUTBOARD on the other.  Pick the sign that points toward the
+            # centreline on every corner: flip spin when it points to the same
+            # lateral side as the wheel.
+            nin = spin * (-1.0 if spin[0] * wc[0] > 0 else 1.0)
+            p_out = wc + nin * off                    # near (outer) bearing, inboard
+            p_in = wc + nin * (off + l1)              # far (inner) bearing
             radial_out = np.array([0.0, float(c.bearing_outer_H), float(c.bearing_outer_V)])
             radial_in = np.array([0.0, float(c.bearing_inner_H), float(c.bearing_inner_V)])
             items.append((p_out, radial_out, _C_UP,
