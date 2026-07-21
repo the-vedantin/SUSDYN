@@ -2178,6 +2178,7 @@ class MainWindow(QMainWindow):
         self._alignment   = {'front_toe_deg': 0., 'front_camber_deg': 0.,
                               'rear_toe_deg':  0., 'rear_camber_deg':  0.}
         self._last_valid_st: dict = {}   # label → last SolvedState within spring limits
+        self._spring_travel_cache: dict = {}  # label → (t_lo, t_hi) spring-stroke travel range
         self._show_rc        = True
         self._show_roll_axis = True
         self._show_cg        = True
@@ -3780,6 +3781,53 @@ class MainWindow(QMainWindow):
     #  SOLVERS
     # ==========================================================================
 
+    def _spring_travel_range(self, solver, label) -> tuple[float, float]:
+        """Travel range [t_lo, t_hi] (metres) over which this corner's spring
+        stays within its stroke [s_min, s_max].  Cached per label (stable
+        geometry; the cache is cleared on _rebuild_solvers).
+
+        Used to CLAMP the input travel: an over-stroke pose then holds AT the
+        stroke limit (deterministic, and identical for the mirror corner under a
+        symmetric input) instead of freezing at a per-corner cached SolvedState
+        that can DESYNC between left/right (roll caches a bump pose on one side
+        and a droop pose on the other → the two sides render at different ride
+        heights → the intermittent asymmetric ARB / rocker / pushrod bug)."""
+        cache = self._spring_travel_cache
+        if label in cache:
+            return cache[label]
+        try:
+            s_min, s_max = self._spring_limits(solver)
+        except Exception:
+            cache[label] = (-1.0, 1.0); return cache[label]
+
+        def spring(t):
+            try:
+                return float(solver.solve(float(t)).spring_length)
+            except Exception:
+                return float('nan')
+
+        # spring_length DECREASES with bump travel; bisect each stroke boundary.
+        def bisect(target, lo, hi):
+            for _ in range(30):
+                mid = 0.5 * (lo + hi)
+                fm = spring(mid)
+                if not np.isfinite(fm):
+                    hi = mid; continue
+                if fm > target:      # spring too long → need more bump → larger t
+                    lo = mid
+                else:
+                    hi = mid
+            return 0.5 * (lo + hi)
+
+        t_hi = bisect(s_min, 0.0, 0.12)    # bump (compression) limit
+        t_lo = bisect(s_max, -0.12, 0.0)   # droop (extension) limit
+        if not np.isfinite(t_hi):
+            t_hi = 0.12
+        if not np.isfinite(t_lo):
+            t_lo = -0.12
+        cache[label] = (float(t_lo), float(t_hi))
+        return cache[label]
+
     def _spring_limits(self, solver: SuspensionConstraints) -> tuple[float, float]:
         """
         Return (spring_min_m, spring_max_m) based on stroke and computed
@@ -3945,6 +3993,9 @@ class MainWindow(QMainWindow):
         read from `self._topology` per axle.  Backward compatible: if
         topology was never set, the standard pushrod default applies.
         """
+        # geometry changed → the per-corner spring-stroke travel range is stale
+        if hasattr(self, '_spring_travel_cache'):
+            self._spring_travel_cache.clear()
         try:
             corners = self._all_corner_hp()
             rt = _rack_travel_from_angle(steer_angle_deg, self._steer)
@@ -5113,15 +5164,21 @@ class MainWindow(QMainWindow):
             if getattr(solver, '_damper_actuation', None) == 'cradle_link':
                 pass   # keep fresh decoupled state (pushrod_inner = NaN)
             else:
-                s_min, s_max = self._spring_limits(solver)
-                if s_min <= st.spring_length <= s_max:
-                    self._last_valid_st[label] = st   # cache valid state
-                else:
-                    cached = self._last_valid_st.get(label)
-                    if cached is not None:
-                        st = cached   # freeze at last valid geometry
-                    else:
-                        continue      # no cache yet (startup), skip corner
+                # Spring-stroke limit: instead of freezing at a per-corner cached
+                # state (which desyncs between mirror sides after a roll/pitch and
+                # yields the intermittent asymmetric render), CLAMP the input
+                # travel to the stroke range and re-solve.  A symmetric input then
+                # clamps identically on both sides -> the corners stay mirror
+                # images; and the corner always renders (no cache-miss skip).
+                try:
+                    s_min, s_max = self._spring_limits(solver)
+                    if not (s_min <= st.spring_length <= s_max):
+                        t_lo, t_hi = self._spring_travel_range(solver, label)
+                        tc = min(max(float(t), t_lo), t_hi)
+                        if abs(tc - float(t)) > 1e-9:
+                            st = solver.solve(tc)   # hold AT the stroke limit
+                except Exception:
+                    pass
 
             hp_d = hp_dicts[label]
 
