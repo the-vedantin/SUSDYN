@@ -334,6 +334,26 @@ def build_box(center, u_ax, u_rad, u_tan, half_ax, half_rad, half_tan):
     return verts, faces
 
 
+def _tube_segments(segs, radius, n=10):
+    """Merge a list of (p0, p1, rgba) into one (verts, faces, vertex_colors)
+    mesh of solid cylinders — used to give the suspension members real 3-D
+    thickness in ONE draw call."""
+    allv, allf, allc = [], [], []
+    off = 0
+    for p0, p1, col in segs:
+        v, f = build_cylinder_between(p0, p1, radius, n=n)
+        allv.append(v)
+        allf.append(f + off)
+        allc.append(np.tile(np.asarray(col, np.float32)[:4], (len(v), 1)))
+        off += len(v)
+    if not allv:
+        return (np.zeros((3, 3), np.float32),
+                np.array([[0, 1, 2]], np.uint32),
+                np.ones((3, 4), np.float32))
+    return (np.concatenate(allv), np.concatenate(allf).astype(np.uint32),
+            np.concatenate(allc))
+
+
 # ── link topology ─────────────────────────────────────────────────────────────
 # (key_a, key_b, RGBA)
 # Note: rocker_spring_pt → spring_chassis_pt is now rendered as a SOLID
@@ -406,6 +426,14 @@ class View3D:
             connect='segments', width=2.5,
             parent=self._view.scene,
         )
+        # Suspension members (control arms / pushrod / tie rods) drawn as SOLID
+        # TUBES (real thickness) merged into one mesh.  ~16 mm OD tube.
+        self._member_mesh = scene.Mesh(
+            vertices=np.zeros((3, 3), np.float32),
+            faces=np.array([[0, 1, 2]], np.uint32),
+            vertex_colors=np.ones((3, 4), np.float32),
+            parent=self._view.scene)
+        self._member_r = 0.008          # 16 mm OD member tubes
         # Clash highlight (Interference mode): fat warning-red segments over any
         # members that interfere.  Empty until set_clashes() is called.
         self._clash_vis = scene.Line(
@@ -844,6 +872,7 @@ class View3D:
         """
         link_pos = []
         link_col = []
+        member_segs = []          # (p0, p1, rgba) → solid member tubes
         mk_pos   = []
         mk_col   = []
         self._hp_snap = []
@@ -864,13 +893,15 @@ class View3D:
                 self._caliper_meshes[ci].set_data(vertices=_z, faces=_t)
                 continue
 
-            # links
+            # control-arm / pushrod / tie-rod members: drawn as SOLID TUBES
+            # (real 3-D thickness), collected here and merged into one mesh
+            # below.  (The old thin-line rendering had no thickness — a thin
+            # pushrod looked like a fat bar when you zoomed in.)
             for pa, pb, col in LINKS:
                 if (pa in pts and pb in pts
                         and np.all(np.isfinite(pts[pa]))
                         and np.all(np.isfinite(pts[pb]))):
-                    link_pos += [pts[pa], pts[pb]]
-                    link_col += [col, col]
+                    member_segs.append((pts[pa], pts[pb], col))
 
             # upright polygon (UCA BJ, LCA BJ, tie rod outer)
             uv = np.array([pts['uca_outer'], pts['lca_outer'],
@@ -1012,17 +1043,27 @@ class View3D:
                 mk_col.append(c)
                 self._hp_snap.append((name, p.copy(), corner['label']))
 
-        # upload lines
+        # upload the thin lines (upright + rocker plate edges only now)
         if link_pos:
             self._last_link_pos = np.array(link_pos, np.float32)
             lc = np.array(link_col, np.float32)
             if self._view_mode in ('load', 'interference') and len(lc):
-                # desaturate the wireframe links so overlaid force vectors /
-                # clash highlights read clearly on top of a pale skeleton.
+                # desaturate the wireframe so overlaid force vectors / clash
+                # highlights read clearly on top of a pale skeleton.
                 grey = np.array([0.78, 0.78, 0.80, 1.0], np.float32)
                 lc = lc * 0.30 + grey * 0.70
                 lc[:, 3] = 0.55
             self._links_vis.set_data(pos=self._last_link_pos, color=lc)
+        else:
+            self._links_vis.set_data(pos=np.zeros((2, 3), np.float32))
+
+        # ── member TUBES (control arms / pushrod / tie rods) — solid 3-D ─────
+        mv, mf, mc = _tube_segments(member_segs, self._member_r, n=10)
+        if self._view_mode in ('load', 'interference') and len(mc):
+            grey = np.array([0.78, 0.78, 0.80, 1.0], np.float32)
+            mc = mc * 0.30 + grey * 0.70
+            mc[:, 3] = 0.55
+        self._member_mesh.set_data(vertices=mv, faces=mf, vertex_colors=mc)
 
         # upload markers
         if mk_pos:
