@@ -43,20 +43,31 @@ class LoadsPage(QWidget):
         left = QVBoxLayout(); left.setSpacing(8)
         def hdr(t):
             l = QLabel(t); l.setStyleSheet('font-weight:bold;color:#e0a83a;font-size:13px'); return l
-        left.addWidget(hdr('LOADS'))
-        left.addWidget(QLabel('Load case'))
-        self._case = QComboBox(); self._case.addItems([c[0] for c in CASES])
-        # Default to a case with BOTH cornering and braking so every load shows at
-        # once: pure cornering has no brake torque (caliper reads as "missing"),
-        # pure braking has little ARB load.  Prefer lat&lon both non-zero, else any
-        # braking case.
-        _combined = [i for i, c in enumerate(CASES) if abs(c[1]) > 1e-6 and abs(c[2]) > 1e-6]
-        _braking = [i for i, c in enumerate(CASES) if abs(c[2]) > 1e-6]
-        if _combined:
-            self._case.setCurrentIndex(_combined[0])
-        elif _braking:
-            self._case.setCurrentIndex(_braking[0])
-        left.addWidget(self._case)
+        left.addWidget(hdr('LOAD CASE (g)'))
+        # The user sets the exact g's to analyse — NOT a fixed dropdown.
+        def _gspin(val):
+            s = QDoubleSpinBox(); s.setRange(-4.0, 4.0); s.setDecimals(2)
+            s.setSingleStep(0.1); s.setValue(val); s.setSuffix(' g')
+            s.setStyleSheet('QDoubleSpinBox{background:#1e1e24;border:1px solid #444;'
+                            'border-radius:3px;padding:2px 4px;}')
+            return s
+        self._lat_g = _gspin(1.40)     # +lateral (cornering)
+        self._lon_g = _gspin(-1.00)    # -longitudinal (braking) / + = accel
+        _gg = QGridLayout(); _gg.setContentsMargins(0, 0, 0, 0); _gg.setSpacing(4)
+        _gg.addWidget(QLabel('Lateral'), 0, 0); _gg.addWidget(self._lat_g, 0, 1)
+        _gg.addWidget(QLabel('Longitudinal'), 1, 0); _gg.addWidget(self._lon_g, 1, 1)
+        left.addLayout(_gg)
+        # quick-fill presets (they just POPULATE the editable g fields above)
+        _pg = QGridLayout(); _pg.setContentsMargins(0, 2, 0, 0); _pg.setSpacing(3)
+        for _i, (_nm, _la, _lo) in enumerate(
+                (('2.0g corner', 2.0, 0.0), ('1.6g brake', 0.0, -1.6),
+                 ('1.0g accel', 0.0, 1.0), ('corner+brake', 1.4, -1.0))):
+            _b = QPushButton(_nm); _b.setStyleSheet('font-size:10px;padding:2px 3px;'
+                'background:#1e1e24;border:1px solid #444;border-radius:3px;')
+            _b.clicked.connect(lambda _c=False, la=_la, lo=_lo:
+                               (self._lat_g.setValue(la), self._lon_g.setValue(lo)))
+            _pg.addWidget(_b, _i // 2, _i % 2)
+        left.addLayout(_pg)
         left.addWidget(QLabel('Corner'))
         self._corner = QComboBox(); self._corner.addItems(_CORNERS); left.addWidget(self._corner)
         left.addWidget(QLabel('3D vectors'))
@@ -130,8 +141,9 @@ class LoadsPage(QWidget):
         self._split.setStretchFactor(1, 2)
         root.addWidget(self._split, stretch=1)
 
-        for w in (self._case, self._corner):
-            w.currentTextChanged.connect(self._on_input)
+        self._corner.currentTextChanged.connect(self._on_input)
+        for _s in (self._lat_g, self._lon_g):
+            _s.valueChanged.connect(self._on_input)
         self._res.toggled.connect(self._on_input)
         self.refresh()
 
@@ -141,7 +153,7 @@ class LoadsPage(QWidget):
         return None if c.startswith('All') else c
 
     def _case_g(self):
-        return next((c[1], c[2]) for c in CASES if c[0] == self._case.currentText())
+        return float(self._lat_g.value()), float(self._lon_g.value())
 
     def _ensure_view(self):
         """Build the embedded View3D on first use (its GL canvas needs a running
@@ -151,11 +163,32 @@ class LoadsPage(QWidget):
         try:
             from gui.view3d import View3D
             self._v3d = View3D()
+            # wire the embedded view's navcube controls (perspective / floor /
+            # thickness) — without this they did nothing on the Loads page.
+            self._v3d.set_on_view_controls(self._on_v3d_controls)
             self._view_host_lay.removeWidget(self._view_ph)
             self._view_ph.hide()
             self._view_host_lay.addWidget(self._v3d.native)
         except Exception:
             self._v3d = None
+
+    def _on_v3d_controls(self, d):
+        """Navcube controls on the EMBEDDED loads view (perspective/floor/thickness)."""
+        v = self._v3d
+        if v is None:
+            return
+        try:
+            if 'perspective' in d:
+                v.set_perspective(bool(d['perspective']))
+            if 'floor' in d and hasattr(v, '_ground'):
+                v._ground.visible = bool(d['floor'])
+            if 'thickness' in d:
+                # route through _car so build_load_view keeps it on the next rebuild
+                self._main._car['show_shock_thickness'] = bool(d['thickness'])
+                self._refresh_3d()
+            v._canvas.update()
+        except Exception:
+            pass
 
     def _on_input(self, *_):
         self.refresh()
@@ -200,8 +233,11 @@ class LoadsPage(QWidget):
             cat = parts[0].split(' ', 1)[-1] if ' ' in parts[0] else parts[0]
             point = parts[1] if len(parts) > 1 else ''
             mag = float(np.linalg.norm(v))
+            is_moment = 'N·m' in lab
             typ = ''
-            if 'tension' in lab:
+            if is_moment:
+                typ = 'MOMENT (N·m)'
+            elif 'tension' in lab:
                 typ = 'tension'
             elif 'compression' in lab:
                 typ = 'compression'
@@ -209,7 +245,7 @@ class LoadsPage(QWidget):
                 typ = 'axial'
             elif 'RADIAL' in lab:
                 typ = 'radial'
-            elif 'moment' in lab:
+            elif 'PIVOT' in lab or 'pivot' in lab:
                 typ = 'moment reaction'
             cells = [cat, point, f'{mag:,.0f}',
                      f'{v[0]:+,.0f} / {v[1]:+,.0f} / {v[2]:+,.0f}', typ]

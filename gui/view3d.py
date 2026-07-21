@@ -1624,9 +1624,13 @@ class View3D:
                 perp = perp / np.linalg.norm(perp)
                 perp2 = np.cross(u, perp)
                 hl = min(0.02, 0.32 * L)
-                for pp in (perp, -perp, perp2, -perp2):
-                    barb = tip - u * hl + pp * hl * 0.55
-                    segs += [tip, barb]; cols += [c, c]
+                # a MOMENT vector (label carries N·m) gets a DOUBLE arrowhead so it
+                # reads as a torque, not a force.
+                _tips = [tip, tip - u * hl] if ('N·m' in lab) else [tip]
+                for _t in _tips:
+                    for pp in (perp, -perp, perp2, -perp2):
+                        barb = _t - u * hl + pp * hl * 0.55
+                        segs += [_t, barb]; cols += [c, c]
             self._loadvec_vis.set_data(pos=np.array(segs, np.float32),
                                        color=np.array(cols, np.float32))
         except Exception:

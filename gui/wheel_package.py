@@ -50,6 +50,7 @@ _C_UP = (0.95, 0.72, 0.12, 1.0)    # UPRIGHT ball joints + bearings (amber)
 _C_RK = (0.80, 0.82, 0.92, 1.0)    # ROCKER (pushrod / spring / pivot) grey-white
 _C_ARB = (0.20, 0.45, 1.00, 1.0)   # ARB drop-link / arm / chassis mount (solid blue)
 _C_CAL = (0.35, 0.90, 0.95, 1.0)   # brake CALIPER mount (cyan — distinct from blue + amber)
+_C_MOM = (1.00, 0.55, 0.00, 1.0)   # MOMENTS (N·m) — orange, drawn double-headed
 
 
 def _load_items(win, lat_g, lon_g, only_corner=None):
@@ -164,6 +165,26 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
         items.append((patch, Fpatch, _C_UP,
                       f'{lbl} TYRE · contact patch into hub · {np.linalg.norm(Fpatch):,.0f} N'))
 
+        # ── MOMENTS at the hub (N·m, drawn double-headed along the moment axis) ──
+        # The contact-patch forces act R_r below the axle, so they apply moments
+        # on the wheel/upright (Seward Ch.6):
+        #   * Fx (long) × R_r = the wheel BRAKE / DRIVE torque about the spin axis
+        #     (reacted by the caliper couple front / the driveshaft rear).
+        #   * Fy (lat)  × R_r = the OVERTURNING moment about the fore-aft axis
+        #     (reacted by the two wheel bearings as a V force couple).
+        R_r = max(float(wc[2]), 1e-3)                     # loaded rolling radius
+        Fx = float(res.Fx.get(lbl, 0.0)); Fy = float(res.Fy.get(lbl, 0.0))
+        fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
+        fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
+        T_hub = Fx * R_r
+        M_ot = Fy * R_r
+        if abs(T_hub) > 1.0:
+            items.append((wc, T_hub * spin, _C_MOM,
+                          f'{lbl} HUB · brake/drive torque (about axle) · {abs(T_hub):,.0f} N·m'))
+        if abs(M_ot) > 1.0:
+            items.append((wc, M_ot * fwd, _C_MOM,
+                          f'{lbl} BEARINGS · overturning moment · {abs(M_ot):,.0f} N·m'))
+
         # ── ROCKER / ARB free body: pushrod, spring, ARB drop-link (axial),
         #    and the rocker PIVOT reaction (the only moment reaction) ──
         try:
@@ -222,29 +243,40 @@ def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
     items = _load_items(win, lat_g, lon_g, only_corner)
     if not items:
         return []
-    fmax = max(float(np.linalg.norm(v)) for _, v, _, _ in items) or 1.0
+    # Moments (N·m) are a different UNIT from forces (N) — scale each group by its
+    # OWN max so a 270 N·m moment isn't dwarfed by a 5 kN force.  Moments are
+    # tagged by 'N·m' in the label and drawn double-headed in view3d.
+    forces = [it for it in items if 'N·m' not in it[3]]
+    moments = [it for it in items if 'N·m' in it[3]]
+    fmax = max((float(np.linalg.norm(v)) for _, v, _, _ in forces), default=1.0) or 1.0
+    mmax = max((float(np.linalg.norm(v)) for _, v, _, _ in moments), default=1.0) or 1.0
     LMAX, MINL = 0.14, 0.030
     # COMPRESSED (sqrt) length scale: the biggest load is LMAX, but small loads
-    # (ARB ~130 N, caliper ~900 N) keep a readable length instead of collapsing to
-    # a stub next to the 5 kN bearing arrows.  Hover still gives the exact number.
-    def _len(mag):
-        return MINL + (LMAX - MINL) * (max(mag, 0.0) / fmax) ** 0.5
+    # keep a readable length instead of collapsing to a stub.  Hover gives the number.
+    def _len(mag, mx):
+        return MINL + (LMAX - MINL) * (max(mag, 0.0) / mx) ** 0.5
     AX = ('lateral', 'fore-aft', 'vertical')
     arrows = []
-    for p, v, col, lab in items:
+    for p, v, col, lab in forces:
         if mode == 'components':
             for a in range(3):
                 comp = float(v[a])
                 if abs(comp) < 1.0:
                     continue
                 d = np.zeros(3); d[a] = np.sign(comp)
-                arrows.append((p, p + d * _len(abs(comp)), col,
+                arrows.append((p, p + d * _len(abs(comp), fmax), col,
                                f'{lab.split(" · ")[0]} · {AX[a]} {comp:+,.0f} N'))
         else:
             mag = float(np.linalg.norm(v))
             if mag < 1.0:
                 continue
-            arrows.append((p, p + (v / mag) * _len(mag), col, lab))
+            arrows.append((p, p + (v / mag) * _len(mag, fmax), col, lab))
+    # moments: one arrow along the moment axis (right-hand rule), both modes.
+    for p, v, col, lab in moments:
+        mag = float(np.linalg.norm(v))
+        if mag < 1.0:
+            continue
+        arrows.append((p, p + (v / mag) * _len(mag, mmax) * 0.9, col, lab))
     return arrows
 
 
