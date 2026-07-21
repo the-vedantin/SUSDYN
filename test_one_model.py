@@ -398,6 +398,30 @@ except Exception as _e:
     fails += 1
     print(f'force transfer   : UNEXPECTED FAIL ({_e})')
 
+# ── BRAKE TORQUE IS BRAKE-ONLY (vahan/dynamics.py): under power the driven
+#    axle's hub torque is reacted by the DRIVESHAFT, not the caliper.  Booking
+#    drive torque as brake torque put phantom kN-level loads into the caliper
+#    mount lugs at full acceleration (found 2026-07-21 when the binder's load
+#    viewer was finally wired to the GUI's own load model).
+print('-' * 64)
+try:
+    from gui import wheel_package as _WP
+    _brk = _WP.compute_case(win, 0.0, -1.5)[3]      # pure braking
+    _acc = _WP.compute_case(win, 0.0, +1.0)[3]      # full acceleration
+    _bt_brake = max(_brk.brake_torque.values())
+    _bt_accel = max(_acc.brake_torque.values())
+    _cal_accel = [it for it in _WP._load_items(win, 0.0, 1.0)
+                  if 'CALIPER' in it[3]]
+    bt_ok = (_bt_brake > 50.0 and _bt_accel == 0.0 and not _cal_accel)
+    if not bt_ok:
+        fails += 1
+    print(f'brake torque     : braking {_bt_brake:.0f} Nm, accel {_bt_accel:.0f} Nm, '
+          f'{len(_cal_accel)} caliper loads under power   '
+          f'{"pass" if bt_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'brake torque     : UNEXPECTED FAIL ({_e})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)

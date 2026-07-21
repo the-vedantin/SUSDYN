@@ -1031,10 +1031,18 @@ class SteadyStateSolver:
             # Store per-corner forces for component load analysis
             result.Fy = dict(fy_per_corner)
             result.Fx = dict(fx_per_corner)
-            # Brake torque per corner = Fx × tire_radius
+            # Brake torque per corner = Fx × tire_radius — ONLY while braking.
+            # Under power (ax > 0) the driven-axle Fx is DRIVE force: its hub
+            # torque is reacted through the DRIVESHAFT into the diff, not by the
+            # brake caliper (the pads are not clamping).  Booking it as brake
+            # torque put ~1.9 kN of phantom load into the caliper mount lugs at
+            # full acceleration.  The hub torque itself is still reported — see
+            # the "brake/drive torque (about axle)" moment in wheel_package.
             tire_r = self._veh.tire_radius_m
+            braking = ax < 0
             for label in ['FL', 'FR', 'RL', 'RR']:
-                result.brake_torque[label] = abs(fx_per_corner.get(label, 0)) * tire_r
+                result.brake_torque[label] = (
+                    abs(fx_per_corner.get(label, 0)) * tire_r if braking else 0.0)
 
             # Understeer gradient: back-calculate slip angles from tire model
             # (per-axle tire so a split setup shifts the balance correctly).
@@ -1085,8 +1093,9 @@ class SteadyStateSolver:
             else:
                 result.Fx = {'FL': 0, 'FR': 0, 'RL': total_fx/2, 'RR': total_fx/2}
             tire_r = v.tire_radius_m
-            for label in ['FL', 'FR', 'RL', 'RR']:
-                result.brake_torque[label] = abs(result.Fx.get(label, 0)) * tire_r
+            for label in ['FL', 'FR', 'RL', 'RR']:   # brake torque only under braking
+                result.brake_torque[label] = (
+                    abs(result.Fx.get(label, 0)) * tire_r if ax < 0 else 0.0)
 
         return result
 
