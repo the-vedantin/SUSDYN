@@ -435,6 +435,11 @@ class View3D:
                                    for _ in range(2)]   # RL, RR
         self._tripod_meshes = [self._new_mesh((0.95, 0.85, 0.25, 0.95))
                                for _ in range(2)]       # RL, RR
+        # Brake rotors (grey disc coaxial with the wheel) + calipers (red block
+        # straddling the rotor at the top).  One per corner.
+        self._rotor_meshes = [self._new_mesh((0.32, 0.32, 0.35, 0.85)) for _ in range(4)]
+        self._caliper_meshes = [self._new_mesh((0.88, 0.20, 0.20, 0.95)) for _ in range(4)]
+        self._show_brakes = True
 
         # ── Decoupled (twin-bellcrank) visuals ───────────────────────────
         # Per axle (front + rear) we render:
@@ -804,6 +809,8 @@ class View3D:
                 self._upright_meshes[ci].set_data(vertices=_z, faces=_t)
                 self._rocker_meshes[ci].set_data(vertices=_z, faces=_t)
                 self._spring_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._rotor_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._caliper_meshes[ci].set_data(vertices=_z, faces=_t)
                 continue
 
             # links
@@ -897,6 +904,24 @@ class View3D:
                 wc, spin,
                 self._tire_outer_r, self._tire_rim_r, self._tire_half_w)
             self._tire_meshes[ci].set_data(vertices=tv, faces=tf)
+
+            # brake rotor (disc coaxial with the wheel) + caliper block at top
+            if ci < len(self._rotor_meshes):
+                _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
+                if self._show_brakes:
+                    s = _norm(np.asarray(spin, float))
+                    rr = 0.55 * self._tire_outer_r
+                    wcv = np.asarray(wc, float)
+                    rv, rf = build_cylinder_between(wcv - s * 0.004, wcv + s * 0.004, rr, n=28)
+                    self._rotor_meshes[ci].set_data(vertices=rv, faces=rf)
+                    up = np.array([0, 0, 1.0]) - np.dot([0, 0, 1.0], s) * s
+                    up = up / max(np.linalg.norm(up), 1e-9)
+                    cp = wcv + up * rr
+                    cv, cf = build_cylinder_between(cp - s * 0.024, cp + s * 0.024, 0.016, n=12)
+                    self._caliper_meshes[ci].set_data(vertices=cv, faces=cf)
+                else:
+                    self._rotor_meshes[ci].set_data(vertices=_z, faces=_t)
+                    self._caliper_meshes[ci].set_data(vertices=_z, faces=_t)
 
             # markers
             #
@@ -1323,6 +1348,10 @@ class View3D:
                 self._clash_vis.set_data(pos=np.zeros((2, 3), np.float32))
         except Exception:
             pass
+
+    def set_brakes(self, show: bool) -> None:
+        """Show/hide the brake rotors + calipers in the 3-D view."""
+        self._show_brakes = bool(show)
 
     def set_isolate_corner(self, lbl) -> None:
         """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by

@@ -562,6 +562,7 @@ class CarParamsPanel(CollapsibleSection):
             'tripod_od_mm':          self._tripod_od.value(),
             'driveshaft_dia_mm':     self._ds_dia.value(),
             'show_driveshaft':       self._show_driveshaft.isChecked(),
+            'show_brakes':           self._show_brakes.isChecked(),
             'show_shock_thickness':  self._show_shock_thick.isChecked(),
             'view_mode':             self._view_mode_combo.currentText().lower(),
         }
@@ -670,6 +671,12 @@ class CarParamsPanel(CollapsibleSection):
             lambda _: self.params_changed.emit(self.get_params()))
         self.add_widget(self._show_driveshaft)
 
+        self._show_brakes = QCheckBox('Show brake rotors + calipers')
+        self._show_brakes.setChecked(True)
+        self._show_brakes.stateChanged.connect(
+            lambda _: self.params_changed.emit(self.get_params()))
+        self.add_widget(self._show_brakes)
+
         self._show_shock_thick = QCheckBox('Show shock thickness (spring/damper OD)')
         self._show_shock_thick.setChecked(True)
         self._show_shock_thick.setToolTip(
@@ -750,6 +757,7 @@ class CarParamsPanel(CollapsibleSection):
             self._show_ground.setChecked(d['show_ground'])
             self._show_ground.blockSignals(False)
         for key, chk in (('show_driveshaft', self._show_driveshaft),
+                         ('show_brakes', self._show_brakes),
                          ('show_shock_thickness', self._show_shock_thick)):
             if key in d:
                 chk.blockSignals(True)

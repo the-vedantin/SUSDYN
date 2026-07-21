@@ -3154,6 +3154,7 @@ class MainWindow(QMainWindow):
         car_data.setdefault('tripod_od_mm', 90.)
         car_data.setdefault('driveshaft_dia_mm', 25.4)
         car_data.setdefault('show_driveshaft', True)
+        car_data.setdefault('show_brakes', True)
         car_data.setdefault('show_shock_thickness', True)
         self._car.update(car_data)
         self._steer.update(data.get('steer', {}))
@@ -5515,6 +5516,7 @@ class MainWindow(QMainWindow):
             try:
                 self.view3d.set_view_mode(self._car.get('view_mode', 'normal'))
                 self.view3d.set_isolate_corner(self._car.get('wheel_pkg_corner'))
+                self.view3d.set_brakes(self._car.get('show_brakes', True))
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)
