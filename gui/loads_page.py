@@ -44,7 +44,18 @@ class LoadsPage(QWidget):
             l = QLabel(t); l.setStyleSheet('font-weight:bold;color:#e0a83a;font-size:13px'); return l
         left.addWidget(hdr('LOADS'))
         left.addWidget(QLabel('Load case'))
-        self._case = QComboBox(); self._case.addItems([c[0] for c in CASES]); left.addWidget(self._case)
+        self._case = QComboBox(); self._case.addItems([c[0] for c in CASES])
+        # Default to a case with BOTH cornering and braking so every load shows at
+        # once: pure cornering has no brake torque (caliper reads as "missing"),
+        # pure braking has little ARB load.  Prefer lat&lon both non-zero, else any
+        # braking case.
+        _combined = [i for i, c in enumerate(CASES) if abs(c[1]) > 1e-6 and abs(c[2]) > 1e-6]
+        _braking = [i for i, c in enumerate(CASES) if abs(c[2]) > 1e-6]
+        if _combined:
+            self._case.setCurrentIndex(_combined[0])
+        elif _braking:
+            self._case.setCurrentIndex(_braking[0])
+        left.addWidget(self._case)
         left.addWidget(QLabel('Corner'))
         self._corner = QComboBox(); self._corner.addItems(_CORNERS); left.addWidget(self._corner)
         left.addWidget(QLabel('3D vectors'))

@@ -5309,12 +5309,17 @@ class MainWindow(QMainWindow):
         try:
             if getattr(view3d, '_load_framed_corner', '__unset__') != corner_label:
                 if corner_label:
-                    wc = next((c['pts']['wheel_center'] for c in corners_draw
-                               if c['label'] == corner_label
-                               and 'wheel_center' in c['pts']), None)
-                    if wc is not None:
-                        view3d.set_camera_center((float(wc[0]), float(wc[1]), float(wc[2])))
-                        view3d._cam.scale_factor = 0.65
+                    _cd = next((c for c in corners_draw
+                                if c['label'] == corner_label
+                                and 'wheel_center' in c['pts']), None)
+                    if _cd is not None:
+                        wc = np.asarray(_cd['pts']['wheel_center'], float)
+                        # Frame the WHOLE corner (wheel + rocker/ARB), not just the
+                        # wheel, so the rocker / spring / ARB load arrows are in view.
+                        rp = np.asarray(_cd['pts'].get('rocker_pivot', wc), float)
+                        ctr = 0.5 * (wc + rp)
+                        view3d.set_camera_center((float(ctr[0]), float(ctr[1]), float(ctr[2])))
+                        view3d._cam.scale_factor = 1.05
                 else:
                     wb_half = cp['axle_spacing_mm'] / 2000.
                     view3d.set_camera_center((0., wb_half, 0.2))

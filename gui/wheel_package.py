@@ -46,8 +46,10 @@ def _u(st, a, b):
 # The category is what the user asked to keep distinct.
 _C_TEN = (0.92, 0.92, 0.96, 1.0)   # CHASSIS reaction, tension (white)
 _C_COMP = (0.95, 0.25, 0.25, 1.0)  # CHASSIS reaction, compression (red)
-_C_UP = (0.95, 0.72, 0.12, 1.0)    # UPRIGHT (ball joints, bearings, caliper) amber
-_C_RK = (0.80, 0.82, 0.92, 1.0)    # ROCKER / ARB (grey-white, distinct from grey car)
+_C_UP = (0.95, 0.72, 0.12, 1.0)    # UPRIGHT ball joints + bearings (amber)
+_C_RK = (0.80, 0.82, 0.92, 1.0)    # ROCKER (pushrod / spring / pivot) grey-white
+_C_ARB = (0.20, 0.45, 1.00, 1.0)   # ARB drop-link / arm / chassis mount (solid blue)
+_C_CAL = (0.35, 0.90, 0.95, 1.0)   # brake CALIPER mount (cyan — distinct from blue + amber)
 
 
 def _load_items(win, lat_g, lon_g, only_corner=None):
@@ -131,8 +133,8 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             lug_F = 0.5 * bt / max(rrad, 1e-3)         # each of two lugs
             for s2 in (0.03, -0.03):
                 cp = wc + up_rad * (rrad - 0.006) + tan * s2
-                items.append((cp, np.sign(bt) * lug_F * tan, _C_UP,
-                              f'{lbl} UPRIGHT · caliper lug · {lug_F:,.0f} N (x2, torque {bt:,.0f} Nm)'))
+                items.append((cp, np.sign(bt) * lug_F * tan, _C_CAL,
+                              f'{lbl} CALIPER · mount lug · {lug_F:,.0f} N (x2, brake torque {bt:,.0f} Nm)'))
 
         # ── UPRIGHT / TYRE: contact-patch load into the hub ──
         patch = np.array([wc[0], wc[1], 0.0])
@@ -167,15 +169,25 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             lever = np.cross(dt - P, u_arb) @ axis
             F_arb = (-m0 / lever if abs(lever) > 1e-9 else 0.0) * u_arb
             F_pivot = -(F_push + F_spr + F_arb)
-            for pt, v, nm in ((pi, F_push, 'ROCKER · pushrod force'),
-                              (sp, F_spr, 'ROCKER · spring force'),
-                              (sc, -F_spr, 'CHASSIS · spring mount'),
-                              (dt, F_arb, 'ARB · drop-link (axial)'),
-                              (ae, -F_arb, 'ARB · arm end (axial)'),
-                              (P, F_pivot, 'ROCKER · PIVOT reaction (moment)')):
+            # ARB blade reacts the drop-link force into the CHASSIS at its pivot
+            # mount (the torsion bar carries the moment; the pivot carries the
+            # force) — sum of forces on the blade => pivot force = +F_arb.
+            arb_piv = arb.get('arb_pivot')
+            if arb_piv is not None:
+                arb_piv = np.asarray(arb_piv, float)
+                if lbl in ('FR', 'RR'):
+                    arb_piv = arb_piv * np.array([-1.0, 1.0, 1.0])
+            rows = [(pi, F_push, 'ROCKER · pushrod force', _C_RK),
+                    (sp, F_spr, 'ROCKER · spring force', _C_RK),
+                    (sc, -F_spr, 'CHASSIS · spring mount', _C_TEN),
+                    (dt, F_arb, 'ARB · drop-link (axial)', _C_ARB),
+                    (ae, -F_arb, 'ARB · arm end (axial)', _C_ARB),
+                    (P, F_pivot, 'ROCKER · PIVOT reaction (moment)', _C_RK)]
+            if arb_piv is not None:
+                rows.append((arb_piv, F_arb, 'ARB · chassis pivot mount', _C_ARB))
+            for pt, v, nm, col in rows:
                 if np.linalg.norm(v) < 1.0 or not np.all(np.isfinite(pt)):
                     continue
-                col = _C_TEN if nm.startswith('CHASSIS') else _C_RK
                 items.append((np.asarray(pt, float), v, col,
                               f'{lbl} {nm} · {np.linalg.norm(v):,.0f} N'))
         except Exception:
@@ -191,8 +203,12 @@ def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
     if not items:
         return []
     fmax = max(float(np.linalg.norm(v)) for _, v, _, _ in items) or 1.0
-    SC = 0.14 / fmax
-    MINL = 0.026
+    LMAX, MINL = 0.14, 0.030
+    # COMPRESSED (sqrt) length scale: the biggest load is LMAX, but small loads
+    # (ARB ~130 N, caliper ~900 N) keep a readable length instead of collapsing to
+    # a stub next to the 5 kN bearing arrows.  Hover still gives the exact number.
+    def _len(mag):
+        return MINL + (LMAX - MINL) * (max(mag, 0.0) / fmax) ** 0.5
     AX = ('lateral', 'fore-aft', 'vertical')
     arrows = []
     for p, v, col, lab in items:
@@ -202,14 +218,13 @@ def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
                 if abs(comp) < 1.0:
                     continue
                 d = np.zeros(3); d[a] = np.sign(comp)
-                L = max(abs(comp) * SC, MINL)
-                arrows.append((p, p + d * L, col, f'{lab.split(" · ")[0]} · {AX[a]} {comp:+,.0f} N'))
+                arrows.append((p, p + d * _len(abs(comp)), col,
+                               f'{lab.split(" · ")[0]} · {AX[a]} {comp:+,.0f} N'))
         else:
             mag = float(np.linalg.norm(v))
             if mag < 1.0:
                 continue
-            L = max(mag * SC, MINL)
-            arrows.append((p, p + (v / mag) * L, col, lab))
+            arrows.append((p, p + (v / mag) * _len(mag), col, lab))
     return arrows
 
 
