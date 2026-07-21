@@ -599,6 +599,33 @@ class View3D:
         self._navcube.view_requested.connect(self._snap_camera)
         self._navcube.set_orientation(self._cam.azimuth, self._cam.elevation)
 
+        # ── View-controls overlay UNDER the navcube: mode dropdown +
+        #    perspective + floor toggles (the box the user asked for).
+        from PyQt6.QtWidgets import QComboBox, QCheckBox, QWidget, QVBoxLayout
+        self._viewctrl = QWidget(parent=n)
+        self._viewctrl.setStyleSheet(
+            'QWidget{background:rgba(18,18,22,190);border-radius:7px;}'
+            'QComboBox{color:#e6e6e6;background:#2a2a30;border:1px solid #444;'
+            'border-radius:3px;padding:2px 4px;font:11px "Segoe UI";}'
+            'QCheckBox{color:#dcdce2;font:11px "Segoe UI";spacing:5px;}')
+        _vl = QVBoxLayout(self._viewctrl)
+        _vl.setContentsMargins(7, 5, 7, 5); _vl.setSpacing(3)
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItems(['Normal', 'Load', 'Interference'])
+        self._mode_combo.setToolTip(
+            'Normal · Load (force vectors, desaturated) · Interference '
+            '(highlight clashing parts)')
+        self._persp_chk = QCheckBox('Perspective'); self._persp_chk.setChecked(True)
+        self._floor_chk = QCheckBox('Floor'); self._floor_chk.setChecked(True)
+        _vl.addWidget(self._mode_combo)
+        _vl.addWidget(self._persp_chk)
+        _vl.addWidget(self._floor_chk)
+        self._viewctrl.adjustSize()
+        self._on_view_controls = None
+        self._mode_combo.currentTextChanged.connect(self._emit_view_controls)
+        self._persp_chk.toggled.connect(self._emit_view_controls)
+        self._floor_chk.toggled.connect(self._emit_view_controls)
+
         # ── Watermark (top-right credit) ──────────────────────────────────
         self._watermark = QLabel('Made by Yu @ Cougar Racing', parent=n)
         self._watermark.setStyleSheet(
@@ -1349,6 +1376,32 @@ class View3D:
         except Exception:
             pass
 
+    def set_on_view_controls(self, cb) -> None:
+        """Register cb(dict) fired when the navcube view-controls change
+        (keys: view_mode, perspective, floor)."""
+        self._on_view_controls = cb
+
+    def _emit_view_controls(self, *_):
+        if self._on_view_controls:
+            self._on_view_controls({
+                'view_mode': self._mode_combo.currentText().lower(),
+                'perspective': self._persp_chk.isChecked(),
+                'floor': self._floor_chk.isChecked()})
+
+    def sync_view_controls(self, view_mode=None, perspective=None, floor=None):
+        """Set the overlay controls to match external state without re-firing."""
+        for w, v, setter in ((self._mode_combo, view_mode, 'combo'),
+                             (self._persp_chk, perspective, 'chk'),
+                             (self._floor_chk, floor, 'chk')):
+            if v is None:
+                continue
+            w.blockSignals(True)
+            if setter == 'combo':
+                w.setCurrentText(str(v).capitalize())
+            else:
+                w.setChecked(bool(v))
+            w.blockSignals(False)
+
     def set_brakes(self, show: bool) -> None:
         """Show/hide the brake rotors + calipers in the 3-D view."""
         self._show_brakes = bool(show)
@@ -1623,6 +1676,13 @@ class View3D:
         # NavCube sits just below the watermark so neither overlaps.
         self._navcube.move(w - self._navcube.width() - 4,
                            6 + self._watermark.height() + 4)
+        # View-controls box sits just BELOW the navcube.
+        if hasattr(self, '_viewctrl'):
+            self._viewctrl.adjustSize()
+            self._viewctrl.move(
+                w - self._viewctrl.width() - 4,
+                6 + self._watermark.height() + 4 + self._navcube.height() + 6)
+            self._viewctrl.raise_()
 
     def _snap_camera(self, az, el):
         """Snap the camera to the requested orientation."""

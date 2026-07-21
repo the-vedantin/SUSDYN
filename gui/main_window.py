@@ -3169,6 +3169,13 @@ class MainWindow(QMainWindow):
         self._front_hp_panel.refresh(self._front_hp, self._front_arb, self._front_heave, self._front_decoupled)
         self._rear_hp_panel.refresh(self._rear_hp,  self._rear_arb,  self._rear_heave,  self._rear_decoupled)
         self._car_panel.set_params(self._car)
+        try:
+            self.view3d.sync_view_controls(
+                view_mode=self._car.get('view_mode', 'normal'),
+                perspective=self._car_panel._chk_perspective.isChecked(),
+                floor=self._car.get('show_ground', True))
+        except Exception:
+            pass
 
         # Restore panel state (v2+).  Old v1 files have no "panels"
         # block; in that case the four panels keep their defaults.
@@ -3656,6 +3663,7 @@ class MainWindow(QMainWindow):
         self._steer_panel.steering_changed.connect(self._on_steer)
         self._car_panel.params_changed.connect(self._on_car)
         self._car_panel.perspective_changed.connect(self.view3d.set_perspective)
+        self.view3d.set_on_view_controls(self._on_view_controls_changed)
         self._front_hp_panel.hp_changed.connect(
             lambda d, cat: self._on_hp(d, 'front', cat))
         self._rear_hp_panel.hp_changed.connect(
@@ -8417,6 +8425,29 @@ class MainWindow(QMainWindow):
     # ==========================================================================
     #  COMPONENT LOADS
     # ==========================================================================
+
+    def _on_view_controls_changed(self, d):
+        """Navcube view-controls box (mode / perspective / floor) drives the view
+        and syncs the Car Parameters panel controls."""
+        try:
+            self._car['view_mode'] = d.get('view_mode', 'normal')
+            self._car['show_ground'] = bool(d.get('floor', True))
+            try:
+                cb = self._car_panel._view_mode_combo
+                cb.blockSignals(True); cb.setCurrentText(self._car['view_mode'].capitalize())
+                cb.blockSignals(False)
+                self._car_panel._show_ground.blockSignals(True)
+                self._car_panel._show_ground.setChecked(self._car['show_ground'])
+                self._car_panel._show_ground.blockSignals(False)
+                self._car_panel._chk_perspective.blockSignals(True)
+                self._car_panel._chk_perspective.setChecked(bool(d.get('perspective', True)))
+                self._car_panel._chk_perspective.blockSignals(False)
+            except Exception:
+                pass
+            self.view3d.set_perspective(bool(d.get('perspective', True)))
+            self._update_3d()
+        except Exception:
+            pass
 
     def _open_wheel_package(self):
         """Open the Seward-style Wheel Package Load Analysis (upright + arms)."""
