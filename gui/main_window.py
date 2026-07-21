@@ -3153,6 +3153,7 @@ class MainWindow(QMainWindow):
         car_data.setdefault('diff_housing_width_mm', 292.1)   # inboard pivot spacing
         car_data.setdefault('tripod_od_mm', 90.)
         car_data.setdefault('driveshaft_dia_mm', 25.4)
+        car_data.setdefault('rotor_dia_mm', 240.0)
         car_data.setdefault('show_driveshaft', True)
         car_data.setdefault('show_brakes', True)
         car_data.setdefault('show_shock_thickness', True)
@@ -5525,6 +5526,7 @@ class MainWindow(QMainWindow):
                 self.view3d.set_view_mode(self._car.get('view_mode', 'normal'))
                 self.view3d.set_isolate_corner(self._car.get('wheel_pkg_corner'))
                 self.view3d.set_brakes(self._car.get('show_brakes', True))
+                self.view3d.set_brake_dims(self._car.get('rotor_dia_mm', 240.0))
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)

@@ -314,6 +314,26 @@ def build_cylinder_between(p0, p1, radius, n=20):
     return _merge([(side_v, side_f), (cap0_v, cap0_f), (cap1_v, cap1_f)])
 
 
+def build_box(center, u_ax, u_rad, u_tan, half_ax, half_rad, half_tan):
+    """Oriented box (8 verts, 12 tris) about `center` along three unit axes.
+    Used for the brake caliper block straddling the rotor."""
+    c = np.asarray(center, float)
+    u_ax = _norm(np.asarray(u_ax, float))
+    u_rad = _norm(np.asarray(u_rad, float))
+    u_tan = _norm(np.asarray(u_tan, float))
+    verts = []
+    for sa in (-1, 1):
+        for sr in (-1, 1):
+            for st in (-1, 1):
+                verts.append(c + sa * half_ax * u_ax
+                             + sr * half_rad * u_rad + st * half_tan * u_tan)
+    verts = np.array(verts, np.float32)
+    faces = np.array([[0, 1, 3], [0, 3, 2], [4, 6, 7], [4, 7, 5],
+                      [0, 4, 5], [0, 5, 1], [2, 3, 7], [2, 7, 6],
+                      [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]], np.uint32)
+    return verts, faces
+
+
 # ── link topology ─────────────────────────────────────────────────────────────
 # (key_a, key_b, RGBA)
 # Note: rocker_spring_pt → spring_chassis_pt is now rendered as a SOLID
@@ -438,8 +458,12 @@ class View3D:
         # Brake rotors (grey disc coaxial with the wheel) + calipers (red block
         # straddling the rotor at the top).  One per corner.
         self._rotor_meshes = [self._new_mesh((0.32, 0.32, 0.35, 0.85)) for _ in range(4)]
-        self._caliper_meshes = [self._new_mesh((0.88, 0.20, 0.20, 0.95)) for _ in range(4)]
+        self._caliper_meshes = [self._new_mesh((0.62, 0.64, 0.68, 0.95)) for _ in range(4)]
         self._show_brakes = True
+        # Brake dims (metres).  Rotor thickness fixed at the Wilwood GP200's
+        # 0.25 in rotor width; rotor radius is a user input (<= 11 in max dia).
+        self._rotor_r = 0.120
+        self._rotor_hw = 0.5 * 0.25 * 0.0254        # 0.25 in / 2 = 3.175 mm
 
         # ── Decoupled (twin-bellcrank) visuals ───────────────────────────
         # Per axle (front + rear) we render:
@@ -937,14 +961,21 @@ class View3D:
                 _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
                 if self._show_brakes:
                     s = _norm(np.asarray(spin, float))
-                    rr = 0.55 * self._tire_outer_r
+                    rr = self._rotor_r
                     wcv = np.asarray(wc, float)
-                    rv, rf = build_cylinder_between(wcv - s * 0.004, wcv + s * 0.004, rr, n=28)
+                    # rotor: disc, thickness = GP200 0.25 in rotor width
+                    rv, rf = build_cylinder_between(
+                        wcv - s * self._rotor_hw, wcv + s * self._rotor_hw, rr, n=32)
                     self._rotor_meshes[ci].set_data(vertices=rv, faces=rf)
+                    # caliper: GP200 body ~97.8 mm tangential x 27.9 mm radial
+                    # (mount height) x ~40 mm axial, straddling the rotor edge at
+                    # the top (12 o'clock default).
                     up = np.array([0, 0, 1.0]) - np.dot([0, 0, 1.0], s) * s
                     up = up / max(np.linalg.norm(up), 1e-9)
-                    cp = wcv + up * rr
-                    cv, cf = build_cylinder_between(cp - s * 0.024, cp + s * 0.024, 0.016, n=12)
+                    tan = np.cross(s, up)
+                    cal_c = wcv + up * (rr - 0.006)
+                    cv, cf = build_box(cal_c, s, up, tan,
+                                       half_ax=0.020, half_rad=0.0140, half_tan=0.0489)
                     self._caliper_meshes[ci].set_data(vertices=cv, faces=cf)
                 else:
                     self._rotor_meshes[ci].set_data(vertices=_z, faces=_t)
@@ -1405,6 +1436,13 @@ class View3D:
     def set_brakes(self, show: bool) -> None:
         """Show/hide the brake rotors + calipers in the 3-D view."""
         self._show_brakes = bool(show)
+
+    def set_brake_dims(self, rotor_dia_mm) -> None:
+        """Rotor diameter (mm); rotor thickness stays the GP200's 0.25 in."""
+        try:
+            self._rotor_r = max(0.02, float(rotor_dia_mm) / 2.0 / 1000.0)
+        except (TypeError, ValueError):
+            pass
 
     def set_isolate_corner(self, lbl) -> None:
         """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by

@@ -561,6 +561,7 @@ class CarParamsPanel(CollapsibleSection):
             'diff_housing_width_mm': self._diff_hw.value(),
             'tripod_od_mm':          self._tripod_od.value(),
             'driveshaft_dia_mm':     self._ds_dia.value(),
+            'rotor_dia_mm':          self._rotor_dia.value(),
             'show_driveshaft':       self._show_driveshaft.isChecked(),
             'show_brakes':           self._show_brakes.isChecked(),
             'show_shock_thickness':  self._show_shock_thick.isChecked(),
@@ -616,6 +617,9 @@ class CarParamsPanel(CollapsibleSection):
                                dec=1, step=1); r += 1
         self._ds_dia     = row('Driveshaft OD:',           1, 300, 25.4, ' mm', r,
                                dec=2, step=1); r += 1
+        # Brake rotor diameter (Wilwood GP200 max rotor dia = 11 in = 279 mm).
+        self._rotor_dia  = row('Rotor dia:',               1, 279, 240, ' mm', r,
+                               dec=1, step=5); r += 1
         self.add_layout(g)
 
         # Info: axle spacing vs wheelbase
@@ -726,6 +730,7 @@ class CarParamsPanel(CollapsibleSection):
             'diff_housing_width_mm':  self._diff_hw,
             'tripod_od_mm':   self._tripod_od,
             'driveshaft_dia_mm': self._ds_dia,
+            'rotor_dia_mm':   self._rotor_dia,
         }
         # back-compat: older files have no diff/driveshaft block → defaults
         d.setdefault('diff_long_mm', 1537.)
@@ -734,6 +739,7 @@ class CarParamsPanel(CollapsibleSection):
         d.setdefault('diff_housing_width_mm', 292.1)   # inboard pivot spacing
         d.setdefault('tripod_od_mm', 90.)
         d.setdefault('driveshaft_dia_mm', 25.4)
+        d.setdefault('rotor_dia_mm', 240.)
         # backward compat: old files have cg_height_mm → map to cg_z_mm
         if 'cg_height_mm' in d and 'cg_z_mm' not in d:
             d['cg_z_mm'] = d.pop('cg_height_mm')
