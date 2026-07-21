@@ -3177,7 +3177,8 @@ class MainWindow(QMainWindow):
             self.view3d.sync_view_controls(
                 view_mode=self._car.get('view_mode', 'normal'),
                 perspective=self._car_panel._chk_perspective.isChecked(),
-                floor=self._car.get('show_ground', True))
+                floor=self._car.get('show_ground', True),
+                thickness=self._car.get('show_shock_thickness', True))
         except Exception:
             pass
 
@@ -5264,6 +5265,7 @@ class MainWindow(QMainWindow):
             view3d.set_spring_dims(
                 cp.get('spring_od_mm', 63.0) if _thick else 2.0,
                 cp.get('damper_od_mm', 50.0) if _thick else 2.0)
+            view3d.set_thickness(_thick)
         except Exception:
             pass
         try:
@@ -5626,6 +5628,7 @@ class MainWindow(QMainWindow):
                 self.view3d.set_spring_dims(
                     self._car.get('spring_od_mm', 63.0) if _thick else 2.0,
                     self._car.get('damper_od_mm', 50.0) if _thick else 2.0)
+                self.view3d.set_thickness(_thick)   # members / ARB / driveshaft too
             except Exception:
                 pass
             # View mode + corner isolation MUST be set before update_scene so
@@ -8543,6 +8546,8 @@ class MainWindow(QMainWindow):
         try:
             self._car['view_mode'] = d.get('view_mode', 'normal')
             self._car['show_ground'] = bool(d.get('floor', True))
+            if 'thickness' in d:
+                self._car['show_shock_thickness'] = bool(d['thickness'])
             try:
                 cb = self._car_panel._view_mode_combo
                 cb.blockSignals(True); cb.setCurrentText(self._car['view_mode'].capitalize())
@@ -8553,6 +8558,10 @@ class MainWindow(QMainWindow):
                 self._car_panel._chk_perspective.blockSignals(True)
                 self._car_panel._chk_perspective.setChecked(bool(d.get('perspective', True)))
                 self._car_panel._chk_perspective.blockSignals(False)
+                if 'thickness' in d and hasattr(self._car_panel, '_show_shock_thick'):
+                    self._car_panel._show_shock_thick.blockSignals(True)
+                    self._car_panel._show_shock_thick.setChecked(self._car['show_shock_thickness'])
+                    self._car_panel._show_shock_thick.blockSignals(False)
             except Exception:
                 pass
             self.view3d.set_perspective(bool(d.get('perspective', True)))

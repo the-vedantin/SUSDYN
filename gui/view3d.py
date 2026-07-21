@@ -433,7 +433,10 @@ class View3D:
             faces=np.array([[0, 1, 2]], np.uint32),
             vertex_colors=np.ones((3, 4), np.float32),
             parent=self._view.scene)
-        self._member_r = 0.008          # 16 mm OD member tubes
+        self._member_r_full = 0.008     # 16 mm OD member tubes (thickness ON)
+        self._member_r_thin = 0.0006    # ~1 mm wisps (thickness OFF → reads as lines)
+        self._member_r = self._member_r_full
+        self._thick_on  = True          # navcube "Thickness" toggle state
         # ARB drawn as a SOLID TUBE too (was a thin line).
         self._arb_mesh = scene.Mesh(
             vertices=np.zeros((3, 3), np.float32),
@@ -688,14 +691,19 @@ class View3D:
             '(highlight clashing parts)')
         self._persp_chk = QCheckBox('Perspective'); self._persp_chk.setChecked(True)
         self._floor_chk = QCheckBox('Floor'); self._floor_chk.setChecked(True)
+        self._thick_chk = QCheckBox('Thickness'); self._thick_chk.setChecked(True)
+        self._thick_chk.setToolTip('Draw members / ARB / pushrods / driveshaft / '
+                                   'springs as solid tubes (off = thin lines)')
         _vl.addWidget(self._mode_combo)
         _vl.addWidget(self._persp_chk)
         _vl.addWidget(self._floor_chk)
+        _vl.addWidget(self._thick_chk)
         self._viewctrl.adjustSize()
         self._on_view_controls = None
         self._mode_combo.currentTextChanged.connect(self._emit_view_controls)
         self._persp_chk.toggled.connect(self._emit_view_controls)
         self._floor_chk.toggled.connect(self._emit_view_controls)
+        self._thick_chk.toggled.connect(self._emit_view_controls)
 
         # ── Watermark (top-right credit) ──────────────────────────────────
         self._watermark = QLabel('Made by Yu @ Cougar Racing', parent=n)
@@ -1500,13 +1508,16 @@ class View3D:
             self._on_view_controls({
                 'view_mode': self._mode_combo.currentText().lower(),
                 'perspective': self._persp_chk.isChecked(),
-                'floor': self._floor_chk.isChecked()})
+                'floor': self._floor_chk.isChecked(),
+                'thickness': self._thick_chk.isChecked()})
 
-    def sync_view_controls(self, view_mode=None, perspective=None, floor=None):
+    def sync_view_controls(self, view_mode=None, perspective=None, floor=None,
+                           thickness=None):
         """Set the overlay controls to match external state without re-firing."""
         for w, v, setter in ((self._mode_combo, view_mode, 'combo'),
                              (self._persp_chk, perspective, 'chk'),
-                             (self._floor_chk, floor, 'chk')):
+                             (self._floor_chk, floor, 'chk'),
+                             (self._thick_chk, thickness, 'chk')):
             if v is None:
                 continue
             w.blockSignals(True)
@@ -1515,6 +1526,15 @@ class View3D:
             else:
                 w.setChecked(bool(v))
             w.blockSignals(False)
+
+    def set_thickness(self, on) -> None:
+        """Toggle solid-tube thickness for members / ARB / pushrods / driveshaft.
+        OFF → member+ARB tubes shrink to ~1 mm wisps (read as lines); the
+        driveshaft/tripod thin in set_driveshaft_package; springs thin via
+        set_spring_dims (driven by the same show_shock_thickness flag).
+        Caller must re-run update_scene / set_driveshaft_package to apply."""
+        self._thick_on = bool(on)
+        self._member_r = self._member_r_full if self._thick_on else self._member_r_thin
 
     def set_brakes(self, show: bool) -> None:
         """Show/hide the brake rotors + calipers in the 3-D view."""
@@ -1593,6 +1613,9 @@ class View3D:
         tri_r = 0.5 * float(pkg['tripod_od_mm']) / 1000.0
         body_w = 0.55 * span                  # diff BODY is shorter than the span
         diff_r = max(0.14 * span, 0.03)       # diff body radial size (visual)
+        if not self._thick_on:                # thickness toggle OFF → thin wisps
+            shaft_r = tri_r = 0.0006
+            diff_r = max(0.10 * diff_r, 0.004)
         if only:                              # isolating one corner → no diff body
             _clear(self._diff_mesh)
         else:
