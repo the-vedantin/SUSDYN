@@ -935,6 +935,7 @@ class View3D:
         link_pos = []
         link_col = []
         member_segs = []          # (p0, p1, rgba) → solid member tubes
+        _rocker_polys = []        # rocker PLATE outlines actually drawn this frame
         mk_pos   = []
         mk_col   = []
         self._hp_snap = []
@@ -1023,12 +1024,16 @@ class View3D:
                 # (a machined plate, not a tube frame).  Thin the plate with the
                 # thickness toggle so it reads as an outline when OFF.
                 _ht = self._rocker_half_t if self._thick_on else 0.0004
-                rv, rf = build_prism([pts[k] for k in rk4], _ht)
+                _poly = [pts[k] for k in rk4]
+                rv, rf = build_prism(_poly, _ht)
                 self._rocker_meshes[ci].set_data(vertices=rv, faces=rf)
+                _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
             elif _have(rk3):
                 _ht = self._rocker_half_t if self._thick_on else 0.0004
-                rv, rf = build_prism([pts[k] for k in rk3], _ht)
+                _poly = [pts[k] for k in rk3]
+                rv, rf = build_prism(_poly, _ht)
                 self._rocker_meshes[ci].set_data(vertices=rv, faces=rf)
+                _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
             else:
                 # No valid per-corner rocker (DECOUPLED — pushrod goes to the
                 # shared cradle — or missing/NaN rocker points).  Clear the
@@ -1100,6 +1105,18 @@ class View3D:
                 mk_col.append(c)
                 self._hp_snap.append((name, p.copy(), corner['label']))
 
+        # Record EXACTLY what this frame draws for the members, so an external
+        # consumer (the HTML binder dump) can reproduce the GUI 1:1.  These are
+        # MESHES now (tubes / plates), so they are invisible to a Line.set_data
+        # capture — without this the binder loses every arm, pushrod, tie rod,
+        # rocker and the ARB.  Stored BEFORE the thin-line routing below empties
+        # member_segs.
+        self._last_member_segs = [(np.asarray(a, float).copy(),
+                                   np.asarray(b, float).copy(),
+                                   tuple(float(x) for x in np.ravel(c)[:4]))
+                                  for a, b, c in member_segs]
+        self._last_rocker_polys = _rocker_polys
+
         # thickness OFF → members render as crisp THIN LINES.  A sub-millimetre
         # tube renders as a dotted/broken mesh, so route the member segments into
         # the Line visual instead; the tube mesh below is then built from an empty
@@ -1155,6 +1172,10 @@ class View3D:
         self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
         _arb_show = bool(arb_segs) and (not self._isolate
                                         or self._view_mode in ('load', 'interference'))
+        # record the ARB linkage this frame draws (mesh → invisible to a Line capture)
+        self._last_arb_segs = ([(np.asarray(s[0], float).copy(),
+                                 np.asarray(s[1], float).copy()) for s in arb_segs]
+                               if _arb_show else [])
         if _arb_show:
             ap = np.array([p for seg in arb_segs for p in seg], np.float32)
             self._last_arb_pos = ap
@@ -1649,6 +1670,9 @@ class View3D:
         def _clear(m):
             m.set_data(vertices=np.zeros((3, 3), np.float32),
                        faces=np.array([[0, 1, 2]], np.uint32))
+        # record what this frame draws (meshes → invisible to a Line capture, so
+        # the HTML binder dump reads this to stay 1:1 with the GUI)
+        self._last_ds_segs = []
         if not pkg or not show:
             _clear(self._diff_mesh)
             for m in self._driveshaft_meshes + self._tripod_meshes:
@@ -1669,6 +1693,8 @@ class View3D:
             dv, df = build_cylinder_between(c + np.array([-body_w / 2, 0, 0]),
                                             c + np.array([body_w / 2, 0, 0]), diff_r, n=20)
             self._diff_mesh.set_data(vertices=dv, faces=df)
+            self._last_ds_segs.append((c + np.array([-body_w / 2, 0, 0]),
+                                       c + np.array([body_w / 2, 0, 0])))
         for i, corner in enumerate(('RL', 'RR')):
             seg = pkg.get(corner)
             if not seg or (only and corner != only):
@@ -1679,6 +1705,7 @@ class View3D:
             axis = np.asarray(seg['axis'], float)
             sv, sf = build_cylinder_between(inner, outer, shaft_r, n=16)
             self._driveshaft_meshes[i].set_data(vertices=sv, faces=sf)
+            self._last_ds_segs.append((inner.copy(), outer.copy()))
             # tripod = stubby cylinder at the inner (diff) end, along the shaft
             t = float(pkg['tripod_od_mm']) / 1000.0
             tv, tf = build_cylinder_between(inner - axis * 0.5 * t,
