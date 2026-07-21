@@ -1076,6 +1076,16 @@ class View3D:
                 mk_col.append(c)
                 self._hp_snap.append((name, p.copy(), corner['label']))
 
+        # thickness OFF → members render as crisp THIN LINES.  A sub-millimetre
+        # tube renders as a dotted/broken mesh, so route the member segments into
+        # the Line visual instead; the tube mesh below is then built from an empty
+        # list (cleared).
+        if not self._thick_on:
+            for _p0, _p1, _c in member_segs:
+                link_pos += [_p0, _p1]
+                link_col += [_c, _c]
+            member_segs = []
+
         # upload the thin lines (upright + rocker plate edges only now)
         if link_pos:
             self._last_link_pos = np.array(link_pos, np.float32)
@@ -1114,8 +1124,9 @@ class View3D:
                 face_color=np.array(mk_col, np.float32),
                 size=9, edge_width=0)
 
-        # ARB — SOLID TUBE (real thickness); hidden when a corner is isolated,
-        # desaturated in Load / Interference mode.  The thin line stays cleared.
+        # ARB — SOLID TUBE (thickness ON) or a crisp THIN LINE (thickness OFF, so
+        # it doesn't render as a dotted sub-mm tube); hidden when a corner is
+        # isolated, desaturated in Load / Interference mode.
         self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
         if arb_segs and not self._isolate:
             ap = np.array([p for seg in arb_segs for p in seg], np.float32)
@@ -1123,9 +1134,14 @@ class View3D:
             _acol = ((0.55, 0.55, 0.57, 0.9)
                      if self._view_mode in ('load', 'interference')
                      else (0.90, 0.80, 0.10, 1.0))
-            _asegs = [(seg[0], seg[1], _acol) for seg in arb_segs]
-            av, af, ac = _tube_segments(_asegs, self._member_r, n=10)
-            self._arb_mesh.set_data(vertices=av, faces=af, vertex_colors=ac)
+            if self._thick_on:
+                _asegs = [(seg[0], seg[1], _acol) for seg in arb_segs]
+                av, af, ac = _tube_segments(_asegs, self._member_r, n=10)
+                self._arb_mesh.set_data(vertices=av, faces=af, vertex_colors=ac)
+            else:
+                self._arb_mesh.set_data(vertices=np.zeros((3, 3), np.float32),
+                                        faces=np.array([[0, 1, 2]], np.uint32))
+                self._arb_vis.set_data(pos=ap, color=_acol)
         else:
             self._last_arb_pos = None
             self._arb_mesh.set_data(vertices=np.zeros((3, 3), np.float32),
