@@ -434,6 +434,12 @@ class View3D:
             vertex_colors=np.ones((3, 4), np.float32),
             parent=self._view.scene)
         self._member_r = 0.008          # 16 mm OD member tubes
+        # ARB drawn as a SOLID TUBE too (was a thin line).
+        self._arb_mesh = scene.Mesh(
+            vertices=np.zeros((3, 3), np.float32),
+            faces=np.array([[0, 1, 2]], np.uint32),
+            vertex_colors=np.ones((3, 4), np.float32),
+            parent=self._view.scene)
         # Clash highlight (Interference mode): fat warning-red segments over any
         # members that interfere.  Empty until set_clashes() is called.
         self._clash_vis = scene.Line(
@@ -984,15 +990,13 @@ class View3D:
                     vertices=rv, faces=np.array([[0,1,2],[0,2,3]], np.uint32))
                 for pa2, pb2 in [(rk4[0],rk4[1]),(rk4[1],rk4[2]),
                                  (rk4[2],rk4[3]),(rk4[3],rk4[0])]:
-                    link_pos += [pts[pa2], pts[pb2]]
-                    link_col += [(0.85, 0.70, 0.12, 1.0)] * 2
+                    member_segs.append((pts[pa2], pts[pb2], (0.85, 0.70, 0.12, 1.0)))
             elif _have(rk3):
                 rv = np.array([pts[k] for k in rk3], np.float32)
                 self._rocker_meshes[ci].set_data(
                     vertices=rv, faces=np.array([[0,1,2]], np.uint32))
                 for pa2, pb2 in [(rk3[0],rk3[1]),(rk3[1],rk3[2]),(rk3[2],rk3[0])]:
-                    link_pos += [pts[pa2], pts[pb2]]
-                    link_col += [(0.85, 0.70, 0.12, 1.0)] * 2
+                    member_segs.append((pts[pa2], pts[pb2], (0.85, 0.70, 0.12, 1.0)))
             else:
                 # No valid per-corner rocker (DECOUPLED — pushrod goes to the
                 # shared cradle — or missing/NaN rocker points).  Clear the
@@ -1102,18 +1106,22 @@ class View3D:
                 face_color=np.array(mk_col, np.float32),
                 size=9, edge_width=0)
 
-        # ARB — hidden when a single corner is isolated; desaturated in
-        # Load / Interference mode.
+        # ARB — SOLID TUBE (real thickness); hidden when a corner is isolated,
+        # desaturated in Load / Interference mode.  The thin line stays cleared.
+        self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
         if arb_segs and not self._isolate:
             ap = np.array([p for seg in arb_segs for p in seg], np.float32)
             self._last_arb_pos = ap
-            _acol = ((0.55, 0.55, 0.57, 0.35)
+            _acol = ((0.55, 0.55, 0.57, 0.9)
                      if self._view_mode in ('load', 'interference')
                      else (0.90, 0.80, 0.10, 1.0))
-            self._arb_vis.set_data(pos=ap, color=_acol)
+            _asegs = [(seg[0], seg[1], _acol) for seg in arb_segs]
+            av, af, ac = _tube_segments(_asegs, self._member_r, n=10)
+            self._arb_mesh.set_data(vertices=av, faces=af, vertex_colors=ac)
         else:
             self._last_arb_pos = None
-            self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
+            self._arb_mesh.set_data(vertices=np.zeros((3, 3), np.float32),
+                                    faces=np.array([[0, 1, 2]], np.uint32))
 
         # ── Spring / damper cylinders (per corner) ───────────────────────
         # Draw a translucent cylinder of the user-set OD between
