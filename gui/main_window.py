@@ -5510,6 +5510,13 @@ class MainWindow(QMainWindow):
                     self._car.get('damper_od_mm', 50.0) if _thick else 2.0)
             except Exception:
                 pass
+            # View mode + corner isolation MUST be set before update_scene so
+            # the desaturation and single-corner hiding apply on this frame.
+            try:
+                self.view3d.set_view_mode(self._car.get('view_mode', 'normal'))
+                self.view3d.set_isolate_corner(self._car.get('wheel_pkg_corner'))
+            except Exception:
+                pass
             self.view3d.update_scene(corners_draw, arb_segs)
 
             # ── Rear driveshaft / differential package (rear-only, RWD) ──────
@@ -5527,8 +5534,10 @@ class MainWindow(QMainWindow):
                     and 'wheel_center' in c['pts']}
                 _pkg = (_ds_package(self._car, _rear_states)
                         if len(_rear_states) == 2 else None)
-                self.view3d.set_driveshaft_package(
-                    _pkg, show=self._car.get('show_driveshaft', True))
+                _iso = self._car.get('wheel_pkg_corner')
+                _show_ds = (self._car.get('show_driveshaft', True)
+                            and (_iso is None or _iso in ('RL', 'RR')))
+                self.view3d.set_driveshaft_package(_pkg, show=_show_ds)
             except Exception:
                 pass
 
@@ -5536,7 +5545,6 @@ class MainWindow(QMainWindow):
             try:
                 from vahan.interference import clashes as _clashfn
                 _mode = self._car.get('view_mode', 'normal')
-                self.view3d.set_view_mode(_mode)
                 _clash_segs = []
                 if _mode == 'interference' and _pkg is not None:
                     _TR = 0.008

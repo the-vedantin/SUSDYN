@@ -405,6 +405,8 @@ class View3D:
             connect='segments', width=3.0, antialias=True,
             parent=self._view.scene)
         self._loadvec_count = 0
+        # Corner isolation (wheel-package view): draw only this corner, or all.
+        self._isolate = None
         self._markers = scene.Markers(parent=self._view.scene)
         self._markers.set_data(
             pos=np.zeros((1, 3), np.float32),
@@ -795,6 +797,15 @@ class View3D:
             spin = corner['spin_axis']
             wc   = pts['wheel_center']
 
+            # corner isolation (wheel-package view): hide the other corners
+            if self._isolate and corner.get('label') != self._isolate:
+                _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
+                self._tire_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._upright_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._rocker_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._spring_meshes[ci].set_data(vertices=_z, faces=_t)
+                continue
+
             # links
             for pa, pb, col in LINKS:
                 if (pa in pts and pb in pts
@@ -955,6 +966,11 @@ class View3D:
             if ci >= len(self._spring_meshes):
                 break
             pts = corner['pts']
+            if self._isolate and corner.get('label') != self._isolate:
+                self._spring_meshes[ci].set_data(
+                    vertices=np.zeros((3, 3), np.float32),
+                    faces=np.array([[0, 1, 2]], np.uint32))
+                continue
             if ('rocker_spring_pt' in pts) and ('spring_chassis_pt' in pts) \
                     and np.all(np.isfinite(pts['rocker_spring_pt'])) \
                     and np.all(np.isfinite(pts['spring_chassis_pt'])):
@@ -1307,6 +1323,11 @@ class View3D:
                 self._clash_vis.set_data(pos=np.zeros((2, 3), np.float32))
         except Exception:
             pass
+
+    def set_isolate_corner(self, lbl) -> None:
+        """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by
+        the wheel-package view to isolate one corner."""
+        self._isolate = lbl if lbl in ('FL', 'FR', 'RL', 'RR') else None
 
     def set_load_vectors(self, arrows) -> None:
         """Draw force-vector arrows in Load mode.
