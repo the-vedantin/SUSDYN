@@ -509,6 +509,42 @@ except Exception as _e:
     fails += 1
     print(f'bearings/pivot   : UNEXPECTED FAIL ({_e})')
 
+# ── REAR ROCKER COPLANAR across travel (config 2027_v28): the pushrod, rocker
+#    and shock must stay in the rocker plate plane through the whole wheel travel
+#    (was 48 mm off / 68 mm across travel before v28). Guards the coplanar re-tune
+#    AND that the rear rates were held (MR_r ~0.808, arb_r ~353k).
+print('-' * 64)
+try:
+    import glob as _glob
+    _cfgs = _glob.glob('configs/2027_v28_*.vahan')
+    if _cfgs:
+        win._load_project_from_path(_cfgs[0]); win._rebuild_solvers(0.)
+        _hp = win._rear_hp
+        _p0 = np.asarray(_hp['rocker_pivot'], float)
+        _P = []
+        for _t in np.linspace(-0.04, 0.04, 7):
+            _st = win._solvers['RL'].solve(_t)
+            for _a in ('pushrod_inner', 'rocker_spring_pt', 'rocker_pivot'):
+                _P.append(np.asarray(getattr(_st, _a), float))
+        _P = np.array(_P); _u, _sv, _Vt = np.linalg.svd(_P - _P.mean(0)); _n = _Vt[2]
+        _worst = 0.0
+        for _t in np.linspace(-0.045, 0.045, 11):
+            _st = win._solvers['RL'].solve(_t)
+            for _a in ('pushrod_outer', 'spring_chassis_pt'):
+                _worst = max(_worst, abs(float(np.dot(np.asarray(getattr(_st, _a), float) - _p0, _n))) * 1000)
+        _veh = win._build_dynamics_solver()._veh
+        _mr = _veh.motion_ratio_rear; _arb = _veh.arb_rate_rear_Npm
+        cop_ok = (_worst < 3.0 and abs(_mr - 0.808) < 0.01 and abs(_arb - 353000) < 8000)
+        if not cop_ok:
+            fails += 1
+        print(f'rear coplanar    : {_worst:.2f} mm across travel, MR_r {_mr:.4f}, '
+              f'arb_r {_arb:.0f}   {"pass" if cop_ok else "UNEXPECTED FAIL"}')
+    else:
+        print('rear coplanar    : no v28 config found — skipped')
+except Exception as _e:
+    fails += 1
+    print(f'rear coplanar    : UNEXPECTED FAIL ({_e})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)
