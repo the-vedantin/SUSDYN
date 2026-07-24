@@ -372,17 +372,18 @@ if _design:
     gfail = []
     for lbl in ('RL', 'RR'):
         arb = wD._rear_arb
-        # coplanarity of the rocker PLATE across travel.  The plate is defined by the
-        # points bolted to it: pushrod_inner, rocker_pivot, rocker_spring_pt,
-        # arb_drop_top (+ the coplanar damper's spring_chassis_pt).  pushrod_OUTER is
-        # NOT on the plate — it is the wishbone-side rod-end, deliberately lifted ~1"
-        # above the lower-arm plane for bearing clearance — so it is excluded here (its
-        # height is checked separately below).
+        # coplanarity of the WHOLE actuation chain across travel — INCLUDING
+        # pushrod_outer.  The bellcrank is a planar mechanism: the rod must lie IN
+        # the plate plane or it side-thrusts the pivot bearing (USER HARD
+        # REQUIREMENT).  Being ~1" above the LOWER-ARM plane (checked below) is a
+        # Z offset and says NOTHING about the rocker plane (a fore-aft slice) —
+        # v33 shipped a foot 22 mm out of the rocker plane while this check only
+        # looked at the plate points.  Never exclude the pushrod again.
         cop = 0.0
         for _t in (-0.025, 0.0, 0.025):
             st = wD._solvers[lbl].solve(_t)
             P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
-            pts = np.array([P('pushrod_inner'), P('rocker_pivot'),
+            pts = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
                             P('rocker_spring_pt'), P('spring_chassis_pt'),
                             np.asarray(arb['arb_drop_top'], float) * 1000.0])
             c = pts.mean(0); _, _, vt = np.linalg.svd(pts - c)
