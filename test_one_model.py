@@ -648,6 +648,74 @@ except Exception as _e:
     fails += 1
     print(f'caliper one model: UNEXPECTED FAIL ({_e})')
 
+# ── BALANCE BAR reaches the PEDAL FORCE.  compute_brake_system() computed
+#    bias_f / bias_r and then never used them, so the pedal force needed to lock
+#    a wheel ignored the bias bar entirely — understating it by 1/bias (1.54x
+#    front, 2.86x rear at 65% bias) on the exact number a pedal box is sized
+#    from.  F_pedal = P_lock * A_mc / (pedal_ratio * bias).
+print('-' * 64)
+try:
+    from vahan.loads import (compute_brake_system as _cbs,
+                             BrakeSystemParams as _BSP, BrakeParams as _BP)
+    _Fz = {'FL': 900.0, 'FR': 900.0, 'RL': 700.0, 'RR': 700.0}
+    _pf, _pr = _BP(), _BP()
+    _bias = 65.0
+    _sys = _BSP(pedal_ratio=5.0, mc_bore_front_mm=15.87, mc_bore_rear_mm=15.87,
+                bias_pct_front=_bias)
+    _rb = _cbs(_Fz, _pf, _pr, _sys)
+    _fl, _rl = _rb['FL'], _rb['RL']
+    _exp_f = _fl.lockup_line_pressure_MPa * _sys.mc_area_front_mm2 / (5.0 * _bias / 100.0)
+    _exp_r = _rl.lockup_line_pressure_MPa * _sys.mc_area_rear_mm2 / (5.0 * (1 - _bias / 100.0))
+    _bb_ok = (abs(_fl.lockup_pedal_force_N - _exp_f) < 0.5 and
+              abs(_rl.lockup_pedal_force_N - _exp_r) < 0.5 and
+              _fl.lockup_pedal_force_N > 1.0)
+    # and the bias must actually MOVE the answer (the old code was bias-blind)
+    _sys2 = _BSP(pedal_ratio=5.0, mc_bore_front_mm=15.87, mc_bore_rear_mm=15.87,
+                 bias_pct_front=50.0)
+    _rb2 = _cbs(_Fz, _pf, _pr, _sys2)
+    _moves = abs(_rb2['FL'].lockup_pedal_force_N - _fl.lockup_pedal_force_N) > 1.0
+    _bb_ok = _bb_ok and _moves
+    if not _bb_ok:
+        fails += 1
+    print(f'brake bias->pedal: F {_fl.lockup_pedal_force_N:.0f} N (expect {_exp_f:.0f}), '
+          f'R {_rl.lockup_pedal_force_N:.0f} N (expect {_exp_r:.0f}), '
+          f'bias moves it={_moves}   {"pass" if _bb_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'brake bias->pedal: UNEXPECTED FAIL ({_e})')
+
+# ── STATIC SAG uses SPRUNG weight only.  The spring carries the sprung corner
+#    weight; the unsprung corner (wheel/upright/hub/brake) is reacted by the TIRE
+#    to the ground and never passes through the spring.  static_sag() added the
+#    unsprung term, overstating required spring compression by 15.5% front /
+#    15.6% rear -- i.e. it lied about where the damper sits and how much stroke
+#    the spring needs, which is exactly what a spring-selection decision reads.
+print('-' * 64)
+try:
+    _vv = win._build_dynamics_solver()._veh
+    _sag = _vv.static_sag()
+    _g = 9.81
+    _wf = _vv.front_weight_fraction
+    _exp_f = (_vv.sprung_mass_kg * _wf * _g / 2.0) / (
+        _vv.motion_ratio_front * _vv.spring_rate_front_Npm / 1000.0)
+    _exp_r = (_vv.sprung_mass_kg * (1 - _wf) * _g / 2.0) / (
+        _vv.motion_ratio_rear * _vv.spring_rate_rear_Npm / 1000.0)
+    _got_f = float(_sag['required_spring_compression_front_mm'])
+    _got_r = float(_sag['required_spring_compression_rear_mm'])
+    # the WRONG (unsprung-inclusive) answer, which must NOT be what we get
+    _bad_f = _exp_f * (1 + (_vv.unsprung_mass_front_kg / 2.0) /
+                       (_vv.sprung_mass_kg * _wf / 2.0))
+    _sag_ok = (abs(_got_f - _exp_f) < 0.05 and abs(_got_r - _exp_r) < 0.05
+               and abs(_got_f - _bad_f) > 0.5)
+    if not _sag_ok:
+        fails += 1
+    print(f'static sag sprung: front {_got_f:.2f} mm (sprung-only {_exp_f:.2f}, '
+          f'unsprung-inclusive would be {_bad_f:.2f})   '
+          f'{"pass" if _sag_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'static sag sprung: UNEXPECTED FAIL ({_e})')
+
 # ── CALIPER MOUNT matches the caliper DRAWING, and the drawn caliper sits where
 #    the load arrows do.  Three different answers used to coexist: loads at
 #    R_pad-25 = 69.4 mm, the render hardcoded rearward at R_rotor-6 = 114 mm

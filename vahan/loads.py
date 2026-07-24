@@ -595,12 +595,22 @@ def compute_brake_system(
         else:
             lockup_pressure = 0.0
 
-        # Pedal force to generate that line pressure
-        # P_line = F_pedal × pedal_ratio / A_mc
-        # → F_pedal = P_line × A_mc / pedal_ratio
+        # Pedal force to generate that line pressure.
+        #
+        # The BALANCE BAR splits the pedal pushrod force between the two master
+        # cylinders, so only a FRACTION of it reaches this circuit:
+        #     F_pushrod = F_pedal × pedal_ratio
+        #     F_mc      = F_pushrod × bias          (bias_f front, bias_r rear)
+        #     P_line    = F_mc / A_mc
+        # → F_pedal = P_line × A_mc / (pedal_ratio × bias)
+        #
+        # Omitting the bias term UNDERSTATES the pedal force (by 1/0.65 = 1.54x
+        # front and 1/0.35 = 2.86x rear at a 65% bias) — it was previously
+        # dropped here, which made the pedal-box sizing optimistic.
         mc_area = system.mc_area_front_mm2 if is_front else system.mc_area_rear_mm2
-        if system.pedal_ratio > 0:
-            lockup_pedal = lockup_pressure * mc_area / system.pedal_ratio
+        bias = bias_f if is_front else bias_r
+        if system.pedal_ratio > 0 and bias > 0:
+            lockup_pedal = lockup_pressure * mc_area / (system.pedal_ratio * bias)
         else:
             lockup_pedal = 0.0
 

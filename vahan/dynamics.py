@@ -393,15 +393,18 @@ class VehicleParams:
         mr_f = mr_front if mr_front is not None else self.motion_ratio_front
         mr_r = mr_rear  if mr_rear  is not None else self.motion_ratio_rear
 
-        # Static corner wheel loads (including unsprung weight at wheel).
+        # Static load THE SPRING CARRIES = SPRUNG weight only.  The unsprung
+        # corner weight (wheel, upright, hub, brake) is reacted by the TIRE
+        # straight to the ground and never passes through the spring, so
+        # including it here overstated the required spring compression by
+        # Fz_unsprung/Fz_sprung — 15.5% front and 15.6% rear on the 2027 car.
+        # (Wheel LOAD does include unsprung; SPRING load does not.)
         # Weight fractions come from CG, then split left/right 50/50.
         w_f = self.front_weight_fraction
         Fz_sprung_f = self.sprung_mass_kg * w_f * g / 2.0
         Fz_sprung_r = self.sprung_mass_kg * (1 - w_f) * g / 2.0
-        Fz_us_f     = self.unsprung_mass_front_kg * g / 2.0
-        Fz_us_r     = self.unsprung_mass_rear_kg  * g / 2.0
-        Fz_f        = Fz_sprung_f + Fz_us_f
-        Fz_r        = Fz_sprung_r + Fz_us_r
+        Fz_f        = Fz_sprung_f
+        Fz_r        = Fz_sprung_r
 
         # Spring compression required at static (shock frame, mm)
         # k_spring is in N/m; convert to N/mm and use mm throughout.
