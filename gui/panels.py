@@ -6282,21 +6282,18 @@ class AnalysisPlotsPanel(CollapsibleSection):
         self.add_widget(btn)
         self.add_widget(_panel_sep())
 
-        # Steering torque
+        # Steering torque — everything comes from the solved model + the config
+        # rack (no inputs): probed steering arm, per-wheel loads, TTC aligning
+        # torque, mechanical trail, pinion mm/rev from the steer block.
         g = QGridLayout(); g.setSpacing(4)
-        lbl = QLabel('Steering-wheel torque vs steer angle')
+        lbl = QLabel('Steering effort (torque at the driver\'s hands)')
         lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
         g.addWidget(lbl, 0, 0, 1, 4)
-        g.addWidget(QLabel('Steering ratio:'), 1, 0)
-        self._steer_ratio = _spin(2.0, 25.0, 6.0, ':1', dec=1, step=0.5)
-        self._steer_ratio.setToolTip('Steering-wheel to road-wheel angle ratio')
-        g.addWidget(self._steer_ratio, 1, 1)
-        g.addWidget(QLabel('Speeds:'), 1, 2)
-        sp = QLabel('10, 15, 20 m/s')
+        sp = QLabel('probed arm + solved loads + config rack — no inputs needed')
         sp.setStyleSheet('color:#888;font-size:10px;')
-        g.addWidget(sp, 1, 3)
+        g.addWidget(sp, 1, 0, 1, 4)
         self.add_layout(g)
-        btn = QPushButton('Plot steering torque vs steer angle')
+        btn = QPushButton('Plot steering torque vs lateral g')
         btn.clicked.connect(lambda: self.steering_torque_requested.emit())
         self.add_widget(btn)
         self.add_widget(_panel_sep())
@@ -6389,10 +6386,6 @@ class AnalysisPlotsPanel(CollapsibleSection):
 
     def rc_vs_roll_inputs(self):
         return dict(max_lat_g=self._rc_max_g.value())
-
-    def steering_torque_inputs(self):
-        return dict(steering_ratio=self._steer_ratio.value(),
-                    speeds_mps=(10, 15, 20))
 
     def ackermann_demand_inputs(self):
         return dict(ackermann_pct=self._ack_demand_pct.value(),

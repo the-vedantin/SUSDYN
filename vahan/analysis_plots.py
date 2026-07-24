@@ -310,53 +310,47 @@ def plot_rc_vs_body_roll(steady_solver, max_lat_g: float = 2.0) -> Figure:
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. Steering torque vs steer angle
 # ═════════════════════════════════════════════════════════════════════════════
-def plot_steering_torque(
-    tire_model, vehicle_params,
-    scrub_radius_m: float, kpi_deg: float,
-    steering_ratio: float = 6.0,
-    speeds_mps: list = (10, 15, 20),
-    wheelbase_m: float = 1.537, weight_dist_front: float = 0.45,
-) -> Figure:
-    """Estimated steering-wheel torque vs front-wheel steer angle at constant V."""
-    m = vehicle_params.total_mass_kg
-    g_acc = 9.81
-    a_dist = wheelbase_m * (1 - weight_dist_front)  # CG to front
-    b_dist = wheelbase_m * weight_dist_front         # CG to rear
-    steering_arm_m = scrub_radius_m * np.cos(np.radians(kpi_deg))
-
-    delta_arr = np.linspace(0.5, 25, 30)
-    fig, ax = _styled_fig(figsize=(9.5, 5))
-    colors = [_BLUE, _YELLOW, _RED]
-
-    Fz_front_static = m * g_acc * (b_dist / wheelbase_m) / 2
-    for V, col in zip(speeds_mps, colors):
-        ts = []
-        for d in delta_arr:
-            R = wheelbase_m / np.tan(np.radians(d))
-            Ay = V * V / R / g_acc
-            if Ay > 2.5: continue
-            Fy_demand = m * Ay * g_acc * (b_dist / wheelbase_m) / 2
-            try:
-                alpha = tire_model.slip_angle_for_Fy(Fy_demand, Fz_front_static, 0.0)
-            except Exception:
-                alpha = 5.0
-            if alpha is None or np.isnan(alpha):
-                alpha = 5.0
-            Mz = float(tire_model.Mz(alpha, Fz_front_static, 0.0))
-            T_kingpin = abs(Mz) + abs(Fy_demand) * abs(steering_arm_m)
-            T_wheel = 2 * T_kingpin / steering_ratio
-            ts.append((d, T_wheel))
-        if ts:
-            xs, ys = zip(*ts)
-            ax.plot(xs, ys, color=col, lw=2.0, label=f'V = {V*3.6:.0f} km/h')
-
-    ax.set_xlabel('Front-wheel steer angle (°)', fontsize=10)
-    ax.set_ylabel('Steering-wheel torque (N·m)', fontsize=10)
-    ax.set_title(f'Steering-Wheel Torque vs Steer Angle\n'
-                 f'(theoretical, from TTC Mz + scrub-radius geometry)',
-                 fontsize=10, color=_TEXT)
+def plot_steering_torque(effort: dict) -> Figure:
+    """Steering effort vs lateral g from vahan.steering.compute_steering_effort
+    — the ONE implementation shared with the binder (probed linkage + per-wheel
+    solved loads + TTC aligning torque + mechanical trail).  Replaces the old
+    constant-speed estimate, which used static Fz and the wrong lever (scrub)
+    for the side-force term."""
+    fig, ax = _styled_fig(figsize=(9.5, 5.2))
+    have_T = 'T_vs_latg' in effort
+    if have_T:
+        xs = [g for g, _ in effort['T_vs_latg']]
+        ys = [t for _, t in effort['T_vs_latg']]
+        ax.set_ylabel('Steering-wheel torque (N·m)', fontsize=10)
+    else:
+        xs = [g for g, _ in effort['F_rack_vs_latg']]
+        ys = [f for _, f in effort['F_rack_vs_latg']]
+        ax.set_ylabel('Rack force (N)  [no pinion mm/rev in config]', fontsize=10)
+    ax.plot(xs, ys, '-o', color=_YELLOW, lw=2.2, ms=5, mfc=_RED, mec=_RED,
+            label='steering effort (solved per-wheel loads)')
+    ipk = int(np.argmax(ys))
+    ax.annotate(f'peak {ys[ipk]:.1f} at {xs[ipk]:.1f} g\n(before the grip limit — '
+                'pneumatic trail collapses)',
+                xy=(xs[ipk], ys[ipk]), xytext=(xs[0] + 0.1, ys[ipk] * 0.86),
+                arrowprops=dict(arrowstyle='->', color=_TEXT, lw=1.1),
+                fontsize=9, color=_TEXT)
+    ax.set_xlabel('Lateral acceleration (g)', fontsize=10)
+    bits = [f'effective arm {effort.get("arm_eff_mm", float("nan")):.1f} mm']
+    if effort.get('arm_physical_mm') is not None:
+        bits.append(f'physical arm (KP→tie-rod outer) {effort["arm_physical_mm"]:.1f} mm')
+    if effort.get('ratio_to1') is not None:
+        bits.append(f'ratio {effort["ratio_to1"]:.2f}:1 '
+                    f'({effort.get("C_mm_per_rev", 0):.1f} mm/rev)')
+    if effort.get('lock_to_lock_deg') is not None:
+        bits.append(f'lock-to-lock {effort["lock_to_lock_deg"]:.0f}°')
+    if effort.get('tie_rod_force_max_N') is not None:
+        bits.append(f'tie-rod {effort["tie_rod_force_max_N"]:.0f} N max')
+    half = (len(bits) + 1) // 2
+    ax.set_title('Steering effort vs lateral acceleration\n'
+                 + '  ·  '.join(bits[:half]) + '\n' + '  ·  '.join(bits[half:]),
+                 fontsize=9, color=_TEXT)
     ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=9,
-              loc='lower right')
+              loc='lower center')
     fig.tight_layout()
     return fig
 

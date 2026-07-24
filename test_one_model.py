@@ -484,6 +484,43 @@ if _design:
     print(f'design actuation : {os.path.basename(_design)} — {_msg}   '
           f'{"pass" if gok else "UNEXPECTED FAIL"}')
 
+    # ── STEERING EFFORT (vahan.steering — the ONE implementation the GUI and
+    #    the binder share).  Internal consistency + physical sanity on the
+    #    current design config.
+    try:
+        from vahan.steering import compute_steering_effort as _cse
+        _ssD = wD._build_dynamics_solver()
+        _tf = getattr(_ssD, '_tire_front', None) or getattr(_ssD, '_tire', None)
+        if _tf is None:
+            print('steering effort  : no tire model loaded — skipped')
+        else:
+            _eff = _cse(_ssD, wD._front_hp, wD._topology.front.damper_mount.value,
+                        _tf, steer_cfg=dict(getattr(wD, '_steer', None) or {}),
+                        front_solver=wD._solvers['FL'])
+            _sfail = []
+            _Fs = [f for _, f in _eff['F_rack_vs_latg']]
+            if not all(np.isfinite(f) and f >= 0 for f in _Fs):
+                _sfail.append('non-finite/negative rack force in curve')
+            if not (50.0 < _eff['arm_eff_mm'] < 150.0):
+                _sfail.append(f'effective arm {_eff["arm_eff_mm"]} mm outside 50..150')
+            _C = _eff.get('C_mm_per_rev')
+            if _C and _eff.get('T_max_Nm') is not None:
+                _texp = _eff['F_max_N'] * _C / (2 * np.pi * 1000.0)
+                if abs(_eff['T_max_Nm'] - _texp) > 0.02:
+                    _sfail.append(f'T_max {_eff["T_max_Nm"]} != F*C/2pi {_texp:.2f}')
+            if _eff['peak_latg'] >= _eff['F_rack_vs_latg'][-1][0]:
+                _sfail.append('rack force never peaks below the grip limit '
+                              '(pneumatic-trail collapse missing)')
+            if _sfail:
+                fails += 1
+            print(f'steering effort  : arm {_eff["arm_eff_mm"]:.1f} mm, '
+                  f'F_max {_eff["F_max_N"]:.0f} N @ {_eff["peak_latg"]:.1f} g'
+                  + (f', T_max {_eff["T_max_Nm"]:.2f} N.m @ C {_C:.1f}' if _C else '')
+                  + f'   {"pass" if not _sfail else "UNEXPECTED FAIL: " + "; ".join(_sfail)}')
+    except Exception as _e:
+        fails += 1
+        print(f'steering effort  : UNEXPECTED FAIL (exception: {_e})')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly

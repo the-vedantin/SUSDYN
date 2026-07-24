@@ -243,3 +243,167 @@ class SteeringGeometry:
         """Clamp a demanded road-wheel angle to the physical rack limit."""
         lim = self.max_road_wheel_rad
         return float(np.clip(rw_rad, -lim, +lim))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# STEERING EFFORT — what the driver's hands feel, from the ONE solved model.
+#
+# Chain (virtual work), the binder-verified method:
+#     F_rack  = SUM_i  M_kingpin,i * (d delta_i / d rack)          [N]
+#     T_wheel = F_rack * C / (2*pi)                                 [N*m]
+#       M_kingpin,i = |Mz_tire(alpha_i, Fz_i, camber_i)|  (TTC aligning torque)
+#                   + |Fy_i| * mechanical_trail            (caster contribution)
+#       d delta_i / d rack : per-wheel linkage ratio PROBED from the real front
+#           solver; its inverse is the EFFECTIVE steering arm (mm/rad).
+# Also reports the PHYSICAL arm (kingpin axis -> outboard tie-rod mount, the
+# machined lever) and the tie-rod force on it.  The GUI Analysis plot and the
+# binder generator both call compute_steering_effort — one implementation.
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_LAT_GRID = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.2, 2.3)
+
+
+def linkage_gains(front_hp: dict, pushrod_body: str):
+    """Per-wheel d(road-wheel)/d(rack) at centre, rad/m, probed from the real
+    front solver (translate tie_rod_inner in X, solve, read toe)."""
+    from vahan.hardpoints import DoubleWishboneHardpoints
+    from vahan.solver import SuspensionConstraints
+    from vahan.kinematics import KinematicMetrics
+
+    hp0 = {k: np.asarray(v, float).copy() for k, v in front_hp.items()
+           if v is not None and np.all(np.isfinite(np.asarray(v, float)))}
+    d_tr = hp0['tie_rod_outer'] - hp0['tie_rod_inner']
+    tierod_sq = float(d_tr @ d_tr)
+
+    def toe_at(rack_m, side):
+        r = rack_m if side == 'L' else -rack_m
+        hp = {k: v.copy() for k, v in hp0.items()}
+        hp['tie_rod_inner'] = hp0['tie_rod_inner'] + np.array([r, 0., 0.])
+        solver = SuspensionConstraints(
+            DoubleWishboneHardpoints(**{k: np.array(v, float) for k, v in hp.items()}),
+            tierod_len_sq=tierod_sq, pushrod_body=pushrod_body,
+            damper_actuation='pushrod', damper_body=pushrod_body)
+        st = solver.solve(0.0)
+        m = KinematicMetrics(st, 'left')
+        return np.radians(float(m.toe)) * (1.0 if side == 'L' else -1.0)
+
+    h = 0.003                                     # +/-3 mm central difference
+    gL = (toe_at(+h, 'L') - toe_at(-h, 'L')) / (2 * h)
+    gR = (toe_at(+h, 'R') - toe_at(-h, 'R')) / (2 * h)
+    return float(gL), float(gR)
+
+
+def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
+                            tire_model, steer_cfg: Optional[dict] = None,
+                            lat_grid=DEFAULT_LAT_GRID,
+                            front_solver=None) -> dict:
+    """Steering-effort report from the solved model.
+
+    ss_solver: SteadyStateSolver (per-wheel Fy/Fz/camber at each lat g).
+    front_hp:  front hardpoint dict.  pushrod_body: topology damper mount.
+    tire_model: front TTC tire (Mz + slip_angle_for_Fy).
+    steer_cfg: config 'steer' block {rack_travel_per_rev_mm, total_rack_travel_mm}.
+    front_solver: solved FL corner solver, for trail/scrub + the physical arm.
+    """
+    from vahan.kinematics import KinematicMetrics
+
+    steer_cfg = steer_cfg or {}
+    C_mm = float(steer_cfg.get('rack_travel_per_rev_mm', 0.0) or 0.0)
+    stroke_mm = float(steer_cfg.get('total_rack_travel_mm', 0.0) or 0.0)
+
+    gL, gR = linkage_gains(front_hp, pushrod_body)
+    arm_L = 1.0 / gL * 1000.0 if gL else float('nan')
+    arm_R = 1.0 / gR * 1000.0 if gR else float('nan')
+    arm_eff = 0.5 * (abs(arm_L) + abs(arm_R))
+
+    t_mech, scrub = 0.0136, 0.0079
+    st0 = None
+    if front_solver is not None:
+        try:
+            st0 = front_solver.solve(0.0)
+            m0 = KinematicMetrics(st0, 'left')
+            if np.isfinite(m0.mechanical_trail):
+                t_mech = float(m0.mechanical_trail)
+            if np.isfinite(m0.scrub_radius):
+                scrub = float(m0.scrub_radius)
+        except Exception:
+            st0 = None
+
+    def mz_tire(alpha_deg, Fz, camber_deg):
+        try:
+            return abs(float(tire_model.Mz(alpha_deg, max(Fz, 1.0), camber_deg)))
+        except Exception:
+            return float('nan')
+
+    def alpha_for(Fy, Fz, camber_deg):
+        try:
+            a = float(tire_model.slip_angle_for_Fy(abs(Fy), max(Fz, 1.0), camber_deg))
+            return abs(a) if np.isfinite(a) else 6.0
+        except Exception:
+            return 6.0
+
+    def F_rack_at(lat_g):
+        r = ss_solver.solve(float(lat_g), 0.0)
+        total = 0.0
+        parts = {}
+        for lbl, g in (('FL', gL), ('FR', gR)):
+            Fy = float(r.Fy.get(lbl, 0.0)); Fz = float(r.Fz.get(lbl, 1.0))
+            cam = float(r.camber.get(lbl, 0.0)) if hasattr(r, 'camber') else 0.0
+            al = alpha_for(Fy, Fz, cam)
+            mz = mz_tire(al, Fz, cam)
+            if not np.isfinite(mz):
+                mz = abs(Fy) * 0.012          # fallback pneumatic trail 12 mm
+            mk = mz + abs(Fy) * t_mech
+            total += mk * abs(g)
+            parts[lbl] = dict(Fy=Fy, Fz=Fz, alpha_deg=al, Mz=mz, M_kp=mk)
+        return total, parts
+
+    curve, parts_at = [], {}
+    for lg in lat_grid:
+        F, parts = F_rack_at(lg)
+        curve.append((float(lg), float(F)))
+        parts_at[float(lg)] = parts
+    F_arr = [f for _, f in curve]
+    F_max = max(F_arr)
+    peak_g = curve[int(np.argmax(F_arr))][0]
+
+    arm_phys = arm_torq = f_tr_max = float('nan')
+    if st0 is not None:
+        P = lambda k: np.asarray(getattr(st0, k), float)
+        lo, uo, tro, tri = P('lca_outer'), P('uca_outer'), P('tr_outer'), P('tr_inner')
+        kp = (uo - lo) / np.linalg.norm(uo - lo)
+        v = tro - lo
+        arm_phys = float(np.linalg.norm(v - (v @ kp) * kp) * 1000.0)
+        utr = (tri - tro) / np.linalg.norm(tri - tro)
+        arm_torq = float(abs(np.cross(tro - lo, utr) @ kp) * 1000.0)
+        mk_max = max((p['M_kp'] for p in parts_at[peak_g].values()), default=float('nan'))
+        if np.isfinite(mk_max) and arm_torq > 0:
+            f_tr_max = float(mk_max / (arm_torq / 1000.0))
+
+    out = dict(
+        arm_eff_mm_L=round(arm_L, 1), arm_eff_mm_R=round(arm_R, 1),
+        arm_eff_mm=round(arm_eff, 1),
+        arm_physical_mm=(round(arm_phys, 1) if np.isfinite(arm_phys) else None),
+        arm_torque_mm=(round(arm_torq, 1) if np.isfinite(arm_torq) else None),
+        tie_rod_force_max_N=(round(f_tr_max, 0) if np.isfinite(f_tr_max) else None),
+        mech_trail_mm=round(t_mech * 1000.0, 1), scrub_mm=round(scrub * 1000.0, 1),
+        F_rack_vs_latg=[(g, round(f, 1)) for g, f in curve],
+        F_max_N=round(F_max, 1), peak_latg=peak_g,
+        C_mm_per_rev=(C_mm or None), stroke_total_mm=(stroke_mm or None),
+    )
+    if C_mm:
+        c = C_mm / (2.0 * np.pi * 1000.0)
+        out['T_vs_latg'] = [(g, round(f * c, 2)) for g, f in curve]
+        out['T_max_Nm'] = round(F_max * c, 2)
+        out['ratio_to1'] = round((arm_eff / 1000.0) / (C_mm / 1000.0 / (2 * np.pi)), 2)
+    if stroke_mm and np.isfinite(arm_eff):
+        wb = float(getattr(getattr(ss_solver, '_veh', None), 'wheelbase_m', 1.537))
+        delta_need = np.degrees(np.arctan(wb / 3.93)) + 3.0   # FSAE hairpin + slip margin
+        need = (arm_eff / 1000.0) * np.radians(delta_need) * 1000.0
+        out['delta_need_deg'] = round(delta_need, 1)
+        out['stroke_need_side_mm'] = round(need, 1)
+        out['stroke_side_mm'] = round(stroke_mm / 2.0, 1)
+        out['stroke_fits'] = bool(need <= stroke_mm / 2.0)
+        if C_mm:
+            out['lock_to_lock_deg'] = round(2.0 * need / C_mm * 360.0, 0)
+    return out

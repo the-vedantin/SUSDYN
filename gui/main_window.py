@@ -8980,29 +8980,33 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f'RC plot error: {e}', 5000)
 
     def _on_plot_steering_torque(self):
+        """Steering effort vs lateral g — the ONE implementation
+        (vahan.steering.compute_steering_effort), shared with the binder:
+        probed linkage gains x (TTC Mz + Fy x mechanical trail) per wheel from
+        the steady-state solve, x the config rack's mm/rev."""
         try:
             from vahan.analysis_plots import plot_steering_torque
-            solver = self._build_dynamics_solver()
-            veh = solver._veh
+            from vahan.steering import compute_steering_effort
             if self._tire_model is None:
                 self.statusBar().showMessage('Steering-torque plot needs TTC data loaded', 5000)
                 return
-            # Scrub radius + KPI from FL kinematic at design ride
-            from vahan.kinematics import KinematicMetrics
             fl_solver = self._solvers.get('FL')
             if fl_solver is None:
                 self.statusBar().showMessage('FL solver not ready', 5000); return
-            state = fl_solver.solve(0.0)
-            km = KinematicMetrics(state, side='left')
-            wf = (veh.cg_to_rear_axle_m / veh.wheelbase_m) if hasattr(veh, 'cg_to_rear_axle_m') else 0.45
-            inp = self._analysis_plots_panel.steering_torque_inputs()
-            fig = plot_steering_torque(
-                tire_model=self._tire_model, vehicle_params=veh,
-                scrub_radius_m=km.scrub_radius, kpi_deg=km.kpi,
-                wheelbase_m=veh.wheelbase_m, weight_dist_front=wf,
-                **inp,
-            )
-            self._show_plot(fig, 'Steering Torque vs Steer Angle')
+            ss = self._build_dynamics_solver()
+            tire_f = getattr(ss, '_tire_front', None) or self._tire_model
+            effort = compute_steering_effort(
+                ss, self._front_hp, self._topology.front.damper_mount.value,
+                tire_f, steer_cfg=dict(self._steer),
+                front_solver=fl_solver)
+            fig = plot_steering_torque(effort)
+            self._show_plot(fig, 'Steering Effort vs Lateral g')
+            t = effort.get('T_max_Nm')
+            self.statusBar().showMessage(
+                (f'Max steering torque {t:.1f} N·m at {effort["peak_latg"]:.1f} g'
+                 if t is not None else
+                 f'Max rack force {effort["F_max_N"]:.0f} N at {effort["peak_latg"]:.1f} g'
+                 ' — set steer.rack_travel_per_rev_mm for hand torque'), 8000)
         except Exception as e:
             import traceback; traceback.print_exc()
             self.statusBar().showMessage(f'Steering torque plot error: {e}', 5000)
