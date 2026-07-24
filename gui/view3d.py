@@ -360,6 +360,39 @@ def build_prism(poly, half_t):
     return verts, np.array(faces, np.uint32)
 
 
+def build_sphere(center, radius, n_lat=12, n_lon=16):
+    """UV-sphere mesh (verts, faces) — draws a ball joint's spherical envelope
+    as a real solid so it is visible and can be clash-checked."""
+    center = np.asarray(center, float)
+    verts = []
+    for i in range(n_lat + 1):
+        theta = np.pi * i / n_lat                       # 0..pi  (pole to pole)
+        st, ct = np.sin(theta), np.cos(theta)
+        for j in range(n_lon):
+            phi = 2.0 * np.pi * j / n_lon
+            verts.append(center + radius * np.array([st * np.cos(phi),
+                                                     st * np.sin(phi), ct]))
+    verts = np.array(verts, np.float32)
+    faces = []
+    for i in range(n_lat):
+        for j in range(n_lon):
+            a = i * n_lon + j
+            b = i * n_lon + (j + 1) % n_lon
+            c = (i + 1) * n_lon + j
+            d = (i + 1) * n_lon + (j + 1) % n_lon
+            faces.append([a, c, d]); faces.append([a, d, b])
+    return verts, np.array(faces, np.uint32)
+
+
+def build_tetra(p0, p1, p2, p3):
+    """Solid tetrahedron from 4 (non-coplanar) points — a coarse convex-hull
+    fill for the upright mounting volume (lca_outer / uca_outer / tie_rod_outer
+    / wheel_center)."""
+    verts = np.array([p0, p1, p2, p3], np.float32)
+    faces = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]], np.uint32)
+    return verts, faces
+
+
 def _tube_segments(segs, radius, n=10):
     """Merge a list of (p0, p1, rgba) into one (verts, faces, vertex_colors)
     mesh of solid cylinders — used to give the suspension members real 3-D
@@ -478,6 +511,11 @@ class View3D:
             connect='segments', width=7.0, antialias=True,
             parent=self._view.scene,
         )
+        # A clash HIGHLIGHT must always be visible — draw it on top of the solid
+        # meshes (uprights, ball-joint spheres, dampers) instead of letting depth
+        # testing hide the red behind them.
+        self._clash_vis.set_gl_state(depth_test=False, blend=True)
+        self._clash_vis.order = 10
         # View mode: 'normal' | 'load' (desaturate links) | 'interference'
         # (desaturate + show all thicknesses + highlight clashes).
         self._view_mode = 'normal'
@@ -502,6 +540,11 @@ class View3D:
         # Per-corner meshes (4 corners max)
         self._tire_meshes    = [self._new_mesh((0.18, 0.18, 0.18, 0.6)) for _ in range(4)]
         self._upright_meshes = [self._new_mesh((0.50, 0.40, 0.30, 0.30)) for _ in range(4)]
+        # Ball-joint spheres (1" dia envelope) + upright mounting VOLUME per
+        # corner — makes the packaging visible and gives the interference check
+        # a real solid to test against (see set_frame_overlay / clash lists).
+        self._balljoint_meshes  = [self._new_mesh((0.85, 0.85, 0.88, 0.92)) for _ in range(4)]
+        self._uprightvol_meshes = [self._new_mesh((0.55, 0.42, 0.30, 0.26)) for _ in range(4)]
         self._rocker_meshes  = [self._new_mesh((0.85, 0.70, 0.12, 1.0)) for _ in range(4)]
         # Spring / damper cylinder per corner — radius set via set_spring_dims
         self._spring_meshes  = [self._new_mesh((0.75, 0.75, 0.78, 0.70)) for _ in range(4)]
@@ -538,6 +581,8 @@ class View3D:
         self._car_meshes = (
             [(m, (0.18, 0.18, 0.18, 0.6)) for m in self._tire_meshes]
             + [(m, (0.50, 0.40, 0.30, 0.30)) for m in self._upright_meshes]
+            + [(m, (0.85, 0.85, 0.88, 0.92)) for m in self._balljoint_meshes]
+            + [(m, (0.55, 0.42, 0.30, 0.26)) for m in self._uprightvol_meshes]
             + [(m, (0.85, 0.70, 0.12, 1.0)) for m in self._rocker_meshes]
             + [(m, (0.75, 0.75, 0.78, 0.70)) for m in self._spring_meshes]
             + [(self._diff_mesh, (0.55, 0.55, 0.58, 0.90))]
@@ -958,6 +1003,8 @@ class View3D:
                 self._spring_meshes[ci].set_data(vertices=_z, faces=_t)
                 self._rotor_meshes[ci].set_data(vertices=_z, faces=_t)
                 self._caliper_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._balljoint_meshes[ci].set_data(vertices=_z, faces=_t)
+                self._uprightvol_meshes[ci].set_data(vertices=_z, faces=_t)
                 continue
 
             # control-arm / pushrod / tie-rod members: drawn as SOLID TUBES
@@ -980,6 +1027,22 @@ class View3D:
                               ('tie_rod_outer','uca_outer')]:
                 link_pos += [pts[pa2], pts[pb2]]
                 link_col += [(0.65, 0.50, 0.38, 1.0)] * 2
+
+            # ball-joint spheres (1" dia) at the lower + upper ball joints, and a
+            # coarse upright mounting VOLUME (tetra over the 4 upright hardpoints).
+            _bjr = 0.0127   # 1 inch diameter -> 12.7 mm radius
+            if (np.all(np.isfinite(pts['lca_outer']))
+                    and np.all(np.isfinite(pts['uca_outer']))):
+                sv0, sf0 = build_sphere(pts['lca_outer'], _bjr)
+                sv1, sf1 = build_sphere(pts['uca_outer'], _bjr)
+                bv = np.vstack([sv0, sv1]).astype(np.float32)
+                bf = np.vstack([sf0, sf1 + len(sv0)]).astype(np.uint32)
+                self._balljoint_meshes[ci].set_data(vertices=bv, faces=bf)
+            if all(pk in pts and np.all(np.isfinite(pts[pk]))
+                   for pk in ('lca_outer', 'uca_outer', 'tie_rod_outer', 'wheel_center')):
+                tv, tf = build_tetra(pts['lca_outer'], pts['uca_outer'],
+                                     pts['tie_rod_outer'], pts['wheel_center'])
+                self._uprightvol_meshes[ci].set_data(vertices=tv, faces=tf)
 
             # rocker polygon: pivot at centre, 3 arms (pushrod, spring, ARB drop)
             # order by angle so the fan covers the whole rocker plate.
@@ -1860,11 +1923,20 @@ class View3D:
                 # View direction (toward center) = [-sin(az)*cos(el), cos(az)*cos(el), -sin(el)]
                 # Camera RIGHT (cross(view_dir, world_up)) = [cos(az), sin(az), 0]
                 az    = np.radians(cam.azimuth)
+                el    = np.radians(cam.elevation)
                 sf    = cam.scale_factor * 0.003
+                # screen-right and screen-UP in world coords.  The up vector MUST
+                # include elevation: at the top view (el≈90°) world +Z is the camera's
+                # view/depth axis, so the old hard-coded c[2]+=dy dollied the camera
+                # (read as zoom).  up_w below stays in the ground plane at the top and
+                # degrades to (0,0,1) at el=0, so front/side pan is byte-identical.
                 right_w = np.array([np.cos(az), np.sin(az), 0.0])   # screen-right in world
+                up_w    = np.array([-np.sin(az) * np.sin(el),
+                                     np.cos(az) * np.sin(el),
+                                     np.cos(el)])                    # screen-up in world
                 c     = np.array(cam.center, float)
                 c    -= right_w * (dx * sf)   # drag right → center shifts left → scene pans right
-                c[2] += dy * sf               # drag down  → scene pans down
+                c    += up_w   * (dy * sf)    # drag down  → scene pans down (any elevation)
                 cam.center = tuple(c)
 
             self._canvas.update()

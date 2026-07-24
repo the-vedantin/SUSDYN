@@ -3600,11 +3600,12 @@ class MainWindow(QMainWindow):
             self._on_snap_axis_to_normal)
         self._direct_edit_panel.snap_actuation_to_plane_requested.connect(
             self._on_snap_actuation_to_plane)
+        self._direct_edit_panel.snap_pushrod_to_lca_requested.connect(
+            self._on_snap_pushrod_to_lca)
         # Frame / interference check — its OWN always-visible panel (placed high
         # in the left sidebar) so the thickness toggle is never buried.
         self._frame_panel = FrameInterferencePanel()
         self._frame_panel.frame_changed.connect(self._update_3d)
-        self._direct_edit_panel.rack_length_changed.connect(self._on_rack_length)
         self._direct_edit_panel.shock_length_changed.connect(self._on_shock_length)
         self._mirror_to_other_axle = False
 
@@ -5767,27 +5768,45 @@ class MainWindow(QMainWindow):
                 from vahan.interference import clashes as _clashfn
                 _mode = self._car.get('view_mode', 'normal')
                 _clash_segs = []
-                if _mode == 'interference' and _pkg is not None:
-                    _TR = 0.008
+                if _mode == 'interference':
+                    _TR = 0.008        # arm / rod capsule radius
+                    _UR = 0.010        # upright body edge radius
+                    _BJ = 0.0127       # 1" ball-joint sphere radius
                     _dr = 0.5 * float(self._car.get('driveshaft_dia_mm', 25.4)) / 1000.0
+                    # every corner (front + rear), guarded so a missing key never
+                    # aborts the whole check.  Ball joints are zero-length (sphere)
+                    # capsules.  clashes() skips pairs that share an endpoint, so an
+                    # arm/tie-rod BOLTING to a ball joint is not a false clash — but a
+                    # pushrod or tie-rod passing THROUGH one (v31's bug) is caught.
+                    # NOTE: the upright body is drawn as a solid volume (view3d tetra)
+                    # for the eye, but is NOT added here as edge-capsules — its corners
+                    # ARE the members' own pickups, so edge-capsules falsely flag every
+                    # arm/tie-rod that legitimately attaches to it.  The ball-joint
+                    # spheres carry the meaningful automated check.
+                    _ = _UR  # (upright edge radius reserved; not used as a clash body)
+                    _specs = [
+                        ('upper arm front', 'uca_front', 'uca_outer', _TR),
+                        ('upper arm rear',  'uca_rear',  'uca_outer', _TR),
+                        ('lower arm front', 'lca_front', 'lca_outer', _TR),
+                        ('lower arm rear',  'lca_rear',  'lca_outer', _TR),
+                        ('tie / toe rod',   'tie_rod_inner', 'tie_rod_outer', _TR),
+                        ('pushrod',         'pushrod_outer', 'pushrod_inner', _TR),
+                        ('lower ball joint', 'lca_outer', 'lca_outer', _BJ),
+                        ('upper ball joint', 'uca_outer', 'uca_outer', _BJ),
+                    ]
                     for c in corners_draw:
-                        if c['label'] not in ('RL', 'RR'):
-                            continue
                         pp = c['pts']
-                        if not all(k in pp for k in ('uca_front', 'lca_front',
-                                                     'pushrod_inner', 'tie_rod_inner')):
-                            continue
                         def _P(k):
-                            return np.asarray(pp[k], float)
-                        mem = [
-                            {'name': 'upper arm front', 'a': _P('uca_front'), 'b': _P('uca_outer'), 'r': _TR},
-                            {'name': 'upper arm rear',  'a': _P('uca_rear'),  'b': _P('uca_outer'), 'r': _TR},
-                            {'name': 'lower arm front', 'a': _P('lca_front'), 'b': _P('lca_outer'), 'r': _TR},
-                            {'name': 'lower arm rear',  'a': _P('lca_rear'),  'b': _P('lca_outer'), 'r': _TR},
-                            {'name': 'tie / toe rod',   'a': _P('tie_rod_inner'),  'b': _P('tie_rod_outer'), 'r': _TR},
-                            {'name': 'pushrod',         'a': _P('pushrod_outer'), 'b': _P('pushrod_inner'), 'r': _TR},
-                        ]
-                        _seg = _pkg.get(c['label'])
+                            v = pp.get(k)
+                            return None if v is None else np.asarray(v, float)
+                        mem = []
+                        for nm, ka, kb, rr in _specs:
+                            a, b = _P(ka), _P(kb)
+                            if a is not None and b is not None and np.all(np.isfinite(a)) and np.all(np.isfinite(b)):
+                                mem.append({'name': nm, 'a': a, 'b': b, 'r': rr})
+                        if len(mem) < 2:
+                            continue
+                        _seg = _pkg.get(c['label']) if (_pkg is not None and c['label'] in ('RL', 'RR')) else None
                         if _seg is not None:
                             mem.append({'name': 'driveshaft', 'a': np.asarray(_seg['inner'], float),
                                         'b': np.asarray(_seg['outer'], float), 'r': _dr})
@@ -6078,6 +6097,17 @@ class MainWindow(QMainWindow):
             for k in shift_keys:
                 if k in self._rear_hp:
                     self._rear_hp[k] = self._rear_hp[k] + dx
+
+        # ── rack length → set front tie_rod_inner X to +/- length/2 ─────
+        # Single source for rack length (the duplicate DirectEdit box was
+        # removed); applied live here so editing the top Car-panel box moves
+        # the geometry immediately.  Sign of tie_rod_inner.X is preserved.
+        rk = params.get('rack_length_mm', old.get('rack_length_mm'))
+        if rk is not None and 'tie_rod_inner' in self._front_hp:
+            tri = np.asarray(self._front_hp['tie_rod_inner'], float).copy()
+            if abs(abs(tri[0]) * 2000.0 - float(rk)) > 0.05:
+                tri[0] = (1.0 if tri[0] >= 0 else -1.0) * float(rk) / 2000.0
+                self._front_hp['tie_rod_inner'] = tri
 
         # ── wheel offset delta → shift ONLY wheel_center in X ────────────
         # Wheel offset = how far the wheel sits beyond the outboard pickups.
@@ -6919,6 +6949,57 @@ class MainWindow(QMainWindow):
             f'Snapped {len(snap)} actuation point(s) onto the {axle} rocker '
             'plane.', 4000)
 
+    def _on_snap_pushrod_to_lca(self, axle: str):
+        """Snap pushrod_outer onto the CONTROL-ARM plane + 1" bearing clearance.
+
+        The pushrod foot bolts to a plate welded on TOP of the wishbone, so its
+        1" spherical rod-end must sit ~1" ABOVE the arm plane (clear of the arm
+        thickness), loading straight into the arm.  Rear pushrod picks up on the
+        LOWER arm; the front pushrod is UCA-mounted so it snaps to the UPPER arm.
+        ONE undo step.
+        """
+        is_front = axle.lower().startswith('f')
+        hp = self._front_hp if is_front else self._rear_hp
+        trio = ('uca_front', 'uca_rear', 'uca_outer') if is_front else \
+               ('lca_front', 'lca_rear', 'lca_outer')
+        need = trio + ('pushrod_outer',)
+        if not all(k in hp and hp[k] is not None and np.all(np.isfinite(hp[k])) for k in need):
+            self.statusBar().showMessage(
+                f'SNAP PUSHROD — {axle} axle missing arm / pushrod points', 3000)
+            return
+        a0 = np.asarray(hp[trio[0]], float)
+        n = np.cross(np.asarray(hp[trio[1]], float) - a0,
+                     np.asarray(hp[trio[2]], float) - a0)
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-9:
+            self.statusBar().showMessage('SNAP PUSHROD — arm plane degenerate', 4000)
+            return
+        n /= nn
+        if n[2] < 0:
+            n = -n                                   # orient the normal "up"
+        CLEAR = 0.0254                               # 1" bearing clearance above the plane
+        snap = [{'is_front': is_front, 'category': 'corner', 'hp_name': 'pushrod_outer',
+                 'prev': np.asarray(hp['pushrod_outer'], float).copy()}]
+        P = np.asarray(hp['pushrod_outer'], float)
+        foot = P - float(np.dot(P - a0, n)) * n      # perpendicular foot on the plane
+        hp['pushrod_outer'] = foot + CLEAR * n       # lift 1" along the normal
+        self._edit_history.append(snap)
+        self._redo_stack.clear()
+        if len(self._edit_history) > 200:
+            self._edit_history.pop(0)
+        try:
+            panel = self._front_hp_panel if is_front else self._rear_hp_panel
+            panel.refresh(hp, self._front_arb if is_front else self._rear_arb,
+                          self._front_heave if is_front else self._rear_heave,
+                          self._front_decoupled if is_front else self._rear_decoupled)
+        except Exception:
+            pass
+        self._rebuild_solvers()
+        self._update_3d()
+        self._direct_edit_panel.set_edit_count(len(self._edit_history))
+        self.statusBar().showMessage(
+            f'Snapped {axle} pushrod_outer onto the arm plane + 1" clearance.', 4000)
+
     @staticmethod
     def _seg_seg_dist(p1, q1, p2, q2):
         """Minimum distance between two 3-D segments p1-q1 and p2-q2 (metres)."""
@@ -7037,12 +7118,8 @@ class MainWindow(QMainWindow):
         return None, None
 
     def _update_dimension_readouts(self):
-        """Populate the panel's rack length + front/rear shock length boxes
-        from the current geometry."""
-        rack = None
-        if 'tie_rod_inner' in self._front_hp:
-            rack = abs(float(self._front_hp['tie_rod_inner'][0])) * 2000.0
-
+        """Populate the panel's front/rear shock-length boxes from the current
+        geometry (rack length lives on the top Car panel)."""
         def shock(hp):
             fk, mk = self._shock_ends(hp)
             if fk is None:
@@ -7051,7 +7128,7 @@ class MainWindow(QMainWindow):
                                         - np.asarray(hp[fk], float))) * 1000.0
         try:
             self._direct_edit_panel.set_dimensions(
-                rack, shock(self._front_hp), shock(self._rear_hp))
+                shock(self._front_hp), shock(self._rear_hp))
         except Exception:
             pass
 
@@ -7074,22 +7151,9 @@ class MainWindow(QMainWindow):
         self._update_3d()
         self._direct_edit_panel.set_edit_count(len(self._edit_history))
 
-    def _on_rack_length(self, length_mm: float):
-        """Front rack length (tip-to-tip inner tie-rod pickups): set
-        tie_rod_inner X to +/- length/2; Y and Z (position) untouched."""
-        hp = self._front_hp
-        if 'tie_rod_inner' not in hp:
-            return
-        cur = np.asarray(hp['tie_rod_inner'], float)
-        if abs(abs(cur[0]) * 2000.0 - length_mm) < 0.05:
-            return
-        new = cur.copy()
-        new[0] = (length_mm / 2000.0) * (1.0 if cur[0] >= 0 else -1.0)
-        hp['tie_rod_inner'] = new
-        self._commit_dim_edit(True, 'corner', 'tie_rod_inner', cur)
-        self.statusBar().showMessage(
-            f'Front rack length set to {length_mm:.1f} mm '
-            f'(tie_rod_inner X = {new[0]*1000:.1f} mm).', 4000)
+    # (Rack length is edited on the top Car panel only — _on_car applies it to
+    #  tie_rod_inner.X live.  The old DirectEdit rack box + its handler were
+    #  removed as duplicates.)
 
     def _on_shock_length(self, axle: str, length_mm: float):
         """Damper mount-to-mount length: move the chassis end along the damper

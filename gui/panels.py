@@ -6516,8 +6516,8 @@ class DirectEditPanel(CollapsibleSection):
     # spring_chassis_pt / damper ends / ARB drop link onto the rocker plate
     # plane and snap the rocker pin normal.  Payload = (axle,).
     snap_actuation_to_plane_requested = pyqtSignal(str)
+    snap_pushrod_to_lca_requested = pyqtSignal(str)
     # Set a LENGTH directly (coordinates stay for position).
-    rack_length_changed = pyqtSignal(float)        # mm, inner-pickup tip-to-tip
     shock_length_changed = pyqtSignal(str, float)  # (axle, mm) mount-to-mount
     # Fired when the plane-tilt axle selector changes, so MainWindow can
     # repopulate the pivot dropdown with the pivots that actually exist on
@@ -6830,6 +6830,24 @@ class DirectEditPanel(CollapsibleSection):
         prow4b.addWidget(btn_snap_act, 1)
         self.add_layout(prow4b)
 
+        prow4c = QHBoxLayout(); prow4c.setSpacing(6)
+        btn_snap_pr = QPushButton('Snap pushrod → arm plane + 1"')
+        btn_snap_pr.setToolTip(
+            'Project pushrod_outer onto the CONTROL-ARM plane (lower arm; the '
+            'front UCA-mounted pushrod snaps to the upper arm) and lift it 1" '
+            '(25.4 mm) along the plane normal — the pushrod foot bolts to a plate '
+            'welded on TOP of the wishbone, so the rod-end must clear the arm '
+            'thickness.\nONE undo step.')
+        btn_snap_pr.clicked.connect(self._emit_snap_pushrod_to_lca)
+        btn_snap_pr.setStyleSheet("""
+            QPushButton { background:#2a2a2a; color:#FFD600;
+                          border:1px solid #3a3a3a; border-radius:4px;
+                          padding:5px 10px; }
+            QPushButton:hover { background:#3a3a3a; color:#FFEA00; }
+        """)
+        prow4c.addWidget(btn_snap_pr, 1)
+        self.add_layout(prow4c)
+
         plane_hint = QLabel(
             'Moves all rocker-plane hardpoints together (pushrod, rocker,\n'
             'spring chassis pt, drop link) so the plane tilts as one rigid\n'
@@ -6873,37 +6891,38 @@ class DirectEditPanel(CollapsibleSection):
             """)
             return b
 
-        srow = QHBoxLayout(); srow.setSpacing(6)
-        srow.addWidget(QLabel('Spring set:'))
-        srow.addWidget(_gbtn('▲ up', 'spring', 2, +1.0,
-            'Move the inboard spring/actuation hardware (rocker, spring-chassis, '
-            'pushrod inner, heave / decoupled cradle) UP. Pushrod OUTER stays on '
-            'the wishbone.'), 1)
-        srow.addWidget(_gbtn('▼ down', 'spring', 2, -1.0,
-            'Move the inboard spring/actuation hardware DOWN.'), 1)
-        self.add_layout(srow)
+        # Full 6-direction mover per group (all 3 axes).  Directions are named the
+        # same way as the single-point WASDQE nudge (W/S = fwd/aft, Q/E = up/down,
+        # A = out, D = in) so the two edit surfaces read alike.  Group moves are
+        # BUTTON-driven; there is no group keyboard shortcut (the bare WASDQE keys
+        # nudge the single selected hardpoint).
+        def _grow6(label, group, extra=''):
+            row = QHBoxLayout(); row.setSpacing(4)
+            lab = QLabel(label); lab.setMinimumWidth(78); row.addWidget(lab)
+            for txt, ax, sg, dsc in (
+                ('◄in',  0, -1.0, 'inboard (−X, toward centreline)'),
+                ('out►', 0, +1.0, 'outboard (+X)'),
+                ('fwd',  1, +1.0, 'forward (+Y — matches the W key)'),
+                ('aft',  1, -1.0, 'rearward (−Y — matches the S key)'),
+                ('▲up',  2, +1.0, 'up (+Z — matches the Q key)'),
+                ('▼dn',  2, -1.0, 'down (−Z — matches the E key)'),
+            ):
+                row.addWidget(_gbtn(txt, group, ax, sg, f'{label}: move {dsc}. {extra}'), 1)
+            self.add_layout(row)
 
-        arow = QHBoxLayout(); arow.setSpacing(6)
-        arow.addWidget(QLabel('ARB:'))
-        arow.addWidget(_gbtn('▲ up', 'arb', 2, +1.0,
-            'Move the ARB body UP. The drop-link top stays bolted to the '
-            'rocker/upright.'), 1)
-        arow.addWidget(_gbtn('▼ down', 'arb', 2, -1.0,
-            'Move the ARB body DOWN (drop-link top stays put).'), 1)
-        self.add_layout(arow)
-
-        crow = QHBoxLayout(); crow.setSpacing(6)
-        crow.addWidget(QLabel('Inboard arms:'))
-        crow.addWidget(_gbtn('◄ in', 'arms', 0, -1.0,
-            'Move inboard control-arm + toe-link pickups INBOARD (toward '
-            'centreline). Front steering-rack inboard point is NOT moved.'), 1)
-        crow.addWidget(_gbtn('out ►', 'arms', 0, +1.0,
-            'Move inboard control-arm + toe-link pickups OUTBOARD. Front '
-            'steering-rack inboard point is NOT moved.'), 1)
-        self.add_layout(crow)
+        _grow6('Spring set:', 'spring',
+               'Inboard spring/actuation hardware (rocker, spring-chassis, pushrod '
+               'inner, heave/decoupled cradle). Pushrod OUTER stays on the wishbone.')
+        _grow6('ARB:', 'arb',
+               'ARB body; the drop-link top stays bolted to the rocker/upright.')
+        _grow6('Inboard arms:', 'arms',
+               'Inboard control-arm + toe-link pickups. Front steering-rack inboard '
+               'point is NOT moved.')
 
         grp_hint = QLabel(
             'Shifts a whole sub-assembly on the selected axle as ONE undo step.\n'
+            '(Bare WASDQE still nudges the single selected point: A out, D in, '
+            'W fwd, S aft, Q up, E down.)\n'
             'Geometry stays the source of truth — track / dynamics / loads follow.')
         grp_hint.setStyleSheet(f'color:{C_SUB}; font-size:10px;'
                                ' padding:2px 2px 6px 2px;')
@@ -6929,11 +6948,11 @@ class DirectEditPanel(CollapsibleSection):
             self.add_layout(row)
             return sb
 
-        self._rack_len = _len('Rack length (front):', 50.0, 900.0,
-            'Tip-to-tip spacing of the two inner tie-rod pickups. Sets the X of '
-            'tie_rod_inner symmetrically; Y/Z (position) untouched.')
-        self._rack_len.editingFinished.connect(
-            lambda: self.rack_length_changed.emit(self._rack_len.value()))
+        # Rack length is a whole-car dimension — it lives ONCE at the top (Car
+        # panel), which now drives tie_rod_inner.X live.  The duplicate box that
+        # used to sit here was removed per user feedback ("redundant... isn't that
+        # already on the very tippy top?").  Shock lengths stay: they have no
+        # top-level twin.
         self._shock_len_f = _len('Shock length (front):', 50.0, 600.0,
             'Mount-to-mount length of the front damper. Moves the chassis end '
             'along the damper axis; the rocker/spring end stays put.')
@@ -7149,10 +7168,15 @@ class DirectEditPanel(CollapsibleSection):
         self.snap_actuation_to_plane_requested.emit(
             self._cmb_plane_axle.currentText().lower())
 
-    def set_dimensions(self, rack_mm, shock_f_mm, shock_r_mm):
-        """Populate the length boxes with current geometry (no signal)."""
-        for sb, v in ((self._rack_len, rack_mm),
-                      (self._shock_len_f, shock_f_mm),
+    def _emit_snap_pushrod_to_lca(self):
+        """Snap pushrod_outer onto the control-arm plane + 1" clearance."""
+        self.snap_pushrod_to_lca_requested.emit(
+            self._cmb_plane_axle.currentText().lower())
+
+    def set_dimensions(self, shock_f_mm, shock_r_mm):
+        """Populate the shock-length boxes with current geometry (no signal).
+        Rack length is shown/edited on the top Car panel, not here."""
+        for sb, v in ((self._shock_len_f, shock_f_mm),
                       (self._shock_len_r, shock_r_mm)):
             sb.blockSignals(True)
             if v is not None and v > 0:

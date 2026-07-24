@@ -316,6 +316,157 @@ print(f'interference     : {len(_cl)} clash(es) {[(d["a"],d["b"],d["gap_mm"]) fo
       f'real-overlap flagged + pushrod/LCA joint skipped={_int_ok}   '
       f'{"pass" if _int_ok else "UNEXPECTED FAIL"}')
 
+# ── REAL-GEOMETRY ACTUATION GATE ─────────────────────────────────────────────
+# The synthetic test above only proves the ENGINE runs.  v28 slid the rear
+# pushrod off the lower arm toward the tie-rod (dy -51 mm, tie-rod gap 71->22 mm)
+# and canted the damper 63 mm rearward to force coplanarity by projection -- and
+# NOTHING here caught it, because the net never loaded the actual design.  A pure
+# capsule-overlap alarm would have missed it too (22 mm is a near-miss, not an
+# overlap).  So load the CURRENT design config and assert the three properties a
+# bad rear-actuation edit breaks -- pushrod over the LCA, damper flat (not canted
+# fore-aft), rocker coplanar -- plus a realistic-radius clash sweep.  This block
+# FAILS on v28 and PASSES on v29 (the fix).  Skips cleanly if no config present.
+import glob as _glob, re as _re
+def _seg_gap(a1, a2, b1, b2, ra, rb):
+    # all inputs in mm; returns surface-to-surface gap in mm (negative = overlap)
+    a1, a2, b1, b2 = (np.asarray(x, float) for x in (a1, a2, b1, b2))
+    d1, d2, r = a2 - a1, b2 - b1, a1 - b1
+    A, E, F = d1 @ d1, d2 @ d2, d2 @ r
+    if A < 1e-12 and E < 1e-12: s = t = 0.0
+    elif A < 1e-12: s, t = 0.0, np.clip(F / E, 0, 1)
+    else:
+        C = d1 @ r
+        if E < 1e-12: t, s = 0.0, np.clip(-C / A, 0, 1)
+        else:
+            B = d1 @ d2; den = A * E - B * B
+            s = np.clip((B * F - C * E) / den, 0, 1) if den > 1e-12 else 0.0
+            t = (B * s + F) / E
+            if t < 0: t, s = 0.0, np.clip(-C / A, 0, 1)
+            elif t > 1: t, s = 1.0, np.clip((B - C) / A, 0, 1)
+    return float(np.linalg.norm((a1 + s * d1) - (b1 + t * d2)) - (ra + rb))
+
+_cfgs = _glob.glob('configs/2027_v*.vahan')
+_design = max(_cfgs, key=lambda p: int((_re.search(r'2027_v(\d+)', p) or [0, -1]).__getitem__(1))
+              if _re.search(r'2027_v(\d+)', p) else -1) if _cfgs else None
+if _design:
+    wD = MainWindow(); wD._load_project_from_path(_design); wD._rebuild_solvers(0.)
+    # Rear half-shaft segments (mm) so the gate catches the pushrod crossing the
+    # driveshaft -- the v32 clash the old gate MISSED (it had no driveshaft member).
+    import types as _types
+    try:
+        from vahan.driveshaft import package as _dspkg
+        _rs = {}
+        for _l in ('RL', 'RR'):
+            _s = wD._solvers[_l].solve(0.)
+            _rs[_l] = _types.SimpleNamespace(wheel_center=np.asarray(_s.wheel_center, float),
+                                             spin_axis=np.asarray(_s.spin_axis, float))
+        _pkg = _dspkg(wD._car, _rs)
+        _DS = {_l: (np.asarray(_pkg[_l]['inner'], float) * 1000, np.asarray(_pkg[_l]['outer'], float) * 1000)
+               for _l in ('RL', 'RR') if _pkg.get(_l)}
+    except Exception:
+        _DS = {}
+    # v32 RESOLVED (user chose the clearing-window pushrod foot): driveshaft clears
+    # +4.7 mm, rear bump steer re-nulled 0.017 deg.  No standing exemptions -- any
+    # clash or bump-steer failure is UNEXPECTED again and fails the net.
+    _KNOWN = ()
+    gfail = []
+    for lbl in ('RL', 'RR'):
+        arb = wD._rear_arb
+        # coplanarity of the rocker PLATE across travel.  The plate is defined by the
+        # points bolted to it: pushrod_inner, rocker_pivot, rocker_spring_pt,
+        # arb_drop_top (+ the coplanar damper's spring_chassis_pt).  pushrod_OUTER is
+        # NOT on the plate — it is the wishbone-side rod-end, deliberately lifted ~1"
+        # above the lower-arm plane for bearing clearance — so it is excluded here (its
+        # height is checked separately below).
+        cop = 0.0
+        for _t in (-0.025, 0.0, 0.025):
+            st = wD._solvers[lbl].solve(_t)
+            P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
+            pts = np.array([P('pushrod_inner'), P('rocker_pivot'),
+                            P('rocker_spring_pt'), P('spring_chassis_pt'),
+                            np.asarray(arb['arb_drop_top'], float) * 1000.0])
+            c = pts.mean(0); _, _, vt = np.linalg.svd(pts - c)
+            cop = max(cop, float(np.abs((pts - c) @ vt[-1]).max()))
+        st = wD._solvers[lbl].solve(0.)
+        P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
+        po, lo = P('pushrod_outer'), P('lca_outer')
+        lf, lr = P('lca_front'), P('lca_rear')
+        rsp, scp = P('rocker_spring_pt'), P('spring_chassis_pt')
+        A = lambda k: np.asarray(arb[k], float) * 1000.0
+        # "over the LCA" = the pushrod loads onto a PLATE welded on TOP of the lower
+        # arm: the 1" spherical rod-end (pushrod_outer is its centre) sits ~1" ABOVE
+        # the arm plane, clear of the arm's own thickness, never buried below it and
+        # never flung far off it (v28 slid it toward the tie-rod).  Signed perpendicular
+        # distance to the plane through the arm's three pickups, +normal oriented up.
+        _n = np.cross(lr - lf, lo - lf); _n = _n / (np.linalg.norm(_n) or 1.0)
+        if _n[2] < 0:
+            _n = -_n
+        d_arm = float((po - lo) @ _n)          # signed mm; + = above the arm plane
+        if d_arm < -3.0 or d_arm > 35.0:
+            gfail.append(f'{lbl} pushrod perp-to-arm {d_arm:.0f} mm (want 0..35 above)')
+        if abs(rsp[1] - scp[1]) > 25:
+            gfail.append(f'{lbl} damper canted fore-aft {abs(rsp[1]-scp[1]):.0f} mm')
+        if cop > 3.0:
+            gfail.append(f'{lbl} rocker non-coplanar {cop:.1f} mm')
+        # realistic-radius clash sweep (mm radii: pushrod 5, arm 9, tierod 6, damper 11)
+        # restricted to the pairs a bad ACTUATION edit newly breaks (v28 drove the
+        # pushrod at the tie-rod and canted the damper into the arms).  Same-arm
+        # legs share the outer ball joint (designed), and the rear pushrod already
+        # runs close to the upper A-arm front leg in EVERY version since v27 -- both
+        # are excluded so this gate flags only NEW actuation clashes, not standing
+        # geometry the user has already accepted.
+        mem = {'uarm_f': (P('uca_front'), P('uca_outer'), 9), 'uarm_r': (P('uca_rear'), P('uca_outer'), 9),
+               'larm_f': (P('lca_front'), P('lca_outer'), 9), 'larm_r': (P('lca_rear'), P('lca_outer'), 9),
+               'tierod': (P('tr_inner'), P('tr_outer'), 6), 'pushrod': (P('pushrod_outer'), P('pushrod_inner'), 5),
+               'damper': (rsp, scp, 11)}
+        AT_RISK = [('pushrod', 'tierod'), ('damper', 'uarm_f'), ('damper', 'uarm_r'),
+                   ('damper', 'larm_f'), ('damper', 'larm_r'), ('damper', 'tierod')]
+        for n1, n2 in AT_RISK:
+            gap = _seg_gap(mem[n1][0], mem[n1][1], mem[n2][0], mem[n2][1], mem[n1][2], mem[n2][2])
+            if gap < 0:
+                gfail.append(f'{lbl} CLASH {n1}<->{n2} {gap:.0f} mm')
+        # ball-joint spheres (1" dia): catch a rod passing THROUGH a joint (v31's
+        # tie-rod-through-ball-joint), skipping the designed rod-end that bolts to it.
+        for _rn in ('pushrod', 'tierod'):
+            _sg = mem[_rn]
+            for _bn, _bp in (('lowerBJ', P('lca_outer')), ('upperBJ', P('uca_outer'))):
+                if min(np.linalg.norm(_sg[0] - _bp), np.linalg.norm(_sg[1] - _bp)) < 8:
+                    continue                       # designed joint (rod-end bolts here)
+                if _seg_gap(_sg[0], _sg[1], _bp, _bp, _sg[2], 12.7) < 0:
+                    gfail.append(f'{lbl} CLASH {_rn}<->{_bn}')
+        # rear pushrod vs the half-shaft (the v32 clash the old gate never checked).
+        if lbl in _DS:
+            _g = _seg_gap(mem['pushrod'][0], mem['pushrod'][1], _DS[lbl][0], _DS[lbl][1], mem['pushrod'][2], 12.7)
+            if _g < 0:
+                gfail.append(f'{lbl} CLASH pushrod<->driveshaft {_g:.0f} mm')
+    # bump steer: a tie-rod move must not wreck the toe curve (the v32 rear
+    # regression 0.002 -> 0.167 deg/25mm the old gate never checked).
+    for _l, _isf in (('FL', True), ('RL', False)):
+        _aln = wD._alignment
+        _rr = wD._do_sweep(wD._solvers[_l], np.linspace(-0.025, 0.025, 5), 'left',
+                           arb_hp=wD._front_arb if _isf else wD._rear_arb,
+                           camber_off=_aln['front_camber_deg'] if _isf else _aln['rear_camber_deg'],
+                           toe_off=_aln['front_toe_deg'] if _isf else _aln['rear_toe_deg'], is_front=_isf)
+        _toe = np.asarray(_rr['toe'], float)
+        _bs = float(np.nanmax(_toe) - np.nanmin(_toe))   # full-range over +/-25 mm
+        if _bs > 0.15:
+            gfail.append(f'{"front" if _isf else "rear"} bump steer {_bs:.3f} deg full-travel')
+    # UNEXPECTED failures fail the net; the documented KNOWN open v32 conflict
+    # (pushrod/driveshaft + rear bump steer) prints but does not (awaiting user).
+    _unexp = [g for g in gfail if not any(k in g for k in _KNOWN)]
+    _known = [g for g in gfail if any(k in g for k in _KNOWN)]
+    gok = not _unexp
+    if not gok:
+        fails += 1
+    if not gfail:
+        _msg = "pushrod over LCA, damper flat, coplanar, no clash, bump steer OK"
+    elif _unexp:
+        _msg = "; ".join(_unexp) + (f"  [+KNOWN: {'; '.join(_known)}]" if _known else "")
+    else:
+        _msg = "KNOWN open conflict [" + "; ".join(_known) + "] -- awaiting user decision on rear pushrod routing"
+    print(f'design actuation : {os.path.basename(_design)} — {_msg}   '
+          f'{"pass" if gok else "UNEXPECTED FAIL"}')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly
