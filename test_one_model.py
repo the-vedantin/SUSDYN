@@ -394,6 +394,22 @@ if _design:
         lf, lr = P('lca_front'), P('lca_rear')
         rsp, scp = P('rocker_spring_pt'), P('spring_chassis_pt')
         A = lambda k: np.asarray(arb[k], float) * 1000.0
+        # DROP-LINK rule (user): at STATIC the ARB drop link must lie IN the rocker
+        # actuation plane (both ends).  Across travel the blade end arcs with the
+        # bar so it CANNOT stay in-plane — that lean is minimized by design and
+        # only reported here, not failed.
+        try:
+            _cd, _ = wD._assemble_corners_draw({_l: 0.0 for _l in ('FL', 'FR', 'RL', 'RR')}, 0.0)
+            _pts = [c for c in _cd if c['label'] == lbl][0]['pts']
+            _ae = np.asarray(_pts['arb_arm_end_world'], float) * 1000.0
+            _pl = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
+                            P('rocker_spring_pt'), P('spring_chassis_pt')])
+            _c0 = _pl.mean(0); _, _, _vt = np.linalg.svd(_pl - _c0)
+            _doff = float(abs((_ae - _c0) @ _vt[-1]))
+            if _doff > 3.0:
+                gfail.append(f'{lbl} ARB drop link off the actuation plane at static ({_doff:.1f} mm)')
+        except Exception:
+            pass
         # "over the LCA" = the pushrod loads onto a PLATE welded on TOP of the lower
         # arm: the 1" spherical rod-end (pushrod_outer is its centre) sits ~1" ABOVE
         # the arm plane, clear of the arm's own thickness, never buried below it and
