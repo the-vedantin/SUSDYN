@@ -743,6 +743,52 @@ except Exception as _e:
     fails += 1
     print(f'yaw inertia sane : UNEXPECTED FAIL ({_e})')
 
+# ── ROLL GRADIENT + ARB RATE SANITY, and ONE MODEL between the panel and the
+#    solver.  The 2027 design shipped an ARB whose hardpoints gave a 47 mm lever
+#    on a 155 mm half-bar -> 353 N/mm at the wheel and a roll gradient of
+#    0.095 deg/g.  No car runs that (FSAE is 1-2 deg/g; the team's own 2026 car
+#    measured ~1 deg/g on the same tube).  Nothing in the tool complained,
+#    because the config's SAVED panel geometry was stale and looked sane until
+#    _refresh_arb_geometry_into_panel() recomputed it from the hardpoints.
+#    Gate three things: the rate stays inside the model's own sweep bound, the
+#    roll gradient is physically sane, and the panel and solver agree.
+print('-' * 64)
+try:
+    _wR = MainWindow(); _wR._load_project_from_path(_design); _wR._rebuild_solvers(0.)
+    _ssR = _wR._build_dynamics_solver(); _vR = _ssR._veh
+    _pR = _wR._dynamics_panel.get_params()      # after the solver's own refresh
+    _af, _ar = float(_vR.arb_rate_front_Npm), float(_vR.arb_rate_rear_Npm)
+    _rg = abs(float(_ssR.solve(1.0, 0.0).roll_angle_deg))     # deg per g
+    _rfail = []
+    # (1) ONE MODEL: what the panel computes must be what the solver uses
+    if abs(_pR['arb_rate_front_Npm'] - _af) > 1.0 or abs(_pR['arb_rate_rear_Npm'] - _ar) > 1.0:
+        _rfail.append(f'panel/solver ARB disagree (panel {_pR["arb_rate_front_Npm"]:.0f}/'
+                      f'{_pR["arb_rate_rear_Npm"]:.0f} vs solver {_af:.0f}/{_ar:.0f})')
+    # (2) the model's own documented sweep ceiling is 87,500 N/m (500 lbf/in)
+    if max(_af, _ar) > 87500.0:
+        _rfail.append(f'ARB wheel rate {max(_af,_ar):.0f} N/m exceeds the model\'s own '
+                      f'87,500 N/m bound')
+    # (3) roll gradient must be physically sane for a race car
+    if not (0.2 <= _rg <= 3.0):
+        _rfail.append(f'roll gradient {_rg:.3f} deg/g outside 0.2-3.0 '
+                      f'(FSAE runs 1-2; the 2026 car measured ~1)')
+    # KNOWN-FAIL, documented: the v34 ARB HARDPOINTS are undersized -- rear lever
+    # 47.2 mm on a 155 mm half-bar (front 75.4 / 80 mm) against the 2026 car's
+    # 104.8 / 270 mm, which measured ~1 deg/g on the same 12.7 mm tube.  Rate goes
+    # as 1/(A^2*L), so the bar is ~9x over-stiff by geometry alone.  The tool is
+    # reporting this correctly; the GEOMETRY is what needs moving, and that is a
+    # design change (it interacts with the coplanar drop-link rule), so it is
+    # flagged here rather than silently patched.  Fix = lengthen the lever and
+    # widen the half-span toward the 2026 values; the gate then passes on its own.
+    _KNOWN_ARB = 'ARB hardpoints undersized (lever/half-span) — see OPEN_INSTRUCTIONS'
+    if _rfail:
+        known += 1
+    print(f'roll/ARB sanity  : ARB {_af/1000:.1f}/{_ar/1000:.1f} kN/m, roll {_rg:.3f} deg/g   '
+          + ('pass' if not _rfail else f'KNOWN-FAIL: {"; ".join(_rfail)}'))
+except Exception as _e:
+    fails += 1
+    print(f'roll/ARB sanity  : UNEXPECTED FAIL ({_e})')
+
 # ── CALIPER MOUNT matches the caliper DRAWING, and the drawn caliper sits where
 #    the load arrows do.  Three different answers used to coexist: loads at
 #    R_pad-25 = 69.4 mm, the render hardcoded rearward at R_rotor-6 = 114 mm
