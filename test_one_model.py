@@ -716,6 +716,33 @@ except Exception as _e:
     fails += 1
     print(f'static sag sprung: UNEXPECTED FAIL ({_e})')
 
+# ── YAW INERTIA must be PHYSICALLY POSSIBLE.  m·a·b is the exact maximum
+#    longitudinal yaw inertia for mass living between the axles (all mass split
+#    onto the two axles, honouring the CG, gives exactly m·a·b).  The estimator
+#    shipped k=1.2, i.e. 1.2x that hard ceiling — a yaw radius of gyration LARGER
+#    than the half-wheelbase, which needs heavy overhangs this car does not have.
+#    Every yaw-acceleration number divides by this, so gate the ceiling, not a
+#    guessed value: any k >= 1 is unphysical for a car with light overhangs.
+print('-' * 64)
+try:
+    _vy = win._build_dynamics_solver()._veh
+    _m = float(_vy.total_mass_kg); _wb = float(_vy.wheelbase_m)
+    _wf = float(_vy.front_weight_fraction)
+    _a = _wb * (1 - _wf); _b = _wb * _wf          # CG->front, CG->rear
+    _ceil = _m * _a * _b                           # hard in-wheelbase maximum
+    _k = float(getattr(_vy, 'yaw_inertia_factor', 1.2))
+    _izz = _k * _ceil
+    _kgyr = np.sqrt(_izz / _m) if _m > 0 else 0.0
+    _yaw_ok = (_izz < _ceil) and (_kgyr < _wb / 2.0)
+    if not _yaw_ok:
+        fails += 1
+    print(f'yaw inertia sane : k={_k:.2f} -> Izz {_izz:.0f} kg.m^2 vs ceiling '
+          f'{_ceil:.0f}; gyradius {_kgyr*1000:.0f} mm vs half-wheelbase '
+          f'{_wb*500:.0f} mm   {"pass" if _yaw_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'yaw inertia sane : UNEXPECTED FAIL ({_e})')
+
 # ── CALIPER MOUNT matches the caliper DRAWING, and the drawn caliper sits where
 #    the load arrows do.  Three different answers used to coexist: loads at
 #    R_pad-25 = 69.4 mm, the render hardcoded rearward at R_rotor-6 = 114 mm

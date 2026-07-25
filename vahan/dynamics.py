@@ -114,7 +114,18 @@ class VehicleParams:
 
     # Auto-inertia coefficients — used by the GUI when Ixx/Izz aren't
     # measured directly.  Documented so they show up in from_car_dict.
-    yaw_inertia_factor:        float = 1.2   # Izz ≈ k · m · a · b
+    # Izz ≈ k · m · a · b.  k = 1.2 was IMPOSSIBLE: m·a·b is the exact MAXIMUM
+    # longitudinal yaw inertia for any mass distribution living between the axles
+    # (put b/L of the mass on the front axle and a/L on the rear — the CG
+    # constraint then gives exactly m·a·b, and nothing inside the wheelbase beats
+    # it).  k=1.2 therefore demands heavy overhangs this car does not have: it
+    # implied a yaw radius of gyration of 839 mm on a 768 mm half-wheelbase, i.e.
+    # every kilogram effectively outside its own axles.  An FSAE car carries its
+    # mass centrally, so k sits well BELOW 1.  0.62 puts Izz near 105 kg·m² for
+    # the 2027 car, inside the 90–120 band a component build-up supports.
+    # THIS IS STILL AN ESTIMATE — measure it with a bifilar/trifilar swing and
+    # set yaw_inertia directly; the net gates the physical ceiling either way.
+    yaw_inertia_factor:        float = 0.62
     roll_gyradius_track_frac:  float = 0.35  # k_roll ≈ frac · track_avg
 
     # Speed-hold PI controller (normalised by mass so the same gains give
