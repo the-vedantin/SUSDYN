@@ -93,7 +93,7 @@ Suspension simulation and optimization software for double-wishbone suspensions 
   - **Friction circle** — each corner's (Fx, Fy) operating point normalised by its grip capacity μ·Fz against the unit circle; set a longitudinal g and re-open to see the points spread into combined braking/acceleration
 - Uses the loaded TTC model (e.g. a Hoosier `.mat`) or the linear fallback; colourblind-safe load ramp + corner colours.
 
-![Tire / grip characterization](screenshots/tire_plots.png)
+*(Tire characterization screenshot intentionally not included — plots derived from FSAE TTC data are not redistributed. Load your own TTC file to see this page.)*
 
 ### Fixes
 - **Dynamics longitudinal-sweep crash fixed** — `_on_dynamics_sweep_done` referenced the removed `_total_mass` spinbox; total mass is now derived (sprung + unsprung F + R) the same way the panel computes it.
