@@ -16,6 +16,7 @@ All plots use the existing "dark theme" facecolor so they match the rest
 of the GUI; the PlotDialog provides a light-theme export option.
 """
 from __future__ import annotations
+import math
 import numpy as np
 import matplotlib
 matplotlib.use('QtAgg')
@@ -408,6 +409,30 @@ def plot_ackermann_loads(
 # ═════════════════════════════════════════════════════════════════════════════
 # 6. Ackermann slip-angle demand vs geometry supply
 # ═════════════════════════════════════════════════════════════════════════════
+def _peak_sa(sa, fy):
+    """Slip angle at peak Fy, interpolated BETWEEN grid points.
+
+    A bare argmax snaps the peak to the sweep grid (0.203 deg at 70 points over
+    0-14 deg).  The Ackermann demand curve is the DIFFERENCE of two such peaks,
+    and the whole effect being measured is 0.02-0.27 deg — smaller than one grid
+    step.  Quantised that way the difference collapses to 0 or +/-1 step and
+    flips sign on rounding, which is exactly what made the demand curve look
+    like meaningless noise.  Fit a parabola through the peak and its neighbours
+    so the answer is continuous in load instead.
+    """
+    i = int(np.argmax(fy))
+    if i <= 0 or i >= len(sa) - 1:
+        return float(sa[i])
+    y0, y1, y2 = float(fy[i - 1]), float(fy[i]), float(fy[i + 1])
+    den = y0 - 2.0 * y1 + y2
+    if abs(den) < 1e-12:
+        return float(sa[i])
+    # vertex offset in grid units, clamped to the bracketing interval
+    off = 0.5 * (y0 - y2) / den
+    off = max(-1.0, min(1.0, off))
+    return float(sa[i] + off * (sa[i + 1] - sa[i]))
+
+
 def plot_ackermann_demand(
     tire_model, total_mass_kg: float, weight_dist_front: float,
     wheelbase_m: float, cg_height_m: float, track_front_m: float,
@@ -440,10 +465,15 @@ def plot_ackermann_demand(
         fz_in_arr.append(fz_i)
         fz_out_arr.append(fz_o)
 
+        # Peak slip angle from the TIRE MODEL's fitted value, not a local
+        # argmax over this sweep.  These curves are flat near the peak, so an
+        # argmax reads noise: on the R20 data it scatters with R2 = 0.07 and
+        # slopes the WRONG WAY, which made this demand curve point backwards.
+        # The model's fitted peak gives R2 = 0.83, rising with load.
         Fy_i = np.array([abs(float(tire_model.Fy(s, fz_i, 0.0))) for s in sa_sweep])
         Fy_o = np.array([abs(float(tire_model.Fy(s, fz_o, 0.0))) for s in sa_sweep])
-        sa_pk_in.append(float(sa_sweep[np.argmax(Fy_i)]))
-        sa_pk_out.append(float(sa_sweep[np.argmax(Fy_o)]))
+        sa_pk_in.append(_peak_sa(sa_sweep, Fy_i))
+        sa_pk_out.append(_peak_sa(sa_sweep, Fy_o))
 
     sa_pk_in  = np.array(sa_pk_in)
     sa_pk_out = np.array(sa_pk_out)
@@ -531,22 +561,32 @@ def plot_ackermann_demand(
         d_o_100 = np.degrees(np.arctan(L / (R + t / 2.0)))
         half = (d_i_100 - d_o_100) * ackermann_pct / 100.0 / 2.0
 
+        def _axle_fy(a, h):
+            """Signed total axle Fy at average slip a with half-split h.
+
+            SIGNED, and NOT floored at +0.01.  A large Ackermann split can drive
+            one wheel past straight-ahead into negative slip, where it pulls
+            AGAINST the turn.  Clamping that wheel to +0.01 deg made a wrong-way
+            wheel free, so the solve below could satisfy the force balance with a
+            split that is physically a penalty.  Same clamp class as the tyre
+            model's flat extrapolation — see the module note there.
+            """
+            si, so = a + h, a - h
+            fi = abs(float(tire_model.Fy(si, fz_i, 0.0))) * (1.0 if si >= 0 else -1.0)
+            fo = abs(float(tire_model.Fy(so, fz_o, 0.0))) * (1.0 if so >= 0 else -1.0)
+            return fi + fo
+
         def _solve_avg(h):
             """Find avg SA where inner+outer Fy = Fy_front, given half-split h."""
-            def resid(a):
-                fi = abs(float(tire_model.Fy(max(a + h, 0.01), fz_i, 0.0)))
-                fo = abs(float(tire_model.Fy(max(a - h, 0.01), fz_o, 0.0)))
-                return fi + fo - Fy_front
             try:
-                return brentq(resid, 0.01, 14.0)
+                return brentq(lambda a: _axle_fy(a, h) - Fy_front, 0.01, 14.0)
             except ValueError:
                 # Tires saturated — find SA that maximises total Fy
-                best_a, best_fy = 0.0, 0.0
+                best_a, best_fy = 0.0, -np.inf
                 for a in np.linspace(0.5, 14, 50):
-                    fi = abs(float(tire_model.Fy(max(a + h, 0.01), fz_i, 0.0)))
-                    fo = abs(float(tire_model.Fy(max(a - h, 0.01), fz_o, 0.0)))
-                    if fi + fo > best_fy:
-                        best_a, best_fy = a, fi + fo
+                    tot = _axle_fy(a, h)
+                    if tot > best_fy:
+                        best_a, best_fy = a, tot
                 return best_a
 
         # With Ackermann
@@ -600,32 +640,198 @@ def plot_ackermann_demand(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. Ackermann Fz–Fy operating map
+# 7. Ackermann Fz–Fy operating map — demand vs delivered, per front wheel
 # ═════════════════════════════════════════════════════════════════════════════
-def plot_ackermann_fz_fy(
-    tire_model, total_mass_kg: float, weight_dist_front: float,
-    wheelbase_m: float, cg_height_m: float, track_front_m: float,
-    ackermann_pct: float = 33.0,
-    velocity_mps: float = 13.4,
-) -> Figure:
-    """Fz–Fy operating map with iso-slip-angle lines.
+def ackermann_fz_fy_data(
+    tire_model, solver, radius_m: float = 8.0,
+    ackermann_pct: float = 45.0, grip_multiplier: float = 1.0,
+    lat_g_list=None,
+) -> dict:
+    """THE COMPUTE HALF of the Fz-Fy map — arrays only, no plotting.
 
-    Gray background lines show tire Fy at constant slip angles (2°–12°).
-    Overlaid: demand paths (equal-utilisation Fy split) and Ackermann-supply
-    paths for inner & outer front tires as lateral g sweeps.
+    Split out of ``plot_ackermann_fz_fy`` (which now calls it) so a second
+    consumer — the Ackermann page — can draw the same numbers on its own
+    canvas in its own palette WITHOUT owning a second copy of the physics.
+    Duplicating this loop is exactly the mechanism that produced rival
+    Ackermann answers before; there is one loop and it lives here.
+
+    Returns, all as numpy arrays indexed by the swept lateral g:
+        lat_g            lateral g of each row (ROAD g)
+        fz_inner/outer   per-wheel vertical load from solver.solve (N)
+        cap_inner/outer  MOST that wheel can make at its own load (N)
+        del_inner/outer  what it DELIVERS at ackermann_pct (N), length
+                         n_delivered — a PREFIX of lat_g, stopped at the
+                         grip limit rather than fabricated past it
+        n_delivered      how many rows the delivered paths cover
+        g_limit          first g where the axle demand is unreachable at any
+                         steer angle, or None
+        spread_deg       the 100%-Ackermann kinematic toe split at this radius
+        split_deg        the as-built toe split (spread x pct/100)
     """
-    g_acc = 9.81
-    m = total_mass_kg
-    wf = weight_dist_front
-    Fz_static = m * g_acc * (wf) / 2.0  # static front-corner Fz
-    L = wheelbase_m
-    t = track_front_m
-    V = velocity_mps
+    veh = solver._veh
+    L = float(veh.wheelbase_m)
+    t = float(veh.front_track_m)
+    R = float(radius_m)
+
+    # ── Kinematic steer at this radius, ZERO-CRAB approximation ─────────────
+    # Chassis slip angle taken as 0: each wheel's zero-slip heading is the
+    # tangent of its own circle about a common centre on the rear-axle line.
+    # Good enough HERE because both wheels sit at the SAME radius — a common
+    # crab angle shifts both tangents together and largely cancels out of the
+    # inner-outer split that Ackermann acts on.
+    th_in = math.degrees(math.atan(L / max(R - t / 2.0, 0.05)))
+    th_out = math.degrees(math.atan(L / (R + t / 2.0)))
+    spread = th_in - th_out                      # 100%-Ackermann toe split
+    split = spread * float(ackermann_pct) / 100.0  # as-built toe split
+    th_mean = 0.5 * (th_in + th_out)
+
+    # 0.1-g steps put the 0.5 / 1.0 / 1.5 g labels exactly on grid points
+    # (17 points, inside the 25-point speed budget).
+    if lat_g_list is not None:
+        lat_g_arr = np.asarray(list(lat_g_list), float)[:25]
+    else:
+        lat_g_arr = np.linspace(0.2, 1.8, 17)
+
+    def _pair(d_mean, fz_i, fz_o):
+        """Signed per-wheel force toward the corner at mean steer *d_mean*.
+
+        Slip = the wheel's OWN steer minus its OWN tangent direction.  The
+        tyre data is SAE (+slip → −Fy), so negate once: positive = pulls into
+        the corner.  A wheel left short of its tangent (under-Ackermann'd
+        inner at low g) goes to NEGATIVE slip and comes back negative — it
+        plots below zero instead of being clamped free, same lesson as the
+        pair analysis above.
+        """
+        s_i = (d_mean + split / 2.0) - th_in
+        s_o = (d_mean - split / 2.0) - th_out
+        f_i = -float(tire_model.Fy(s_i, fz_i, 0.0)) * grip_multiplier
+        f_o = -float(tire_model.Fy(s_o, fz_o, 0.0)) * grip_multiplier
+        return f_i, f_o
+
+    # ── Sweep lateral g: demand always, delivered until the grip limit ──────
+    g_ok, fz_ip, fz_op = [], [], []
+    fy_dem_i, fy_dem_o = [], []
+    n_del = 0                       # delivered points kept (prefix of g_ok)
+    fy_del_i, fy_del_o = [], []
+    g_limit = None                  # first g where demand is unreachable
+
+    scan = np.linspace(th_mean - 2.0, th_mean + 16.0, 25)  # mean-steer grid
+    for ag in lat_g_arr:
+        try:
+            res = solver.solve(float(ag), 0.0)
+        except Exception:
+            continue                # solver refused (e.g. wheel lift) — skip
+        fz_fl, fz_fr = float(res.Fz['FL']), float(res.Fz['FR'])
+        # Inner front = the LIGHTER of FL/FR: the solver decides which side
+        # unloads, this plot assumes no turn direction of its own.
+        fz_i, fz_o = min(fz_fl, fz_fr), max(fz_fl, fz_fr)
+
+        g_ok.append(float(ag))
+        fz_ip.append(fz_i);  fz_op.append(fz_o)
+        # PER-WHEEL CAPABILITY, not a per-wheel "demand".
+        # This used to plot fz*ag per wheel and call it demand.  That is the
+        # EQUAL-UTILISATION assumption (same mu on both wheels) — and 100%
+        # Ackermann is the EQUAL-SLIP geometry, which on this tyre lands in
+        # almost the same place.  So the plot was comparing an assumption
+        # against its own twin and 100% "won" by construction, every time.
+        # The circular reference is gone: each wheel is now drawn against the
+        # MOST IT CAN ACTUALLY MAKE at its own load, which is a measured
+        # property of the tyre and owes nothing to any Ackermann setting.  The
+        # axle requirement (which IS real: the front pair must total the
+        # front's share of m*a) is annotated instead of split by fiat.
+        fy_dem_i.append(abs(float(tire_model.peak_Fy(max(fz_i, 1.0), 0.0)))
+                        * grip_multiplier)
+        fy_dem_o.append(abs(float(tire_model.peak_Fy(max(fz_o, 1.0), 0.0)))
+                        * grip_multiplier)
+
+        if g_limit is not None:
+            continue                        # delivered path already stopped
+
+        demand_axle = (fz_i + fz_o) * ag
+        totals = np.array([sum(_pair(d, fz_i, fz_o)) for d in scan])
+        k_pk = int(np.argmax(totals))
+        if float(totals[k_pk]) < demand_axle:
+            g_limit = float(ag)             # unreachable at ANY steer — stop
+            continue
+        # Bracket the crossing on the RISING side only (up to the peak):
+        # past the peak the same total repeats at silly steer angles, and the
+        # low-steer solution is the one the driver actually reaches first.
+        k = 1
+        while k <= k_pk and totals[k] < demand_axle:
+            k += 1
+        lo, hi = float(scan[k - 1]), float(scan[min(k, k_pk)])
+        for _ in range(40):                 # ≤ 40 bisection steps (budget)
+            mid = 0.5 * (lo + hi)
+            if sum(_pair(mid, fz_i, fz_o)) < demand_axle:
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo < 1e-4:
+                break
+        f_i, f_o = _pair(0.5 * (lo + hi), fz_i, fz_o)
+        fy_del_i.append(f_i);  fy_del_o.append(f_o)
+        n_del += 1
+
+    return {
+        'lat_g': np.array(g_ok),
+        'fz_inner': np.array(fz_ip), 'fz_outer': np.array(fz_op),
+        'cap_inner': np.array(fy_dem_i), 'cap_outer': np.array(fy_dem_o),
+        'del_inner': np.array(fy_del_i), 'del_outer': np.array(fy_del_o),
+        'n_delivered': int(n_del), 'g_limit': g_limit,
+        'radius_m': R, 'ackermann_pct': float(ackermann_pct),
+        'grip_multiplier': float(grip_multiplier),
+        'spread_deg': float(spread), 'split_deg': float(split),
+    }
+
+
+def plot_ackermann_fz_fy(
+    tire_model, solver, radius_m: float = 8.0,
+    ackermann_pct: float = 45.0, grip_multiplier: float = 1.0,
+    lat_g_list=None,
+) -> Figure:
+    """Fz–Fy operating map: DEMAND vs DELIVERED per front wheel vs lateral g.
+
+    x = vertical load Fz, y = SIGNED lateral force toward the corner, on the
+    usual tyre-space background (gray iso-slip lines + peak-Fy envelope).
+
+      DEMAND (solid) — each wheel corners ITS OWN vertical load:
+          Fy = Fz · a_y.   Fz is already in newtons and a_y is a dimensionless
+          ratio of accelerations (a/g), so there is NO extra 9.81 here — the
+          gravity constants cancel:  m_corner·a = (Fz/g)·(a_y·g) = Fz·a_y.
+      DELIVERED (dashed) — what the tyres actually give at the as-built
+          Ackermann %, once the MEAN steer angle is bisected so the axle
+          total matches the axle demand.  Where no steer angle can reach the
+          demand, the delivered path STOPS and the last point gets an 'x' —
+          no fabricated points past the grip limit.
+
+    Per-corner loads come from ``solver.solve(lat_g, 0).Fz`` — the ONE solved
+    model.  The previous version carried its own rigid-car load-transfer
+    formula (m·a·h/t); its own comment admitted it was a SECOND model, which
+    is exactly what the ONE-MODEL rule forbids, so it is gone.
+
+    The numbers come from ``ackermann_fz_fy_data`` — this function is the
+    DRAW half only, so the Ackermann page can plot the identical arrays in
+    its own palette without a second copy of the physics.
+    """
+    R = float(radius_m)
+    _d = ackermann_fz_fy_data(tire_model, solver, radius_m=R,
+                              ackermann_pct=ackermann_pct,
+                              grip_multiplier=grip_multiplier,
+                              lat_g_list=lat_g_list)
+    g_ok = _d['lat_g']
+    fz_ip, fz_op = _d['fz_inner'], _d['fz_outer']
+    fy_dem_i, fy_dem_o = _d['cap_inner'], _d['cap_outer']
+    fy_del_i, fy_del_o = _d['del_inner'], _d['del_outer']
+    n_del, g_limit = _d['n_delivered'], _d['g_limit']
 
     fig, ax = _styled_fig(figsize=(10, 7))
 
-    # ── Iso-slip-angle lines (tire capability background) ───────────
-    fz_range = np.linspace(50, 1500, 80)
+    # ── Iso-slip-angle lines (tire capability background) ───────────────────
+    # Scaled by grip_multiplier so the background matches the delivered
+    # curves — an unscaled envelope would show delivered points floating
+    # impossibly above the very capability lines they came from.
+    fz_hi = max(1500.0, float(fz_op.max()) * 1.10) if len(fz_op) else 1500.0
+    fz_range = np.linspace(50, fz_hi, 80)
     sa_levels = [2, 4, 6, 8, 10, 12]
     # Dodge the edge labels: near the top the iso-lines converge (saturated
     # tire), so stacked labels would overprint.  Skip a label if it would sit
@@ -633,7 +839,7 @@ def plot_ackermann_fz_fy(
     _placed_y = []
     for sa in sa_levels:
         fy_line = np.array([abs(float(tire_model.Fy(sa, fz, 0.0)))
-                            for fz in fz_range])
+                            for fz in fz_range]) * grip_multiplier
         ax.plot(fz_range, fy_line, color=_TICK, lw=0.8, alpha=0.35)
         y_end = float(fy_line[-1])
         span = max(abs(float(np.nanmax(fy_line))), 1.0)
@@ -642,90 +848,301 @@ def plot_ackermann_fz_fy(
                     fontsize=7, color=_TICK, va='center', alpha=0.6)
             _placed_y.append(y_end)
 
-    # Peak-Fy envelope
     peak_fy = np.array([abs(float(tire_model.peak_Fy(fz, 0.0)))
-                        for fz in fz_range])
+                        for fz in fz_range]) * grip_multiplier
     ax.plot(fz_range, peak_fy, color=_YELLOW, lw=1.5, ls='--', alpha=0.6,
-            label='Peak Fy envelope')
+            label=f'Peak Fy envelope (×{grip_multiplier:.2f} grip)')
 
-    # ── Sweep lateral g ─────────────────────────────────────────────
-    lat_g_arr = np.linspace(0.2, 2.0, 35)
+    # ── Demand paths (solid) ────────────────────────────────────────────────
+    ax.plot(fz_op, fy_dem_o, color=_WHITE, lw=2.4,
+            label='Outer CAPABILITY (most it can make)')
+    ax.plot(fz_ip, fy_dem_i, color=_YELLOW, lw=2.4,
+            label='Inner CAPABILITY (most it can make)')
 
-    fz_ip, fz_op = [], []
-    fy_dem_i, fy_dem_o = [], []
-    fy_ack_i, fy_ack_o = [], []
+    # ── Delivered paths (dashed), stopped at the grip limit ─────────────────
+    if n_del > 0:
+        ax.plot(fz_op[:n_del], fy_del_o, color=_RED, lw=2.0, ls='--',
+                label=f'Outer delivered at {ackermann_pct:.0f}% Ackermann')
+        ax.plot(fz_ip[:n_del], fy_del_i, color=_BLUE, lw=2.0, ls='--',
+                label=f'Inner delivered at {ackermann_pct:.0f}% Ackermann')
+        if g_limit is not None:
+            g_last = float(g_ok[n_del - 1])  # last g the axle still reached
+            ax.plot(fz_op[n_del - 1], fy_del_o[-1], 'x', color=_RED,
+                    markersize=10, markeredgewidth=2.2, zorder=6)
+            ax.plot(fz_ip[n_del - 1], fy_del_i[-1], 'x', color=_BLUE,
+                    markersize=10, markeredgewidth=2.2, zorder=6)
+            # The ✕ itself says WHERE on the g sweep it sits, per wheel —
+            # not only the summary box.  Dropped a full text-height clear of
+            # the ✕: at the limit the delivered point rejoins the demand
+            # curve, so the demand curve's own g tag lives right next door.
+            ax.annotate(f'limit {g_last:.2f} g',
+                        xy=(float(fz_op[n_del - 1]), float(fy_del_o[-1])),
+                        xytext=(12, -24), textcoords='offset points',
+                        ha='left', va='top', fontsize=7, color=_RED)
+            ax.annotate(f'limit {g_last:.2f} g',
+                        xy=(float(fz_ip[n_del - 1]), float(fy_del_i[-1])),
+                        xytext=(-9, -22), textcoords='offset points',
+                        ha='right', va='top', fontsize=7, color=_BLUE)
+            ax.text(fz_op[n_del - 1], fy_del_o[-1] * 1.04,
+                    f'grip limit — axle demand\nunreachable from {g_limit:.2f} g',
+                    fontsize=8, color=_RED, ha='right', va='bottom')
 
-    for ag in lat_g_arr:
-        LT = m * ag * g_acc * cg_height_m / t
-        fz_i = max(Fz_static - LT / 2.0, 10.0)
-        fz_o = Fz_static + LT / 2.0
-        fz_ip.append(fz_i);  fz_op.append(fz_o)
+    # ── g-sweep markers: every curve is a PATH over lateral g ───────────────
+    # The x-axis is Fz, but the swept variable is LATERAL g — without dots the
+    # four curves read as four functions of load.  So: major dots + tiny
+    # 'X.X g' tags at 0.5 / 1.0 / 1.5 g on ALL FOUR curves, plus small
+    # unlabelled dots every 0.25 g so the direction of travel reads anywhere
+    # on a path.  Tag dodge: inner-cluster tags hang LEFT of their points,
+    # outer-cluster tags sit RIGHT; within a cluster the demand and delivered
+    # points share the same Fz at a given g (same solved load), so their only
+    # possible collision is vertical — the upper point of the pair tags
+    # upward, the lower downward, and they can never pile up.
+    clusters = {
+        'outer': [(fz_op, fy_dem_o, g_ok, _WHITE, False)],
+        'inner': [(fz_ip, fy_dem_i, g_ok, _YELLOW, False)],
+    }
+    if n_del > 1:
+        clusters['outer'].append(
+            (fz_op[:n_del], fy_del_o, g_ok[:n_del], _RED, True))
+        clusters['inner'].append(
+            (fz_ip[:n_del], fy_del_i, g_ok[:n_del], _BLUE, True))
+    xmark = {}                      # ✕ position per cluster, for tag dodging
+    if n_del > 0 and g_limit is not None:
+        xmark['outer'] = (float(fz_op[n_del - 1]), float(fy_del_o[-1]))
+        xmark['inner'] = (float(fz_ip[n_del - 1]), float(fy_del_i[-1]))
+    xr = float(np.diff(ax.get_xlim())[0])
+    yr = float(np.diff(ax.get_ylim())[0])
+    for cluster, members in clusters.items():
+        sx = 9 if cluster == 'outer' else -9        # tag side, offset points
+        ha = 'left' if cluster == 'outer' else 'right'
+        for x_a, y_a, g_a, col, _delv in members:
+            if len(g_a) < 2:
+                continue
+            # minor dots every 0.25 g, interpolated onto the path
+            for gm in np.arange(0.25, float(g_a[-1]) + 1e-9, 0.25):
+                if gm < float(g_a[0]) or any(abs(gm - m) < 1e-9
+                                             for m in (0.5, 1.0, 1.5)):
+                    continue        # majors get their own bigger dot below
+                ax.plot(float(np.interp(gm, g_a, x_a)),
+                        float(np.interp(gm, g_a, y_a)), 'o', color=col,
+                        markersize=2.2, markeredgewidth=0, zorder=4)
+        for g_mark in (0.5, 1.0, 1.5):
+            pts = []
+            for x_a, y_a, g_a, col, delv in members:
+                if len(g_a) == 0:
+                    continue
+                idx = int(np.argmin(np.abs(g_a - g_mark)))
+                if abs(float(g_a[idx]) - g_mark) > 0.051:
+                    continue        # this curve's sweep never hit this g
+                near_x = (delv and g_limit is not None
+                          and idx >= len(g_a) - 2)
+                if delv and g_limit is not None and idx == len(g_a) - 1:
+                    continue        # that point IS the ✕ — already g-tagged
+                ax.plot(float(x_a[idx]), float(y_a[idx]), 'o', color=col,
+                        markersize=4, markeredgecolor=_DARK_BG, zorder=5)
+                if near_x:
+                    continue        # dot only: one step from the ✕ a text
+                                    # tag piles onto 'limit X.XX g'
+                pts.append((float(x_a[idx]), float(y_a[idx]), col))
+            pts.sort(key=lambda p: p[1])            # bottom → top
+            for rank, (x_p, y_p, col) in enumerate(pts):
+                if len(pts) == 2:                   # pair: point away from twin
+                    up = (rank == 1)
+                else:                               # alone: cluster default…
+                    up = (cluster == 'outer')
+                    # …unless the ✕ sits practically ON this point (delivered
+                    # rejoins demand at the limit) — then tag away from it
+                    if cluster in xmark:
+                        mx, my = xmark[cluster]
+                        if (abs(x_p - mx) / xr < 0.025
+                                and abs(y_p - my) / yr < 0.03):
+                            up = (y_p >= my)
+                ax.annotate(f'{g_mark:.1f} g', xy=(x_p, y_p),
+                            xytext=(sx, 5 if up else -5),
+                            textcoords='offset points', ha=ha,
+                            va='bottom' if up else 'top',
+                            fontsize=7, color=col, zorder=7)
 
-        Fy_front = m * ag * g_acc * wf          # total front-axle Fy needed
+    # ── Direction of travel: one arrow per cluster, along its demand curve ──
+    # Outer GAINS load as g rises, so its path walks up-right; inner SHEDS
+    # load, so its path walks left.  Drawn just above each curve between the
+    # 1.0 and 1.5 g tags, offset enough to share no space with them.
+    if len(g_ok) >= 6:
+        x_lo, x_hi = ax.get_xlim()
+        y_lo, y_hi = ax.get_ylim()
+        i0 = int(np.argmin(np.abs(g_ok - 1.05)))
+        i1 = int(np.argmin(np.abs(g_ok - 1.45)))
+        if i0 != i1:
+            arrows = (
+                # outer: sideways offset — the white curve is steep here, so
+                # a vertical offset would land the arrow on the red delivered
+                # path; the space just RIGHT of the white curve is empty
+                (fz_op, fy_dem_o, _WHITE, 0.07 * (x_hi - x_lo), 0.0),
+                # inner: the curve is nearly flat, float the arrow above it
+                (fz_ip, fy_dem_i, _YELLOW, 0.0, 0.06 * (y_hi - y_lo)),
+            )
+            for x_a, y_a, col, dx, dy in arrows:
+                tail = (float(x_a[i0]) + dx, float(y_a[i0]) + dy)
+                head = (float(x_a[i1]) + dx, float(y_a[i1]) + dy)
+                top = max(tail[1], head[1])
+                if top > y_hi:                      # keep the arrow on-axes
+                    y_hi = top + 0.04 * (y_hi - y_lo)
+                    ax.set_ylim(y_lo, y_hi)
+                ax.annotate('g increases', xy=head, xytext=tail,
+                            fontsize=7, color=col, va='center', ha='left',
+                            annotation_clip=False,
+                            arrowprops=dict(arrowstyle='->', color=col,
+                                            lw=1.1))
 
-        # ── Demand: equal-utilisation split ──
-        pk_i = abs(float(tire_model.peak_Fy(fz_i, 0.0)))
-        pk_o = abs(float(tire_model.peak_Fy(fz_o, 0.0)))
-        tot_pk = max(pk_i + pk_o, 1.0)
-        fy_d_i = Fy_front * pk_i / tot_pk
-        fy_d_o = Fy_front * pk_o / tot_pk
-        fy_dem_i.append(fy_d_i);  fy_dem_o.append(fy_d_o)
+    # Signed axis: a wheel delivering wrong-way force sits BELOW this line.
+    ax.axhline(0, color=_TICK, lw=0.8)
 
-        # ── Ackermann supply (geometry → SA → Fy, no demand coupling) ──
-        R = V * V / (ag * g_acc)
-        if R < t:
-            fy_ack_i.append(np.nan); fy_ack_o.append(np.nan)
-            continue
-        d_i100 = np.degrees(np.arctan(L / max(R - t / 2, 0.01)))
-        d_o100 = np.degrees(np.arctan(L / (R + t / 2)))
-        geo_half = (d_i100 - d_o100) / 2.0          # half geometric diff
-        ack_half = geo_half * ackermann_pct / 100.0  # how much is recovered
-        # At 0% Ackermann (parallel): outer gets geo_half MORE SA than avg,
-        #   inner gets geo_half LESS — the outer is underturned geometrically.
-        # At 100% Ackermann (ideal): both get equal SA (geo mismatch zeroed).
-        # sa_i = a_avg - geo_half*(1-ack%), sa_o = a_avg + geo_half*(1-ack%)
-        Ca_i = abs(float(tire_model.Fy(1.0, fz_i, 0.0)))   # N/deg
-        Ca_o = abs(float(tire_model.Fy(1.0, fz_o, 0.0)))   # N/deg
-        a_avg = min(m * ag * g_acc * wf / max(Ca_i + Ca_o, 1.0), 14.0)
-        sa_i = max(a_avg - geo_half + ack_half, 0.01)   # inner: less SA at low ack%
-        sa_o = max(a_avg + geo_half - ack_half, 0.01)   # outer: more SA at low ack%
-        fy_ack_i.append(abs(float(tire_model.Fy(sa_i, fz_i, 0.0))))
-        fy_ack_o.append(abs(float(tire_model.Fy(sa_o, fz_o, 0.0))))
-
-    fz_ip = np.array(fz_ip);       fz_op = np.array(fz_op)
-    fy_dem_i = np.array(fy_dem_i);  fy_dem_o = np.array(fy_dem_o)
-    fy_ack_i = np.array(fy_ack_i);  fy_ack_o = np.array(fy_ack_o)
-
-    # ── Plot demand & supply paths ──────────────────────────────────
-    ax.plot(fz_ip, fy_dem_i, color=_BLUE, lw=2.4,
-            label='Inner demand (equal util.)')
-    ax.plot(fz_op, fy_dem_o, color=_RED,  lw=2.4,
-            label='Outer demand (equal util.)')
-    ax.plot(fz_ip, fy_ack_i, color=_BLUE, lw=2.0, ls='--',
-            label=f'Inner at {ackermann_pct:.0f}% Ackermann')
-    ax.plot(fz_op, fy_ack_o, color=_RED,  lw=2.0, ls='--',
-            label=f'Outer at {ackermann_pct:.0f}% Ackermann')
-
-    # Mark static Fz
-    ax.axvline(Fz_static, color=_YELLOW, lw=1.0, ls=':', alpha=0.4,
-               label=f'Static Fz ({Fz_static:.0f} N)')
-
-    # Annotate a few lateral-g markers along the outer path
-    for g_mark in [0.5, 1.0, 1.5]:
-        idx = np.argmin(np.abs(lat_g_arr - g_mark))
-        ax.plot(fz_op[idx], fy_dem_o[idx], 'o', color=_RED,
-                markersize=5, markeredgecolor=_WHITE, zorder=5)
-        ax.text(fz_op[idx] + 20, fy_dem_o[idx],
-                f'{g_mark:.1f}g', fontsize=7, color=_TEXT)
-
-    ax.set_xlabel('Normal load Fz (N)', fontsize=10, color=_TICK)
-    ax.set_ylabel('Lateral force |Fy| (N)', fontsize=10, color=_TICK)
-    ax.set_title(f'Fz–Fy Operating Map — {ackermann_pct:.0f}% Ackermann '
-                 f'at {V * 3.6:.0f} km/h\n'
-                 f'(gray lines = constant slip angle)',
+    ax.set_xlabel('Vertical load Fz (N)  —  from the solved car, per corner',
+                  fontsize=10, color=_TICK)
+    ax.set_ylabel('Lateral force toward the corner (N, signed)',
+                  fontsize=10, color=_TICK)
+    ax.set_title(f'Fz–Fy Map at R = {R:.1f} m — {ackermann_pct:.0f}% '
+                 f'Ackermann, grip ×{grip_multiplier:.2f}\n'
+                 f'solid = MOST that wheel can make at its own load  ·  '
+                 f'dashed = what it delivers  ·  '
+                 f'swept over lateral g  ·  below zero = fights the turn',
                  fontsize=10, color=_TEXT)
     ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID,
               fontsize=8, loc='upper left')
+    fig.tight_layout()
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7b. Steady-State Pair Analysis  (RCVD Chapter 7, Figures 7.2 / 7.3)
+# ═════════════════════════════════════════════════════════════════════════════
+def ackermann_pair_potential(
+    tire_model, solver, lat_g: float = 1.5,
+    ackermann_list=(-100.0, -50.0, 0.0, 50.0, 100.0),
+    steer_max_deg: float = 18.0, n_steer: int = 91,
+    front: bool = True,
+):
+    """Milliken's steady-state PAIR ANALYSIS for one axle, swept over Ackermann.
+
+    THE METHOD IS NOT MINE — it is RCVD Chapter 7 (printed p.279-291).  Milliken:
+    *"In a pair analysis, steady-state lateral force performance is calculated
+    for a pair of tires on a single track/axle, using data measured on a single
+    tire"*, and it exists precisely for our question: *"the objective is usually
+    one of increasing the lateral force capability of either the front or rear
+    track"* (p.280).  The procedure, p.285: fix the wheel loads from the load
+    transfer, choose a series of REFERENCE STEER angles (the average of the two
+    wheels, since *"no absolute steer reference exists for a single track"*),
+    let the two wheels differ by toe and Ackermann, and enter the tyre data with
+    each wheel's OWN angle.  The output is the "lateral force potential diagram",
+    RCVD Fig. 7.2/7.3 — cornering coefficient against reference steer angle, one
+    curve per design variable.  Fig. 7.3 runs exactly this format for camber,
+    roll-rate distribution, roll-centre height, toe and CG height; Ackermann is
+    the same kind of test.
+
+    WHY THIS AND NOT THE Fz-Fy MAP.  On the Fz-Fy map the x-axis is vertical
+    load, which does not depend on Ackermann at all, and the whole Ackermann
+    knob is the small slip-angle split it produces at the ONE steer angle that
+    corner implies.  At the map's default 48 km/h the entire kinematic spread is
+    0.30 deg, so -50% and -60% differ by 0.015 deg of slip and draw the same
+    picture.  Ackermann authority grows as steer SQUARED, so the honest
+    independent variable is STEER ANGLE — sweep it and the settings separate.
+
+    DIRECTION IS ACCOUNTED FOR, TWICE OVER:
+      * each wheel's force is taken SIGNED from the tyre model, so a wheel
+        dragged to negative slip returns a negative number and subtracts
+        (never abs(Fy)*sign(slip) — those disagree wherever the curve's own
+        zero crossing is not exactly at zero slip);
+      * the force acts perpendicular to ITS OWN WHEEL, and Ackermann points the
+        two wheels differently, so each is resolved onto the car axes:
+            useful  = Fy * cos(delta)     pulls the car round
+            scrub   = Fy * sin(delta)     pure drag, slows the car
+        Adding raw magnitudes credits a steered wheel with force it never
+        delivers.
+
+    Loads come from the SOLVED CAR (`solver.solve(lat_g).Fz`), not a private
+    load-transfer formula — RCVD p.284 says to do exactly this when analysing a
+    given vehicle rather than a bare wheel pair.
+
+    Returns a dict (no plotting) so the GUI, the binder and the regression net
+    all read the same numbers.
+    """
+    veh = solver._veh
+    L = float(veh.wheelbase_m)
+    t = float(veh.front_track_m if front else veh.rear_track_m)
+    res = solver.solve(float(lat_g), 0.0)
+    ka, kb = ('FL', 'FR') if front else ('RL', 'RR')
+    fz_a, fz_b = float(res.Fz[ka]), float(res.Fz[kb])
+    fz_out, fz_in = max(fz_a, fz_b), max(min(fz_a, fz_b), 0.0)
+    w_axle = fz_in + fz_out
+    # RCVD Eq. 7.1: fraction of the axle load moved from inner to outer
+    flt = (fz_out - fz_in) / max(w_axle, 1e-9)
+
+    steer = np.linspace(0.0, float(steer_max_deg), int(n_steer))
+    out = {'steer_deg': steer, 'lat_g': float(lat_g), 'flt': flt,
+           'fz_in': fz_in, 'fz_out': fz_out, 'w_axle': w_axle, 'curves': {}}
+    for ack in ackermann_list:
+        d_rad = np.radians(steer)
+        # kinematic 100% Ackermann toe-out between the wheels grows as steer^2
+        spread = np.degrees((t / L) * d_rad ** 2) * (float(ack) / 100.0)
+        d_in = steer + spread / 2.0          # inner turns MORE when ack > 0
+        d_out = steer - spread / 2.0
+        fy_in = np.array([-float(tire_model.Fy(a, fz_in, 0.0)) for a in d_in])
+        fy_out = np.array([-float(tire_model.Fy(a, fz_out, 0.0)) for a in d_out])
+        useful = (fy_in * np.cos(np.radians(d_in))
+                  + fy_out * np.cos(np.radians(d_out)))
+        scrub = (fy_in * np.sin(np.radians(d_in))
+                 + fy_out * np.sin(np.radians(d_out)))
+        k = int(np.argmax(useful))
+        out['curves'][float(ack)] = {
+            'useful_N': useful, 'scrub_N': scrub,
+            'cornering_coeff': useful / max(w_axle, 1e-9),
+            'inner_N': fy_in * np.cos(np.radians(d_in)),
+            'outer_N': fy_out * np.cos(np.radians(d_out)),
+            'peak_N': float(useful[k]), 'peak_steer_deg': float(steer[k]),
+            'scrub_at_peak_N': float(scrub[k]),
+        }
+    return out
+
+
+def plot_ackermann_pair_potential(
+    tire_model, solver, lat_g: float = 1.5,
+    ackermann_pct: float = 33.0,
+    ackermann_list=(-100.0, -50.0, 0.0, 50.0, 100.0),
+    steer_max_deg: float = 18.0,
+) -> Figure:
+    """RCVD Fig. 7.2/7.3 lateral-force potential diagram, family = Ackermann."""
+    d = ackermann_pair_potential(
+        tire_model, solver, lat_g=lat_g, steer_max_deg=steer_max_deg,
+        ackermann_list=tuple(sorted(set(list(ackermann_list)
+                                        + [float(ackermann_pct)]))))
+    steer = d['steer_deg']
+    fig, (ax1, ax2) = _styled_fig(figsize=(12.5, 6.2), n=1, m=2)
+    styles = [(_WHITE, '-'), (_YELLOW, '--'), (_RED, '-.'),
+              (_BLUE, ':'), (_TICK, '-'), (_YELLOW, ':')]
+    for (ack, c), (col, ls) in zip(sorted(d['curves'].items()), styles):
+        lw = 2.6 if abs(ack - ackermann_pct) < 0.51 else 1.7
+        lab = f'{ack:+.0f}%' + ('  (this car)' if lw > 2 else '')
+        ax1.plot(steer, c['useful_N'], color=col, ls=ls, lw=lw, label=lab)
+        ax1.plot([c['peak_steer_deg']], [c['peak_N']], 'o', color=col, ms=6)
+        ax2.plot(steer, c['scrub_N'], color=col, ls=ls, lw=lw, label=lab)
+    ax1.set_xlabel('Reference steer angle (deg)  —  average of the two wheels',
+                   fontsize=9, color=_TICK)
+    ax1.set_ylabel('Axle lateral force toward the corner (N)',
+                   fontsize=9, color=_TICK)
+    ax1.set_title(f'Pair analysis (RCVD ch.7) at {d["lat_g"]:.2f} g\n'
+                  f'inner {d["fz_in"]:.0f} N / outer {d["fz_out"]:.0f} N, '
+                  f'load transfer {100*d["flt"]:.0f}%   ·  dot = best steer',
+                  fontsize=9.5, color=_TEXT)
+    ax2.set_xlabel('Reference steer angle (deg)', fontsize=9, color=_TICK)
+    ax2.set_ylabel('Scrub drag from the front tyres (N)', fontsize=9,
+                   color=_TICK)
+    ax2.set_title('What it costs: force resolved along the car, not across it\n'
+                  '(the part of the tyre force that only slows you down)',
+                  fontsize=9.5, color=_TEXT)
+    for ax in (ax1, ax2):
+        ax.axhline(0, color=_GRID, lw=0.8)
+        ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID,
+                  fontsize=8, title='Ackermann', loc='best')
     fig.tight_layout()
     return fig
 
@@ -744,6 +1161,7 @@ def plot_mmd(
     toe_front_deg: float = 0.0,
     toe_rear_deg: float = 0.0,
     velocity_mps: float = 13.4,
+    ackermann_pct: float = 0.0,
     beta_range_deg: tuple = (-8, 8), beta_n: int = 9,
     delta_range_deg: tuple = (-20, 20), delta_n: int = 11,
 ) -> Figure:
@@ -754,55 +1172,44 @@ def plot_mmd(
     distribution (LLTD) between front and rear axles.  Static toe angles
     (+ = toe-in) shift the individual corner slip angles.
     """
-    g_acc = 9.81
-    m = total_mass_kg
-    # l_f = distance from front axle to CG;  l_r = CG to rear axle
-    l_f = wheelbase_m * (1.0 - weight_dist_front)   # a_d
-    l_r = wheelbase_m * weight_dist_front            # b_d
-    Fz_F0 = m * g_acc * (l_r / wheelbase_m) / 2     # static front Fz per corner
-    Fz_R0 = m * g_acc * (l_f / wheelbase_m) / 2     # static rear  Fz per corner
+    # ── State computation: rerouted through vahan.ymd (the ONE yaw-moment
+    # engine).  This function used to carry its own private iteration with
+    # rear slip set EQUAL to body slip (aRL = aRR = beta) — only true for a
+    # car that is not rotating.  The engine adds the missing yaw-rate term
+    # (rear slip differs from beta by degrees(l_r*r/V); front by l_f*r/V, RCVD
+    # Eqs. 5.3/5.4), so ABSOLUTE NUMBERS HAVE MOVED versus older MMD figures:
+    # the old diagrams understated rear slip — and therefore rear force — at
+    # high Ay.  The LLTD what-if knobs (ARB lever deltas) stay a closed-form
+    # loads model by design (a parameter study), owned by ymd.LLTDCar; only
+    # the loads source differs from the trim-sweep path, never the physics.
+    from vahan import ymd
+    car = ymd.LLTDCar(
+        total_mass_kg=total_mass_kg, weight_dist_front=weight_dist_front,
+        wheelbase_m=wheelbase_m, cg_height_m=cg_height_m,
+        track_front_m=track_front_m, track_rear_m=track_rear_m,
+        roll_stiffness_front_Npm_rad=roll_stiffness_front_Npm_rad,
+        roll_stiffness_rear_Npm_rad=roll_stiffness_rear_Npm_rad,
+        delta_arb_front_Npm=delta_arb_front_Npm,
+        delta_arb_rear_Npm=delta_arb_rear_Npm)
+    LLTD_f = car.lltd_front                     # front fraction, for the box
+    # dense enough that the 10 N wheel-lift clamp doesn't kink the interp
+    _loads = ymd.build_loads_table(car, ay_max=3.0, n=61)
 
-    # ── Lateral load transfer distribution (LLTD) ───────────────────────────
-    # K_roll = (K_wheel + K_arb) * t^2 / 2  (from VehicleParams property)
-    # delta_arb_* lets the user add or remove ARB wheel-rate to explore LLTD.
-    K_f = max(roll_stiffness_front_Npm_rad
-              + delta_arb_front_Npm * track_front_m ** 2 / 2, 0.0)
-    K_r = max(roll_stiffness_rear_Npm_rad
-              + delta_arb_rear_Npm  * track_rear_m  ** 2 / 2, 0.0)
-    K_tot = K_f + K_r
-    LLTD_f = K_f / K_tot if K_tot > 1.0 else 0.5   # front fraction; default 50 %
+    # Warm-start each state from the previous one along the sweep: the
+    # fixed-point map holds one attractor per turn hand, and cold 0-starts
+    # let states at the extreme corners (big beta against big opposite
+    # delta) hop hands mid-line, scribbling the diagram tips.  Continuation
+    # keeps each isoline on its own branch (and converges faster).
+    _prev_ay = {'ay': 0.0}
 
-    def compute_state(beta_deg, delta_deg, max_iter=20, tol=1e-4):
-        Ay = 0.0
-        for _ in range(max_iter):
-            # Lateral load transfer — corrected formula (was missing g_acc)
-            # Each axle's share of the roll couple is LLTD_f / (1-LLTD_f).
-            LT_F = LLTD_f       * m * g_acc * Ay * cg_height_m / track_front_m
-            LT_R = (1.0 - LLTD_f) * m * g_acc * Ay * cg_height_m / track_rear_m
-            Fz_FL = max(Fz_F0 - LT_F, 10.0); Fz_FR = max(Fz_F0 + LT_F, 10.0)
-            Fz_RL = max(Fz_R0 - LT_R, 10.0); Fz_RR = max(Fz_R0 + LT_R, 10.0)
-
-            # Per-corner slip angles: toe-in shifts inner vs outer SA
-            # sign(β) tracks which side is inner (inner = lower load).
-            t_sgn = 1.0 if beta_deg >= 0 else -1.0
-            # front toe-in: inner reduces SA, outer increases SA
-            a_FL = beta_deg - delta_deg - toe_front_deg * t_sgn
-            a_FR = beta_deg - delta_deg + toe_front_deg * t_sgn
-            # rear toe-in: inner reduces SA, outer increases SA
-            a_RL = beta_deg - toe_rear_deg * t_sgn
-            a_RR = beta_deg + toe_rear_deg * t_sgn
-
-            Fy_FL = -float(tire_model.Fy(a_FL, Fz_FL, 0.0))
-            Fy_FR = -float(tire_model.Fy(a_FR, Fz_FR, 0.0))
-            Fy_RL = -float(tire_model.Fy(a_RL, Fz_RL, 0.0))
-            Fy_RR = -float(tire_model.Fy(a_RR, Fz_RR, 0.0))
-            Ay_new = (Fy_FL + Fy_FR + Fy_RL + Fy_RR) / (m * g_acc)
-            if abs(Ay_new - Ay) < tol:
-                Ay = Ay_new
-                break
-            Ay = 0.5 * Ay + 0.5 * Ay_new
-        N = l_f * (Fy_FL + Fy_FR) - l_r * (Fy_RL + Fy_RR)
-        return Ay, N
+    def compute_state(beta_deg, delta_deg):
+        st = ymd.ymd_state(
+            tire_model, car, beta_deg, delta_deg, V_mps=velocity_mps,
+            ackermann_pct=ackermann_pct, toe_front_deg=toe_front_deg,
+            toe_rear_deg=toe_rear_deg, loads_table=_loads,
+            Ay0=_prev_ay['ay'])
+        _prev_ay['ay'] = st['Ay_g']
+        return st['Ay_g'], st['N_Nm']
 
     # Isoline VALUES stay at the user's chosen spacing (beta_n / delta_n
     # lines), but each line is SAMPLED densely along its sweep axis so the
@@ -834,6 +1241,87 @@ def plot_mmd(
     else:
         dN_db = float('nan')
     stable = dN_db < 0 if np.isfinite(dN_db) else None
+
+    # ── THE NUMBERS, from the same states the curves are drawn from ────────
+    # Trimmed limit: walk every constant-beta line, find its N = 0 crossings
+    # by sign change + linear interpolation, keep the one with the highest
+    # positive-Ay (left-turn) crossing.  Control/stability at that exact
+    # point come from two extra engine calls each (central differences) —
+    # not read off the coarse grid.
+    # The trimmed limit can sit OUTSIDE the drawn attitude window (post
+    # tyre-clamp it does: the outer N = 0 crossings live beyond beta = -8
+    # at this speed), so the search sweeps a WIDER attitude range than the
+    # figure shows.  The drawn window stays the user's choice.
+    lim = {'ay': float('nan'), 'beta': float('nan'), 'delta': float('nan'),
+           'ctrl': float('nan'), 'stab': float('nan')}
+    _b_lo = min(beta_range_deg) - 10.0
+    _b_hi = max(beta_range_deg) + 4.0
+    for b in np.arange(_b_lo, _b_hi + 0.5, 1.0):
+        Nrow = np.empty(line_n); Arow = np.empty(line_n)
+        for j, d in enumerate(deltas_dense):
+            Arow[j], Nrow[j] = compute_state(float(b), float(d))
+        for j in range(line_n - 1):
+            if Nrow[j] == 0 or (Nrow[j] > 0) != (Nrow[j + 1] > 0):
+                f = Nrow[j] / (Nrow[j] - Nrow[j + 1] + 1e-12)
+                ayc = Arow[j] + f * (Arow[j + 1] - Arow[j])
+                dc = deltas_dense[j] + f * (deltas_dense[j + 1]
+                                            - deltas_dense[j])
+                if np.isfinite(ayc) and (not np.isfinite(lim['ay'])
+                                         or ayc > lim['ay']):
+                    lim.update(ay=float(ayc), beta=float(b), delta=float(dc))
+    # Second transect family: at high Ay the N = 0 contour can run parallel
+    # to the constant-beta lines (no crossing along them at all) — the
+    # crossings then only show up sweeping BETA at constant steer.
+    _bd = np.arange(_b_lo, _b_hi + 0.4, 0.75)
+    for d in deltas:
+        Nrow = np.empty(len(_bd)); Arow = np.empty(len(_bd))
+        for j, b in enumerate(_bd):
+            Arow[j], Nrow[j] = compute_state(float(b), float(d))
+        for j in range(len(_bd) - 1):
+            if Nrow[j] == 0 or (Nrow[j] > 0) != (Nrow[j + 1] > 0):
+                f = Nrow[j] / (Nrow[j] - Nrow[j + 1] + 1e-12)
+                ayc = Arow[j] + f * (Arow[j + 1] - Arow[j])
+                bc = _bd[j] + f * (_bd[j + 1] - _bd[j])
+                if np.isfinite(ayc) and (not np.isfinite(lim['ay'])
+                                         or ayc > lim['ay']):
+                    lim.update(ay=float(ayc), beta=float(bc), delta=float(d))
+    # Local refinement: the family sweeps quantize the crossing to the
+    # coarse grids (a 4-deg steer bin moved the cross-setting comparison
+    # more than the physics did).  Re-sweep finely around the found point,
+    # both directions, keeping the best N = 0 crossing.
+    if np.isfinite(lim['ay']):
+        for _pass in range(2):
+            _df = np.arange(lim['delta'] - 2.5, lim['delta'] + 2.51, 0.25)
+            Nr = np.empty(len(_df)); Ar = np.empty(len(_df))
+            for j, d in enumerate(_df):
+                Ar[j], Nr[j] = compute_state(lim['beta'], float(d))
+            for j in range(len(_df) - 1):
+                if (Nr[j] > 0) != (Nr[j + 1] > 0):
+                    f = Nr[j] / (Nr[j] - Nr[j + 1] + 1e-12)
+                    ayc = Ar[j] + f * (Ar[j + 1] - Ar[j])
+                    if ayc > lim['ay']:
+                        lim.update(ay=float(ayc),
+                                   delta=float(_df[j] + f * 0.25))
+            _bf = np.arange(lim['beta'] - 1.5, lim['beta'] + 1.51, 0.25)
+            Nr = np.empty(len(_bf)); Ar = np.empty(len(_bf))
+            for j, b in enumerate(_bf):
+                Ar[j], Nr[j] = compute_state(float(b), lim['delta'])
+            for j in range(len(_bf) - 1):
+                if (Nr[j] > 0) != (Nr[j + 1] > 0):
+                    f = Nr[j] / (Nr[j] - Nr[j + 1] + 1e-12)
+                    ayc = Ar[j] + f * (Ar[j + 1] - Ar[j])
+                    if ayc > lim['ay']:
+                        lim.update(ay=float(ayc),
+                                   beta=float(_bf[j] + f * 0.25))
+    if np.isfinite(lim['ay']):
+        h = 0.5
+        _, n_dp = compute_state(lim['beta'], lim['delta'] + h)
+        _, n_dm = compute_state(lim['beta'], lim['delta'] - h)
+        _, n_bp = compute_state(lim['beta'] + h, lim['delta'])
+        _, n_bm = compute_state(lim['beta'] - h, lim['delta'])
+        lim['ctrl'] = float((n_dp - n_dm) / (2 * h))
+        lim['stab'] = float((n_bp - n_bm) / (2 * h))
+    ay_reach = float(np.nanmax([np.nanmax(Ay_b), np.nanmax(Ay_d)]))
 
     fig, ax = _styled_fig(figsize=(10, 8))
     # Constant β — solid blue
@@ -908,6 +1396,34 @@ def plot_mmd(
             fontsize=8.5, color=stability_color,
             bbox=dict(facecolor=_PANEL_BG, edgecolor=_GRID, pad=4))
 
+    # ── Numbers box (bottom-right): the readable results ────────────────
+    if np.isfinite(lim['ay']):
+        num_lines = (
+            f"AT THE TRIMMED LIMIT (N = 0, driven clean)\n"
+            f"  lateral grip     {lim['ay']:+.3f} g\n"
+            f"  body slip        {lim['beta']:+.1f} deg\n"
+            f"  mean steer       {lim['delta']:+.1f} deg\n"
+            f"  control  dN/dd   {lim['ctrl']:+.0f} N·m/deg\n"
+            f"  stability dN/db  {lim['stab']:+.0f} N·m/deg\n"
+            f"MAX REACH (untrimmed, spinning) {ay_reach:+.3f} g"
+        )
+    else:
+        num_lines = 'no N = 0 crossing found in the swept range'
+    ax.text(0.98, 0.02, num_lines,
+            transform=ax.transAxes, ha='right', va='bottom',
+            fontsize=9, color=_TEXT, family='monospace',
+            bbox=dict(facecolor=_PANEL_BG, edgecolor=_YELLOW, pad=6))
+    if np.isfinite(lim['ay']):
+        ax.plot([lim['ay']], [0.0], 'o', ms=12, mfc='none',
+                mec=_YELLOW, mew=2.0, zorder=6)
+
+    fig._mmd_numbers = dict(ackermann_pct=float(ackermann_pct),
+                            ay_trim_limit_g=lim['ay'],
+                            beta_at_limit_deg=lim['beta'],
+                            delta_at_limit_deg=lim['delta'],
+                            control_Nm_per_deg=lim['ctrl'],
+                            stability_Nm_per_deg=lim['stab'],
+                            ay_reach_g=ay_reach)
     fig.tight_layout()
     return fig
 
@@ -1349,3 +1865,239 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
 
     fig.tight_layout()
     return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 12. Slip angle vs vertical load vs lateral force  (the tyre, seen directly)
+# ═════════════════════════════════════════════════════════════════════════════
+def plot_slip_load_force(tire_model, solver=None, grip_multiplier: float = 1.0,
+                         lat_g_list=(0.5, 1.0, 1.5, 2.0)) -> Figure:
+    """Slip angle against lateral force, one curve per vertical load — plus
+    where the CAR's four wheels actually sit on that family.
+
+    This is the diagnostic the user asked for and the one every Ackermann
+    argument rests on: how much side force a tyre makes at a given slip angle
+    AT ITS OWN LOAD.  It exists as a Vahan feature (button + this function)
+    rather than a report script because a number nobody can pull up and drive
+    is not a result.
+
+    Everything is read from the tyre model and the solved car — no physics is
+    computed here.  The right panel is the FRICTION CHECK the user demanded:
+    peak available force against load, with the car's own operating points on
+    top, so an impossible demand is visible instead of implied.
+    """
+    fig, (ax1, ax2) = _styled_fig(figsize=(13, 5.6), n=1, m=2)
+    gm = max(float(grip_multiplier), 1e-6)
+    fz_lo, fz_hi = (float(tire_model.fz_range[0]),
+                    float(tire_model.fz_range[1]))
+    loads = np.linspace(max(fz_lo * 0.5, 50.0), fz_hi, 6)
+    sa_hi = float(np.max(np.abs(tire_model.sa_range)))
+    sa = np.linspace(0.0, sa_hi, 120)
+    # Load is the series variable, so vary it by SHADE within one hue family
+    # (never a second colour) — the in-app palette stays yellow/red/white.
+    shades = ['#ffffff', '#ffe082', '#ffca28', '#ff8f00', '#e64a19', '#b71c1c']
+    for fz, col in zip(loads, shades):
+        fy = np.array([abs(float(tire_model.Fy(a, float(fz), 0.0))) * gm
+                       for a in sa])
+        ax1.plot(sa, fy, color=col, lw=1.9, label=f'{fz:.0f} N')
+        k = int(np.argmax(fy))
+        ax1.plot([sa[k]], [fy[k]], 'o', color=col, ms=4)
+    ax1.set_xlabel('Slip angle (deg)', fontsize=10, color=_TICK)
+    ax1.set_ylabel(f'Lateral force (N){"" if gm >= 1 else f"  x{gm:.2f} asphalt"}',
+                   fontsize=10, color=_TICK)
+    ax1.set_title('What the tyre makes: slip angle vs load\n'
+                  'dot = that load\'s peak (later at higher load)',
+                  fontsize=10, color=_TEXT)
+    ax1.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID,
+               fontsize=8, title='vertical load', loc='lower right')
+    ax1.grid(alpha=0.25, lw=0.5)
+
+    # ── right: the friction check ────────────────────────────────────────
+    fzs = np.linspace(50.0, fz_hi * 1.25, 90)
+    pk = np.array([abs(float(tire_model.peak_Fy(float(f), 0.0))) * gm
+                   for f in fzs])
+    ax2.plot(fzs, pk, color=_YELLOW, lw=2.2,
+             label='MOST the tyre can make (peak)')
+    ax2.axvline(fz_lo, color=_TICK, lw=0.8, ls=':', alpha=0.7)
+    ax2.axvline(fz_hi, color=_TICK, lw=0.8, ls=':', alpha=0.7)
+    ax2.text(fz_hi, pk.max() * 0.05, ' measured data ends',
+             fontsize=7.5, color=_TICK, rotation=90, va='bottom')
+    if solver is not None:
+        marks = ['o', 's', '^', 'D']
+        over = 0
+        for gi, g in enumerate(lat_g_list):
+            try:
+                r = solver.solve(float(g), 0.0)
+            except Exception:
+                continue
+            for c in ('FL', 'FR', 'RL', 'RR'):
+                fz = max(float(r.Fz[c]), 0.0)
+                fy = abs(float(r.Fy[c]))
+                cap = abs(float(tire_model.peak_Fy(max(fz, 1.0), 0.0))) * gm
+                bad = fy > cap * 1.001
+                over += int(bad)
+                ax2.plot([fz], [fy], marks[gi % 4],
+                         color=(_RED if bad else _WHITE), ms=6,
+                         markeredgecolor=_RED if bad else _TICK, mew=1.0,
+                         label=(f'{g:.1f} g' if c == 'FL' else None))
+        ax2.set_title('Friction check: is any wheel asked for more than the\n'
+                      'tyre can give?  ' + ('RED = IMPOSSIBLE DEMAND'
+                                            if over else
+                                            'all inside the envelope'),
+                      fontsize=10, color=(_RED if over else _TEXT))
+    ax2.set_xlabel('Vertical load Fz (N)', fontsize=10, color=_TICK)
+    ax2.set_ylabel('Lateral force (N)', fontsize=10, color=_TICK)
+    ax2.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID,
+               fontsize=8, loc='upper left')
+    ax2.grid(alpha=0.25, lw=0.5)
+    fig.tight_layout()
+    return fig
+
+
+def plot_ymd_ackermann_grid(tire_model, solver, radius_m=8.0,
+                            pct_list=(100, 70, 50, 30, 0, -30, -70),
+                            grip_multiplier=0.70, aero_Fz_per_g=None,
+                            fig=None):
+    """Ackermann vs stability/control — READABLE version.
+
+    The first version drew nine full moment diagrams in a grid; they were
+    near-identical postage stamps (that near-identity IS the physics), so
+    the figure carried no readable information.  This version shows only
+    what differs:
+
+      LEFT  — the trim region, zoomed and overlaid: for each Ackermann
+              setting, the constant-steer line through its own trimmed
+              limit, in the last tenths of a g before the limit.  Where a
+              curve crosses CN = 0 is that setting's trimmed limit; the
+              slope through the crossing is how gradually the car
+              approaches it.
+      RIGHT — the metrics: max trimmed lateral g (with the measured
+              0.006 g noise band), control dN/d(steer) and stability
+              dN/d(body slip) at trim, per setting.
+
+    Returns (fig, rows) where rows is vahan.ymd.trim_sweep_ackermann
+    output enriched with a plain-language verdict per metric.  All physics
+    from vahan.ymd — this function only sweeps and draws.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from . import ymd as YMD
+
+    m, L, l_f, l_r, t_f, t_r = YMD._dims(solver)
+    W = m * 9.80665
+    table = YMD.build_loads_table(solver, aero_Fz_per_g)
+
+    trim = YMD.trim_sweep_ackermann(
+        tire_model, solver, radius_m, list(pct_list),
+        grip_multiplier=grip_multiplier, aero_Fz_per_g=aero_Fz_per_g,
+        loads_table=table)
+
+    if fig is None:
+        fig = plt.figure(figsize=(13.0, 6.0))
+    axL, axR = fig.subplots(1, 2)
+    NOISE_G = 0.006
+
+    # LEFT: one curve per setting — beta swept through the setting's own
+    # trim attitude at its trim steer, plotted only near the limit.
+    styles = ['-', '--', '-.', ':', '-', '--', '-.']
+    widths = [2.6, 2.2, 2.2, 2.2, 2.6, 2.2, 2.2]
+    cols = ['#1a1a1a', '#1a1a1a', '#8a8a8a', '#8a8a8a',
+            '#C43B3B', '#C43B3B', '#D99000']
+    ay_lo = 1e9
+    for k, r in enumerate(trim):
+        if not np.isfinite(r.get('Ay_trim_max', float('nan'))):
+            continue
+        b0, d0 = r['beta_at'], r['delta_at']
+        bs = np.linspace(b0 - 2.5, b0 + 2.5, 21)
+        pts = []
+        ay0 = max(r['Ay_trim_max'] - 0.1, 0.5)
+        for b in bs:
+            try:
+                st = YMD.ymd_state(tire_model, solver, float(b), float(d0),
+                                   radius_m=radius_m,
+                                   ackermann_pct=float(r['pct']),
+                                   grip_multiplier=grip_multiplier,
+                                   aero_Fz_per_g=aero_Fz_per_g,
+                                   loads_table=table, Ay0=ay0)
+            except Exception:
+                continue
+            if st.get('converged', True):
+                pts.append((st['Ay_g'], st['N_Nm'] / (W * L)))
+                ay0 = st['Ay_g']
+        if len(pts) > 2:
+            a = np.array(pts)
+            axL.plot(a[:, 0], a[:, 1], styles[k % 7], color=cols[k % 7],
+                     lw=widths[k % 7],
+                     label=f"{r['pct']:+.0f}%  (trim {r['Ay_trim_max']:.3f} g)")
+            ay_lo = min(ay_lo, float(np.nanmin(a[:, 0])))
+            # RCVD Fig 8.26 limit parameters (printed p334-335), read from
+            # the same swept states:
+            #   SI — slope of the steer line through trim, dCN/dAy
+            #        (negative = stable; ~0 = divergence boundary, p205)
+            #   apex — max untrimmed Ay and its CN: below the axis = PLOW,
+            #        on it = NEUTRAL drift, above = SPIN (p306, p320);
+            #        race cars are tuned neutral at the limit (p320).
+            _near = np.argsort(np.abs(a[:, 1]))[:5]
+            if len(_near) >= 2:
+                _aa, _cc = a[_near, 0], a[_near, 1]
+                _den = (_aa.max() - _aa.min())
+                r['SI_CN_per_g'] = (float(np.polyfit(_aa, _cc, 1)[0])
+                                    if _den > 1e-4 else float('nan'))
+            _kk = int(np.nanargmax(a[:, 0]))
+            r['Ay_apex_g'] = float(a[_kk, 0])
+            r['CN_apex'] = float(a[_kk, 1])
+            r['limit_character'] = ('PLOW (safe push)' if r['CN_apex'] < -0.004
+                                    else 'SPIN (nose-in past limit)'
+                                    if r['CN_apex'] > 0.004
+                                    else 'NEUTRAL (race target, RCVD p320)')
+        axL.plot([r['Ay_trim_max']], [0.0], 'o', ms=7,
+                 color=cols[k % 7], zorder=5)
+    axL.axhline(0.0, color='#D99000', lw=1.4)
+    ays = [r['Ay_trim_max'] for r in trim
+           if np.isfinite(r.get('Ay_trim_max', float('nan')))]
+    if ays:
+        axL.axvspan(max(ays) - NOISE_G, max(ays), color='#D99000',
+                    alpha=0.25)
+        axL.set_xlim(min(min(ays) - 0.02, ay_lo), max(ays) + 0.012)
+    axL.set_ylim(-0.05, 0.05)
+    axL.set_xlabel('lateral g (road)')
+    axL.set_ylabel('CN = N / (W L)')
+    axL.set_title('The trim region, zoomed — dots on CN = 0 are each '
+                  'setting\'s limit;\nshaded band = 0.006 g noise floor',
+                  fontsize=10)
+    axL.grid(alpha=0.25)
+    axL.legend(fontsize=8.5, loc='lower left')
+
+    # RIGHT: metrics vs Ackermann
+    pc = np.array([r['pct'] for r in trim], float)
+    ay = np.array([r.get('Ay_trim_max', float('nan')) for r in trim], float)
+    ct = np.array([r.get('N_delta', float('nan')) for r in trim], float)
+    sb = np.array([r.get('N_beta', float('nan')) for r in trim], float)
+    o = np.argsort(pc)
+    axR.plot(pc[o], ay[o], 'o-', color='#1a1a1a', lw=2.2,
+             label='max trimmed g')
+    if np.isfinite(ay).any():
+        axR.axhspan(np.nanmax(ay) - NOISE_G, np.nanmax(ay),
+                    color='#D99000', alpha=0.25,
+                    label='tie band (0.006 g noise)')
+    ax2 = axR.twinx()
+    ax2.plot(pc[o], ct[o], 's--', color='#C43B3B', lw=1.6,
+             label='control dN/d(steer) @trim')
+    ax2.plot(pc[o], sb[o], '^:', color='#8a8a8a', lw=1.6,
+             label='stability dN/d(body slip) @trim')
+    ax2.set_ylabel('N·m per deg', fontsize=9)
+    axR.set_xlabel('Ackermann %')
+    axR.set_ylabel('trimmed lateral g')
+    axR.set_title('Metrics vs Ackermann — inside the band = tie',
+                  fontsize=10)
+    axR.grid(alpha=0.25)
+    h1, l1 = axR.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    axR.legend(h1 + h2, l1 + l2, fontsize=8, loc='lower center')
+
+    fig.suptitle(
+        f'Ackermann vs stability and control — constant radius '
+        f'{radius_m:.0f} m, asphalt {grip_multiplier:.2f}x rig grip, '
+        f'{"with" if aero_Fz_per_g else "no"} aero', fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    return fig, trim

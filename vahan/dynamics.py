@@ -97,6 +97,56 @@ class VehicleParams:
     max_steer_angle_deg: float = 28.0
     front_brake_bias: float = 0.65
 
+    # ── ROTATING INERTIA (equivalent mass) ───────────────────────────────
+    # Every spinning part has to be accelerated as well as the car, so the
+    # SAME tyre force produces LESS acceleration than F/m.  Referred to the
+    # wheels, the extra ("equivalent") mass is
+    #     m_eq = [ 2*(I_wheel_front + I_wheel_rear) + I_engine * ratio^2 ]
+    #            / tyre_radius^2
+    # and every longitudinal acceleration — drive AND brake — is divided by
+    # (1 + m_eq/m).  The engine term is amplified by the SQUARE of the total
+    # ratio, so on a 9.75:1 first gear a 0.05 kg*m^2 crank behaves like ~115 kg.
+    # Ignoring this always FLATTERS the lap time.
+    #
+    # !! THE DEFAULTS BELOW ARE ASSUMED, NOT MEASURED !!  They are order-of-
+    # magnitude values for a 10-inch-wheel FSAE car with a 600 cc four:
+    #   wheel  0.19 kg*m^2 each  = tyre + rim + hub + upright-side rotor
+    #   engine 0.05 kg*m^2       = crank + primary gear + clutch basket
+    # Measure them (bifilar swing for the wheel, manufacturer data or a
+    # run-down test for the engine) before quoting an absolute lap time.
+    wheel_inertia_front_kgm2: float = 0.19   # PER WHEEL, ASSUMED
+    wheel_inertia_rear_kgm2:  float = 0.19   # PER WHEEL, ASSUMED
+    # Honda CBR600RR (20 mm restricted) — the engine's IDENTITY is user-
+    # confirmed 2026-07-30; this inertia is still ASSUMED (600cc-I4
+    # crank+clutch class value; measure by coastdown or bifilar swing).  It is
+    # 86% of the equivalent mass in 1st, so measuring it is worth real seconds.
+    engine_inertia_kgm2:      float = 0.05
+
+    # ── GEARSHIFT MODEL (driver + gearbox, LVS driver block) ─────────────
+    # shift_time_s          torque is CUT for this long, end to end (drop
+    #                       drive, select, pick drive back up).  0 = the old
+    #                       free instantaneous shift.
+    # min_shift_interval_s  shortest allowed time between two shifts — this
+    #                       is what stops the best-force picker chattering.
+    # shift_hysteresis_frac the new gear must beat the current gear's wheel
+    #                       force by this fraction before the driver bothers.
+    # A redline up-shift bypasses the interval (the limiter forces it) but
+    # still pays the dead time.
+    shift_time_s:           float = 0.10     # ASSUMED (LVS default)
+    min_shift_interval_s:   float = 0.60     # ASSUMED
+    shift_hysteresis_frac:  float = 0.04     # ASSUMED
+
+    # Static toe, TOTAL across the axle, in degrees, POSITIVE = TOE-OUT.
+    # The pair-analysis force split needs it: it is what makes the two wheels of
+    # an axle sit at different slip angles, and RCVD (Ch.7, printed p.285) is
+    # explicit that the two wheels' angles differ "because of initial toe and
+    # Ackermann/reverse Ackermann geometry".  Each wheel is offset by half of
+    # this from the axle's reference angle.  Ackermann is deliberately NOT here
+    # — it depends on the corner radius, which a generic steady-state point does
+    # not carry; vahan.ackermann applies it where a radius exists.
+    toe_front_deg: float = 0.0
+    toe_rear_deg: float = 0.0
+
     # Aerodynamic drag — bounds terminal speed during longitudinal
     # acceleration trajectories.  CdA is the lumped drag coefficient ×
     # frontal area (m²).  Without these, the steady-state power-limit
@@ -599,6 +649,13 @@ class VehicleParams:
             'roll_gyradius_track_frac': 'roll_gyradius_track_frac',
             'speed_hold_kp_per_kg':     'speed_hold_kp_per_kg',
             'speed_hold_ki_per_kg':     'speed_hold_ki_per_kg',
+            # Rotating inertia + shift model (lap sim); ASSUMED defaults
+            'wheel_inertia_front_kgm2': 'wheel_inertia_front_kgm2',
+            'wheel_inertia_rear_kgm2':  'wheel_inertia_rear_kgm2',
+            'engine_inertia_kgm2':      'engine_inertia_kgm2',
+            'shift_time_s':             'shift_time_s',
+            'min_shift_interval_s':     'min_shift_interval_s',
+            'shift_hysteresis_frac':    'shift_hysteresis_frac',
         }
         for src, dst in _map.items():
             if src in car:
@@ -663,6 +720,18 @@ class SteadyStateResult:
 
     # Per-corner brake torque (Nm, positive = retarding)
     brake_torque: dict = field(default_factory=dict)
+
+    # Per-corner slip angle (deg) needed to make that corner's lateral force.
+    # These were already being computed to get the understeer gradient and then
+    # THROWN AWAY — only their axle-average difference survived.  The Ackermann
+    # solver needs them per wheel (the loaded outer tyre and the light inner one
+    # want different angles, which is the whole design lever), so they are kept.
+    slip_angle: dict = field(default_factory=dict)
+
+    # True when the axle pair cannot make the demanded force at ANY slip angle.
+    # Without this the solver returned its saturated angle and the caller could
+    # not tell a solved point from an impossible one.
+    grip_exceeded: dict = field(default_factory=lambda: {'F': False, 'R': False})
 
     # Understeer gradient (front avg SA - rear avg SA, positive = understeer)
     understeer_gradient_deg: float = 0.0
@@ -989,24 +1058,105 @@ class SteadyStateSolver:
                     ca *= fz_raw / fz_data_min
                 C_a[label] = ca
 
-            # Distribute Fy within each axle by cornering stiffness alone.
-            # Both tires on an axle share the same slip angle α, so each
-            # produces Fy = Cα(Fz)·α  →  left/right split ∝ Cα.
+            # ── AXLE FORCE SPLIT: Milliken pair analysis, not a stiffness ratio
+            # This used to read: "Both tires on an axle share the same slip
+            # angle a, so each produces Fy = Ca(Fz)*a -> split proportional to
+            # Ca."  Fy = Ca*a is the STRAIGHT-LINE part of the tyre curve, and
+            # at the 1.5-2.0 g this solver is asked about, the loaded outer tyre
+            # is nowhere near straight-line — it is saturating.  RCVD calls the
+            # lumped-stiffness treatment the BICYCLE model (Ch.5, Eq. 5.5); the
+            # two-wheel axle gets pair analysis (Ch.7, printed p.285), where
+            # each wheel is looked up SEPARATELY in the nonlinear tyre data at
+            # its own steer, camber and load, and the results are summed.
+            #
+            # The old split was also self-contradicting: it assumed equal slip
+            # angle to derive the ratio, then the understeer block inverted the
+            # resulting forces per wheel and got UNEQUAL angles back (measured:
+            # 2.42 deg on the 1101 N wheel vs 3.53 deg on the 193 N one — the
+            # light wheel apparently wanting MORE slip, which is backwards; RCVD
+            # printed p.25 and p.715 both say peak slip RISES with load, and the
+            # TTC data agrees at +1.5 to +2.5 deg per 1000 N).
+            #
+            # Now: find the ONE reference slip angle whose per-wheel nonlinear
+            # forces add up to the axle demand.  Wheels differ by static toe, so
+            # they sit at different angles and make different forces — which is
+            # the physics the stiffness ratio threw away.  Ackermann is NOT
+            # applied here: it needs a corner radius, which a generic
+            # steady-state point does not carry.  vahan.ackermann does that.
+            def _axle_split(labels, fy_axle, toe_deg):
+                """(per-wheel Fy, reference slip angle, hit_capability)."""
+                offs = {labels[0]: +0.5 * toe_deg, labels[1]: -0.5 * toe_deg}
+                def pair(a):
+                    # SIGNED sum, then magnitude.  Summing |Fy| per wheel put a
+                    # FLOOR under the axle: with static toe the two wheels sit
+                    # at +/-half-toe and OPPOSE each other near zero steer, so
+                    # adding magnitudes said the rear axle made 139.5 N while
+                    # the car was going straight (0.001 g demanded 2.8 N — a
+                    # 4900% error, and a phantom 4.6x rear bias in utilization
+                    # at 0.02 g).  Opposing forces must cancel, which is what
+                    # toe physically does.
+                    tot = 0.0
+                    for lb in labels:
+                        fzl = max(Fz[lb], 0.0)
+                        if fzl <= 1e-6:
+                            continue          # lifted wheel makes nothing
+                        tot += float(self._tire_for(lb).Fy(
+                            a + offs[lb], fzl, abs(cambers.get(lb, 0))))
+                    return abs(tot)
+                if fy_axle <= 1e-9:
+                    return {lb: 0.0 for lb in labels}, 0.0, False
+                # Bracket on the PAIR's own maximum, not one tyre's peak and not
+                # the end of the sweep — that mistake is what pinned
+                # slip_angle_for_Fy at a grid index (9.86 deg).
+                sa_hi = float(np.max(np.abs(getattr(
+                    self._tire_for(labels[0]), 'sa_range', (13.0,)))))
+                grid = np.linspace(0.0, sa_hi, 60)
+                vals = np.array([pair(float(a)) for a in grid])
+                k = int(np.argmax(vals))
+                cap = float(vals[k])
+                if fy_axle >= cap:
+                    # Demand exceeds what the pair can make at ANY slip angle.
+                    # There is no root, so evaluate at the pair's peak to get
+                    # the RATIO, then scale to the demanded total and flag it.
+                    # Fy must stay the DEMAND, not the capability: utilization
+                    # is demand/capability, so capping Fy here would make
+                    # utilization saturate below 1 and the grip-limit bisection
+                    # would never find a crossing (it ran to its 3.0 g ceiling).
+                    a_ref = float(grid[k])
+                    hit = True
+                else:
+                    lo, hi = 0.0, float(grid[k])
+                    for _ in range(60):
+                        mid = 0.5 * (lo + hi)
+                        lo, hi = (mid, hi) if pair(mid) < fy_axle else (lo, mid)
+                    a_ref = 0.5 * (lo + hi)
+                    hit = False
+                out = {}
+                for lb in labels:
+                    fzl = max(Fz[lb], 0.0)
+                    out[lb] = (abs(float(self._tire_for(lb).Fy(
+                        a_ref + offs[lb], fzl, abs(cambers.get(lb, 0)))))
+                        if fzl > 1e-6 else 0.0)
+                if hit:
+                    _s = sum(out.values())
+                    if _s > 1e-9:
+                        out = {lb: val * fy_axle / _s for lb, val in out.items()}
+                    else:                      # both wheels off the ground
+                        out = {lb: fy_axle / len(labels) for lb in labels}
+                return out, a_ref, hit
+
             fy_per_corner = {}
-            Wf = C_a['FL'] + C_a['FR']
-            Wr = C_a['RL'] + C_a['RR']
-            if Wf > 0:
-                fy_per_corner['FL'] = fy_front_axle * C_a['FL'] / Wf
-                fy_per_corner['FR'] = fy_front_axle * C_a['FR'] / Wf
-            else:
-                fy_per_corner['FL'] = fy_front_axle / 2
-                fy_per_corner['FR'] = fy_front_axle / 2
-            if Wr > 0:
-                fy_per_corner['RL'] = fy_rear_axle * C_a['RL'] / Wr
-                fy_per_corner['RR'] = fy_rear_axle * C_a['RR'] / Wr
-            else:
-                fy_per_corner['RL'] = fy_rear_axle / 2
-                fy_per_corner['RR'] = fy_rear_axle / 2
+            _sa_ref = {}
+            _cap_hit = {}
+            for _lbls, _fy_axle, _toe, _ax in (
+                    (('FL', 'FR'), fy_front_axle,
+                     float(getattr(v, 'toe_front_deg', 0.0)), 'F'),
+                    (('RL', 'RR'), fy_rear_axle,
+                     float(getattr(v, 'toe_rear_deg', 0.0)), 'R')):
+                _f, _a, _hit = _axle_split(_lbls, _fy_axle, _toe)
+                fy_per_corner.update(_f)
+                _sa_ref[_ax] = _a
+                _cap_hit[_ax] = _hit
 
             # Longitudinal force demand per corner
             total_fx = abs(v.total_mass_kg * ax)
@@ -1058,24 +1208,28 @@ class SteadyStateSolver:
                 result.brake_torque[label] = (
                     abs(fx_per_corner.get(label, 0)) * tire_r if braking else 0.0)
 
-            # Understeer gradient: back-calculate slip angles from tire model
-            # (per-axle tire so a split setup shifts the balance correctly).
-            if abs(ay) > 0.1 and hasattr(self._tire, 'slip_angle_for_Fy') \
-                    and hasattr(self._tire_rear, 'slip_angle_for_Fy'):
-                try:
-                    sa_fl = self._tire.slip_angle_for_Fy(
-                        fy_per_corner['FL'], max(Fz['FL'], 1.0), abs(cambers.get('FL', 0)))
-                    sa_fr = self._tire.slip_angle_for_Fy(
-                        fy_per_corner['FR'], max(Fz['FR'], 1.0), abs(cambers.get('FR', 0)))
-                    sa_rl = self._tire_rear.slip_angle_for_Fy(
-                        fy_per_corner['RL'], max(Fz['RL'], 1.0), abs(cambers.get('RL', 0)))
-                    sa_rr = self._tire_rear.slip_angle_for_Fy(
-                        fy_per_corner['RR'], max(Fz['RR'], 1.0), abs(cambers.get('RR', 0)))
-                    sa_front = (sa_fl + sa_fr) / 2
-                    sa_rear = (sa_rl + sa_rr) / 2
-                    result.understeer_gradient_deg = sa_front - sa_rear
-                except Exception:
-                    pass
+            # Slip angles + understeer gradient come STRAIGHT OUT of the pair
+            # analysis above — no inverse lookup at all.  The old code inverted
+            # each wheel's force back through `slip_angle_for_Fy`, which (a) was
+            # answering a question the split had already answered, (b) could
+            # disagree with the split's own premise, and (c) silently returned a
+            # grid index when it judged a force unreachable.  A wheel differs
+            # from its axle's reference angle only by its static toe.
+            if abs(ay) > 0.1:
+                _tf = float(getattr(v, 'toe_front_deg', 0.0))
+                _tr = float(getattr(v, 'toe_rear_deg', 0.0))
+                result.slip_angle = {
+                    'FL': _sa_ref['F'] + 0.5 * _tf,
+                    'FR': _sa_ref['F'] - 0.5 * _tf,
+                    'RL': _sa_ref['R'] + 0.5 * _tr,
+                    'RR': _sa_ref['R'] - 0.5 * _tr}
+                result.understeer_gradient_deg = _sa_ref['F'] - _sa_ref['R']
+            # Demand beyond what an axle pair can physically make is a REAL
+            # over-limit condition, not something to round away — surface it so
+            # the GUI and the lap sim can see it instead of reading a saturated
+            # angle as a valid solution.
+            result.grip_exceeded = {'F': bool(_cap_hit.get('F', False)),
+                                    'R': bool(_cap_hit.get('R', False))}
 
             # ── DIFFERENTIAL: yaw moment -> understeer-gradient shift ──────
             # The driven-axle drive/overrun torque, biased by the diff, makes
@@ -2049,10 +2203,15 @@ class SteadyStateSolver:
         else:
             elastic_front = elastic_rear = 0.0
 
-        # Unsprung mass (directly through axle height)
+        # Unsprung mass (directly through axle height).
+        # NO /2 HERE: unsprung_mass_*_kg is documented per AXLE (both wheels),
+        # so the whole axle mass transfers.  The stray /2 made total lateral
+        # load transfer 4.8% short of the m*a*h invariant at EVERY lateral g,
+        # on every car — and every published wheel load with it.  Gated in
+        # test_one_model.py ("load transfer inv") so it cannot come back.
         h_us = v.unsprung_cg_height_m
-        unsprung_front = (v.unsprung_mass_front_kg / 2) * ay * h_us / v.front_track_m
-        unsprung_rear = (v.unsprung_mass_rear_kg / 2) * ay * h_us / v.rear_track_m
+        unsprung_front = v.unsprung_mass_front_kg * ay * h_us / v.front_track_m
+        unsprung_rear = v.unsprung_mass_rear_kg * ay * h_us / v.rear_track_m
 
         return {
             'geometric_front': geo_front,

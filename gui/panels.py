@@ -34,10 +34,39 @@ CHASSIS_PTS = frozenset({
 
 ARB_HP_NAMES = ['arb_drop_top', 'arb_arm_end', 'arb_pivot']
 
-C_BLUE = '#cccccc'
+C_BLUE = '#d4d4da'
 C_RED  = '#EF5350'
-C_TEXT = '#e0e0e0'
-C_SUB  = '#888888'
+C_TEXT = '#e8e8ea'
+C_SUB  = '#9a9aa2'
+
+# ── shared chrome styles (ONE definition, used app-wide) ─────────────────────
+# Approved chrome palette: near-black/slate surfaces, white/warm-grey text,
+# AMBER (#FFB74D family) for primary/active emphasis, RED for destructive.
+# NO blue chrome (user request); blue stays ONLY as corner-data / plot-series
+# coding.  Every style has an INSTANT :pressed state (1px translate via the
+# padding trick — no animations, snappy = immediate).
+ACCENT       = '#FFB74D'   # amber — primary emphasis / info glyphs
+ACCENT_DIM   = '#8f6a2e'   # darker amber — borders/focus (matches global QSS)
+BTN_PRIMARY = (
+    'QPushButton { background: #FFB74D; color: #141414; padding: 6px 16px; '
+    'border-radius: 4px; font-weight: bold; border: none; } '
+    'QPushButton:hover { background: #ffc875; } '
+    'QPushButton:pressed { background: #d99a3c; padding: 7px 16px 5px 16px; } '
+    'QPushButton:disabled { background: #3a3a42; color: #63636b; }')
+BTN_SECONDARY = (
+    'QPushButton { background: #2c2c34; color: #e8e8ea; padding: 6px 16px; '
+    'border-radius: 4px; font-weight: bold; border: 1px solid #3e3e48; } '
+    'QPushButton:hover { background: #34343e; border-color: #4a4a56; } '
+    'QPushButton:pressed { background: #1e1e24; padding: 7px 16px 5px 16px; } '
+    'QPushButton:disabled { background: #17171b; color: #63636b; '
+    'border-color: #26262c; }')
+# Round ⓘ/? info buttons — amber glyph, amber-tinted hover
+BTN_INFO_ROUND = (
+    'QPushButton {{ background: transparent; color: #FFB74D; '
+    'border: 1px solid #26262c; border-radius: {r}px; '
+    'font-weight: bold; font-size: 14px; }} '
+    'QPushButton:hover {{ background: #241c0e; border-color: #FFB74D; }} '
+    'QPushButton:pressed {{ background: #171208; }}')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -68,36 +97,35 @@ class CollapsibleSection(QWidget):
         header.setSpacing(3)
 
         self._btn = QToolButton()
-        self._btn.setText(f'  v  {title}')
+        self._btn.setText(f'−  {title.upper()}')
         self._btn.setCheckable(True)
         self._btn.setChecked(True)
         self._btn.setStyleSheet(f"""
             QToolButton {{
-                background: #111111;
+                background: transparent;
                 color: {header_color};
-                border: 1px solid #2a2a2a;
-                border-radius: 3px;
+                border: none;
+                border-bottom: 1px solid #26262c;
+                border-radius: 0;
                 text-align: left;
-                font-weight: bold;
-                font-size: 12px;
-                padding: 5px 8px;
-                width: 100%;
+                font-weight: 600;
+                font-size: 11px;
+                padding: 7px 4px 6px 2px;
             }}
-            QToolButton:hover {{ background: #1a1a1a; }}
+            QToolButton:hover {{
+                background: #131316;
+                border-bottom-color: #4a4a54;
+            }}
         """)
         self._btn.clicked.connect(self._toggle)
         self._btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         header.addWidget(self._btn, 1)
 
-        # Info (ⓘ) button — colour-blind-safe blue circle, hidden until set_info.
+        # Info (ⓘ) button — amber circle (no blue chrome), hidden until set_info.
         self._info_btn = QPushButton('ⓘ')          # ⓘ
         self._info_btn.setFixedSize(26, 26)
         self._info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._info_btn.setStyleSheet(
-            'QPushButton { background: #111111; color: #4FC3F7; '
-            'border: 1px solid #2a2a2a; border-radius: 13px; '
-            'font-weight: bold; font-size: 15px; }'
-            'QPushButton:hover { background: #14344a; border-color: #4FC3F7; }')
+        self._info_btn.setStyleSheet(BTN_INFO_ROUND.format(r=13))
         self._info_btn.setToolTip('What is this section? Click for full detail.')
         self._info_btn.clicked.connect(self._show_info)
         self._info_btn.setVisible(False)
@@ -132,8 +160,8 @@ class CollapsibleSection(QWidget):
         dlg.setWindowTitle(f'ⓘ  {self._info_title}')
         dlg.resize(640, 720)
         dlg.setStyleSheet(
-            'QDialog { background: #0a0a0a; }'
-            'QTextBrowser { background: #0a0a0a; color: #e0e0e0; border: none; '
+            'QDialog { background: #0e0e11; }'
+            'QTextBrowser { background: #0e0e11; color: #e8e8ea; border: none; '
             'font-size: 12px; }')
         lay = QVBoxLayout(dlg)
         tb = QTextBrowser()
@@ -142,17 +170,14 @@ class CollapsibleSection(QWidget):
         lay.addWidget(tb)
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(dlg.accept)
-        close_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 20px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #1f6da0; }')
+        close_btn.setStyleSheet(BTN_PRIMARY)
         lay.addWidget(close_btn)
         dlg.exec()
 
     def _toggle(self, checked: bool):
         self._content.setVisible(checked)
-        arrow = 'v' if checked else '>'
-        self._btn.setText(f'  {arrow}  {self._title}')
+        arrow = '−' if checked else '+'
+        self._btn.setText(f'{arrow}  {self._title.upper()}')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -196,6 +221,7 @@ class MotionPanel(CollapsibleSection):
     position_changed      = pyqtSignal(float)
     damper_params_changed = pyqtSignal(dict)
     apply_sag_requested   = pyqtSignal()
+    dance_toggled         = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__('Motion')
@@ -203,6 +229,7 @@ class MotionPanel(CollapsibleSection):
         self._min_val = -50.0
         self._max_val =  50.0
         self._pos     =   0.0
+        self._travel_limits = None      # (droop, bump) mm, set from stroke+sag
         self._building = False
         self._build()
         self.set_info(section_info.MOTION)
@@ -229,15 +256,17 @@ class MotionPanel(CollapsibleSection):
             row.addWidget(rb)
         self.add_layout(row)
 
-        # Asymmetric range
-        grid = QGridLayout(); grid.setSpacing(4)
-        grid.addWidget(QLabel('Min:'), 0, 0)
-        self._min_spin = _spin(-1e6, 0, -50, ' mm'); self._min_spin.valueChanged.connect(self._on_range)
-        grid.addWidget(self._min_spin, 0, 1)
-        grid.addWidget(QLabel('Max:'), 0, 2)
-        self._max_spin = _spin(0, 1e6, 50, ' mm');   self._max_spin.valueChanged.connect(self._on_range)
-        grid.addWidget(self._max_spin, 0, 3)
-        self.add_layout(grid)
+        # Travel range is NOT an input.  For the mm motions it is exactly what
+        # the damper allows: droop = the sag already in the shock, bump = the
+        # stroke left above sag, both divided by the motion ratio to get wheel
+        # travel.  Typing a separate Min/Max was redundant with stroke+sag and
+        # let the slider run past where the damper physically stops.
+        # Degree motions (roll / steer) are not stroke-limited and keep defaults.
+        self._range_lbl = QLabel('Travel: droop — / bump —')
+        self._range_lbl.setStyleSheet(
+            'color: #b0b0b0; font-family: Consolas, monospace; '
+            'font-size: 11px; padding: 2px 0;')
+        self.add_widget(self._range_lbl)
 
         # Damper limits — stroke + per-axle preload + fully-extended length.
         # Sag is COMPUTED (not entered) from spring/mass/MR + preload.
@@ -310,6 +339,20 @@ class MotionPanel(CollapsibleSection):
         self._pos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.add_widget(self._pos_label)
 
+        # Easter egg: wave the four corners (FL leads, FR / RL / RR follow
+        # a quarter period apart each).  Checkable -- click again to stop.
+        from PyQt6.QtWidgets import QPushButton
+        dance_row = QHBoxLayout()
+        self._dance_btn = QPushButton('💃 Dance')
+        self._dance_btn.setCheckable(True)
+        self._dance_btn.setToolTip(
+            'Wave the car corner by corner: FL up first, then FR, RL, RR -- '
+            'each a quarter period behind the last. Click again to stop.')
+        self._dance_btn.toggled.connect(self.dance_toggled.emit)
+        dance_row.addWidget(self._dance_btn)
+        dance_row.addStretch(1)
+        self.add_layout(dance_row)
+
     def _on_motion(self, checked, key):
         if not checked: return
         self._motion = key
@@ -317,19 +360,46 @@ class MotionPanel(CollapsibleSection):
         defs = {'heave': (-50, 50, ' mm'), 'roll': (-5, 5, ' °'),
                 'pitch': (-30, 30, ' mm'), 'steer': (-360, 360, ' °')}
         lo, hi, suf = defs[key]
-        self._min_spin.setSuffix(suf); self._min_spin.setValue(lo)
-        self._max_spin.setSuffix(suf); self._max_spin.setValue(hi)
+        if key in ('heave', 'pitch') and self._travel_limits is not None:
+            lo, hi = self._travel_limits          # damper-derived, not typed
         self._min_val, self._max_val = lo, hi
         self._building = False
         self._sync()
         self.motion_changed.emit(key)
         self.range_changed.emit(self._min_val, self._max_val)
 
-    def _on_range(self):
-        if self._building: return
-        self._min_val = self._min_spin.value()
-        self._max_val = self._max_spin.value()
-        if self._min_val >= self._max_val: return
+    def set_travel_limits(self, droop_mm: float, bump_mm: float):
+        """Clamp the mm-motion slider to what the damper actually allows.
+
+        droop_mm / bump_mm are WHEEL travel either side of static, worked out
+        from stroke, sag and motion ratio by the caller.  Called whenever the
+        sag readout refreshes, so the slider can never travel past a topped-out
+        or bottomed-out damper.
+        """
+        droop_mm = abs(float(droop_mm)); bump_mm = abs(float(bump_mm))
+        if droop_mm + bump_mm < 1e-6:
+            return
+        # No-op guard: the sag readout refreshes on EVERY dynamics-solver
+        # build (Solve click, constants refresh) even when nothing moved.
+        # Re-emitting range_changed for identical limits re-triggers the
+        # full kinematic sweep + 3D + replot pipeline (seconds, on the GUI
+        # thread).  Skip when both the stored limits and — if the slider is
+        # currently in mm mode — the displayed range already match.
+        if (self._travel_limits is not None
+                and abs(self._travel_limits[0] + droop_mm) < 1e-6
+                and abs(self._travel_limits[1] - bump_mm) < 1e-6
+                and (self._motion not in ('heave', 'pitch')
+                     or (abs(self._min_val + droop_mm) < 1e-6
+                         and abs(self._max_val - bump_mm) < 1e-6))):
+            return
+        self._travel_limits = (-droop_mm, bump_mm)
+        self._range_lbl.setText(
+            f'Travel: droop {-droop_mm:.1f} / bump +{bump_mm:.1f} mm  (0 = static sag)')
+        if self._motion not in ('heave', 'pitch'):
+            return
+        self._building = True
+        self._min_val, self._max_val = -droop_mm, bump_mm
+        self._building = False
         self._sync()
         self.range_changed.emit(self._min_val, self._max_val)
 
@@ -383,6 +453,38 @@ class MotionPanel(CollapsibleSection):
             return
         f_mm  = sag_info.get('sag_shock_front_mm', 0.0)
         r_mm  = sag_info.get('sag_shock_rear_mm',  0.0)
+        # Derive the slider's travel range from the damper itself: droop is
+        # the compression ALREADY IN the shock at the slider's zero, bump is
+        # the stroke left above it, each taken through that axle's motion
+        # ratio.  Use the TIGHTER axle so neither end can be driven past its
+        # stop.
+        #
+        # Which compression is "already in" depends on where zero currently
+        # sits.  Before "Apply Sag to Hardpoints", zero is the CAD pose and
+        # the honest number is the CAD damper compression (diagnostic keys,
+        # present when Fully ext. is set).  After applying, the geometry HAS
+        # settled to static, the CAD compression equals the physics sag, and
+        # the range re-zeros automatically: rebound (droop) grows to the
+        # full sag, bump shrinks to stroke minus sag.  Falling back to the
+        # sag numbers keeps the old CAD-is-static convention when no
+        # fully-extended length is given.
+        try:
+            _stroke = float(self._stroke.value())
+            _mrf = float(sag_info.get('mr_front_used') or 0.0)
+            _mrr = float(sag_info.get('mr_rear_used') or 0.0)
+            _cf = sag_info.get('cad_compression_front_mm')
+            _cr = sag_info.get('cad_compression_rear_mm')
+            _comp_f = float(_cf) if _cf is not None else f_mm
+            _comp_r = float(_cr) if _cr is not None else r_mm
+            _dr, _bp = [], []
+            for _s, _mr in ((_comp_f, _mrf), (_comp_r, _mrr)):
+                if _mr > 1e-6:
+                    _dr.append(max(_s, 0.0) / _mr)
+                    _bp.append(max(_stroke - _s, 0.0) / _mr)
+            if _dr and _bp:
+                self.set_travel_limits(min(_dr), min(_bp))
+        except Exception:
+            pass
         f_pct = sag_info.get('sag_front_pct', 0.0)
         r_pct = sag_info.get('sag_rear_pct',  0.0)
         warn_list = []
@@ -459,6 +561,31 @@ class SteeringPanel(CollapsibleSection):
             'total_rack_travel_mm':   self._rack_total.value(),
         }
 
+    def set_params(self, d: dict):
+        """Push SAVED rack numbers into the spinboxes.
+
+        THIS PANEL HAD NO LOAD PATH.  `_load_project_from_path` updated the
+        model dict (`MainWindow._steer`) and the panel kept its CONSTRUCTOR
+        DEFAULTS forever — so a car saved with a 129.54 mm/rev rack displayed
+        120 mm/rev and 64 mm total (4.72 in / 2.52 in), which is exactly the
+        "those are clearly wrong numbers" the user reported.  Two ways that
+        bites: the panel lies about the car, and touching either spinbox fires
+        `_on_rack_changed`, which then OVERWRITES the correct model values with
+        the stale defaults.  Signals are blocked here so restoring state cannot
+        emit that overwrite.
+        """
+        if not d:
+            return
+        for key, spin in (('rack_travel_per_rev_mm', self._rack_ratio),
+                          ('total_rack_travel_mm', self._rack_total)):
+            if key in d and d[key] is not None:
+                spin.blockSignals(True)
+                try:
+                    spin.setValue(float(d[key]))
+                finally:
+                    spin.blockSignals(False)
+        self._refresh_max_hw()
+
     def _build(self):
         grid = QGridLayout(); grid.setSpacing(4)
 
@@ -478,7 +605,7 @@ class SteeringPanel(CollapsibleSection):
         # lock-to-lock = 2 × max_hw_deg
         self._max_hw_lbl = QLabel()
         self._max_hw_lbl.setStyleSheet(
-            'color: #4FC3F7; font-size: 11px; font-weight: bold;'
+            'color: #FFB74D; font-size: 11px; font-weight: bold;'
             ' padding: 2px 4px;')
         self._max_hw_lbl.setWordWrap(True)
         self.add_widget(self._max_hw_lbl)
@@ -902,10 +1029,10 @@ class HardpointPanel(CollapsibleSection):
                 col_str = '#FFB300'   # amber for ARB
             elif cat == 'heave':
                 vals_mm = self._heave[name] * 1000.0
-                col_str = '#42E0A0'   # green for HEAVE 3rd element
+                col_str = '#4FC3F7'   # blue for HEAVE 3rd element
             else:   # decoupled
                 vals_mm = self._decoupled[name] * 1000.0
-                col_str = '#B85FFF'   # purple for DECOUPLED bellcrank/dampers
+                col_str = '#FFD600'   # yellow for DECOUPLED bellcrank/dampers
 
             item = QTableWidgetItem(name)
             item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
@@ -1023,9 +1150,10 @@ class ValuesPanel(CollapsibleSection):
         btn = QPushButton('Show Live Values')
         btn.setStyleSheet(
             'QPushButton { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #444; padding: 6px 16px; border-radius: 3px; '
+            'border: 1px solid #444; padding: 6px 16px; border-radius: 4px; '
             'font-weight: bold; }'
-            'QPushButton:hover { background: #2a2a2a; }')
+            'QPushButton:hover { background: #2a2a2a; }'
+            'QPushButton:pressed { background: #101013; }')
         btn.clicked.connect(self._show_popup)
         self.add_widget(btn)
 
@@ -1512,15 +1640,17 @@ class _SolutionPickerDialog(QDialog):
         layout.addWidget(btns)
 
         self.setStyleSheet("""
-            QDialog { background: #111111; color: #e0e0e0; }
-            QTableWidget { background: #0a0a0a; color: #e0e0e0;
-                           gridline-color: #2a2a2a; }
-            QHeaderView::section { background: #1a1a1a; color: #ccc;
-                                   border: 1px solid #2a2a2a; padding: 3px; }
-            QLabel { color: #e0e0e0; }
-            QPushButton { background: #333; color: #e0e0e0; padding: 5px 12px;
-                          border: 1px solid #555; border-radius: 3px; }
-            QPushButton:hover { background: #444; }
+            QDialog { background: #0e0e11; color: #e8e8ea; }
+            QTableWidget { background: #101013; color: #e8e8ea;
+                           gridline-color: #1e1e23; }
+            QHeaderView::section { background: #15151a; color: #b4b4bc;
+                                   border: none; border-bottom: 1px solid #2a2a32;
+                                   padding: 4px 6px; }
+            QLabel { color: #e8e8ea; }
+            QPushButton { background: #1a1a1f; color: #e8e8ea; padding: 5px 12px;
+                          border: 1px solid #2e2e36; border-radius: 4px; }
+            QPushButton:hover { background: #232329; border-color: #40404a; }
+            QPushButton:pressed { background: #101014; }
         """)
 
     def chosen_result(self) -> dict | None:
@@ -1561,6 +1691,10 @@ class InverseKinematicsPanel(CollapsibleSection):
         grid.addWidget(QLabel('Motion:'), r, 0)
         self._motion = _NoScrollCombo()
         self._motion.addItems(['Heave', 'Roll', 'Pitch', 'Steer'])
+        # Motion decides which physical limit bounds the sweep: suspension
+        # travel for heave/roll/pitch, the RACK for steer.  Re-derive on change.
+        self._motion.currentIndexChanged.connect(
+            lambda _i: self._apply_range_limits())
         grid.addWidget(self._motion, r, 1); r += 1
 
         # Range — auto-clamps to damper limits when set_damper_limits() called
@@ -1712,8 +1846,11 @@ class InverseKinematicsPanel(CollapsibleSection):
         # Solve button
         self._solve_btn = QPushButton('  Solve  ')
         self._solve_btn.setStyleSheet(
-            'background: #555555; color: white; font-weight: bold; '
-            'border-radius: 4px; padding: 6px; font-size: 13px;')
+            'QPushButton { background: #26262e; color: #e8e8ea; font-weight: 600; '
+            'border: 1px solid #3e3e4a; border-radius: 4px; padding: 6px; '
+            'font-size: 13px; }'
+            'QPushButton:hover { background: #30303a; border-color: #4a4a58; }'
+            'QPushButton:pressed { background: #1c1c22; }')
         self._solve_btn.clicked.connect(self._on_solve)
         self.add_widget(self._solve_btn)
 
@@ -1736,8 +1873,10 @@ class InverseKinematicsPanel(CollapsibleSection):
         # Apply button (hidden until solve completes)
         self._apply_btn = QPushButton('Apply to Model')
         self._apply_btn.setStyleSheet(
-            'background: #444444; color: white; font-weight: bold; '
-            'border-radius: 4px; padding: 5px;')
+            'QPushButton { background: #26262e; color: #e8e8ea; font-weight: 600; '
+            'border: 1px solid #3e3e4a; border-radius: 4px; padding: 5px; }'
+            'QPushButton:hover { background: #30303a; border-color: #4a4a58; }'
+            'QPushButton:pressed { background: #1c1c22; }')
         self._apply_btn.setVisible(False)
         self._apply_btn.clicked.connect(self._on_apply)
         self.add_widget(self._apply_btn)
@@ -1745,8 +1884,10 @@ class InverseKinematicsPanel(CollapsibleSection):
         # "Find Solutions" button (hidden until solve shows target not met)
         self._find_btn = QPushButton('Find Solutions (wider search)')
         self._find_btn.setStyleSheet(
-            'background: #555; color: white; font-weight: bold; '
-            'border-radius: 4px; padding: 5px;')
+            'QPushButton { background: #26262e; color: #e8e8ea; font-weight: 600; '
+            'border: 1px solid #3e3e4a; border-radius: 4px; padding: 5px; }'
+            'QPushButton:hover { background: #30303a; border-color: #4a4a58; }'
+            'QPushButton:pressed { background: #1c1c22; }')
         self._find_btn.setVisible(False)
         self._find_btn.clicked.connect(self._on_find_solutions)
         self.add_widget(self._find_btn)
@@ -1860,14 +2001,55 @@ class InverseKinematicsPanel(CollapsibleSection):
             bump  (compress)    : (stroke − sag) / MR
         So sweep range:  lo = −sag/MR   .. hi = +(stroke−sag)/MR
         """
-        sag = max(0.0, min(stroke_mm, sag_shock_mm))
-        mr_safe = max(mr, 1e-6)
-        lo = -sag / mr_safe                   # max droop (wheel can drop this much)
-        hi = (stroke_mm - sag) / mr_safe      # max bump  (wheel can rise this much)
-        self._range_lo.setRange(lo - 5, hi + 5)
-        self._range_hi.setRange(lo - 5, hi + 5)
-        self._range_lo.setValue(lo)
-        self._range_hi.setValue(hi)
+        # Remember the damper numbers: the range has to be RE-DERIVED whenever
+        # the motion changes, and only this call knows them.
+        self._damper_limits = (float(stroke_mm), float(sag_shock_mm), float(mr))
+        self._apply_range_limits()
+
+    def set_rack_limits(self, total_rack_travel_mm: float,
+                        rack_travel_per_rev_mm: float):
+        """Rack numbers, for when Motion = STEER.
+
+        STEERING IS NOT LIMITED BY WHEEL TRAVEL.  This panel clamped the sweep
+        range to damper stroke over motion ratio for EVERY motion, including
+        Steer — so the steering sweep was bounded by suspension travel in
+        millimetres, which is meaningless for steering.  The real bound is the
+        RACK: half the total rack travel is one-way, and rack_travel_per_rev
+        converts it to steering-wheel degrees.
+        """
+        self._rack_limits = (float(total_rack_travel_mm),
+                             float(rack_travel_per_rev_mm))
+        self._apply_range_limits()
+
+    def _apply_range_limits(self):
+        """Set Min/Max range + units from the CURRENT motion selection."""
+        is_steer = self._motion.currentText().strip().lower() == 'steer'
+        if is_steer:
+            total, per_rev = getattr(self, '_rack_limits', (0.0, 0.0))
+            if total <= 0 or per_rev <= 0:
+                return
+            # one-way steering-wheel angle the rack physically allows
+            hw = (total / 2.0) / per_rev * 360.0
+            lo, hi, suffix, dec = -hw, hw, ' deg', 0
+        else:
+            stroke_mm, sag_shock_mm, mr = getattr(
+                self, '_damper_limits', (0.0, 0.0, 1.0))
+            if stroke_mm <= 0:
+                return
+            sag = max(0.0, min(stroke_mm, sag_shock_mm))
+            mr_safe = max(mr, 1e-6)
+            lo = -sag / mr_safe               # max droop (wheel drops this much)
+            hi = (stroke_mm - sag) / mr_safe  # max bump  (wheel rises this much)
+            suffix, dec = ' mm', 0
+        for spin, val in ((self._range_lo, lo), (self._range_hi, hi)):
+            spin.blockSignals(True)
+            try:
+                spin.setSuffix(suffix)
+                spin.setDecimals(dec)
+                spin.setRange(lo - abs(lo) * 0.1 - 5, hi + abs(hi) * 0.1 + 5)
+                spin.setValue(val)
+            finally:
+                spin.blockSignals(False)
 
     def _on_solve(self):
         spec = self.get_spec()
@@ -1999,15 +2181,15 @@ class InverseKinematicsPanel(CollapsibleSection):
 #  DYNAMICS PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
-_DYNAMICS_HELP = """<h3 style="color:#4FC3F7;">Dynamics Panel Reference</h3>
+_DYNAMICS_HELP = """<h3 style="color:#FFB74D;">Dynamics Panel Reference</h3>
 
 <h4 style="color:#e07b30;">Buttons</h4>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;font-weight:bold;">Solve</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">Solve</td>
 <td>Computes the steady-state equilibrium at the specified lateral/longitudinal g.
 Iterates: roll angle &rarr; per-corner travel &rarr; kinematic solve (RC migration,
 camber change) &rarr; load transfer &rarr; updated roll. Converges in 2-3 iterations.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">Sweep</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">Sweep</td>
 <td>Runs Solve at many g-levels (default 0&ndash;2 g, 41 points) and plots
 all outputs vs. acceleration. Select <b>Lateral</b> or <b>Longitudinal</b> sweep mode.
 Lateral sweep = load transfer diagram for understeer/oversteer tuning.
@@ -2016,95 +2198,95 @@ Longitudinal sweep = pitch, front/rear load shift under braking/accel.</td></tr>
 
 <h4 style="color:#e07b30;">Input Parameters</h4>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;">Total mass</td>
+<tr><td style="color:#FFB74D;">Total mass</td>
 <td>Car + driver, fully loaded (kg).</td></tr>
-<tr><td style="color:#4FC3F7;">Sprung mass</td>
+<tr><td style="color:#FFB74D;">Sprung mass</td>
 <td>Everything supported by the springs: chassis, engine, driver, etc. Total mass minus all 4 unsprung corners.</td></tr>
-<tr><td style="color:#4FC3F7;">Unsprung F/R (axle)</td>
+<tr><td style="color:#FFB74D;">Unsprung F/R (axle)</td>
 <td>Mass of both wheels + uprights + hubs + brakes + half-links on one axle (kg). Acts at wheel-center height.</td></tr>
-<tr><td style="color:#4FC3F7;">Spring rate F/R</td>
+<tr><td style="color:#FFB74D;">Spring rate F/R</td>
 <td>Linear spring rate at the spring itself (lbf/in). Wheel rate = spring rate &times; MR&sup2;. MR is read from your geometry automatically. Converted to N/m internally (1 lbf/in = 175.127 N/m).</td></tr>
-<tr><td style="color:#4FC3F7;">Tire rate</td>
+<tr><td style="color:#FFB74D;">Tire rate</td>
 <td>Vertical stiffness of the tire carcass (lbf/in). In series with the spring: ride rate = (wheel rate &times; tire rate) / (wheel rate + tire rate).</td></tr>
-<tr><td style="color:#4FC3F7;">ARB rate F/R</td>
+<tr><td style="color:#FFB74D;">ARB rate F/R</td>
 <td>Anti-roll bar equivalent wheel rate (lbf/in). Force at one wheel per inch of single-side deflection (other side fixed). Set to 0 for no ARB.</td></tr>
-<tr><td style="color:#4FC3F7;">Lateral g</td>
+<tr><td style="color:#FFB74D;">Lateral g</td>
 <td>Centripetal acceleration in units of g (9.81 m/s&sup2;). 1.0 g = steady-state cornering at roughly 1.0 &times; 9.81 m/s&sup2;.</td></tr>
-<tr><td style="color:#4FC3F7;">Longitudinal g</td>
+<tr><td style="color:#FFB74D;">Longitudinal g</td>
 <td>Braking (negative) or acceleration (positive) in g. Shifts load front/rear via pitch load transfer.</td></tr>
-<tr><td style="color:#4FC3F7;">Power (wheel)</td>
+<tr><td style="color:#FFB74D;">Power (wheel)</td>
 <td>Peak wheel horsepower (hp). After all drivetrain losses. Used to compute torque, drive force, and power-limited max acceleration.</td></tr>
-<tr><td style="color:#4FC3F7;">Engine RPM</td>
+<tr><td style="color:#FFB74D;">Engine RPM</td>
 <td>Engine RPM at the operating point. With gear ratio and tire radius, this gives vehicle speed. Speed + turn radius &rarr; lateral g is auto-calculated.</td></tr>
-<tr><td style="color:#4FC3F7;">Total ratio</td>
+<tr><td style="color:#FFB74D;">Total ratio</td>
 <td>Overall drivetrain ratio from engine to wheel. For single-speed FSAE: primary &times; final. E.g. if primary = 2.8 and sprocket = 3.6, total = 10.08.</td></tr>
-<tr><td style="color:#4FC3F7;">Tire radius</td>
+<tr><td style="color:#FFB74D;">Tire radius</td>
 <td>Loaded tire radius (mm). For FSAE 10&rdquo; wheels: ~203 mm. Used in speed and force calculations.</td></tr>
-<tr><td style="color:#4FC3F7;">Turn radius</td>
+<tr><td style="color:#FFB74D;">Turn radius</td>
 <td>Corner radius (m). With speed from RPM, this auto-calculates lateral g = v&sup2;/(R&times;9.81). FSAE hairpin ~4.5m, skidpad ~7.6m.</td></tr>
-<tr><td style="color:#4FC3F7;">Max steer</td>
+<tr><td style="color:#FFB74D;">Max steer</td>
 <td>Maximum front wheel steer angle (deg, not rack). Used to compute minimum turn radius: R_min = wheelbase / tan(steer_max).</td></tr>
-<tr><td style="color:#4FC3F7;">Drivetrain</td>
+<tr><td style="color:#FFB74D;">Drivetrain</td>
 <td>RWD, FWD, or AWD. Determines which tires provide traction force. RWD = rear axle only, FWD = front axle, AWD = all four.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Auto-sourced (not entered here)</h4>
 <table cellspacing="4">
-<tr><td style="color:#66BB6A;">Motion ratio</td>
+<tr><td style="color:#FFB74D;">Motion ratio</td>
 <td>Computed from your pushrod/rocker geometry at design position. d(spring length)/d(wheel travel).</td></tr>
-<tr><td style="color:#66BB6A;">Track, wheelbase, CG</td>
+<tr><td style="color:#FFB74D;">Track, wheelbase, CG</td>
 <td>Read from the Car Parameters panel on the left sidebar.</td></tr>
-<tr><td style="color:#66BB6A;">Roll centre height</td>
+<tr><td style="color:#FFB74D;">Roll centre height</td>
 <td>Queried from the kinematic solver at each iteration's travel. Migrates with roll.</td></tr>
-<tr><td style="color:#66BB6A;">Camber at load</td>
+<tr><td style="color:#FFB74D;">Camber at load</td>
 <td>Queried from the kinematic solver at the operating travel.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Results Table</h4>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;">Fz (N)</td>
+<tr><td style="color:#FFB74D;">Fz (N)</td>
 <td>Vertical load on each tire. Positive = compression. Sum of all 4 = total weight.</td></tr>
-<tr><td style="color:#4FC3F7;">Travel (mm)</td>
+<tr><td style="color:#FFB74D;">Travel (mm)</td>
 <td>Suspension travel at each corner from body roll. Positive = bump (compression).</td></tr>
-<tr><td style="color:#4FC3F7;">Camber (deg)</td>
+<tr><td style="color:#FFB74D;">Camber (deg)</td>
 <td>Wheel camber at the operating travel. Negative = top of wheel leans inboard.</td></tr>
-<tr><td style="color:#4FC3F7;">Utilization</td>
+<tr><td style="color:#FFB74D;">Utilization</td>
 <td>Fraction of available tire grip used. &gt;1.0 means that corner has exceeded its peak lateral force &mdash; the car is sliding.</td></tr>
-<tr><td style="color:#4FC3F7;">LT Geo (N)</td>
+<tr><td style="color:#FFB74D;">LT Geo (N)</td>
 <td><b>Geometric load transfer.</b> Force path through the roll centre directly to the chassis &mdash; no body roll needed. Proportional to RC height. Higher RC = more geometric LT = less roll, but less tunability.</td></tr>
-<tr><td style="color:#4FC3F7;">LT Elastic (N)</td>
+<tr><td style="color:#FFB74D;">LT Elastic (N)</td>
 <td><b>Elastic load transfer.</b> Force path through springs + ARB. Proportional to each axle's share of total roll stiffness. <b>This is what you tune with ARBs.</b> More front elastic LT = more understeer.</td></tr>
-<tr><td style="color:#4FC3F7;">LT Unsprung (N)</td>
+<tr><td style="color:#FFB74D;">LT Unsprung (N)</td>
 <td><b>Unsprung load transfer.</b> Direct inertia of unsprung mass (wheels, uprights, brakes) at axle height. Small but not negligible.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Sweep Controls</h4>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;">Sweep axes</td>
+<tr><td style="color:#FFB74D;">Sweep axes</td>
 <td><b>Lateral</b> = sweep cornering g. <b>Longitudinal</b> = sweep braking/accel g.
 <b>Both checked</b> = combined: sweeps lateral g while also applying the longitudinal g from the spinner.
 This is the real peak load case &mdash; trail braking into a corner, or accelerating out.</td></tr>
-<tr><td style="color:#4FC3F7;">Graphs</td>
+<tr><td style="color:#FFB74D;">Graphs</td>
 <td>Check/uncheck which plots to show. Pitch and Understeer Gradient are new additions.</td></tr>
-<tr><td style="color:#4FC3F7;">Corners</td>
+<tr><td style="color:#FFB74D;">Corners</td>
 <td>Toggle FL/FR/RL/RR visibility on per-corner plots (Fz, Travel, Camber, Utilization).</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">New Plots</h4>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;">Pitch Angle</td>
+<tr><td style="color:#FFB74D;">Pitch Angle</td>
 <td>Nose-down (braking) or nose-up (accel) angle from longitudinal load transfer through pitch stiffness. K_pitch = 2 &times; (K_wheel_F &times; a&sup2; + K_wheel_R &times; b&sup2;).</td></tr>
-<tr><td style="color:#4FC3F7;">Understeer Gradient</td>
+<tr><td style="color:#FFB74D;">Understeer Gradient</td>
 <td>Front avg slip angle minus rear avg slip angle (deg). Positive = understeer (front tires need more SA for the same g). Computed by inverting the tire model: given the required Fy at each corner's Fz and camber, find what SA the tire needs. Requires tire data loaded.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Summary Line</h4>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;">Roll</td>
+<tr><td style="color:#FFB74D;">Roll</td>
 <td>Body roll angle (deg). Roll = (sprung mass &times; ay &times; moment arm) / total roll stiffness.</td></tr>
-<tr><td style="color:#4FC3F7;">LLTD</td>
+<tr><td style="color:#FFB74D;">LLTD</td>
 <td>Lateral Load Transfer Distribution (% front). The fraction of total lateral LT carried by the front axle. Higher LLTD = front tires saturate first = understeer. Typical FSAE target: 50&ndash;58%.</td></tr>
-<tr><td style="color:#4FC3F7;">RC</td>
+<tr><td style="color:#FFB74D;">RC</td>
 <td>Roll centre height front/rear (mm) at the current operating point.</td></tr>
 </table>
 
@@ -2112,21 +2294,21 @@ This is the real peak load case &mdash; trail braking into a corner, or accelera
 <p>Your tire data file (.mat, .csv, or .xlsx) should contain these columns.
 The TTC .mat files from your zip already have all of them.</p>
 <table cellspacing="4">
-<tr><td style="color:#4FC3F7;font-weight:bold;">SA</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">SA</td>
 <td><b>Slip Angle</b> (deg). The angle between where the tire is pointing and where it is actually traveling. This generates lateral force. Positive = tire pointing inboard of travel direction.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">FZ</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">FZ</td>
 <td><b>Normal Load</b> (N). Vertical force pushing the tire into the ground. In TTC raw data, FZ is negative (compression = downward). The loader auto-detects this and flips it to positive.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">FY</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">FY</td>
 <td><b>Lateral Force</b> (N). The cornering force the tire generates perpendicular to its heading. This is what keeps you on the track in a turn.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">IA</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">IA</td>
 <td><b>Inclination Angle / Camber</b> (deg). Tilt of the wheel from vertical. 0 = perfectly upright. Affects the shape of the Fy vs SA curve and peak grip.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">MZ</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">MZ</td>
 <td><b>Aligning Moment</b> (Nm). Torque about the tire's vertical axis &mdash; what you feel through the steering wheel as self-aligning torque. Optional.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">MX</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">MX</td>
 <td><b>Overturning Moment</b> (Nm). Torque about the tire's longitudinal axis from lateral force offset. Optional.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">V</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">V</td>
 <td><b>Velocity</b> (kph). Test speed. Used to filter out stationary data points at the start of the test run. Optional &mdash; if missing, no filter applied.</td></tr>
-<tr><td style="color:#4FC3F7;font-weight:bold;">P</td>
+<tr><td style="color:#FFB74D;font-weight:bold;">P</td>
 <td><b>Pressure</b> (kPa). Tire inflation pressure during the test. Optional.</td></tr>
 </table>
 """
@@ -2139,6 +2321,7 @@ class DynamicsPanel(CollapsibleSection):
     solve_requested        = pyqtSignal(dict)
     sweep_requested        = pyqtSignal(dict)
     tire_file_changed      = pyqtSignal(str)
+    tire_pressure_changed  = pyqtSignal(float)
     tire_plots_requested   = pyqtSignal()   # show tire/grip characterization plots
     params_changed         = pyqtSignal(dict)
     graph_selection_changed = pyqtSignal(list)   # selected graph keys
@@ -2146,7 +2329,7 @@ class DynamicsPanel(CollapsibleSection):
     apply_aero_toggled     = pyqtSignal(bool)    # True = aero on
 
     def __init__(self):
-        super().__init__('Dynamics', header_color='#4FC3F7')
+        super().__init__('Dynamics', header_color='#FFB74D')
         self.set_info(section_info.DYNAMICS)
         self._tire_path = ''
         self._build()
@@ -2157,10 +2340,7 @@ class DynamicsPanel(CollapsibleSection):
         help_row.addStretch()
         self._help_btn = QPushButton('?')
         self._help_btn.setFixedSize(24, 24)
-        self._help_btn.setStyleSheet(
-            'QPushButton { background: #1a1a1a; color: #4FC3F7; border: 1px solid #333; '
-            'border-radius: 12px; font-weight: bold; font-size: 14px; }'
-            'QPushButton:hover { background: #2a2a2a; border-color: #4FC3F7; }')
+        self._help_btn.setStyleSheet(BTN_INFO_ROUND.format(r=12))
         self._help_btn.setToolTip('Click for detailed help on every field')
         self._help_btn.clicked.connect(self._show_help)
         help_row.addWidget(self._help_btn)
@@ -2172,12 +2352,55 @@ class DynamicsPanel(CollapsibleSection):
         self._tire_label = QLabel('No file loaded')
         self._tire_label.setStyleSheet(f'color: {C_SUB}; font-size: 11px;')
         self._tire_label.setWordWrap(True)
+        _tp = self._tire_label.sizePolicy()
+        _tp.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self._tire_label.setSizePolicy(_tp)
         tire_row.addWidget(self._tire_label, 1)
         self._tire_btn = QPushButton('Load')
         self._tire_btn.setMaximumWidth(60)
         self._tire_btn.clicked.connect(self._on_tire_browse)
         tire_row.addWidget(self._tire_btn)
         self.add_layout(tire_row)
+
+        # ── Tyre PRESSURE ────────────────────────────────────────────────
+        # A TTC cornering run sweeps several pressures.  Blending them is not a
+        # tyre, it is an average of several different tyres, and it changes the
+        # answer: on this R20 the low-pressure sweep passes its peak inside the
+        # rig's +/-12 deg of slip while the high-pressure one never reaches it.
+        # So the pressure the car actually runs is an INPUT, not an assumption.
+        p_row = QHBoxLayout()
+        p_row.addWidget(QLabel('Tyre pressure:'))
+        self._tire_psi = _spin(0.0, 40.0, 0.0, ' psi', dec=1, step=0.5)
+        self._tire_psi.setSpecialValueText('blend all (not a tyre)')
+        self._tire_psi.setToolTip(
+            'Pressure to build the tyre model at. The file is filtered to '
+            'samples within +/-0.5 psi of this. 0 = use every pressure in the '
+            'file blended together, which is what the tool used to do and is '
+            'not physically a tyre. Pressures available in the loaded file are '
+            'shown to the right.')
+        self._tire_psi.valueChanged.connect(
+            lambda _v: self.tire_pressure_changed.emit(float(_v)))
+        p_row.addWidget(self._tire_psi)
+        self._tire_psi_avail = QLabel('—')
+        self._tire_psi_avail.setStyleSheet(f'color: {C_SUB}; font-size: 11px;')
+        # Never let this label set the panel's minimum width — 'file has 10,
+        # 12, 14 psi  BLENDED' is long enough to shove the whole content wider
+        # than the scroll viewport (same class of bug as the status label).
+        self._tire_psi_avail.setWordWrap(True)
+        _pp = self._tire_psi_avail.sizePolicy()
+        _pp.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self._tire_psi_avail.setSizePolicy(_pp)
+        p_row.addWidget(self._tire_psi_avail, 1)
+        self.add_layout(p_row)
+
+        # The "peak-slip trend" spinbox that used to sit here is GONE.  It was
+        # a hand knob for how the tyre's best slip angle moves with load —
+        # needed only while the Ackermann solver placed wheels at fractions of
+        # curve PEAKS, a location this dataset cannot resolve (the rig stops at
+        # +/-12 deg and light loads never peak inside that).  The solver now
+        # inverts each wheel's own measured curve at the force it must make,
+        # which never asks where the peak is — so the knob had no consumer,
+        # and a dead input on a panel is a lie waiting to be believed.
 
         # Format hint
         fmt_label = QLabel(
@@ -2213,7 +2436,7 @@ class DynamicsPanel(CollapsibleSection):
         self._total_mass_lbl = QLabel('— kg')
         self._total_mass_lbl.setStyleSheet(
             f'color:{C_TEXT}; padding:2px 6px; background:#0a0a0a; '
-            f'border:1px solid #2a2a2a; border-radius:3px; '
+            f'border:1px solid #2a2a2a; border-radius:4px; '
             "font-family:'Consolas','SF Mono',monospace;")
         g.addWidget(self._total_mass_lbl, r, 1); r += 1
         # Wire the recompute: any of the three mass inputs change → relabel
@@ -2302,7 +2525,7 @@ class DynamicsPanel(CollapsibleSection):
         # other auto-info labels in the panel.
         self._arb_geom_label = QLabel('')
         self._arb_geom_label.setStyleSheet(
-            f'color: #66BB6A; font-size: 10px; font-style: italic;')
+            f'color: #FFB74D; font-size: 10px; font-style: italic;')
         self._arb_geom_label.setWordWrap(True)
         self._refresh_arb_geom_label()
         self.add_widget(self._arb_geom_label)
@@ -2325,10 +2548,10 @@ class DynamicsPanel(CollapsibleSection):
         self._powertrain_type.setMaximumWidth(80)
         self._powertrain_type.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; border: 1px solid #333; '
-            'border-radius: 3px; padding: 2px 6px; }'
+            'border-radius: 4px; padding: 2px 6px; }'
             'QComboBox::drop-down { border: none; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
-            'selection-background-color: #1a5276; }')
+            'selection-background-color: #2e2e38; }')
         self._powertrain_type.currentIndexChanged.connect(self._on_powertrain_type_changed)
         pt_row.addWidget(self._powertrain_type)
         pt_row.addStretch(1)
@@ -2373,10 +2596,10 @@ class DynamicsPanel(CollapsibleSection):
         self._drivetrain.setMaximumWidth(80)
         self._drivetrain.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; border: 1px solid #333; '
-            'border-radius: 3px; padding: 2px 6px; }'
+            'border-radius: 4px; padding: 2px 6px; }'
             'QComboBox::drop-down { border: none; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
-            'selection-background-color: #1a5276; }')
+            'selection-background-color: #2e2e38; }')
         self._drivetrain.currentIndexChanged.connect(
             lambda _: self.params_changed.emit(self.get_params()))
         dt_row.addWidget(self._drivetrain)
@@ -2385,21 +2608,21 @@ class DynamicsPanel(CollapsibleSection):
 
         # Computed driving readout
         self._driving_info = QLabel('')
-        self._driving_info.setStyleSheet(f'color: #66BB6A; font-size: 10px; font-style: italic;')
+        self._driving_info.setStyleSheet(f'color: #FFB74D; font-size: 10px; font-style: italic;')
         self._driving_info.setWordWrap(True)
         self.add_widget(self._driving_info)
 
         # Note about auto-sourced params
         auto_note = QLabel('MR from geometry. Track/WB/CG from Car Params.')
-        auto_note.setStyleSheet(f'color: #66BB6A; font-size: 10px; font-style: italic;')
+        auto_note.setStyleSheet(f'color: #FFB74D; font-size: 10px; font-style: italic;')
         self.add_widget(auto_note)
 
         # ── Computed dynamics constants (auto-updated) ───────────────────
         self._dyn_constants = QLabel('')
         self._dyn_constants.setStyleSheet(
-            'color: #4FC3F7; font-size: 10px; font-family: monospace;'
+            'color: #FFB74D; font-size: 10px; font-family: monospace;'
             'background: #0a0a0a; padding: 4px; border: 1px solid #1a1a1a;'
-            'border-radius: 3px;')
+            'border-radius: 4px;')
         self._dyn_constants.setWordWrap(True)
         self.add_widget(self._dyn_constants)
 
@@ -2443,30 +2666,30 @@ class DynamicsPanel(CollapsibleSection):
         self._solve_btn = QPushButton('Solve')
         self._solve_btn.clicked.connect(self._on_solve)
         self._solve_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #1f6da0; }')
+            BTN_PRIMARY)
         btn_row.addWidget(self._solve_btn)
 
         self._sweep_btn = QPushButton('Sweep')
         self._sweep_btn.clicked.connect(self._on_sweep)
         self._sweep_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #1f6da0; }')
+            BTN_PRIMARY)
         btn_row.addWidget(self._sweep_btn)
 
         # Tire / grip characterization plots (Fy-SA, Cα-Fz, Mz-SA, friction
         # circle) — uses the loaded tire model + the current lat/lon g operating
         # point for the friction circle.
+        self.add_layout(btn_row)
+        # The tire plots button gets its OWN row.  Three padded buttons in one
+        # HBox forced the row to ~380 px minimum inside a ~270 px scroll
+        # viewport with no horizontal scrollbar — this button laid out at
+        # x=360..535 and was UNREACHABLE ("solve hides the tire plot button").
+        # The row width, not the solve, was the bug; solve just made the user
+        # look for it.
         self._tire_btn = QPushButton('Tire / Grip Plots')
         self._tire_btn.clicked.connect(lambda: self.tire_plots_requested.emit())
         self._tire_btn.setStyleSheet(
-            'QPushButton { background: #37474F; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #455A64; }')
-        btn_row.addWidget(self._tire_btn)
-        self.add_layout(btn_row)
+            BTN_SECONDARY)
+        self.add_widget(self._tire_btn)
 
         # ── Friction-circle options (feeds the Tire / Grip Plots popup) ────
         # User-settable vertical loads for the friction-circle panel, plus an
@@ -2494,10 +2717,11 @@ class DynamicsPanel(CollapsibleSection):
         self._apply_aero_btn.setCheckable(True)
         self._apply_aero_btn.setChecked(False)
         self._apply_aero_btn.setStyleSheet(
-            'QPushButton { background: #1a1a1a; color: #888; padding: 5px 14px; '
-            'border: 1px solid #333; border-radius: 3px; font-weight: bold; }'
-            'QPushButton:checked { background: #6A1B9A; color: white; border-color: #CE93D8; }'
-            'QPushButton:hover { background: #2a2a2a; }')
+            'QPushButton { background: #1a1a1f; color: #9a9aa2; padding: 5px 14px; '
+            'border: 1px solid #2e2e36; border-radius: 4px; font-weight: bold; }'
+            'QPushButton:checked { background: #8f6a2e; color: white; border-color: #FFB74D; }'
+            'QPushButton:hover { background: #232329; }'
+            'QPushButton:pressed { background: #131316; }')
         self._apply_aero_btn.setToolTip(
             'Include aero downforce in dynamics solve/sweep.  Source is\n'
             'controlled by the "Aero source" combobox below — either the\n'
@@ -2524,10 +2748,10 @@ class DynamicsPanel(CollapsibleSection):
         self._aero_source.addItem('Solved (from Aero panel)', 'solved')
         self._aero_source.addItem('Custom (CFD validation)',  'custom')
         self._aero_source.setStyleSheet(
-            'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
-            'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
-            'selection-background-color: #6A1B9A; }')
+            'QComboBox { background: #16161b; color: #e8e8ea; '
+            'border: 1px solid #2a2a31; border-radius: 4px; padding: 2px 6px; }'
+            'QComboBox QAbstractItemView { background: #17171c; color: #e8e8ea; '
+            'selection-background-color: #2e2e38; }')
         self._aero_source.currentIndexChanged.connect(self._on_aero_source_changed)
         src_row.addWidget(self._aero_source, 1)
         self.add_layout(src_row)
@@ -2542,8 +2766,8 @@ class DynamicsPanel(CollapsibleSection):
         # which still satisfies the existing "Fz per g" convention.
         self._aero_custom_box = QGroupBox('Custom aero (CFD validation)')
         self._aero_custom_box.setStyleSheet(
-            'QGroupBox { color: #CE93D8; font-size: 11px; border: 1px solid #333; '
-            'border-radius: 3px; margin-top: 6px; padding: 6px; }'
+            'QGroupBox { color: #b4b4bc; font-size: 11px; border: 1px solid #232329; '
+            'border-radius: 4px; margin-top: 6px; padding: 6px; }'
             'QGroupBox::title { left: 6px; padding: 0 4px; }')
         cag = QGridLayout(self._aero_custom_box); cag.setSpacing(4)
         cr = 0
@@ -2583,7 +2807,7 @@ class DynamicsPanel(CollapsibleSection):
         # so the user can sanity-check against their CFD output.
         self._aero_custom_info = QLabel('')
         self._aero_custom_info.setStyleSheet(
-            'color: #CE93D8; font-size: 10px; font-style: italic;')
+            'color: #9a9aa2; font-size: 10px; font-style: italic;')
         self._aero_custom_info.setWordWrap(True)
         cag.addWidget(self._aero_custom_info, cr, 0, 1, 2); cr += 1
 
@@ -2631,9 +2855,9 @@ class DynamicsPanel(CollapsibleSection):
         self._test_mode.addItem('Straights',  'straights')
         self._test_mode.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
-            'selection-background-color: #1a5276; }')
+            'selection-background-color: #2e2e38; }')
         self._test_mode.setMaximumWidth(140)
         self._test_mode.currentIndexChanged.connect(self._on_test_mode_changed)
         mode_row.addWidget(self._test_mode)
@@ -2657,9 +2881,9 @@ class DynamicsPanel(CollapsibleSection):
         self._sweep_axis.addItem('Speed',  'speed')
         self._sweep_axis.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
-            'selection-background-color: #1a5276; }')
+            'selection-background-color: #2e2e38; }')
         self._sweep_axis.setMaximumWidth(110)
         self._sweep_axis.currentIndexChanged.connect(self._on_sweep_axis_changed)
         axis_row.addWidget(self._sweep_axis)
@@ -2752,9 +2976,9 @@ class DynamicsPanel(CollapsibleSection):
         self._traj_direction.addItem('Brake',      'brake')
         self._traj_direction.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
-            'selection-background-color: #1a5276; }')
+            'selection-background-color: #2e2e38; }')
         self._traj_direction.setMaximumWidth(110)
         self._traj_direction.setToolTip(
             'Longitudinal trajectory direction:\n'
@@ -2859,6 +3083,19 @@ class DynamicsPanel(CollapsibleSection):
 
         self._status = QLabel('')
         self._status.setStyleSheet(f'color: {C_SUB}; font-size: 11px;')
+        # WRAP, and never let this label dictate the panel's width.  Without
+        # these, one long status line (the loaded-tyre string reached 533 px
+        # once binning + pressure were appended to it) forced the whole panel
+        # content to 537 px inside a 270 px scroll viewport — no horizontal
+        # scrollbar, so everything laid out to the right (the tire plot
+        # button at x=360..535) was UNREACHABLE.  The user saw it as "solve
+        # expands the left panel and hides the tire plot button".
+        self._status.setWordWrap(True)
+        self._status.setMinimumWidth(0)
+        from PyQt6.QtWidgets import QSizePolicy as _QSP
+        _pol = self._status.sizePolicy()
+        _pol.setHorizontalPolicy(_QSP.Policy.Ignored)
+        self._status.setSizePolicy(_pol)
         self.add_widget(self._status)
 
         # Set initial input visibility based on the default test mode.
@@ -2906,20 +3143,25 @@ class DynamicsPanel(CollapsibleSection):
         D4 = OD ** 4 - ID ** 4             # mm⁴ (positive by check above)
         J = math.pi * D4 / 32.0            # mm⁴
         I = math.pi * D4 / 64.0            # mm⁴
-        # Blade-type arm: a flat leaf bending about its WEAK axis is the
-        # arm's series compliance (and the trackside stiffness adjuster).
-        # w or t = 0 → legacy model (arm bends with the bar tube section).
+        # Blade-type arm: a flat leaf bending about its WEAK axis is a REAL
+        # spring element (and the trackside stiffness adjuster), so when a
+        # blade section is given it stays in series with the tube.
+        #
+        # With NO blade section the arm is a RIGID LEVER and the torsion tube
+        # is the only spring (user decision 2026-07-25: "assume the blade is
+        # rigid, the blade is merely a lever, do not use that as a spring").
+        # The old model borrowed the TUBE section for a cantilever arm, which
+        # quietly softened every bar — 16% at a 130 mm lever, 38% at 197 mm —
+        # i.e. it treated an arm we do not analyse as a designed spring.
         bw = max(0.0, float(blade_w_mm)); bt = max(0.0, float(blade_t_mm))
+        K_t = G * J / (A * A * L)          # N/mm at arm tip (torsion bar)
         if bw > 0.0 and bt > 0.0:
             I_arm = bw * bt ** 3 / 12.0    # mm⁴ (weak axis)
+            K_a = 3.0 * E * I_arm / (A * A * A)  # N/mm at arm tip (blade bending)
+            K_arb = (K_t * K_a) / (K_t + K_a) if K_t > 0.0 and K_a > 0.0 \
+                else max(K_t, K_a)
         else:
-            I_arm = I
-        K_t = G * J / (A * A * L)          # N/mm at arm tip (torsion bar)
-        K_a = 3.0 * E * I_arm / (A * A * A)  # N/mm at arm tip (arm bending)
-        if K_t > 0.0 and K_a > 0.0:
-            K_arb = (K_t * K_a) / (K_t + K_a)
-        else:
-            K_arb = max(K_t, K_a)
+            K_arb = K_t                    # rigid lever: tube carries it all
         K_w_Npmm = K_arb / (MR * MR)       # N/mm at wheel
         return K_w_Npmm * 1000.0           # → N/m
 
@@ -3209,6 +3451,7 @@ class DynamicsPanel(CollapsibleSection):
             # Tire-data file (absolute path; falls back gracefully if
             # the file moved between save & load)
             'tire_path':           str(self._tire_path),
+            'tire_pressure_psi':   float(self._tire_psi.value()),
         }
 
     def set_state(self, d: dict) -> None:
@@ -3390,6 +3633,8 @@ class DynamicsPanel(CollapsibleSection):
 
             # Tire data file — only update the label if a path was
             # actually saved; empty string means "no tire loaded".
+            if 'tire_pressure_psi' in d:
+                self._tire_psi.setValue(float(d['tire_pressure_psi'] or 0.0))
             if 'tire_path' in d:
                 path = str(d['tire_path'])
                 self._tire_path = path
@@ -3492,6 +3737,31 @@ class DynamicsPanel(CollapsibleSection):
 
     def get_tire_path(self) -> str:
         return self._tire_path
+
+    def get_tire_pressure_psi(self):
+        """Pressure to build the tyre at.  Blending is banned — a zero spin
+        (old "blend" convention) now snaps to the 12 psi project default so
+        there is always ONE pressure."""
+        v = float(self._tire_psi.value())
+        if v <= 0.0:
+            v = 12.0
+            self._tire_psi.setValue(v)
+        return v
+
+    def set_tire_pressures_available(self, psi_list, blended: bool):
+        """Show what the loaded file actually holds, and shout if blending."""
+        if not psi_list:
+            self._tire_psi_avail.setText('—')
+            return
+        txt = 'file has ' + ', '.join(f'{p:.0f}' for p in psi_list) + ' psi'
+        if blended and len(psi_list) > 1:
+            self._tire_psi_avail.setText(txt + '  ⚠ BLENDED')
+            self._tire_psi_avail.setStyleSheet(
+                'color: #FFA726; font-size: 11px; font-weight: bold;')
+        else:
+            self._tire_psi_avail.setText(txt)
+            self._tire_psi_avail.setStyleSheet(
+                f'color: {C_SUB}; font-size: 11px;')
 
     def show_result(self, result):
         """Populate the table from a SteadyStateResult."""
@@ -3596,8 +3866,8 @@ class DynamicsPanel(CollapsibleSection):
         dlg.setWindowTitle('Dynamics Reference')
         dlg.resize(620, 700)
         dlg.setStyleSheet(
-            'QDialog { background: #0a0a0a; }'
-            'QTextBrowser { background: #0a0a0a; color: #e0e0e0; border: none; '
+            'QDialog { background: #0e0e11; }'
+            'QTextBrowser { background: #0e0e11; color: #e8e8ea; border: none; '
             'font-size: 12px; }')
         lay = QVBoxLayout(dlg)
         tb = QTextBrowser()
@@ -3606,10 +3876,7 @@ class DynamicsPanel(CollapsibleSection):
         lay.addWidget(tb)
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(dlg.accept)
-        close_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 20px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #1f6da0; }')
+        close_btn.setStyleSheet(BTN_PRIMARY)
         lay.addWidget(close_btn)
         dlg.exec()
 
@@ -3687,15 +3954,15 @@ class DynamicsPanel(CollapsibleSection):
         self.apply_aero_toggled.emit(checked)
         if checked:
             self._apply_aero_btn.setStyleSheet(
-                'QPushButton { background: #6A1B9A; color: white; padding: 5px 14px; '
-                'border: 1px solid #CE93D8; border-radius: 3px; font-weight: bold; }'
-                'QPushButton:hover { background: #8E24AA; }')
+                'QPushButton { background: #8f6a2e; color: white; padding: 5px 14px; '
+                'border: 1px solid #FFB74D; border-radius: 4px; font-weight: bold; }'
+                'QPushButton:hover { background: #a87f3a; }')
         else:
             self._apply_aero_btn.setStyleSheet(
-                'QPushButton { background: #1a1a1a; color: #888; padding: 5px 14px; '
-                'border: 1px solid #333; border-radius: 3px; font-weight: bold; }'
-                'QPushButton:checked { background: #6A1B9A; color: white; border-color: #CE93D8; }'
-                'QPushButton:hover { background: #2a2a2a; }')
+                'QPushButton { background: #1a1a1f; color: #9a9aa2; padding: 5px 14px; '
+                'border: 1px solid #2e2e36; border-radius: 4px; font-weight: bold; }'
+                'QPushButton:checked { background: #8f6a2e; color: white; border-color: #FFB74D; }'
+                'QPushButton:hover { background: #232329; }')
             self._aero_label.setText('OFF')
             self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
 
@@ -3703,7 +3970,7 @@ class DynamicsPanel(CollapsibleSection):
         """Called by main_window when aero state changes."""
         if self._apply_aero_btn.isChecked() and total_N > 0:
             self._aero_label.setText(f'+{total_N:.0f} N applied')
-            self._aero_label.setStyleSheet('color: #CE93D8; font-size: 10px; font-weight: bold;')
+            self._aero_label.setStyleSheet('color: #FFB74D; font-size: 10px; font-weight: bold;')
         else:
             self._aero_label.setText('OFF')
             self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
@@ -4030,7 +4297,7 @@ class AeroPanel(CollapsibleSection):
     sweep_requested = pyqtSignal(dict)
 
     def __init__(self):
-        super().__init__('Aero Load Targets', header_color='#CE93D8')
+        super().__init__('Aero Load Targets', header_color='#d4d4da')
         self.set_info(section_info.AERO)
         self._build()
 
@@ -4046,17 +4313,11 @@ class AeroPanel(CollapsibleSection):
 
         btn_row = QHBoxLayout()
         self._solve_btn = QPushButton('Solve')
-        self._solve_btn.setStyleSheet(
-            'QPushButton { background: #6A1B9A; color: white; padding: 5px 14px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #8E24AA; }')
+        self._solve_btn.setStyleSheet(BTN_PRIMARY)
         self._solve_btn.clicked.connect(self._on_solve)
         btn_row.addWidget(self._solve_btn)
         self._sweep_btn = QPushButton('Sweep')
-        self._sweep_btn.setStyleSheet(
-            'QPushButton { background: #4A148C; color: white; padding: 5px 14px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #6A1B9A; }')
+        self._sweep_btn.setStyleSheet(BTN_PRIMARY)
         self._sweep_btn.clicked.connect(self._on_sweep)
         btn_row.addWidget(self._sweep_btn)
         self.add_layout(btn_row)
@@ -4079,7 +4340,7 @@ class AeroPanel(CollapsibleSection):
         self.add_widget(self._tbl)
 
         self._summary = QLabel('')
-        self._summary.setStyleSheet('color: #CE93D8; font-size: 11px; font-weight: bold;')
+        self._summary.setStyleSheet('color: #e8e8ea; font-size: 11px; font-weight: bold;')
         self._summary.setWordWrap(True)
         self.add_widget(self._summary)
 
@@ -4324,7 +4585,7 @@ class LoadsPanel(CollapsibleSection):
         self._compute_btn = QPushButton('Compute Loads')
         self._compute_btn.setStyleSheet(
             'QPushButton { background: #8B0000; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
+            'border-radius: 4px; font-weight: bold; }'
             'QPushButton:hover { background: #B22222; }')
         self._compute_btn.clicked.connect(lambda: self.loads_requested.emit())
         self.add_widget(self._compute_btn)
@@ -4336,9 +4597,7 @@ class LoadsPanel(CollapsibleSection):
             '(bearings + caliper + ball-joint loads, component or resultant '
             'vectors) and the CONTROL-ARM axial forces, per case and corner.')
         self._wpkg_btn.setStyleSheet(
-            'QPushButton { background: #37474F; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #455A64; }')
+            BTN_SECONDARY)
         self._wpkg_btn.clicked.connect(lambda: self.wheel_package_requested.emit())
         self.add_widget(self._wpkg_btn)
 
@@ -4386,14 +4645,24 @@ class LoadsPanel(CollapsibleSection):
     # ── Save / load (every input on the panel) ───────────────────────
     @staticmethod
     def _brake_state(brk: dict) -> dict:
-        """Snapshot one brake-section's spinbox dict to plain floats."""
-        return {k: float(sb.value()) for k, sb in brk.items()}
+        """Snapshot one brake-section's spinbox dict to plain floats.
+
+        The dict also carries non-input widgets (`_mount_readout` is a QLabel),
+        so filter on the spinbox API instead of assuming every value is one.
+        Blindly calling .value() here raised AttributeError inside
+        _save_project BEFORE json.dump ran, so File > Save silently destroyed
+        the session's work — the user lost a full editing session to it.
+        """
+        return {k: float(sb.value()) for k, sb in brk.items()
+                if hasattr(sb, 'value')}
 
     def _apply_brake_state(self, brk: dict, d: dict) -> None:
         """Restore one brake-section's spinbox dict from a saved dict."""
         if not isinstance(d, dict):
             return
         for k, sb in brk.items():
+            if not hasattr(sb, 'setValue'):
+                continue          # readout QLabel, not an input
             if k in d:
                 try:
                     sb.blockSignals(True)
@@ -4569,10 +4838,11 @@ class LoadsPanel(CollapsibleSection):
                 it = QTableWidgetItem(txt)
                 it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-                # colour: axial → tension green / compression red
+                # colour: axial → tension blue / compression red
+                # (blue/red, never green/red — user is red-green colorblind)
                 if attr in _AXIAL_ATTRS:
                     if val > 10:
-                        it.setForeground(QColor('#66BB6A'))
+                        it.setForeground(QColor('#4FC3F7'))
                     elif val < -10:
                         it.setForeground(QColor('#EF5350'))
                     else:
@@ -4626,20 +4896,19 @@ class LoadsPanel(CollapsibleSection):
 
         # ── buttons ──────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
-                      'border-radius: 3px; } QPushButton:hover { background: #555; }')
-        _btn_green = ('QPushButton { background: #2E7D32; color: white; padding: 6px 16px; '
-                      'border-radius: 3px; font-weight: bold; } '
-                      'QPushButton:hover { background: #388E3C; }')
-
+        _btn_style = ('QPushButton { background: #1e1e24; color: #e8e8ea; padding: 6px 16px; '
+                      'border: 1px solid #32323c; border-radius: 4px; } '
+                      'QPushButton:hover { background: #2a2a33; border-color: #46464f; } '
+                      'QPushButton:pressed { background: #131318; '
+                      'padding: 7px 16px 5px 16px; }')
         copy_btn = QPushButton('Copy to Clipboard')
-        copy_btn.setStyleSheet(_btn_green)
+        copy_btn.setStyleSheet(BTN_PRIMARY)
         def _copy():
             QApplication.clipboard().setText(_build_text())
             copy_btn.setText('Copied!')
             copy_btn.setStyleSheet(
-                'QPushButton { background: #1B5E20; color: #A5D6A7; padding: 6px 16px; '
-                'border-radius: 3px; font-weight: bold; }')
+                'QPushButton { background: #3a2c12; color: #FFD9A0; padding: 6px 16px; '
+                'border-radius: 4px; font-weight: bold; }')
         copy_btn.clicked.connect(_copy)
         btn_row.addWidget(copy_btn)
 
@@ -4765,7 +5034,7 @@ class BrakeCalcPanel(CollapsibleSection):
         self._compute_btn = QPushButton('Compute Brakes')
         self._compute_btn.setStyleSheet(
             'QPushButton { background: #B71C1C; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
+            'border-radius: 4px; font-weight: bold; }'
             'QPushButton:hover { background: #D32F2F; }')
         self._compute_btn.clicked.connect(lambda: self.compute_requested.emit())
         self.add_widget(self._compute_btn)
@@ -4961,9 +5230,9 @@ class BrakeCalcPanel(CollapsibleSection):
                     if val > 600:
                         it.setForeground(QColor('#EF5350'))   # red — too hot
                     elif val > 400:
-                        it.setForeground(QColor('#FFA726'))   # orange — warm
+                        it.setForeground(QColor('#FFD600'))   # yellow — warm
                     else:
-                        it.setForeground(QColor('#66BB6A'))   # green — fine
+                        it.setForeground(QColor('#4FC3F7'))   # blue — cool / fine
                 else:
                     it.setForeground(QColor('#e0e0e0'))
                 tbl.setItem(ri, c, it)
@@ -5019,10 +5288,10 @@ class BrakeCalcPanel(CollapsibleSection):
                 temp_color = '#EF5350'
                 verdict = 'EXCEEDS SAFE LIMIT'
             elif hottest_T > 400:
-                temp_color = '#FFA726'
+                temp_color = '#FFD600'
                 verdict = 'warm but acceptable'
             else:
-                temp_color = '#66BB6A'
+                temp_color = '#4FC3F7'
                 verdict = 'within safe range'
 
             th_lbl = QLabel(
@@ -5034,8 +5303,11 @@ class BrakeCalcPanel(CollapsibleSection):
 
         # ── Buttons ──────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
-                      'border-radius: 3px; } QPushButton:hover { background: #555; }')
+        _btn_style = ('QPushButton { background: #1e1e24; color: #e8e8ea; padding: 6px 16px; '
+                      'border: 1px solid #32323c; border-radius: 4px; } '
+                      'QPushButton:hover { background: #2a2a33; border-color: #46464f; } '
+                      'QPushButton:pressed { background: #131318; '
+                      'padding: 7px 16px 5px 16px; }')
 
         close_btn = QPushButton('Close')
         close_btn.setStyleSheet(_btn_style)
@@ -5099,7 +5371,7 @@ class DynamicsOptPanel(CollapsibleSection):
         self._analyze_btn = QPushButton('Analyze Sensitivities')
         self._analyze_btn.setStyleSheet(
             'QPushButton { background: #7B3F00; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
+            'border-radius: 4px; font-weight: bold; }'
             'QPushButton:hover { background: #A0522D; }')
         self._analyze_btn.clicked.connect(self._on_analyze)
         self.add_widget(self._analyze_btn)
@@ -5125,7 +5397,7 @@ class DynamicsOptPanel(CollapsibleSection):
             self._target_combo.addItem(f'{label}{suffix}', key)
         self._target_combo.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; border: 1px solid #333; '
-            'border-radius: 3px; padding: 2px 6px; }'
+            'border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
             'selection-background-color: #7B3F00; }')
         self._target_combo.currentIndexChanged.connect(self._on_target_changed)
@@ -5146,9 +5418,7 @@ class DynamicsOptPanel(CollapsibleSection):
         # ── Recommendation button ────────────────────────────────────
         self._recommend_btn = QPushButton('Show Recommendations')
         self._recommend_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #1f6da0; }')
+            BTN_PRIMARY)
         self._recommend_btn.clicked.connect(self._on_recommend)
         self._recommend_btn.setEnabled(False)
         self.add_widget(self._recommend_btn)
@@ -5180,9 +5450,9 @@ class DynamicsOptPanel(CollapsibleSection):
         # ── Full sensitivity grid (all knobs x all metrics) ──────────
         self._full_sens_btn = QPushButton('Show Full Sensitivity Grid')
         self._full_sens_btn.setStyleSheet(
-            'QPushButton { background: #333; color: #aaa; padding: 4px 12px; '
-            'border-radius: 3px; font-size: 11px; }'
-            'QPushButton:hover { background: #444; color: #ddd; }')
+            'QPushButton { background: #1e1e24; color: #b4b4bc; padding: 4px 12px; '
+            'border: 1px solid #2c2c34; border-radius: 4px; font-size: 11px; }'
+            'QPushButton:hover { background: #282830; color: #e0e0e4; }')
         self._full_sens_btn.clicked.connect(self._show_full_grid)
         self._full_sens_btn.setEnabled(False)
         self.add_widget(self._full_sens_btn)
@@ -5297,7 +5567,7 @@ class DynamicsOptPanel(CollapsibleSection):
         for i, rec in enumerate(recs):
             # Knob name
             item = QTableWidgetItem(rec['knob'])
-            cat_color = '#66BB6A' if rec['category'] == 'parameter' else '#4FC3F7'
+            cat_color = '#FFB74D' if rec['category'] == 'parameter' else '#4FC3F7'
             item.setForeground(QColor(cat_color))
             self._sens_table.setItem(i, 0, item)
 
@@ -5427,9 +5697,7 @@ class DynamicsOptPanel(CollapsibleSection):
 
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(dlg.accept)
-        close_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 20px; '
-            'border-radius: 3px; font-weight: bold; }')
+        close_btn.setStyleSheet(BTN_PRIMARY)
         lay.addWidget(close_btn)
         dlg.exec()
 
@@ -5494,7 +5762,7 @@ class SkidpadPanel(CollapsibleSection):
             self._test_combo.addItem(label, key)
         self._test_combo.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
             'selection-background-color: #7B3F00; }')
         self._test_combo.currentIndexChanged.connect(self._on_test_changed)
@@ -5515,7 +5783,7 @@ class SkidpadPanel(CollapsibleSection):
             self._solve_mode_combo.addItem(label, key)
         self._solve_mode_combo.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
             'selection-background-color: #7B3F00; }')
         self._solve_mode_combo.currentIndexChanged.connect(self._on_solve_mode_changed)
@@ -5558,7 +5826,7 @@ class SkidpadPanel(CollapsibleSection):
         self._dir_combo.addItems(['Left', 'Right'])
         self._dir_combo.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
-            'border: 1px solid #333; border-radius: 3px; padding: 2px 6px; }'
+            'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
             'selection-background-color: #7B3F00; }')
         self._dir_combo.setMaximumWidth(100)
@@ -5580,7 +5848,7 @@ class SkidpadPanel(CollapsibleSection):
         gg = QGroupBox('Damper rates & steer lag')
         gg.setStyleSheet(
             'QGroupBox { color: #FFB74D; font-size: 11px; border: 1px solid #333; '
-            'border-radius: 3px; margin-top: 6px; padding: 6px; }'
+            'border-radius: 4px; margin-top: 6px; padding: 6px; }'
             'QGroupBox::title { left: 6px; padding: 0 4px; }')
         gl = QGridLayout(gg); gl.setSpacing(4)
         def grow(label, lo, hi, val, suf, r, dec=1, step=1.0):
@@ -5613,7 +5881,7 @@ class SkidpadPanel(CollapsibleSection):
         self._auto_info.setStyleSheet(
             'color: #888; font-size: 10px; font-style: italic; '
             'background: #0a0a0a; padding: 4px 6px; border: 1px solid #1a1a1a; '
-            'border-radius: 3px;')
+            'border-radius: 4px;')
         self._auto_info.setWordWrap(True)
         self.add_widget(self._auto_info)
 
@@ -5621,9 +5889,9 @@ class SkidpadPanel(CollapsibleSection):
         self._sim_btn = QPushButton('Simulate')
         self._sim_btn.setStyleSheet(
             'QPushButton { background: #7B3F00; color: white; padding: 6px 16px; '
-            'border-radius: 3px; font-weight: bold; }'
+            'border-radius: 4px; font-weight: bold; }'
             'QPushButton:hover { background: #A0522D; }'
-            'QPushButton:disabled { background: #333; color: #666; }')
+            'QPushButton:disabled { background: #1a1a1f; color: #63636b; }')
         self._sim_btn.clicked.connect(self._on_simulate)
         self.add_widget(self._sim_btn)
 
@@ -5638,7 +5906,7 @@ class SkidpadPanel(CollapsibleSection):
         self._results_lbl.setStyleSheet(
             'color: #FFB74D; font-size: 11px; font-family: monospace; '
             'background: #0a0a0a; padding: 6px; border: 1px solid #1a1a1a; '
-            'border-radius: 3px;')
+            'border-radius: 4px;')
         self._results_lbl.setWordWrap(True)
         self.add_widget(self._results_lbl)
 
@@ -5982,7 +6250,7 @@ class VehicleConstantsPanel(CollapsibleSection):
     """
 
     def __init__(self):
-        super().__init__('Vehicle Constants', header_color='#4FC3F7')
+        super().__init__('Vehicle Constants', header_color='#FFB74D')
         self.set_info(section_info.VEHICLE_CONSTANTS)
         self._last_veh = None
         self._dlg: QDialog | None = None
@@ -5990,10 +6258,11 @@ class VehicleConstantsPanel(CollapsibleSection):
 
         btn = QPushButton('Show Computed Constants')
         btn.setStyleSheet(
-            'QPushButton { background: #1a1a1a; color: #4FC3F7; '
-            'border: 1px solid #444; padding: 6px 16px; border-radius: 3px; '
+            'QPushButton { background: #1a1a1a; color: #FFB74D; '
+            'border: 1px solid #444; padding: 6px 16px; border-radius: 4px; '
             'font-weight: bold; }'
-            'QPushButton:hover { background: #2a2a2a; }')
+            'QPushButton:hover { background: #2a2a2a; border-color: #8f6a2e; }'
+            'QPushButton:pressed { background: #101013; }')
         btn.clicked.connect(self._show_popup)
         self.add_widget(btn)
 
@@ -6179,7 +6448,10 @@ class AnalysisPlotsPanel(CollapsibleSection):
     steering_torque_requested   = pyqtSignal()
     ackermann_demand_requested  = pyqtSignal()
     ackermann_fzfy_requested    = pyqtSignal()
-    rack_zero_ackermann_requested = pyqtSignal()
+    ackermann_pair_requested    = pyqtSignal()
+    slip_load_force_requested   = pyqtSignal()
+    ackermann_solve_requested   = pyqtSignal()
+    ymd_trim_sweep_requested    = pyqtSignal()
     mmd_requested               = pyqtSignal()
     wheel_rate_linearity_requested = pyqtSignal()
     llt_requested               = pyqtSignal()
@@ -6304,23 +6576,131 @@ class AnalysisPlotsPanel(CollapsibleSection):
         lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Ackermann %:'), 1, 0)
-        self._ack_demand_pct = _spin(-100, 100, 33, ' %', dec=0, step=1)
+        # Range is deliberately wider than +/-100: 100% is only the KINEMATIC
+        # value, not a physical limit, and anti-Ackermann designs (and the
+        # sweeps used to bracket an optimum) run well past it.
+        self._ack_demand_pct = _spin(-300, 300, 33, ' %', dec=0, step=5)
         self._ack_demand_pct.setToolTip('Car\'s actual Ackermann percentage '
-                                         '(from kinematic steer sweep)')
+                                         '(from kinematic steer sweep). '
+                                         'Negative = anti-Ackermann; 100% is '
+                                         'the kinematic value, not a ceiling.')
         g.addWidget(self._ack_demand_pct, 1, 1)
         g.addWidget(QLabel('Speed:'), 1, 2)
         self._ack_demand_speed = _spin(3, 40, 13.4, ' m/s', dec=1, step=0.5)
         g.addWidget(self._ack_demand_speed, 1, 3)
+        # Pair analysis (RCVD ch.7) is parameterised by CORNERING G, because the
+        # load transfer is what sets the two wheel loads; speed alone does not.
+        g.addWidget(QLabel('Pair analysis at:'), 2, 0)
+        self._ack_pair_g = _spin(0.2, 3.0, 1.5, ' g', dec=2, step=0.1)
+        self._ack_pair_g.setToolTip('Cornering g for the pair-analysis plot. '
+                                    'Sets the load transfer, and therefore the '
+                                    'inner/outer wheel loads, from the solved car.')
+        g.addWidget(self._ack_pair_g, 2, 1)
+        # ── The Ackermann SOLVER's own inputs ────────────────────────────
+        # Corner radius is an input because the ANSWER CHANGES SIGN WITH IT:
+        # measured 2026-07-27, pro-Ackermann below roughly 8-9 m at 1.5 g and
+        # reverse above.  Defaulting it silently is how a 10 m default produced
+        # a confident "reverse Ackermann" answer for a car that spends its life
+        # in 3-9 m corners.
+        g.addWidget(QLabel('Solve at radius:'), 2, 2)
+        self._ack_radius = _spin(1.5, 200.0, 8.0, ' m', dec=1, step=0.5)
+        self._ack_radius.setToolTip(
+            'Corner radius to solve the Ackermann geometry at. The required '
+            'toe difference changes SIGN with radius — tight corners want '
+            'pro-Ackermann, large-radius corners want reverse — so solve at '
+            'the corners your car actually drives (FSAE hairpins 3-9 m, '
+            'skidpad path about 8 m).')
+        g.addWidget(self._ack_radius, 2, 3)
+        # Belt->asphalt grip derate.  The TTC curves are belt-rig (Calspan
+        # TIRF) and belt grip is 0.65-0.75x asphalt-real, so running them raw
+        # puts "2.0 g" at only ~87% tyre effort and every slip angle reads
+        # low to anyone thinking in road grip.  Derating the curve moves
+        # saturation to the road limit, where it belongs.
+        g.addWidget(QLabel('Asphalt grip ×:'), 3, 0)
+        self._ack_grip = _spin(0.40, 1.00, 0.70, ' ×', dec=2, step=0.05)
+        self._ack_grip.setToolTip(
+            'Belt-rig grip exceeds asphalt; 0.65-0.75 is the project\'s '
+            'derate band. 1.00 = raw belt curves (slip angles will read low '
+            'and the limit will sit near 2.3 g instead of ~1.6).')
+        g.addWidget(self._ack_grip, 3, 1)
+        # Aero in the solver: on a fixed radius, sweeping lateral g IS
+        # sweeping speed (V^2 = lat g x 9.81 x R), so downforce grows down
+        # the g list.  Default OFF because the package comes from the
+        # Dynamics panel's aero source, which may not be configured yet.
+        self._ack_aero = QCheckBox('Include aero downforce')
+        self._ack_aero.setChecked(False)
+        self._ack_aero.setToolTip(
+            'Adds downforce at each row\'s speed (the speed follows from '
+            'radius + lateral g) to the vertical loads, using the same aero '
+            'package the Dynamics panel applies (solved target or custom '
+            'CFD). Downforce adds NO lateral demand — the car\'s mass is '
+            'unchanged — so it lowers each wheel\'s required grip fraction: '
+            'expect SMALLER slip angles and a HIGHER grip limit.')
+        g.addWidget(self._ack_aero, 3, 2, 1, 2)
+        # No wheel-placement rules.  There used to be a dropdown of them here
+        # (equal slip / equal utilisation / fraction-of-peak): every one was an
+        # invented equalisation, and the user rejected the premise — the two
+        # wheels never share anything; each wheel's slip angle is whatever its
+        # OWN measured curve needs to corner its OWN vertical load, inverted
+        # straight from the tyre data.  One method, no knob.
         self.add_layout(g)
+        btn0 = QPushButton('SOLVE Ackermann (per-corner toe difference)')
+        btn0.setToolTip('Sweeps lateral g at the radius above. Each wheel '
+                        'corners its own vertical load; its slip angle is '
+                        'inverted from its own measured tyre curve; the wheel '
+                        'is pointed tangent-to-its-circle + slip. Answer in '
+                        'DEGREES of toe difference — the unit a steering arm '
+                        'is built to. Percentages shown only while their '
+                        'kinematic reference is meaningful.')
+        btn0.clicked.connect(lambda: self.ackermann_solve_requested.emit())
+        self.add_widget(btn0)
         btn = QPushButton('Plot slip-angle demand vs Ackermann supply')
         btn.clicked.connect(lambda: self.ackermann_demand_requested.emit())
         self.add_widget(btn)
-        btn2 = QPushButton('Plot Fz–Fy operating map (demand vs Ackermann)')
+        btn2 = QPushButton('Plot Fz–Fy map (demand vs delivered)')
+        btn2.setToolTip('Fz on x, lateral force on y. Solid = demand (each '
+                        'wheel corners its own load), dashed = delivered at '
+                        'the as-built Ackermann; signed, so wrong-way force '
+                        'plots below zero, and the delivered path STOPS at '
+                        'the grip limit. Uses the radius and asphalt grip '
+                        'inputs above.')
         btn2.clicked.connect(lambda: self.ackermann_fzfy_requested.emit())
         self.add_widget(btn2)
-        btn3 = QPushButton('Find rack fore-aft position for 0% Ackermann')
-        btn3.clicked.connect(lambda: self.rack_zero_ackermann_requested.emit())
-        self.add_widget(btn3)
+        btn2b = QPushButton('Plot pair analysis (RCVD ch.7)')
+        btn2b.setToolTip('Axle lateral force vs reference steer angle, one '
+                         'curve per Ackermann setting — the published method '
+                         'for axle capability. Uses the pair-analysis g input.')
+        btn2b.clicked.connect(lambda: self.ackermann_pair_requested.emit())
+        self.add_widget(btn2b)
+        btn2d = QPushButton('Plot slip angle vs load vs lateral force')
+        btn2d.setToolTip('Left: how much side force the tyre makes at each '
+                         'slip angle, one curve per vertical load (dots mark '
+                         'the peak for that load). Right: the friction check '
+                         '- the most the tyre can give vs load, with all four '
+                         'wheels of this car plotted on it at several lateral '
+                         'g. A point drawn RED is a demand the tyre cannot '
+                         'meet.')
+        btn2d.clicked.connect(lambda: self.slip_load_force_requested.emit())
+        self.add_widget(btn2d)
+        # Milliken trim criterion — the 4th Ackermann method, deliberately
+        # separate from the 3 above so they can be compared side by side.
+        btn2c = QPushButton('YMD trim sweep (max Ay at N=0)')
+        btn2c.setToolTip('Milliken moment-method criterion: sweep Ackermann; '
+                         'for each setting find the highest lateral g the car '
+                         'holds with ZERO net yaw moment (trimmed — the only '
+                         'points a driver can hold on the skidpad; anything '
+                         'else is still rotating). Also reports control '
+                         '(yaw moment per degree of front wheel) and '
+                         'stability (yaw moment per degree of body slip) at '
+                         'that trim. Uses the radius, asphalt grip and aero '
+                         'inputs above. Takes ~30-60 s.')
+        btn2c.clicked.connect(lambda: self.ymd_trim_sweep_requested.emit())
+        self.add_widget(btn2c)
+        # 'Find rack fore-aft position' REMOVED (user: "doesnt work, id just
+        # get rid of that, IK does a fine enough job").  The InverseSolver
+        # reaches a target Ackermann by moving the tie-rod points properly,
+        # with bounds and collision avoidance, instead of a bisection that
+        # walked the rack into geometry the corner solver could not solve.
         self.add_widget(_panel_sep())
 
         # MMD
@@ -6390,6 +6770,23 @@ class AnalysisPlotsPanel(CollapsibleSection):
     def ackermann_demand_inputs(self):
         return dict(ackermann_pct=self._ack_demand_pct.value(),
                     velocity_mps=self._ack_demand_speed.value())
+
+    def ackermann_solver_inputs(self):
+        """Inputs for the vahan.ackermann solver: radius (changes the SIGN
+        of the answer), the belt->asphalt grip derate (moves where
+        saturation appears — belt limit vs road limit), and whether to
+        include aero downforce (main_window resolves the actual package
+        from its one aero path, _get_aero_Fz_per_g)."""
+        return dict(radius_m=float(self._ack_radius.value()),
+                    grip_multiplier=float(self._ack_grip.value()),
+                    aero=bool(self._ack_aero.isChecked()))
+
+    def ackermann_pair_inputs(self):
+        """Inputs for the RCVD ch.7 pair analysis — kept separate from
+        ackermann_demand_inputs because that dict is splatted into a different
+        plot function and an extra key would raise TypeError."""
+        return dict(ackermann_pct=self._ack_demand_pct.value(),
+                    lat_g=self._ack_pair_g.value())
 
     def mmd_inputs(self):
         return dict(
@@ -6652,7 +7049,7 @@ class DirectEditPanel(CollapsibleSection):
             b.setToolTip(tip)
             b.setStyleSheet(
                 'QPushButton { background:#1a1a1a; color:#999; padding:3px 8px;'
-                ' border:1px solid #2a2a2a; border-radius:3px; font-size:11px; }'
+                ' border:1px solid #2a2a2a; border-radius:4px; font-size:11px; }'
                 'QPushButton:checked { background:#FFD600; color:#0a0a0a;'
                 ' font-weight:bold; }')
             b.clicked.connect(lambda _=False, m=mode: self._emit_constraint(m))
@@ -6691,7 +7088,7 @@ class DirectEditPanel(CollapsibleSection):
             btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             btn.setStyleSheet("""
                 QToolButton { background:#1a1a1a; color:#aaa; border:1px solid #2a2a2a;
-                              border-radius:3px; padding:4px 0; font-size:10.5px; }
+                              border-radius:4px; padding:4px 0; font-size:10.5px; }
                 QToolButton:hover   { background:#222; color:#fff; }
                 QToolButton:checked { background:#FFD600; color:#111; font-weight:bold; }
             """)
@@ -6795,10 +7192,11 @@ class DirectEditPanel(CollapsibleSection):
             'pivots about a pin that MUST be normal to its plate.')
         btn_snap.clicked.connect(self._emit_snap_axis)
         btn_snap.setStyleSheet("""
-            QPushButton { background:#2a2a2a; color:#90CAF9;
+            QPushButton { background:#2a2a2a; color:#FFB74D;
                           border:1px solid #3a3a3a; border-radius:4px;
                           padding:5px 10px; }
-            QPushButton:hover { background:#3a3a3a; color:#BBDEFB; }
+            QPushButton:hover { background:#3a3a3a; color:#FFC875; }
+            QPushButton:pressed { background:#1a1a1a; }
         """)
         prow4.addWidget(btn_snap, 1)
         self.add_layout(prow4)

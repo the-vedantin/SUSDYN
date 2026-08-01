@@ -2,7 +2,7 @@
 
 Suspension simulation and optimization software for double-wishbone suspensions with pushrod/rocker actuation. Built for FSAE but applicable to any double-wishbone geometry.
 
-**Version:** 2.7 (Multi-Topology + Kinematics + Steady & Transient Dynamics + Loads + Aero + Brakes + Onshape)
+**Version:** 2.8 (Ackermann Analysis Suite + One Yaw-Moment Engine + Tire-Model Honesty + Live-3D Performance)
 **Platform:** Python 3.12+ / PyQt6 / NumPy / SciPy
 
 > ## ⚠️ Topology Support Status — please read
@@ -22,7 +22,38 @@ Suspension simulation and optimization software for double-wishbone suspensions 
 
 ---
 
-## Recent Patch Notes (v2.7) — Multi-Topology + ONE MODEL
+## Recent Patch Notes (v2.8) — Ackermann Analysis Suite + Honesty Everywhere
+
+### Tire model: refuse rather than invent
+- **Single pressure only** — a TTC cornering run sweeps several pressures; averaging them is not a tire. Building without picking one pressure now **refuses** (with the file's available pressures listed) instead of silently blending.
+- **Peak-slip clamp** — the rig's ±12° sweep ends before light-load force curves ever decline, so the raw grid kept paying force for absurd slip. The force table is now clamped non-increasing past a per-load peak-slip line whose slope is **measured from pneumatic-trail collapse** on the file's own aligning-moment data (falls back to the RCVD trend only if too few loads resolve). Measured declines pass through untouched.
+- Out-of-range loads/slips continue the measured trends instead of holding the edge value flat; every excursion is recorded.
+
+### Ackermann analysis page (Page menu, Ctrl+5)
+- **Demand solver** — per-wheel slip inverted from the measured tire surface at each wheel's own load share; answers in **degrees** (the buildable spec). Saturated states are refused ("IMPOSSIBLE — needs X% of grip"), never fabricated. Percentages use the standard construction (0% = parallel, 100% = turn centre on the rear-axle line) with divider-health guards, and the demand is capped at the both-wheels-at-own-peak physical bound.
+- **Force-ceiling sweep** — front-axle capability vs Ackermann setting with **plateau tie bands** (no winner declared inside the measured noise) and censored-data flags.
+- **Full MMD sweep** — the Milliken Moment Diagram once per Ackermann setting, each carrying a numbers box (trimmed limit, attitude/steer at the limit, control, stability, max reach), plus a NUMBERS tab comparing the belt-grip and road-grip frames with an explicit verdict line.
+- **YMD-vs-Ackermann view** — trim-region zoom + metrics, reporting RCVD Fig. 8.26's limit parameters per setting (stability index, apex lateral g and its plow/neutral/spin character).
+- Convention: an unqualified Ackermann % is quoted **at full lock** (the ratio drifts with steer angle).
+
+### One yaw-moment engine (`vahan/ymd.py`)
+- Double-track, per-wheel loads and slip angles including the yaw-rate terms, forces resolved per wheel with the **induced-drag couple at ±track/2** (the pathway by which steer geometry yaws the car). Every yaw-moment number in the tool — MMD, trim sweeps, comparisons — comes from this one engine.
+
+### Lap simulator
+- Rotating inertia (wheels + engine through the gearbox), gear-shift model, real torque-curve support with an honest label when the fallback runs, per-station Ackermann capability + scrub-drag channels, and **corner summary stats** on every result: average/min/max speed, time-weighted corner average and peak lateral g, % of lap cornering, peak accel/brake.
+- Track loader median-filters digitized-centerline curvature spikes (phantom sub-metre "corners" no longer exist).
+
+### Live 3D performance
+- Interactive motion went from ~2 FPS to 12+ on-screen: per-frame shader rebuilds eliminated, pose-only mesh updates, empty visuals skipped, motion level-of-detail (detail chrome hides while animating, returns on settle).
+- Slider travel limits re-zero from the damper's actual compression when sag is applied to hardpoints.
+- Easter egg: a **Dance** button waves the car corner by corner.
+
+### Regression net
+- Grown to ~40 gates including tire-selection pinning, pressure blend refusal, Ackermann solver trust (monotone, no fabrication), the >100%-preference tripwire, and ARB drop-link/actuation-plane geometry. Exit code = number of unexpected failures.
+
+---
+
+## Previous Patch Notes (v2.7) — Multi-Topology + ONE MODEL
 
 > ⚠️ Everything in this section is **BETA** for non-standard topologies (see the notice at the top). The standard pushrod-UCA-front / pushrod-LCA-rear + bellcrank-ARB car is the validated reference.
 

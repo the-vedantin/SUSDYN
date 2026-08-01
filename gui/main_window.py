@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QCheckBox, QMenuBar, QFileDialog, QMessageBox,
     QDialog, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QPushButton,
     QListWidget, QListWidgetItem, QAbstractItemView, QMenu,
+    QProxyStyle, QStyle, QToolButton, QRadioButton, QComboBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, QEvent, pyqtSignal as Signal
 from PyQt6.QtGui import QColor, QImage, QAction
@@ -50,7 +51,7 @@ from gui.panels import (
     CollapsibleSection, InverseKinematicsPanel, DynamicsPanel, DynamicsOptPanel,
     LoadsPanel, AeroPanel, SkidpadPanel, BrakeCalcPanel,
     VehicleConstantsPanel, AnalysisPlotsPanel, DirectEditPanel,
-    FrameInterferencePanel,
+    FrameInterferencePanel, BTN_PRIMARY, BTN_SECONDARY,
 )
 from gui.plot_dialog import PlotDialog
 from vahan.optimizer import InverseSolver, DesignVar
@@ -593,13 +594,22 @@ def _all_metrics(state: SolvedState, side: str,
 
 
 def _ackermann_from_pair(toe_left_deg: float, toe_right_deg: float,
-                         wheelbase_m: float, front_track_m: float) -> float:
+                         wheelbase_m: float, front_track_m: float,
+                         inner: str = 'FL') -> float:
     """
     Ackermann % from a single (FL, FR) steer pair.
 
     Inputs are the absolute steer angles of each front wheel (deg).
-    The larger-magnitude wheel is the inner (nearer turn centre); the bicycle
-    model then gives the ideal Ackermann angle split for that turn radius.
+    `inner` names the wheel nearer the turn centre and MUST come from the
+    TURN DIRECTION (the sign of the rack travel the caller commanded).
+
+    It used to be inferred as "whichever wheel steers more" — which is
+    CIRCULAR: in reverse-Ackermann geometry the OUTER wheel steers more, so
+    the probe crowned it inner and mirrored every reverse reading into pro.
+    The readout was structurally unable to go below ~0%: sweeping the rack
+    fore-aft traced a V that bounced off zero (+0.5% floor at -100 mm) when
+    the far branch was genuinely -27% reverse.  Caught 2026-07-28 when a
+    commanded -30% "could not be bracketed" in +/-300 mm of rack travel.
 
     Returns NaN at / near zero steer (indeterminate).
     """
@@ -608,12 +618,18 @@ def _ackermann_from_pair(toe_left_deg: float, toe_right_deg: float,
     if np.isnan(d_L) or np.isnan(d_R):
         return float('nan')
 
-    d_inner = max(d_L, d_R)
-    d_outer = min(d_L, d_R)
+    if inner == 'FL':
+        d_inner, d_outer = d_L, d_R
+    else:
+        d_inner, d_outer = d_R, d_L
 
     # Near-zero steer: indeterminate.  Require a couple tenths of a degree
     # on the inner wheel before the geometry is meaningful.
-    if d_inner < 0.2:
+    # Indeterminate near zero steer.  Guard on the LARGER wheel: with the
+    # inner now fixed by turn direction, a strongly reverse geometry has the
+    # inner steering least, and guarding on it alone would NaN out valid
+    # reverse readings.
+    if max(d_L, d_R) < 0.2:
         return float('nan')
 
     avg_rad = np.radians((d_inner + d_outer) / 2.0)
@@ -1515,6 +1531,28 @@ class CurvesCanvas(FigureCanvas):
                 ax4.text(0, -lim * 1.1, 'solve dynamics for operating points',
                          ha='center', va='top', color='#777777', fontsize=7)
 
+        # ── REGISTER THE CURVES FOR HOVER READOUT ────────────────────────
+        # This method cleared `_plot_data = []` at the top and never appended
+        # to it, so the canvas's hover machinery had nothing to search and the
+        # user could not read a single value off these plots ("you cant hover
+        # read values on tiregrip plots").  Every OTHER plot on this canvas
+        # populates the same list (see the kinematic + dynamics sweeps) — this
+        # one was simply skipped.  Same format: (ax, [(x, y, label, colour)]).
+        for _ax in self.fig.get_axes():
+            _series = []
+            for _line in _ax.get_lines():
+                _lbl = _line.get_label()
+                if _lbl.startswith('_'):
+                    continue
+                _xd, _yd = _line.get_xdata(), _line.get_ydata()
+                if len(_xd) < 2:
+                    continue          # markers/operating points, not curves
+                _series.append((_xd, _yd, _lbl, _line.get_color()))
+            if _series:
+                self._plot_data.append((_ax, _series))
+                if _ax not in self._all_axes:
+                    self._all_axes.append(_ax)
+
         self.fig.subplots_adjust(hspace=0.55, wspace=0.38,
                                  left=0.10, right=0.97, top=0.90, bottom=0.11)
         tname = getattr(tire, 'tire_id', 'tire')
@@ -2005,6 +2043,54 @@ class _TransientSimWorker(QThread):
             self.failed.emit(str(e))
 
 
+class _SnappyStyle(QProxyStyle):
+    """App-wide responsiveness tweaks, applied in ONE central place.
+
+    * Tooltips wake in 150 ms instead of Qt's ~700 ms default (this app
+      leans heavily on tooltips — a slow tooltip reads as a dead app), and
+      stay in the no-redelay window for longer once one has shown.
+    * Every clickable control (buttons, checkboxes, radios, combos) gets a
+      pointing-hand cursor via polish() — the hook Qt calls for every
+      widget when the style attaches, so dialogs created later get it too
+      (no hand-editing hundreds of call sites).
+    """
+    def styleHint(self, hint, option=None, widget=None, return_data=None):
+        if hint == QStyle.StyleHint.SH_ToolTip_WakeUpDelay:
+            return 150
+        if hint == QStyle.StyleHint.SH_ToolTip_FallAsleepDelay:
+            return 5000
+        return super().styleHint(hint, option, widget, return_data)
+
+    def polish(self, thing):
+        if isinstance(thing, (QPushButton, QToolButton, QCheckBox,
+                              QRadioButton, QComboBox)):
+            thing.setCursor(Qt.CursorShape.PointingHandCursor)
+        return super().polish(thing)
+
+
+class _KinSweepWorker(QThread):
+    """Kinematic corner sweep in the background — the debounced hardpoint-
+    edit / motion-change path.  The job dict (from _snapshot_sweep_job) owns
+    FRESH solver objects built from deep-copied hardpoints; the live
+    per-corner solvers stay with the GUI thread and the 3D view, so no
+    solver state is ever shared across threads.  Results return via the
+    `done` signal (queued connection) and land in _apply_sweep_results."""
+    done   = Signal(object)   # result dict from MainWindow._compute_sweep
+    failed = Signal(str)
+
+    def __init__(self, win, job: dict):
+        super().__init__(win)
+        self._win = win
+        self._job = job
+
+    def run(self):
+        try:
+            self.done.emit(self._win._compute_sweep(self._job))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.failed.emit(str(e))
+
+
 class _ReportWorker(QThread):
     """Runs dynamics sweeps + docx generation off the main thread.
 
@@ -2206,9 +2292,19 @@ class MainWindow(QMainWindow):
         self._diff = Differential()      # Drexler FSAE LSD (default option 1)
         self._dyn_sweep_data = None      # last dynamics sweep dict
         self._dyn_worker     = None      # active dynamics worker thread
+        self._kin_sweep_worker = None    # active background kinematic sweep
+        self._kin_sweep_rerun  = False   # one queued rerun while it runs
 
         self._build_ui()
         self._apply_style()
+        # Snappy wheel scrolling: Qt's default QScrollArea singleStep is
+        # 20 px (x3 lines = 60 px per wheel notch) — the long left column
+        # crawls.  Bump to 28 px (84/notch).  Qt recomputes scrollbar
+        # geometry on resize/content changes, so re-assert on rangeChanged.
+        for _sa in self.findChildren(QScrollArea):
+            _bar = _sa.verticalScrollBar()
+            _bar.setSingleStep(28)
+            _bar.rangeChanged.connect(lambda *_a, b=_bar: b.setSingleStep(28))
         # Centre the camera orbit pivot at the car midpoint
         wb_half = self._car['axle_spacing_mm'] / 2000.  # half axle spacing in metres
         self.view3d.set_camera_center((0., wb_half, 0.2))
@@ -2265,6 +2361,12 @@ class MainWindow(QMainWindow):
         loads_act = pm.addAction('Loads')
         loads_act.setShortcut('Ctrl+4')
         loads_act.triggered.connect(lambda: self._switch_page(3))
+        # Ctrl+4 was already Loads, so Ackermann takes the next free slot.
+        ack_act = pm.addAction('Ackermann')
+        ack_act.setShortcut('Ctrl+5')
+        ack_act.setToolTip('Ackermann analysis — five methods, five graphs, '
+                           'one plain-English line each.')
+        ack_act.triggered.connect(lambda: self._switch_page(4))
 
         vm = mb.addMenu('View')
         hp_act = vm.addAction('All Hardpoints…')
@@ -2354,6 +2456,23 @@ class MainWindow(QMainWindow):
             '', 'Vahan Project (*.vahan);;JSON (*.json)')
         if not path:
             return
+        try:
+            self._save_project_to_path(path)
+        except Exception as e:
+            # NEVER fail silently here: a throw inside the save path used to
+            # surface only as a console traceback while the user believed the
+            # file had been written, and a full editing session was lost.
+            QMessageBox.critical(self, 'Save Error',
+                                 f'Project was NOT saved:\n\n{type(e).__name__}: {e}')
+            raise
+
+    def _save_project_to_path(self, path: str):
+        """Serialise the whole project to `path`.
+
+        Split out of `_save_project` so the save path can be exercised
+        headlessly by the regression net — it was welded to the file dialog,
+        which is exactly why a crash in it went unnoticed.
+        """
         mp = self._motion_panel
         # version 2: every panel input is captured under "panels" so the
         # full state of the dynamics / transient / loads / aero pages
@@ -2810,6 +2929,18 @@ class MainWindow(QMainWindow):
         "front roll damper rate at the wheel".
         """
         from vahan.topology import SpringConfig, ARBType
+
+        # STATIC TOE -> dynamics.  The pair-analysis force split needs it: toe is
+        # what makes the two wheels of an axle sit at different slip angles, so
+        # without it the split has nothing to separate them by.  The alignment
+        # dict stores PER-WHEEL toe in degrees with the tool's sign convention;
+        # VehicleParams wants the TOTAL across the axle, positive = toe-out.
+        # Done before the topology early-out so it applies on every topology.
+        _al = getattr(self, '_alignment', None) or {}
+        dyn_params = dict(dyn_params)
+        dyn_params['toe_front_deg'] = 2.0 * float(_al.get('front_toe_deg', 0.0))
+        dyn_params['toe_rear_deg'] = 2.0 * float(_al.get('rear_toe_deg', 0.0))
+
         topo = getattr(self, '_topology', None)
         if topo is None:
             return dyn_params
@@ -3163,6 +3294,13 @@ class MainWindow(QMainWindow):
         car_data.setdefault('show_shock_thickness', True)
         self._car.update(car_data)
         self._steer.update(data.get('steer', {}))
+        # Push the loaded rack numbers INTO the panel.  Without this the panel
+        # showed its constructor defaults forever while the solver used the
+        # saved values — and the first spinbox touch overwrote the saved ones.
+        try:
+            self._steer_panel.set_params(self._steer)
+        except Exception:
+            pass
         self._alignment.update(data.get('alignment', {}))
 
         # Topology — present in files written by this version onwards;
@@ -3224,9 +3362,24 @@ class MainWindow(QMainWindow):
         self._last_valid_st.clear()
 
         self._refresh_hp_names()   # every hardpoint (incl. ARB) editable
+        # The tyre autoloads at construction, BEFORE any project is read, so a
+        # config that names a tire_file must re-select here or the app silently
+        # keeps whatever sorted first in tire_data/.
+        self._project_loaded = True     # enables the wrong-tyre warning
+        try:
+            self._try_autoload_tire()
+        except Exception:
+            pass
         self._rebuild_solvers()
         self._run_sweep()
         self._update_3d()
+        # Sag now drives the travel-slider limits, so refresh it on load —
+        # otherwise the slider keeps the previous range until something else
+        # happens to rebuild the dynamics solver.
+        try:
+            self._refresh_sag()
+        except Exception:
+            pass
         self.statusBar().showMessage(
             f'Loaded: {path}  |  topology: {self._topology.describe()}', 5000)
 
@@ -3354,7 +3507,9 @@ class MainWindow(QMainWindow):
         tbl.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
 
         # Color the corner headers
-        corner_colors = {'FL': '#4FC3F7', 'FR': '#81C784', 'RL': '#FFB74D', 'RR': '#CE93D8'}
+        # Colorblind-safe corner coding — same yellow/red/white/blue
+        # convention as CORNER_PLOT_COLORS (the kinematic graphs).
+        corner_colors = {'FL': '#FFD600', 'FR': '#E53935', 'RL': '#FFFFFF', 'RR': '#42A5F5'}
 
         for ri, name in enumerate(names):
             it = QTableWidgetItem(name)
@@ -3380,15 +3535,14 @@ class MainWindow(QMainWindow):
 
         # ── buttons ──────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        _btn_style = ('QPushButton { background: #333; color: white; padding: 6px 16px; '
-                      'border-radius: 3px; } QPushButton:hover { background: #555; }')
+        _btn_style = ('QPushButton { background: #1e1e24; color: #e8e8ea; padding: 6px 16px; '
+                      'border: 1px solid #32323c; border-radius: 4px; } '
+                      'QPushButton:hover { background: #2a2a33; border-color: #46464f; } '
+                      'QPushButton:pressed { background: #131318; '
+                      'padding: 7px 16px 5px 16px; }')
 
-        _btn_green = ('QPushButton { background: #2E7D32; color: white; padding: 6px 16px; '
-                      'border-radius: 3px; font-weight: bold; } '
-                      'QPushButton:hover { background: #388E3C; }')
-        _btn_purple = ('QPushButton { background: #6A1B9A; color: white; padding: 6px 16px; '
-                       'border-radius: 3px; font-weight: bold; } '
-                       'QPushButton:hover { background: #8E24AA; }')
+        _btn_green  = BTN_PRIMARY     # primary action — amber (no blue chrome)
+        _btn_purple = BTN_SECONDARY   # secondary — neutral slate
 
         copy_btn = QPushButton('Copy to Clipboard')
         copy_btn.setStyleSheet(_btn_green)
@@ -3469,8 +3623,9 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _switch_page(self, idx: int):
-        """Page menu: 0 = Suspension, 1 = Laptime, 2 = Design City.  Pages 1
-        and 2 are built lazily on first use."""
+        """Page menu: 0 = Suspension, 1 = Laptime, 2 = Design City,
+        3 = Loads, 4 = Ackermann.  Every page above 0 is built lazily on
+        first use."""
         if idx >= 1 and self._pages.count() < 2:
             try:
                 from gui.laptime_page import LaptimePage
@@ -3498,10 +3653,20 @@ class MainWindow(QMainWindow):
                 import traceback; traceback.print_exc()
                 self.statusBar().showMessage(f'Loads page failed: {e}', 8000)
                 return
+        if idx >= 4 and self._pages.count() < 5:
+            try:
+                from gui.ackermann_page import AckermannPage
+                self._ackermann_page = AckermannPage(self)
+                self._pages.addWidget(self._ackermann_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Ackermann page failed: {e}', 8000)
+                return
         if idx < self._pages.count():
             self._pages.setCurrentIndex(idx)
             self.statusBar().showMessage(
-                ('Suspension', 'Laptime', 'Design City', 'Loads')[idx] + ' page', 2000)
+                ('Suspension', 'Laptime', 'Design City', 'Loads',
+                 'Ackermann')[idx] + ' page', 2000)
 
     def _build_ui(self):
         self._build_menu()
@@ -3676,6 +3841,7 @@ class MainWindow(QMainWindow):
         self._motion_panel.motion_changed.connect(self._on_sweep_trigger)
         self._motion_panel.range_changed.connect(self._on_sweep_trigger)
         self._motion_panel.position_changed.connect(self._on_position)
+        self._motion_panel.dance_toggled.connect(self._on_dance)
         self._steer_panel.steering_changed.connect(self._on_steer)
         self._car_panel.params_changed.connect(self._on_car)
         self._car_panel.perspective_changed.connect(self.view3d.set_perspective)
@@ -3694,6 +3860,7 @@ class MainWindow(QMainWindow):
         self._dynamics_panel.solve_requested.connect(self._on_dynamics_solve)
         self._dynamics_panel.sweep_requested.connect(self._on_dynamics_sweep)
         self._dynamics_panel.tire_file_changed.connect(self._on_tire_file)
+        self._dynamics_panel.tire_pressure_changed.connect(self._on_tire_pressure)
         self._dynamics_panel.tire_plots_requested.connect(self._on_tire_plots)
         # Live refresh of vehicle constants when ANY dynamics input changes
         # (spring rate, ARB geometry, mass etc.) — debounced 200 ms so a
@@ -3713,7 +3880,13 @@ class MainWindow(QMainWindow):
         self._edit_sweep_timer = QTimer()
         self._edit_sweep_timer.setSingleShot(True)
         self._edit_sweep_timer.setInterval(150)
-        self._edit_sweep_timer.timeout.connect(self._run_sweep)
+        # Background worker, NOT the synchronous _run_sweep: a full corner
+        # sweep is ~1.2 s and used to block the GUI thread on every debounce
+        # fire — the "slow and draggy" hardpoint editing.  _request_sweep
+        # snapshots on the GUI thread, computes in a QThread, replots on
+        # delivery.  (The regression net still calls _run_sweep directly —
+        # that path is untouched and fully synchronous.)
+        self._edit_sweep_timer.timeout.connect(self._request_sweep)
         self._dynamics_panel.graph_selection_changed.connect(self._on_dyn_graph_sel)
         self._dynamics_panel.corners_changed.connect(self._on_dyn_corners_sel)
         self._dynamics_opt_panel.analyze_requested.connect(self._on_sensitivity_analyze)
@@ -3732,7 +3905,14 @@ class MainWindow(QMainWindow):
         self._analysis_plots_panel.steering_torque_requested.connect(self._on_plot_steering_torque)
         self._analysis_plots_panel.ackermann_demand_requested.connect(self._on_plot_ackermann_demand)
         self._analysis_plots_panel.ackermann_fzfy_requested.connect(self._on_plot_ackermann_fzfy)
-        self._analysis_plots_panel.rack_zero_ackermann_requested.connect(self._on_rack_zero_ackermann)
+        self._analysis_plots_panel.ackermann_pair_requested.connect(
+            self._on_plot_ackermann_pair)
+        self._analysis_plots_panel.slip_load_force_requested.connect(
+            self._on_plot_slip_load_force)
+        self._analysis_plots_panel.ackermann_solve_requested.connect(
+            self._on_solve_ackermann)
+        self._analysis_plots_panel.ymd_trim_sweep_requested.connect(
+            self._on_ymd_trim_sweep)
         self._analysis_plots_panel.mmd_requested.connect(self._on_plot_mmd)
         self._analysis_plots_panel.wheel_rate_linearity_requested.connect(self._on_plot_wheel_rate_linearity)
         self._analysis_plots_panel.llt_requested.connect(self._on_plot_llt)
@@ -3761,7 +3941,8 @@ class MainWindow(QMainWindow):
         rr = _mirror_x(rl)
         return {'FL': fl, 'FR': fr, 'RL': rl, 'RR': rr}
 
-    def _steered_hp(self, hp: dict, rack_travel_m: float, is_front: bool,
+    @staticmethod
+    def _steered_hp(hp: dict, rack_travel_m: float, is_front: bool,
                     mirror: bool = False) -> dict:
         """
         Apply rack translation to tie_rod_inner on front axle only.
@@ -3829,7 +4010,27 @@ class MainWindow(QMainWindow):
         cache[label] = (float(t_lo), float(t_hi))
         return cache[label]
 
-    def _spring_limits(self, solver: SuspensionConstraints) -> tuple[float, float]:
+    def _spring_limits(self, solver: SuspensionConstraints,
+                       is_front: bool | None = None) -> tuple[float, float]:
+        """Cached front-end for _spring_limits_uncached.
+
+        The limits depend only on geometry + damper params + vehicle masses
+        -- none of which change while the motion slider (or dance mode) is
+        animating, yet this was recomputed per corner per FRAME with ~5
+        extra kinematic solves each (profiled 2026-07-30: the biggest
+        single share of a 172 ms frame).  Cache per solver object; the
+        cache is cleared wherever solvers are rebuilt or sag inputs change
+        (_rebuild_solvers, _refresh_sag)."""
+        cache = self.__dict__.setdefault('_static_limit_cache', {})
+        key = ('sl', id(solver), is_front)
+        v = cache.get(key)
+        if v is None:
+            v = self._spring_limits_uncached(solver, is_front)
+            cache[key] = v
+        return v
+
+    def _spring_limits_uncached(self, solver: SuspensionConstraints,
+                       is_front: bool | None = None) -> tuple[float, float]:
         """
         Return (spring_min_m, spring_max_m) based on stroke and computed
         static sag.
@@ -3847,20 +4048,21 @@ class MainWindow(QMainWindow):
             spring_0  = st0.spring_length
             stroke_m  = self._motion_panel.stroke_mm / 1000.
 
-            # Determine which axle this corner belongs to from the solver's hardpoints
-            # (front solvers share lca Y with FL; rear share with RL).  We
-            # fall back to the front-axle sag if we can't tell.
-            is_front = True
-            try:
-                for lbl in ('FL', 'FR'):
-                    if self._solvers.get(lbl) is solver:
-                        is_front = True; break
-                else:
-                    for lbl in ('RL', 'RR'):
+            # Determine which axle this corner belongs to.  Callers that hold
+            # a FRESH (snapshot) solver pass is_front explicitly — the
+            # identity scan below only works for the LIVE self._solvers.
+            if is_front is None:
+                is_front = True
+                try:
+                    for lbl in ('FL', 'FR'):
                         if self._solvers.get(lbl) is solver:
-                            is_front = False; break
-            except Exception:
-                pass
+                            is_front = True; break
+                    else:
+                        for lbl in ('RL', 'RR'):
+                            if self._solvers.get(lbl) is solver:
+                                is_front = False; break
+                except Exception:
+                    pass
 
             # Pull the latest sag dict via the motion panel label text is fragile —
             # recompute directly so this works even before the first paint.
@@ -3892,18 +4094,27 @@ class MainWindow(QMainWindow):
         except Exception:
             return 0., 1.
 
-    def _probe_static_ackermann(self, ref_steer_wheel_deg: float = 25.0) -> float:
+    def _probe_static_ackermann(self, ref_steer_wheel_deg: float = None) -> float:
         """
-        Compute a representative Ackermann % by probing FL and FR at a
-        reference steering-wheel angle.  Ackermann is a *geometry* property
-        of the steering linkage — independent of heave/roll/pitch — so this
-        gives a meaningful live readout even when the motion panel is not
-        in steer mode (current rack = 0 would otherwise collapse to NaN).
+        Compute THE Ackermann % by probing FL and FR — AT FULL LOCK.
+
+        TEAM CONVENTION (user, 2026-07-31): a linkage's Ackermann %
+        drifts with steer angle, so an unqualified "Ackermann %" always
+        means the value AT FULL LOCK (rack against its physical stop).
+        The old default probed an arbitrary 25 deg of handwheel, which
+        quoted a number no one could point to on the car.  Pass an
+        explicit ref_steer_wheel_deg only to study the drift itself.
 
         Returns NaN if the solver fails or the geometry is degenerate.
         """
         try:
-            rt_m = _rack_travel_from_angle(ref_steer_wheel_deg, self._steer)
+            if ref_steer_wheel_deg is None:
+                # FULL LOCK: half the total physical rack travel per side.
+                rt_m = float(self._steer.get('total_rack_travel_mm',
+                                             120.0)) / 2.0 / 1000.0
+            else:
+                rt_m = _rack_travel_from_angle(ref_steer_wheel_deg,
+                                               self._steer)
             corners = self._all_corner_hp()
             toes = {}
             for lbl in ('FL', 'FR'):
@@ -3985,6 +4196,9 @@ class MainWindow(QMainWindow):
             return None
 
     def _rebuild_solvers(self, steer_angle_deg: float = 0.0):
+        # New solver objects invalidate every cached static-derived value
+        # (spring limits, static MR) -- see _spring_limits.
+        self._static_limit_cache = {}
         """
         Rebuild all 4 corner solvers.
         steer_angle_deg: current steering wheel angle (used in Steer sweep mode).
@@ -3998,13 +4212,42 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_spring_travel_cache'):
             self._spring_travel_cache.clear()
         try:
-            corners = self._all_corner_hp()
-            rt = _rack_travel_from_angle(steer_angle_deg, self._steer)
-            from vahan.topology import (DamperActuation, DamperMount,
-                                        SpringConfig, ARBType)
-            for label, hp_d in corners.items():
+            self._solvers = self._build_corner_solvers(
+                self._all_corner_hp(), self._steer, self._topology,
+                steer_angle_deg)
+
+            cp = self._car
+            self.view3d.set_tire_params(
+                outer_r = cp['tire_outer_dia_mm'] / 2000.,
+                rim_r   = cp['tire_rim_dia_mm']   / 2000.,
+                half_w  = cp['tire_width_mm']     / 2000.,
+            )
+        except Exception as e:
+            # Don't just swallow — print the traceback to stderr so
+            # broken solver-init bugs (e.g. an extra HP key the dataclass
+            # rejects) don't silently leave stale solvers in place.
+            import traceback as _tb
+            _tb.print_exc()
+            self.statusBar().showMessage(f'Solver init: {e}', 6000)
+
+    @staticmethod
+    def _build_corner_solvers(corners: dict, steer_cfg: dict, topology,
+                              steer_angle_deg: float = 0.0) -> dict:
+        """Construct FRESH per-corner SuspensionConstraints from an explicit
+        hardpoint / steer / topology snapshot.
+
+        Pure with respect to the GUI: it reads only its arguments, so it is
+        the ONE construction path shared by the live rebuild
+        (_rebuild_solvers) and the background sweep worker (which passes
+        deep-copied snapshots — solvers snapshot hardpoints at construction
+        and live solver objects are never shared across threads)."""
+        from vahan.topology import (DamperActuation, DamperMount,
+                                    SpringConfig, ARBType)
+        rt = _rack_travel_from_angle(steer_angle_deg, steer_cfg)
+        solvers = {}
+        for label, hp_d in corners.items():
                 is_front = label in ('FL', 'FR')
-                steered  = self._steered_hp(hp_d, rt, is_front)
+                steered  = MainWindow._steered_hp(hp_d, rt, is_front)
 
                 # Always use the DESIGN tie-rod length (before any rack travel).
                 # Moving tie_rod_inner with the rack must not change the rod length.
@@ -4012,8 +4255,7 @@ class MainWindow(QMainWindow):
                 design_tierod_len_sq = float(d @ d)
 
                 # Topology-driven actuation + body
-                axle_top = (self._topology.front if is_front
-                            else self._topology.rear)
+                axle_top = topology.front if is_front else topology.rear
                 actuation_str = axle_top.damper_actuation.value  # 'pushrod' etc.
 
                 # Standard pushrod convention: front UCA-mounted, rear LCA-mounted.
@@ -4056,32 +4298,19 @@ class MainWindow(QMainWindow):
                         or _central_tbar):
                     solver_actuation = 'cradle_link'
 
-                self._solvers[label] = SuspensionConstraints(
+                solvers[label] = SuspensionConstraints(
                     _hp_obj(solver_hp),
                     tierod_len_sq=design_tierod_len_sq,
                     pushrod_body=mount_str,
                     damper_actuation=solver_actuation,
                     damper_body=mount_str,
                 )
-            # Solvers are always built with sag_offset_m=0 — no hidden
-            # geometric shift.  The "Apply Sag to Hardpoints" button on
-            # the MotionPanel is the only path that changes geometry
-            # because of damper params, and it does so by rewriting the
-            # actual hardpoints (not by setting an offset).
-
-            cp = self._car
-            self.view3d.set_tire_params(
-                outer_r = cp['tire_outer_dia_mm'] / 2000.,
-                rim_r   = cp['tire_rim_dia_mm']   / 2000.,
-                half_w  = cp['tire_width_mm']     / 2000.,
-            )
-        except Exception as e:
-            # Don't just swallow — print the traceback to stderr so
-            # broken solver-init bugs (e.g. an extra HP key the dataclass
-            # rejects) don't silently leave stale solvers in place.
-            import traceback as _tb
-            _tb.print_exc()
-            self.statusBar().showMessage(f'Solver init: {e}', 6000)
+        # Solvers are always built with sag_offset_m=0 — no hidden
+        # geometric shift.  The "Apply Sag to Hardpoints" button on
+        # the MotionPanel is the only path that changes geometry
+        # because of damper params, and it does so by rewriting the
+        # actual hardpoints (not by setting an offset).
+        return solvers
 
     def _arb_drop_top_world(self, label: str, state) -> np.ndarray | None:
         """World position of the ARB drop-link top, accounting for topology.
@@ -4102,19 +4331,27 @@ class MainWindow(QMainWindow):
 
         Returns world-space (X, Y, Z) in metres, or None if data is missing.
         """
-        from vahan.topology import ARBType
         is_front = label in ('FL', 'FR')
         axle_top = self._topology.front if is_front else self._topology.rear
         arb_hp = self._front_arb if is_front else self._rear_arb
-        if not arb_hp:
-            return None
         solver = self._solvers.get(label)
         if solver is None:
             return None
-        hp = solver.hp
+        return self._arb_drop_top_from(state, solver.hp, axle_top, arb_hp,
+                                       label in ('FR', 'RR'))
+
+    @staticmethod
+    def _arb_drop_top_from(state, hp, axle_top, arb_hp,
+                           is_right: bool) -> np.ndarray | None:
+        """Pure core of _arb_drop_top_world: identical math, but every input
+        is explicit (solved state, solver hp object, axle topology, UNFLIPPED
+        arb hardpoint dict).  Thread-safe with snapshot inputs — the sweep
+        worker calls this with its own fresh solver's hp."""
+        from vahan.topology import ARBType
+        if not arb_hp:
+            return None
 
         # Pick the design-position key for the drop-link top per topology
-        is_right = label in ('FR', 'RR')
         flip = np.array([-1., 1., 1.]) if is_right else np.array([1., 1., 1.])
         if axle_top.arb_type == ARBType.CONTROL_ARM:
             # Drop-top = arb_lca_attach (no separate drop link; lever bolts
@@ -4742,59 +4979,128 @@ class MainWindow(QMainWindow):
                     o['motion_ratio'] = _mr_of(sp_o, o_t)
                     o['spring_len'] = sp_o * 1000.0
 
+    def _snapshot_sweep_job(self) -> dict:
+        """GUI-thread snapshot of EVERYTHING a kinematic sweep needs.
+
+        Deep-copies the hardpoint/steer/car/alignment inputs and builds
+        FRESH solver objects from them, so the compute step (sync on the
+        calling thread, or inside _KinSweepWorker) never shares live solver
+        state with the GUI thread.  Widget reads (motion panel, dynamics
+        panel via _spring_limits) all happen HERE, on the GUI thread."""
+        import copy
+        mp = self._motion_panel
+        job = {
+            'motion':    mp.motion,
+            'lo':        mp.min_val,
+            'hi':        mp.max_val,
+            'position':  mp.position,
+            'corners':   {lbl: {k: np.array(v, float) for k, v in d.items()}
+                          for lbl, d in self._all_corner_hp().items()},
+            'steer':     dict(self._steer),
+            'topology':  copy.deepcopy(self._topology),
+            'arb_front': {k: np.array(v, float)
+                          for k, v in (self._front_arb or {}).items()},
+            'arb_rear':  {k: np.array(v, float)
+                          for k, v in (self._rear_arb or {}).items()},
+            'alignment': dict(self._alignment),
+            'car':       dict(self._car),
+        }
+        job['solvers'] = self._build_corner_solvers(
+            job['corners'], job['steer'], job['topology'], 0.0)
+        job['spring_limits'] = {
+            lbl: self._spring_limits(s, is_front=lbl in ('FL', 'FR'))
+            for lbl, s in job['solvers'].items()
+        }
+        return job
+
     def _run_sweep(self):
-        mp     = self._motion_panel
-        motion = mp.motion
-        lo, hi = mp.min_val, mp.max_val
-        n      = 81
+        """Synchronous sweep: snapshot → compute → apply on the calling
+        thread.  The regression net and programmatic callers rely on
+        self._sweep_results being ready when this returns.  The interactive
+        edit path uses _request_sweep (same compute, background thread)."""
         try:
-            _flip_x = np.array([-1., 1., 1.])
-            def _arb(lbl):
-                src = self._front_arb if lbl in ('FL', 'FR') else self._rear_arb
-                if lbl in ('FR', 'RR'):
-                    return {k: v * _flip_x for k, v in src.items()}
-                return src
+            # Keep the LIVE solvers (3D view / values panel / static-MR
+            # queries) in step with the current geometry FIRST, exactly as
+            # the old in-place rebuild did — _snapshot_sweep_job's
+            # _spring_limits→_query_static_mr reads them.
+            mp = self._motion_panel
+            self._rebuild_solvers(mp.position if mp.motion == 'steer' else 0.)
+            job = self._snapshot_sweep_job()
+            res = self._compute_sweep(job)
+        except Exception as e:
+            self.statusBar().showMessage(f'Sweep: {e}', 6000)
+            import traceback; traceback.print_exc()
+            return
+        self._apply_sweep_results(res)
 
-            # Alignment offsets (applied post-solve as measurement shifts).
-            a = self._alignment
-            def _calign(lbl):
-                return a['front_camber_deg'] if lbl in ('FL','FR') else a['rear_camber_deg']
-            def _talign(lbl):
-                return a['front_toe_deg']    if lbl in ('FL','FR') else a['rear_toe_deg']
+    def _compute_sweep(self, job: dict) -> dict:
+        """The kinematic sweep computation: all four corners + vehicle-level
+        post-processing (axle roll centre, roll-axis inclination, Ackermann,
+        turn radius).  Reads ONLY the job snapshot — never live GUI state —
+        so the sync path (_run_sweep) and the background worker run the ONE
+        same implementation."""
+        motion  = job['motion']
+        lo, hi  = job['lo'], job['hi']
+        n       = 81
+        _flip_x = np.array([-1., 1., 1.])
+        car     = job['car']
+        topo    = job['topology']
 
-            def _sweep(lbl, t):
-                return self._do_sweep(
-                    self._solvers[lbl], t,
-                    'left' if lbl in ('FL', 'RL') else 'right',
-                    arb_hp=_arb(lbl),
-                    camber_off=_calign(lbl), toe_off=_talign(lbl),
-                    is_front=lbl in ('FL', 'FR'),
-                    label=lbl,
-                )
+        def _arb_src(lbl):
+            return job['arb_front'] if lbl in ('FL', 'FR') else job['arb_rear']
 
+        def _arb(lbl):
+            src = _arb_src(lbl)
+            if lbl in ('FR', 'RR'):
+                return {k: v * _flip_x for k, v in src.items()}
+            return src
+
+        # Alignment offsets (applied post-solve as measurement shifts).
+        a = job['alignment']
+        def _calign(lbl):
+            return a['front_camber_deg'] if lbl in ('FL','FR') else a['rear_camber_deg']
+        def _talign(lbl):
+            return a['front_toe_deg']    if lbl in ('FL','FR') else a['rear_toe_deg']
+
+        def _sweep(lbl, t):
+            ctx = {
+                'spring_limits': job['spring_limits'][lbl],
+                'car':           car,
+                'axle_top':      topo.front if lbl in ('FL', 'FR') else topo.rear,
+                'arb_src':       _arb_src(lbl),
+            }
+            return self._do_sweep(
+                job['solvers'][lbl], t,
+                'left' if lbl in ('FL', 'RL') else 'right',
+                arb_hp=_arb(lbl),
+                camber_off=_calign(lbl), toe_off=_talign(lbl),
+                is_front=lbl in ('FL', 'FR'),
+                label=lbl,
+                ctx=ctx,
+            )
+
+        if True:   # (indent kept from the old _run_sweep body — reviewable diff)
             if motion == 'heave':
                 t_arr   = np.linspace(lo/1000, hi/1000, n)
                 x_arr   = t_arr * 1000
                 x_label = 'Wheel Travel (mm)'
                 sweeps  = {lbl: t_arr for lbl in ('FL', 'FR', 'RL', 'RR')}
-                self._rebuild_solvers(0.)
-                self._sweep_results = {
+                sweep_results = {
                     lbl: _sweep(lbl, t)
-                    for lbl, t in sweeps.items() if lbl in self._solvers
+                    for lbl, t in sweeps.items() if lbl in job['solvers']
                 }
 
             elif motion == 'roll':
                 angles  = np.linspace(lo, hi, n)
-                th      = self._front_hp['wheel_center'][0]
+                th      = job['corners']['FL']['wheel_center'][0]
                 t_l     =  np.sin(np.radians(angles)) * th
                 t_r     = -t_l
                 x_arr   = angles
                 x_label = 'Roll Angle (deg)'
                 sweeps  = {'FL': t_l, 'FR': t_r, 'RL': t_l, 'RR': t_r}
-                self._rebuild_solvers(0.)
-                self._sweep_results = {
+                sweep_results = {
                     lbl: _sweep(lbl, t)
-                    for lbl, t in sweeps.items() if lbl in self._solvers
+                    for lbl, t in sweeps.items() if lbl in job['solvers']
                 }
 
             elif motion == 'pitch':
@@ -4802,10 +5108,9 @@ class MainWindow(QMainWindow):
                 x_arr   = t_arr * 1000
                 x_label = 'Pitch Travel (mm)'
                 sweeps  = {'FL': t_arr, 'FR': t_arr, 'RL': -t_arr, 'RR': -t_arr}
-                self._rebuild_solvers(0.)
-                self._sweep_results = {
+                sweep_results = {
                     lbl: _sweep(lbl, t)
-                    for lbl, t in sweeps.items() if lbl in self._solvers
+                    for lbl, t in sweeps.items() if lbl in job['solvers']
                 }
 
             else:  # steer -- vary steering wheel angle, zero heave
@@ -4815,10 +5120,11 @@ class MainWindow(QMainWindow):
                 res_fl = {e['key']: np.full(n, float('nan')) for e in CATALOG}
                 res_fr = {e['key']: np.full(n, float('nan')) for e in CATALOG}
                 for i, ang in enumerate(steer_angles):
-                    self._rebuild_solvers(ang)
+                    solvers_i = self._build_corner_solvers(
+                        job['corners'], job['steer'], topo, ang)
                     for lbl, res, side in [('FL', res_fl, 'left'),
                                            ('FR', res_fr, 'right')]:
-                        solver = self._solvers.get(lbl)
+                        solver = solvers_i.get(lbl)
                         if not solver:
                             continue
                         try:
@@ -4844,14 +5150,28 @@ class MainWindow(QMainWindow):
                 # the Ackermann math (a constant toe-in bias on both wheels
                 # would otherwise ruin the |inner|−|outer| relationship near
                 # zero steer).
-                wb       = self._car.get('wheelbase_mm', 1537.) / 1000.
-                ft       = self._car.get('track_f_mm',   1222.) / 1000.
-                toe_off  = self._alignment.get('front_toe_deg', 0.)
+                wb       = car.get('wheelbase_mm', 1537.) / 1000.
+                ft       = car.get('track_f_mm',   1222.) / 1000.
+                toe_off  = a.get('front_toe_deg', 0.)
                 ack = np.full(n, float('nan'))
                 for i in range(n):
                     fl_raw = res_fl['toe'][i] - toe_off
                     fr_raw = res_fr['toe'][i] - toe_off
-                    ack[i] = _ackermann_from_pair(fl_raw, fr_raw, wb, ft)
+                    ang_i = steer_angles[i]   # steer branch only
+                    # TURN DIRECTION COMES FROM THE STEERING INPUT, full stop.
+                    # It cannot be inferred from the toe values: the toe sign
+                    # convention is MIRRORED between the left and right wheels,
+                    # so FL +12.5 deg and FR -13.7 deg describe the SAME
+                    # physical turn.  Summing them was therefore negative in
+                    # BOTH directions, the inner wheel was misidentified on one
+                    # side, and the swept Ackermann curve FLIPPED SIGN about
+                    # zero steer — +53.6% at -60 deg handwheel and -53.6% at
+                    # +60 deg on a symmetric car.  Ackermann is a property of
+                    # the linkage; steering the other way cannot change it.
+                    # Positive handwheel = left turn = the LEFT wheel is inner.
+                    _inn = 'FL' if float(ang_i) >= 0 else 'FR'
+                    ack[i] = _ackermann_from_pair(fl_raw, fr_raw, wb, ft,
+                                                  inner=_inn)
                 res_fl['ackermann'] = ack
                 res_fr['ackermann'] = ack.copy()
 
@@ -4868,13 +5188,9 @@ class MainWindow(QMainWindow):
                 res_fl['turn_radius'] = tr
                 res_fr['turn_radius'] = tr.copy()
 
-                self._sweep_results = {'FL': res_fl, 'FR': res_fr}
-                # Restore solvers at current steer position
-                cur_angle = mp.position if mp.motion == 'steer' else 0.
-                self._rebuild_solvers(cur_angle)
-
-            self._x_arr   = x_arr
-            self._x_label = x_label
+                sweep_results = {'FL': res_fl, 'FR': res_fr}
+                # (live solvers are restored by the caller — _run_sweep /
+                # _request_sweep rebuild them at the current steer position)
 
             # ── Post-process: compute proper axle roll centre ─────────────────
             # Replace per-corner rc_height (which diverges in roll mode because
@@ -4882,8 +5198,8 @@ class MainWindow(QMainWindow):
             # axle roll centre: intersection of the left IC-to-CP line with the
             # right IC-to-CP line in the front view (XZ plane).
             for left_lbl, right_lbl in [('FL', 'FR'), ('RL', 'RR')]:
-                lr = self._sweep_results.get(left_lbl, {})
-                rr = self._sweep_results.get(right_lbl, {})
+                lr = sweep_results.get(left_lbl, {})
+                rr = sweep_results.get(right_lbl, {})
                 l_ic_x = lr.get('_ic_fv_x')
                 l_ic_z = lr.get('_ic_fv_z')
                 l_cp_x = lr.get('_cp_x')
@@ -4910,12 +5226,12 @@ class MainWindow(QMainWindow):
                         axle_rc[i] = rc[1] * 1000.    # Z in mm
                         axle_rc_x[i] = rc[0] * 1000.  # LATERAL in mm
                 for lbl in (left_lbl, right_lbl):
-                    if lbl in self._sweep_results:
-                        self._sweep_results[lbl]['rc_height'] = axle_rc.copy()
+                    if lbl in sweep_results:
+                        sweep_results[lbl]['rc_height'] = axle_rc.copy()
                         # RC LATERAL migration — the industry red-flag plot a
                         # height-only RC graph hides (an RC darting sideways
                         # in roll = geometric load-transfer asymmetry).
-                        self._sweep_results[lbl]['rc_lateral'] = axle_rc_x.copy()
+                        sweep_results[lbl]['rc_lateral'] = axle_rc_x.copy()
 
             # ── Roll axis inclination (vehicle-level) ────────────────────────
             # Roll axis goes from front RC to rear RC.  Inclination angle is
@@ -4927,9 +5243,9 @@ class MainWindow(QMainWindow):
             # same for all four corners — it's a vehicle property, not a
             # corner property — so we copy the result into every corner's
             # array so the existing per-corner plot machinery just works.
-            wb_m = self._car.get('wheelbase_mm', 1530.0) / 1000.0
-            fl = self._sweep_results.get('FL', {})
-            rl = self._sweep_results.get('RL', {})
+            wb_m = car.get('wheelbase_mm', 1530.0) / 1000.0
+            fl = sweep_results.get('FL', {})
+            rl = sweep_results.get('RL', {})
             rc_f = fl.get('rc_height')   # mm, axle-level (post-processed above)
             rc_r = rl.get('rc_height')
             if (rc_f is not None and rc_r is not None
@@ -4938,8 +5254,22 @@ class MainWindow(QMainWindow):
                 rise_m = (np.asarray(rc_r) - np.asarray(rc_f)) / 1000.0
                 incl_deg = np.degrees(np.arctan2(rise_m, wb_m))
                 for lbl in ('FL', 'FR', 'RL', 'RR'):
-                    if lbl in self._sweep_results:
-                        self._sweep_results[lbl]['roll_axis_incl'] = incl_deg.copy()
+                    if lbl in sweep_results:
+                        sweep_results[lbl]['roll_axis_incl'] = incl_deg.copy()
+
+        return {'motion': motion, 'sweep_results': sweep_results,
+                'x_arr': x_arr, 'x_label': x_label}
+
+    def _apply_sweep_results(self, res: dict):
+        """GUI-thread half of the sweep: land the computed results, run the
+        (live-state) MR injections, surface the solvable range and replot.
+        Called directly by _run_sweep and via queued signal by the worker."""
+        motion = res['motion']
+        try:
+            self._sweep_results = res['sweep_results']
+            self._x_arr   = res['x_arr']
+            self._x_label = res['x_label']
+            x_arr = res['x_arr']
 
             # ONE MODEL: decoupled axles get their real cross-car heave/roll
             # spring MR from the cradle solver (was dead NaN before).
@@ -4974,15 +5304,73 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f'Sweep: {e}', 6000)
             import traceback; traceback.print_exc()
 
+    # ── Background sweep (the interactive edit path) ──────────────────────
+    def _request_sweep(self):
+        """Run the kinematic sweep off the GUI thread (hardpoint-edit /
+        motion-change path).  Snapshot on the GUI thread, compute in a
+        QThread on FRESH solvers, results land via queued signal.  Guards
+        re-entry: if a sweep is already running, exactly ONE rerun is queued
+        (with a fresh snapshot when it starts).  Falls back to the
+        synchronous _run_sweep if the worker cannot start."""
+        w = getattr(self, '_kin_sweep_worker', None)
+        if w is not None and w.isRunning():
+            self._kin_sweep_rerun = True
+            return
+        try:
+            # Live solvers first (3D view + the snapshot's static-MR query
+            # read them), then snapshot — same order as the sync path.
+            mp = self._motion_panel
+            self._rebuild_solvers(mp.position if mp.motion == 'steer' else 0.)
+            job = self._snapshot_sweep_job()
+            w = _KinSweepWorker(self, job)
+            w.done.connect(self._on_kin_sweep_done)
+            w.failed.connect(self._on_kin_sweep_failed)
+            self._kin_sweep_worker = w
+            w.start()
+        except Exception:
+            import traceback; traceback.print_exc()
+            self._kin_sweep_worker = None
+            self._run_sweep()
+
+    def _on_kin_sweep_done(self, res: dict):
+        self._kin_sweep_worker = None
+        self._apply_sweep_results(res)
+        if getattr(self, '_kin_sweep_rerun', False):
+            self._kin_sweep_rerun = False
+            self._request_sweep()
+
+    def _on_kin_sweep_failed(self, msg: str):
+        self._kin_sweep_worker = None
+        self.statusBar().showMessage(f'Sweep: {msg}', 6000)
+        if getattr(self, '_kin_sweep_rerun', False):
+            self._kin_sweep_rerun = False
+            self._request_sweep()
+
+    def closeEvent(self, event):
+        # Don't let a running background sweep outlive the window (QThread
+        # destroyed-while-running crash on exit).
+        w = getattr(self, '_kin_sweep_worker', None)
+        if w is not None and w.isRunning():
+            w.wait(5000)
+        super().closeEvent(event)
+
     # Keys whose valid values depend on the spring/rocker being within limits.
     # All other metrics (camber, toe, RC height, etc.) come from the main
     # Newton solver and are independent of whether the rocker/spring is OOB.
     _SPRING_KEYS = frozenset({'motion_ratio', 'spring_len', 'rocker_angle'})
 
     def _do_sweep(self, solver, travels, side, arb_hp=None,
-                  camber_off=0., toe_off=0., is_front=True, label=None):
+                  camber_off=0., toe_off=0., is_front=True, label=None,
+                  ctx=None):
         """
         Sweep over wheel travel positions and record all kinematic metrics.
+
+        ctx (optional): snapshot context from _snapshot_sweep_job.  When given
+        {'spring_limits': (min,max), 'car': dict, 'axle_top': AxleTopology,
+        'arb_src': unflipped arb hp dict}, this method reads NO live GUI state
+        (thread-safe for the background sweep worker, which also passes a
+        FRESH solver).  When None (net / programmatic callers), behaviour is
+        exactly the historical one: limits and car params come from self.
 
         Rocker branch-flip fix: sweep in TWO passes starting from t≈0 (design
         position) outward in each direction. This keeps the warm-start always
@@ -4998,7 +5386,9 @@ class MainWindow(QMainWindow):
         out['_ic_fv_x'] = np.full(len(travels), float('nan'))  # front-view IC X (m)
         out['_ic_fv_z'] = np.full(len(travels), float('nan'))  # front-view IC Z (m)
         out['_cp_x']    = np.full(len(travels), float('nan'))  # contact-patch X (m)
-        spring_min, spring_max = self._spring_limits(solver)
+        spring_min, spring_max = (ctx['spring_limits'] if ctx is not None
+                                  else self._spring_limits(solver))
+        car = ctx['car'] if ctx is not None else self._car
         spring_lens  = np.full(len(travels), float('nan'))
         travels_arr  = np.array([float(t) for t in travels])
         out['_travel_in'] = travels_arr   # input travel (m) — for cross-car cradle/tbar MR
@@ -5052,7 +5442,12 @@ class MainWindow(QMainWindow):
                 arb_kwargs = {}
                 if arb_hp is not None and label is not None:
                     try:
-                        dt_w = self._arb_drop_top_world(label, st)
+                        if ctx is not None:
+                            dt_w = self._arb_drop_top_from(
+                                st, solver.hp, ctx['axle_top'],
+                                ctx['arb_src'], side == 'right')
+                        else:
+                            dt_w = self._arb_drop_top_world(label, st)
                         if dt_w is not None:
                             ang, _, dl_t = self._solve_arb_bellcrank(dt_w, arb_hp)
                             arb_kwargs = {
@@ -5065,9 +5460,9 @@ class MainWindow(QMainWindow):
                         pass
 
                 anti_kwargs = {
-                    'cg_height_m':      self._car.get('cg_z_mm', 280.) / 1000.,
-                    'wheelbase_m':      self._car.get('wheelbase_mm', 1537.) / 1000.,
-                    'front_brake_bias': self._car.get('front_brake_bias_pct', 65.) / 100.,
+                    'cg_height_m':      car.get('cg_z_mm', 280.) / 1000.,
+                    'wheelbase_m':      car.get('wheelbase_mm', 1537.) / 1000.,
+                    'front_brake_bias': car.get('front_brake_bias_pct', 65.) / 100.,
                     'rear_drive_bias':  1.0,   # RWD assumed
                     'front_drive_bias': 0.0,   # RWD = no front drive
                 }
@@ -5129,7 +5524,7 @@ class MainWindow(QMainWindow):
 
         return out
 
-    def _assemble_corners_draw(self, travels, rt_m):
+    def _assemble_corners_draw(self, travels, rt_m, light=False):
         """Build the per-corner draw dicts + metrics from the ONE
         solved model (self._solvers).  Shared by the Suspension 3-D view
         (_update_3d) and the embedded Loads-page 3-D view (build_load_view)
@@ -5237,6 +5632,13 @@ class MainWindow(QMainWindow):
                 'editable': set(hp_d.keys())})
 
             # Compute metrics for this corner
+            # LIGHT MODE: during live animation (slider drag, dance) the
+            # values panel is unreadable anyway -- skip the whole metrics
+            # block (an extra solve at t-delta + _all_metrics + ARB solve
+            # per corner) and return no values.  A full frame runs when
+            # the motion settles.
+            if light:
+                continue
             # Two-point solve for MR + kinematic IC: solve at t - δ first.
             # state_prev is also used by _ic_y/_ic_z to compute the
             # rigid-body-finite-difference instant centre, which
@@ -5276,7 +5678,15 @@ class MainWindow(QMainWindow):
             # ARB metrics for this corner
             try:
                 pivot  = st.rocker_pivot
-                ax_pt  = pivot + np.array([0., 0.0254, 0.])
+                # Use the REAL rocker axis, not a hardcoded +Y.  The front axis
+                # is (0.487,-0.097,0.868) — 84.4 deg from +Y — so this path was
+                # rotating the ARB drop point about the wrong axis entirely and
+                # publishing the result as arb_angle / arb_drop_travel / arb_mr.
+                # (The rear axis really is +Y, which is why it looked fine.)
+                _axp = (hp_d.get('rocker_axis_pt') if isinstance(hp_d, dict)
+                        else getattr(hp_d, 'rocker_axis_pt', None))
+                ax_pt  = (np.asarray(_axp, float) if _axp is not None
+                          else pivot + np.array([0., 0.0254, 0.]))
                 r_axis = _norm(ax_pt - pivot)
                 arb_d  = arb_hp['arb_drop_top'].copy()
                 if label in ('FR', 'RR'):
@@ -5494,13 +5904,20 @@ class MainWindow(QMainWindow):
                             arb_segs += [(ae, dt)]       # right drop link (live)
         return arb_segs
 
-    def _update_3d(self):
+    def _update_3d(self, light=False):
         if not self._solvers:
             return
         try:
             mp     = self._motion_panel
             pos    = mp.position
             motion = mp.motion
+            # Motion level-of-detail: light frames hide the detail chrome
+            # (spheres / volumes / brakes) so the paint keeps up; the full
+            # settle frame restores it.
+            try:
+                self.view3d.set_motion_lod(bool(light))
+            except Exception:
+                pass
 
             # ── rack travel (needed both for solver steer and for visual) ─────
             rt_m = _rack_travel_from_angle(
@@ -5519,7 +5936,12 @@ class MainWindow(QMainWindow):
                 travels = {'FL': pos/1000, 'FR': pos/1000,
                            'RL': -pos/1000, 'RR': -pos/1000}
 
-            corners_draw, all_corner_values = self._assemble_corners_draw(travels, rt_m)
+            # DANCE easter egg: per-corner wave travels override the slider.
+            if getattr(self, '_dance_active', False) and                     getattr(self, '_dance_travels', None) is not None:
+                travels = dict(self._dance_travels)
+
+            corners_draw, all_corner_values = self._assemble_corners_draw(
+                travels, rt_m, light=light)
             flip_x = np.array([-1., 1., 1.])
 
             # ── ARB visual ────────────────────────────────────────────────────
@@ -5769,7 +6191,7 @@ class MainWindow(QMainWindow):
                 _mode = self._car.get('view_mode', 'normal')
                 _clash_segs = []
                 if _mode == 'interference':
-                    _TR = 0.008        # arm / rod capsule radius
+                    _TR = 0.5 * 0.625 * 25.4 / 1000.0   # 0.625" pushrod/arm tube radius (user)
                     _UR = 0.010        # upright body edge radius
                     _BJ = 0.0127       # 1" ball-joint sphere radius
                     _dr = 0.5 * float(self._car.get('driveshaft_dia_mm', 25.4)) / 1000.0
@@ -5784,6 +6206,16 @@ class MainWindow(QMainWindow):
                     # arm/tie-rod that legitimately attaches to it.  The ball-joint
                     # spheres carry the meaningful automated check.
                     _ = _UR  # (upright edge radius reserved; not used as a clash body)
+                    # The ACTUATION members belong here too.  Leaving them out
+                    # meant the whole ARB/damper package was invisible to this
+                    # view: the front drop link overlapped the coilover by 10 mm
+                    # on v34 and nothing flagged it.  The coilover uses the car's
+                    # own spring_od_mm (what view3d already DRAWS it with), so the
+                    # check matches what the user sees rather than a guessed OD.
+                    _SR = 0.5 * float(self._car.get('spring_od_mm', 63.0)) / 1000.0
+                    _LR = 0.006        # ~12 mm drop link / ARB blade tube
+                    _BRG = 0.5 * 38.1 / 1000.0    # 1.5" rocker pivot bearing OD
+                    _RE = 0.315 * 25.4 / 1000.0   # drop-link ball joint RADIUS (user)
                     _specs = [
                         ('upper arm front', 'uca_front', 'uca_outer', _TR),
                         ('upper arm rear',  'uca_rear',  'uca_outer', _TR),
@@ -5793,6 +6225,18 @@ class MainWindow(QMainWindow):
                         ('pushrod',         'pushrod_outer', 'pushrod_inner', _TR),
                         ('lower ball joint', 'lca_outer', 'lca_outer', _BJ),
                         ('upper ball joint', 'uca_outer', 'uca_outer', _BJ),
+                        ('coilover',      'rocker_spring_pt', 'spring_chassis_pt', _SR),
+                        ('ARB drop link', 'arb_arm_end_world', 'arb_drop_top', _LR),
+                        # ROCKER HARDWARE as real volumes (zero-length capsules =
+                        # spheres).  Without these the rocker is three dimensionless
+                        # points and any drop-link radius "fits": v36 put the ARB
+                        # rod end at 20 mm radius, overlapping the pivot bearing by
+                        # 14.9 mm, and nothing flagged it.  Sizes are the user's
+                        # (1.5" rocker bearing, 1/2" bore rod ends ~1.25" housing).
+                        ('rocker bearing',  'rocker_pivot', 'rocker_pivot', _BRG),
+                        ('ARB rod end',     'arb_drop_top', 'arb_drop_top', _RE),
+                        ('spring rod end',  'rocker_spring_pt', 'rocker_spring_pt', _RE),
+                        ('pushrod rod end', 'pushrod_inner', 'pushrod_inner', _RE),
                     ]
                     for c in corners_draw:
                         pp = c['pts']
@@ -5810,6 +6254,23 @@ class MainWindow(QMainWindow):
                         if _seg is not None:
                             mem.append({'name': 'driveshaft', 'a': np.asarray(_seg['inner'], float),
                                         'b': np.asarray(_seg['outer'], float), 'r': _dr})
+                        # ARB TORSION TUBE: chassis-fixed, spans +x to -x through
+                        # arb_pivot.  _assemble_arb_segs already DRAWS it, but it
+                        # was in no clash member list anywhere — so the front bar
+                        # sat 2.9 mm INSIDE both front coilovers at every wheel
+                        # position and neither this view nor the net said a word.
+                        try:
+                            _ahp = self._front_arb if c['label'][0] == 'F' else self._rear_arb
+                            if _ahp and 'arb_pivot' in _ahp:
+                                _pv = np.asarray(_ahp['arb_pivot'], float)
+                                _sp = self._dynamics_panel
+                                _od = float(getattr(_sp, '_arb_OD_f' if c['label'][0] == 'F'
+                                                    else '_arb_OD_r').value())
+                                _a2 = _pv.copy(); _b2 = _pv.copy(); _b2[0] = -_pv[0]
+                                mem.append({'name': 'ARB torsion bar', 'a': _a2, 'b': _b2,
+                                            'r': 0.5 * _od / 1000.0})
+                        except Exception:
+                            pass
                         _byn = {m['name']: (m['a'], m['b']) for m in mem}
                         for cl in _clashfn(mem):
                             _clash_segs.append(_byn[cl['a']])
@@ -5867,10 +6328,13 @@ class MainWindow(QMainWindow):
                           r_c['pts']['wheel_center'][1]) / 2.
                 return np.array([float(rc[0]), y_axle, float(rc[1])], float)
 
-            front_rc = _axle_rc('FL', 'FR')
-            rear_rc  = _axle_rc('RL', 'RR')
-            if self._show_rc:
-                self.view3d.update_rc(front_rc, rear_rc)
+            # Roll-centre construction is derived overlay geometry -- skip
+            # it on light (animating) frames; the settle frame refreshes it.
+            if not light:
+                front_rc = _axle_rc('FL', 'FR')
+                rear_rc  = _axle_rc('RL', 'RR')
+                if self._show_rc:
+                    self.view3d.update_rc(front_rc, rear_rc)
             self.view3d.set_rc_visible(self._show_rc)
             self.view3d.set_roll_axis_visible(self._show_roll_axis)
 
@@ -5939,7 +6403,21 @@ class MainWindow(QMainWindow):
                 toe_off = self._alignment.get('front_toe_deg', 0.)
                 fl_toe_raw = fl_vals.get('toe', float('nan')) - toe_off
                 fr_toe_raw = fr_vals.get('toe', float('nan')) - toe_off
-                ack = _ackermann_from_pair(fl_toe_raw, fr_toe_raw, wb, ft)
+                # Direction from the STEERING INPUT, not the toe sum — the toe
+                # sign convention is mirrored left/right, so the sum is not a
+                # direction (see the sweep site: it flipped the swept curve's
+                # sign about zero steer).  In heave/roll/pitch the live rack is
+                # centred, so use the current motion value when steering and
+                # otherwise assume the positive reference steer the fallback
+                # probe uses (FL inner).
+                try:
+                    _sv = (float(self._motion_panel.position)
+                           if str(self._motion_panel.motion) == 'steer' else 1.0)
+                except Exception:
+                    _sv = 1.0
+                _inn = 'FL' if _sv >= 0 else 'FR'
+                ack = _ackermann_from_pair(fl_toe_raw, fr_toe_raw, wb, ft,
+                                           inner=_inn)
                 if np.isnan(ack):
                     # Live state at/near zero steer → probe the geometry
                     ack = self._probe_static_ackermann()
@@ -5955,11 +6433,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-            self._values_panel.update_values(all_corner_values)
+            if all_corner_values:
+                self._values_panel.update_values(all_corner_values)
 
-            unit = 'deg' if motion in ('roll', 'steer') else ' mm'
-            self.statusBar().showMessage(
-                f'{motion.title()} = {pos:+.2f}{unit}', 2000)
+            if not light:
+                unit = 'deg' if motion in ('roll', 'steer') else ' mm'
+                self.statusBar().showMessage(
+                    f'{motion.title()} = {pos:+.2f}{unit}', 2000)
 
         except Exception as e:
             self.statusBar().showMessage(f'3D: {e}', 5000)
@@ -6001,11 +6481,69 @@ class MainWindow(QMainWindow):
 
     def _deferred_3d(self):
         self._3d_pending = False
-        self._update_3d()
+        # Light frame while the slider is moving; the settle timer below
+        # runs one FULL frame (metrics + values panel) when motion stops.
+        self._update_3d(light=True)
+        if not hasattr(self, '_settle_timer'):
+            self._settle_timer = QTimer(self)
+            self._settle_timer.setSingleShot(True)
+            self._settle_timer.setInterval(200)
+            self._settle_timer.timeout.connect(
+                lambda: self._update_3d(light=False))
+        self._settle_timer.start()
+
+    def _on_dance(self, on: bool):
+        """Easter egg: actuate the corners as a travelling wave --
+        FL leads, FR follows a quarter period later, then RL, then RR.
+        Time-based phase (wall clock), so dropped frames never slow the
+        wave; every frame is a LIGHT frame (no metrics)."""
+        import time as _time
+        if on:
+            self._dance_active = True
+            self._dance_t0 = _time.perf_counter()
+            if not hasattr(self, '_dance_timer'):
+                self._dance_timer = QTimer(self)
+                self._dance_timer.setInterval(16)          # ~60 FPS target
+                self._dance_timer.timeout.connect(self._dance_frame)
+            self._dance_timer.start()
+            self.statusBar().showMessage('Dance mode: FL-FR-RL-RR wave', 4000)
+        else:
+            self._dance_active = False
+            if hasattr(self, '_dance_timer'):
+                self._dance_timer.stop()
+            self._dance_travels = None
+            self._update_3d(light=False)   # settle back to the slider pose
+
+    def _dance_frame(self):
+        if not getattr(self, '_dance_active', False):
+            return
+        if getattr(self, '_in_dance_frame', False):
+            return                          # frame still rendering -- drop tick
+        import time as _time
+        self._in_dance_frame = True
+        try:
+            # Amplitude: 80% of the damper-allowed travel, capped at 25 mm.
+            lim = getattr(self._motion_panel, '_travel_limits', None)
+            if lim is not None:
+                amp_mm = 0.8 * min(abs(lim[0]), abs(lim[1]))
+            else:
+                amp_mm = 20.0
+            amp_mm = min(max(amp_mm, 3.0), 25.0)
+            t = _time.perf_counter() - self._dance_t0
+            omega = 2.0 * np.pi / 1.8       # one full wave every 1.8 s
+            lag = np.pi / 2.0               # quarter period corner-to-corner
+            self._dance_travels = {
+                lbl: amp_mm / 1000.0 * np.sin(omega * t - k * lag)
+                for k, lbl in enumerate(('FL', 'FR', 'RL', 'RR'))}
+            self._update_3d(light=True)
+        finally:
+            self._in_dance_frame = False
 
     def _on_sweep_trigger(self, *_):
-        self._rebuild_solvers()
-        self._run_sweep()
+        # Motion-mode / range changes re-sweep in the background so the
+        # radio buttons and range spinners respond instantly (the sweep
+        # itself is ~1.2 s; _request_sweep rebuilds the live solvers too).
+        self._request_sweep()
         self._update_3d()
 
     def _on_steer(self, params: dict):
@@ -7920,6 +8458,13 @@ class MainWindow(QMainWindow):
         ik_mr  = sag_info.get('mr_front_used' if ik_axle == 'front'
                               else 'mr_rear_used', 1.0) or 1.0
         self._ik_panel.set_damper_limits(stroke, ik_sag, ik_mr)
+        # Steering sweeps are bounded by the RACK, not by wheel travel.
+        try:
+            self._ik_panel.set_rack_limits(
+                float(self._steer.get('total_rack_travel_mm', 0.0) or 0.0),
+                float(self._steer.get('rack_travel_per_rev_mm', 0.0) or 0.0))
+        except Exception:
+            pass
 
         # ValuesPanel uses per-axle sag for per-corner bump/droop.
         self._values_panel.update_damper_params(stroke, sag_f, sag_r)
@@ -8125,6 +8670,8 @@ class MainWindow(QMainWindow):
             f'(F: {nf} pts, R: {nr} pts)', 6000)
 
     def _refresh_sag(self):
+        # Sag inputs may have changed -> cached spring limits / MR are stale.
+        self._static_limit_cache = {}
         """
         Recompute static sag from the current MotionPanel + DynamicsPanel
         state and push the result to all consumers (motion display, IK,
@@ -8142,6 +8689,16 @@ class MainWindow(QMainWindow):
             pass
 
     def _query_static_mr(self, axle: str) -> float:
+        """Cached front-end for _query_static_mr_uncached (same reasoning
+        as _spring_limits: static value, was re-probed with 2 extra solves
+        per call per frame during live motion)."""
+        cache = self.__dict__.setdefault('_static_limit_cache', {})
+        key = ('mr', axle)
+        if key not in cache:
+            cache[key] = self._query_static_mr_uncached(axle)
+        return cache[key]
+
+    def _query_static_mr_uncached(self, axle: str) -> float:
         """
         Return the geometric motion ratio (d_spring / d_wheel) at static
         for the given axle, using a finite difference on the corner solver.
@@ -8409,29 +8966,89 @@ class MainWindow(QMainWindow):
             os.path.abspath(__file__))), 'tire_data')
         files = sorted(glob.glob(os.path.join(base, '*.mat')) +
                        glob.glob(os.path.join(base, '*.csv')))
-        if files:
-            self._on_tire_file(files[0])
+        if not files:
+            return
+        # The PROJECT chooses its tire; the source still names no dataset, so the
+        # public repo implies nothing (the filename lives in the gitignored
+        # config).  Falling back to files[0] picked purely by ALPHABETICAL order
+        # silently ran the car on the wrong compound for months — B1965* (LCO)
+        # sorts ahead of B2356* (R20), and nothing ever said so.
+        want = str(self._car.get('tire_file', '') or '').strip()
+        if want:
+            for f in files:
+                if os.path.basename(f).lower() == want.lower():
+                    self._on_tire_file(f)
+                    return
+        # NEVER fall back SILENTLY.  Alphabetical order is not a tyre choice,
+        # and it is how the car ran months of analysis on the wrong compound.
+        # But do not cry wolf either: at STARTUP no project has been opened yet,
+        # so "this project names no tyre" is meaningless then.  Warning
+        # unconditionally made the message fire on every launch INCLUDING for
+        # configs that name their tyre correctly, and it misled a reviewer into
+        # running a whole analysis believing the wrong compound was loaded.
+        # Only warn once a project is actually open.
+        msg = (f'config asks for {want!r} but it is not in tire_data/'
+               if want else 'this project names NO tyre file')
+        self._on_tire_file(files[0])
+        if getattr(self, '_project_loaded', False):
+            warn = (f'TYRE NOT CHOSEN BY THE PROJECT — {msg}; loaded '
+                    f'{os.path.basename(files[0])} by filename order. '
+                    f'Set the tyre explicitly before trusting any number.')
+            print(f'[tire] {warn}')
+            try:
+                self.statusBar().showMessage(warn, 15000)
+            except Exception:
+                pass
 
     def _on_tire_file(self, path: str):
-        """Load tire data from .mat, .csv, or .xlsx."""
+        """Load tire data from .mat, .csv, or .xlsx, at the chosen pressure."""
         try:
             from vahan.tire_model import TireModel
-            self._tire_model = TireModel.from_file(path)
+            psi = self._dynamics_panel.get_tire_pressure_psi()
+            try:
+                self._tire_model = TireModel.from_file(path, pressure_psi=psi)
+            except ValueError as pe:
+                # asked for a pressure this file does not hold (or none at
+                # all) — REFUSE.  Blended data is banned; there is no
+                # fallback tyre.
+                self._tire_model = None
+                self._dynamics_panel._tire_label.setText(
+                    f'REFUSED: {pe}')
+                self.statusBar().showMessage(f'Tyre pressure: {pe}', 12000)
+                return
+            tm = self._tire_model
             name = path.split('/')[-1].split('\\')[-1]
             self._dynamics_panel._tire_path = path
             self._dynamics_panel._tire_label.setText(name)
             self._dynamics_panel._tire_label.setStyleSheet(
                 'color: #e0e0e0; font-size: 11px;')
-            psi_str = f'  P: {self._tire_model.pressure_psi:.1f} psi' if self._tire_model.pressure_psi > 0 else ''
+            self._dynamics_panel.set_tire_pressures_available(
+                tm.available_pressures_psi, tm.pressure_blended)
+            psi_str = (f'  P: {tm.pressure_psi:.1f} psi'
+                       + ('  [BLENDED - not one tyre]'
+                          if tm.pressure_blended
+                          and len(tm.available_pressures_psi) > 1 else '')
+                       ) if tm.pressure_psi > 0 else ''
             self._dynamics_panel.set_status(
-                f'Loaded: {self._tire_model.tire_id}  '
-                f'SA: {self._tire_model.sa_range[0]:.0f} to {self._tire_model.sa_range[1]:.0f} deg  '
-                f'Fz: {self._tire_model.fz_range[0]:.0f}-{self._tire_model.fz_range[1]:.0f} N'
+                f'Loaded: {tm.tire_id}  '
+                f'SA: {tm.sa_range[0]:.0f} to {tm.sa_range[1]:.0f} deg  '
+                f'Fz: {tm.fz_range[0]:.0f}-{tm.fz_range[1]:.0f} N '
+                f'({tm.fz_binning})'
                 f'{psi_str}')
             self.statusBar().showMessage(f'Tire model loaded: {path}', 4000)
         except Exception as e:
             self._dynamics_panel.set_status(f'Error: {e}')
             self.statusBar().showMessage(f'Tire load error: {e}', 6000)
+
+    def _on_tire_pressure(self, _psi: float):
+        """Pressure spinbox moved — rebuild the tyre from the same file."""
+        path = self._dynamics_panel.get_tire_path()
+        if path:
+            self._on_tire_file(path)
+            try:
+                self._rebuild_solvers(0.0)
+            except Exception:
+                pass
 
     def _set_rear_tire(self, path):
         """Set the REAR-axle tire for a split front/rear compound setup.
@@ -8440,7 +9057,8 @@ class MainWindow(QMainWindow):
             self._tire_model_rear = None
             return None
         from vahan.tire_model import TireModel
-        self._tire_model_rear = TireModel.from_file(path)
+        self._tire_model_rear = TireModel.from_file(
+            path, pressure_psi=self._dynamics_panel.get_tire_pressure_psi())
         return self._tire_model_rear
 
     def _on_tire_plots(self):
@@ -8879,6 +9497,33 @@ class MainWindow(QMainWindow):
     #  ANALYSIS & VALIDATION PLOTS  (separate from main graph viewport)
     # ==========================================================================
 
+    def _show_text_popup(self, title, text):
+        """Monospaced, selectable, resizable text report window."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QPlainTextEdit,
+                                     QPushButton)
+        from PyQt6.QtGui import QFont
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(900, 620)
+        lay = QVBoxLayout(dlg)
+        box = QPlainTextEdit()
+        box.setPlainText(text)
+        box.setReadOnly(True)
+        box.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        f = QFont('Consolas')
+        f.setStyleHint(QFont.StyleHint.Monospace)
+        f.setPointSize(10)
+        box.setFont(f)
+        lay.addWidget(box)
+        btn = QPushButton('Copy to clipboard')
+        btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(text))
+        lay.addWidget(btn)
+        dlg.show()
+        if not hasattr(self, '_open_plot_dialogs'):
+            self._open_plot_dialogs = []
+        self._open_plot_dialogs.append(dlg)
+
     def _show_plot(self, fig, title):
         """Open fig in a PlotDialog popup."""
         dlg = PlotDialog(self, fig, title=title)
@@ -9061,30 +9706,394 @@ class MainWindow(QMainWindow):
             import traceback; traceback.print_exc()
             self.statusBar().showMessage(f'Ackermann demand plot error: {e}', 5000)
 
+    def _on_solve_ackermann(self):
+        """Run the Ackermann solver: ONE method (the user's), answer in
+        DEGREES of toe difference.  Each wheel corners its own vertical load;
+        its slip angle is inverted from its own measured tyre curve; the wheel
+        is pointed tangent + slip.  No placement rules — those were invented
+        equalisations and were rejected; a wheel's slip evolves from zero with
+        cornering intensity on its own trajectory because it does its own
+        amount of work."""
+        try:
+            from vahan.ackermann import ackermann_bucket
+            if self._tire_model is None:
+                self.statusBar().showMessage(
+                    'Ackermann solver needs TTC data loaded', 6000)
+                return
+            solver = self._build_dynamics_solver()
+            inp = self._analysis_plots_panel.ackermann_solver_inputs()
+            R = inp['radius_m']
+            # Aero: reuse the ONE per-corner aero path the dynamics view
+            # applies (_get_aero_Fz_per_g — solved-deficit or custom-CFD
+            # source, N per lateral g) so this table and the dynamics view
+            # can never disagree about the package.  That getter gates on
+            # the Apply Aero toggle; the checkbox HERE is the user asking
+            # for aero, so lift the gate just for the read.
+            aero_per_g = None
+            if inp.get('aero'):
+                _was_active = self._aero_active
+                self._aero_active = True
+                try:
+                    aero_per_g = self._get_aero_Fz_per_g()
+                finally:
+                    self._aero_active = _was_active
+                if aero_per_g is None:
+                    self.statusBar().showMessage(
+                        'Aero requested but no package data — run the aero '
+                        'target solver or enter custom CFD numbers in the '
+                        'Dynamics panel. Solving WITHOUT aero.', 8000)
+            # Start well below the g list of interest so the EVOLUTION the
+            # method describes is visible: slip angles start at zero and grow,
+            # each wheel on its own trajectory.  At the bottom of the sweep the
+            # percentage must read ~100 (pure geometry) — a built-in sanity row.
+            # Runs to 2.0 so the SATURATED rows are visible: with the belt
+            # curves derated to asphalt the road limit (~1.6-1.7 g) sits
+            # inside this list and the stars actually appear.
+            gl = (0.3, 0.8, 1.2, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0)
+            rows = ackermann_bucket(self._tire_model, solver, radius_m=R,
+                                    lat_g_list=gl,
+                                    grip_multiplier=inp['grip_multiplier'],
+                                    aero=aero_per_g if aero_per_g else False)
+            tm = self._tire_model
+            # Say which surface the g axis means — a raw-belt table and a
+            # derated table look identical except every number lies 0.7x
+            # apart, so the header must name the derate.
+            gmul = float(inp['grip_multiplier'])
+            grip_line = (f'Asphalt grip x{gmul:.2f} — lat g axis is ROAD g'
+                         if gmul < 1.0 else
+                         'RAW BELT curves — the road limit is ~0.7x these '
+                         'g numbers')
+            # When aero is in the solve the header must SAY so, name where
+            # the front/rear split (CoP) comes from, and the table must show
+            # the downforce actually applied per row — otherwise this table
+            # and a no-aero one are indistinguishable at a glance.
+            aero_line = ''
+            if aero_per_g:
+                _tot1g = sum(aero_per_g.values())
+                _rear1g = (aero_per_g.get('RL', 0.0)
+                           + aero_per_g.get('RR', 0.0))
+                _src = 'solved'
+                if hasattr(self._dynamics_panel, 'get_aero_source'):
+                    _src = self._dynamics_panel.get_aero_source()
+                _src_txt = ('the aero target solver (axle-deficit split)'
+                            if _src == 'solved' else
+                            'the custom CFD inputs on the Dynamics panel')
+                aero_line = (
+                    f'AERO INCLUDED — downforce at each row\'s speed '
+                    f'(on a fixed {R:.1f} m circle, speed follows from '
+                    f'lat g). Package {_tot1g:.0f} N per lateral g; front/'
+                    f'rear split (CoP) from {_src_txt}: '
+                    f'{100.0 * _rear1g / max(_tot1g, 1e-9):.0f}% rear. '
+                    f'Downforce adds vertical load but NO lateral demand, '
+                    f'so slip angles shrink and the grip limit rises.\n')
+            hdr = (f'ACKERMANN SOLVER — {R:.1f} m corner\n'
+                   f'{grip_line}\n'
+                   + aero_line
+                   + f'Tyre {tm.tire_id} at '
+                   + (f'{tm.pressure_psi:.1f} psi'
+                      if not tm.pressure_blended else
+                      f'{tm.pressure_psi:.1f} psi BLENDED — pick one pressure')
+                   + '\nMethod: each wheel corners its OWN vertical load '
+                     '(Fy = Fz x lat g); its slip angle is inverted from its '
+                     'OWN measured tyre curve at that force and load; the '
+                     'wheel is pointed tangent-to-its-circle + slip.  No '
+                     'placement rules, no trend knob — the slip split comes '
+                     'out of the measured curves.\n'
+                     'Positive toe difference = PRO-Ackermann (inner turns '
+                     'more). Negative = REVERSE.  * = wheel past its grip '
+                     'limit (angle shown is its peak).\n')
+            # DF column only when aero is on — the no-aero table stays
+            # byte-identical to what it always was.
+            df_hdr = f' {"DF (N)":>7}' if aero_per_g else ''
+            lines = [hdr, f'{"lat g":>6} {"km/h":>7} {"crab":>7} '
+                          f'{"Fz in/out (N)":>16} {"slip in/out":>15} '
+                          f'{"TOE DIFF":>10}   {"Ackermann %":>12}' + df_hdr]
+            for r in rows:
+                pct = r['ackermann_pct']
+                ps = f'{pct:+11.0f}%' if pct == pct else '   n/a (ref~0)'
+                fi = '*' if r.get('inner_saturated') else ' '
+                fo = '*' if r.get('outer_saturated') else ' '
+                if not r.get('valid', True):
+                    # Refuse to print a toe difference built from a saturated
+                    # wheel's peak-angle fallback — that is what made this
+                    # table jump around across g.  Say WHY instead.
+                    lines.append(
+                        f'{r["lat_g"]:6.2f} {r["speed_kph"]:7.1f} '
+                        f'{r["crab_deg"]:+7.2f} '
+                        f'{r["Fz_inner"]:7.0f}/{r["Fz_outer"]:7.0f} '
+                        f'{r["inner_slip_deg"]:6.2f}{fi}/'
+                        f'{r["outer_slip_deg"]:5.2f}{fo} '
+                        f'{"IMPOSSIBLE":>10}   '
+                        f'needs {100*max(r.get("inner_util",0), r.get("outer_util",0)):.0f}% '
+                        f'of grip')
+                    continue
+                df_cell = (f' {r.get("downforce_N", 0.0):7.0f}'
+                           if aero_per_g else '')
+                lines.append(
+                    f'{r["lat_g"]:6.2f} {r["speed_kph"]:7.1f} '
+                    f'{r["crab_deg"]:+7.2f} '
+                    f'{r["Fz_inner"]:7.0f}/{r["Fz_outer"]:7.0f} '
+                    f'{r["inner_slip_deg"]:6.2f}{fi}/'
+                    f'{r["outer_slip_deg"]:5.2f}{fo} '
+                    f'{r["point_spread_deg"]:+10.3f}   {ps}' + df_cell)
+            lines.append('\nRead the TOE DIFF column — degrees are what the '
+                         'steering arms are built to.  The percentage divides '
+                         'by the kinematic spread, which collapses as the '
+                         'turn centre moves level with the front axle, so it '
+                         'blows up while the degrees stay sane.')
+            lines.append('A steering linkage gives spread = k*(steer)^2 with '
+                         'ONE fixed k, so one linkage cannot match every '
+                         'radius. Solve at the radii your car actually '
+                         'drives before speccing.')
+            self._show_text_popup('Ackermann Solver', '\n'.join(lines))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage(f'Ackermann solver error: {e}', 8000)
+
+    def _on_ymd_trim_sweep(self):
+        """The 4th Ackermann criterion — Milliken moment method (Big-12,
+        2026-07): only operating points with ZERO net yaw moment count (a car
+        with leftover moment is still rotating — not a state a driver can hold
+        on the skidpad); sweep Ackermann, the setting with the most trimmed
+        lateral g wins.  Control and stability derivatives are read at each
+        winner's trim.  All states come from vahan.ymd — the ONE yaw-moment
+        engine (plot_mmd runs through the same ymd_state)."""
+        try:
+            from vahan.ymd import trim_sweep_ackermann
+            if self._tire_model is None:
+                self.statusBar().showMessage(
+                    'YMD trim sweep needs TTC data loaded', 6000)
+                return
+            solver = self._build_dynamics_solver()
+            inp = self._analysis_plots_panel.ackermann_solver_inputs()
+            R = float(inp['radius_m'])
+            gmul = float(inp['grip_multiplier'])
+            # Aero: the ONE per-corner aero path the dynamics view applies
+            # (_get_aero_Fz_per_g).  Same gate-lift as _on_solve_ackermann:
+            # the getter honours the Apply Aero toggle, and the checkbox HERE
+            # is the user asking for aero, so lift the gate just for the read.
+            aero_per_g = None
+            if inp.get('aero'):
+                _was_active = self._aero_active
+                self._aero_active = True
+                try:
+                    aero_per_g = self._get_aero_Fz_per_g()
+                finally:
+                    self._aero_active = _was_active
+                if aero_per_g is None:
+                    self.statusBar().showMessage(
+                        'Aero requested but no package data — run the aero '
+                        'target solver or enter custom CFD numbers in the '
+                        'Dynamics panel. Solving WITHOUT aero.', 8000)
+            asb = float(self._probe_static_ackermann())
+            pcts = [-100.0, -60.0, -30.0, 0.0, 30.0, 45.0, 60.0, 100.0]
+            if np.isfinite(asb) and all(abs(asb - p) > 0.5 for p in pcts):
+                pcts.append(round(asb, 1))       # the as-built probe value
+            pcts = sorted(pcts)
+            self.statusBar().showMessage(
+                'YMD trim sweep running (thousands of quasi-steady states — '
+                '~30-60 s)...', 60000)
+            QApplication.processEvents()
+            rows = trim_sweep_ackermann(
+                self._tire_model, solver, radius_m=R, ackermann_list=pcts,
+                grip_multiplier=gmul,
+                aero_Fz_per_g=aero_per_g if aero_per_g else None)
+            tm = self._tire_model
+            grip_line = (f'Asphalt grip x{gmul:.2f} — the lat g column is '
+                         f'ROAD g' if gmul < 1.0 else
+                         'RAW BELT curves — road grip is ~0.7x these g '
+                         'numbers')
+            aero_line = ''
+            if aero_per_g:
+                _tot1g = sum(aero_per_g.values())
+                aero_line = (f'AERO INCLUDED — package {_tot1g:.0f} N per '
+                             f'lateral g, applied at each state\'s speed on '
+                             f'the fixed {R:.1f} m circle.\n')
+            hdr = (
+                f'YMD TRIM SWEEP — Ackermann on a {R:.1f} m corner\n'
+                f'{grip_line}\n' + aero_line +
+                f'Tyre {tm.tire_id} at '
+                + (f'{tm.pressure_psi:.1f} psi'
+                   if not tm.pressure_blended else
+                   f'{tm.pressure_psi:.1f} psi BLENDED — pick one pressure')
+                + '\n\nTHE CRITERION (Milliken moment method): only operating '
+                  'points with zero net\nyaw moment count — leftover moment '
+                  'means the car is still rotating, which a\ndriver cannot '
+                  'hold on the skidpad.  For each Ackermann setting the whole '
+                  'body-\nslip range is searched for the trimmed point with '
+                  'the most lateral g; most g\nwins.\n'
+                  '  stability = yaw moment per degree of body slip (want '
+                  'negative — the car\n              self-corrects; magnitude '
+                  'good to ~2 figures)\n'
+                  'NO control column: at the maximum-trim point dN/dsteer = 0 '
+                  'BY CONSTRUCTION\n(a nonzero value would mean more steer '
+                  'buys more trimmed moment, so it was\nnot the max).  An '
+                  'adversarial pass measured the printed values were pure\n'
+                  'step-size + tyre-grid artifact — sign not even stable.  '
+                  'Rows within\n+/-0.006 g of each other are TIES (the '
+                  'method\'s measured noise floor).\n')
+            lines = [hdr,
+                     f'{"Ackermann":>10} {"max trim Ay":>12} {"body slip":>10} '
+                     f'{"steer":>7} {"stability":>13}',
+                     f'{"%":>10} {"(g, N=0)":>12} {"(deg)":>10} '
+                     f'{"(deg)":>7} {"(Nm/deg)":>13}']
+            asb_tag = (round(asb, 1) if np.isfinite(asb) else None)
+            for r in rows:
+                tag = ' <- as built' if (asb_tag is not None
+                                         and abs(r['pct'] - asb_tag) < 0.6) \
+                    else ''
+                if not np.isfinite(r['Ay_trim_max']):
+                    lines.append(f'{r["pct"]:>+9.0f}%   no trim found (no '
+                                 f'N=0 point in the search window)' + tag)
+                    continue
+                warn = '' if r['converged'] else ' (not converged)'
+                lines.append(
+                    f'{r["pct"]:>+9.0f}% {r["Ay_trim_max"]:12.3f} '
+                    f'{r["beta_at"]:10.2f} {r["delta_at"]:7.2f} '
+                    f'{r["N_beta"]:+13.0f}'
+                    + tag + warn)
+            ok_rows = [r for r in rows if np.isfinite(r['Ay_trim_max'])]
+            if ok_rows:
+                # NO "WINNER" UNLESS IT BEATS THE NOISE FLOOR.
+                # This used to crown the argmax unconditionally, and the user
+                # caught it red-handed: with the model at -30% it declared
+                # +60% the winner, and with the model at +60% it declared
+                # +30% — a sweep whose answer moves with the setting it is
+                # sweeping is reporting noise, not physics.  The adversarial
+                # pass measured this method's per-row noise at 0.001-0.006 g
+                # while the mid-pack rows sit 0.001-0.004 g apart, so the
+                # argmax genuinely wanders.  Only call a winner when the gap
+                # to the runner-up clears NOISE_G; otherwise say TIE and name
+                # the band.  The endpoints usually DO clear it, which is the
+                # part that is real.
+                NOISE_G = 0.006
+                srt = sorted(ok_rows, key=lambda r: -r['Ay_trim_max'])
+                best = srt[0]
+                gap = (best['Ay_trim_max'] - srt[1]['Ay_trim_max']
+                       if len(srt) > 1 else float('inf'))
+                ref = (min(ok_rows, key=lambda r: abs(r['pct'] - asb_tag))
+                       if asb_tag is not None else None)
+                tied = [r for r in ok_rows
+                        if best['Ay_trim_max'] - r['Ay_trim_max'] <= NOISE_G]
+                if gap > NOISE_G:
+                    msg = (f'\nBEST: {best["pct"]:+.0f}% at '
+                           f'{best["Ay_trim_max"]:.3f} g trimmed, clear of the '
+                           f'runner-up by {gap:.3f} g (> {NOISE_G:.3f} g noise '
+                           f'floor).')
+                    if ref is not None:
+                        msg += (f'  As-built {ref["pct"]:+.0f}%: '
+                                f'{ref["Ay_trim_max"]:.3f} g '
+                                f'({ref["Ay_trim_max"] - best["Ay_trim_max"]:+.3f} g).')
+                    lines.append(msg)
+                else:
+                    band = ', '.join(f'{r["pct"]:+.0f}%' for r in
+                                     sorted(tied, key=lambda r: r['pct']))
+                    lines.append(
+                        f'\nNO WINNER — TIE. The top settings ({band}) are '
+                        f'within {NOISE_G:.3f} g of each other, which is this '
+                        f'method\'s own noise. Picking the highest row here '
+                        f'would be reading noise: it moves if you change the '
+                        f'search grid, or the car\'s current Ackermann.')
+                    if ref is not None:
+                        inb = ('IS' if ref in tied else 'is NOT')
+                        lines.append(f'The as-built {ref["pct"]:+.0f}% '
+                                     f'({ref["Ay_trim_max"]:.3f} g) {inb} in '
+                                     f'that tied band.')
+                worst = srt[-1]
+                if best['Ay_trim_max'] - worst['Ay_trim_max'] > NOISE_G:
+                    lines.append(f'WORST: {worst["pct"]:+.0f}% at '
+                                 f'{worst["Ay_trim_max"]:.3f} g — '
+                                 f'{worst["Ay_trim_max"] - best["Ay_trim_max"]:+.3f} g. '
+                                 f'The extremes are the part that is real.')
+                spread = (max(r['Ay_trim_max'] for r in ok_rows)
+                          - min(r['Ay_trim_max'] for r in ok_rows))
+                lines.append(f'Spread across the sweep: {spread:.3f} g '
+                             f'(noise floor {NOISE_G:.3f} g).')
+            self._show_text_popup('YMD Trim Sweep — Ackermann',
+                                  '\n'.join(lines))
+            self.statusBar().showMessage('YMD trim sweep done', 4000)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage(f'YMD trim sweep error: {e}', 8000)
+
     def _on_plot_ackermann_fzfy(self):
+        """Fz-Fy demand vs delivered map — REBUILT, back on its own button.
+
+        The original was blind to Ackermann (x-axis was vertical load, which
+        does not depend on it, and its 48 km/h default left the whole kinematic
+        spread at 0.30 deg) and ran a private load-transfer formula.  The
+        rebuilt one reads loads from the solver, defines demand as EACH WHEEL
+        CORNERS ITS OWN LOAD, delivers at the as-built Ackermann with signed
+        force, honours the asphalt grip multiplier, and STOPS the delivered
+        path at the grip limit instead of fabricating points past it."""
         try:
             from vahan.analysis_plots import plot_ackermann_fz_fy
             if self._tire_model is None:
-                self.statusBar().showMessage('Fz-Fy map needs TTC data loaded', 5000)
+                self.statusBar().showMessage(
+                    'Fz-Fy map needs TTC data loaded', 5000)
                 return
             solver = self._build_dynamics_solver()
-            veh = solver._veh
-            wf = (veh.cg_to_rear_axle_m / veh.wheelbase_m) if hasattr(veh, 'cg_to_rear_axle_m') else 0.45
-            inp = self._analysis_plots_panel.ackermann_demand_inputs()
+            inp = self._analysis_plots_panel.ackermann_solver_inputs()
+            # The % comes from the PANEL SPINBOX, not the as-built probe — the
+            # point of the map is simming candidate settings, and hard-wiring
+            # the probe meant every render showed the car you already have.
+            pct = float(self._analysis_plots_panel._ack_demand_pct.value())
             fig = plot_ackermann_fz_fy(
-                tire_model=self._tire_model,
-                total_mass_kg=veh.total_mass_kg,
-                weight_dist_front=wf,
-                wheelbase_m=veh.wheelbase_m,
-                cg_height_m=veh.cg_height_m,
-                track_front_m=veh.front_track_m if hasattr(veh, 'front_track_m')
-                              else veh.track_front_m,
-                **inp,
-            )
-            self._show_plot(fig, 'Fz–Fy Operating Map')
+                tire_model=self._tire_model, solver=solver,
+                radius_m=inp['radius_m'],
+                ackermann_pct=pct,
+                grip_multiplier=inp['grip_multiplier'])
+            asb = float(self._probe_static_ackermann())
+            self._show_plot(fig, f'Fz–Fy Map — demand vs delivered at '
+                                 f'{pct:+.0f}% (as built {asb:+.0f}%)')
         except Exception as e:
             import traceback; traceback.print_exc()
             self.statusBar().showMessage(f'Fz-Fy map error: {e}', 5000)
+
+    def _on_plot_slip_load_force(self):
+        """Slip angle vs vertical load vs lateral force + the friction check.
+
+        The user asked for this directly, and it is the graph every Ackermann
+        argument in this app rests on — so it is a button, not a script."""
+        try:
+            from vahan.analysis_plots import plot_slip_load_force
+            if self._tire_model is None:
+                self.statusBar().showMessage(
+                    'Slip/load/force plot needs TTC data loaded', 5000)
+                return
+            solver = self._build_dynamics_solver()
+            gm = 1.0
+            try:
+                gm = float(self._analysis_plots_panel
+                           .ackermann_solver_inputs().get('grip_multiplier', 1.0))
+            except Exception:
+                pass
+            fig = plot_slip_load_force(tire_model=self._tire_model,
+                                       solver=solver, grip_multiplier=gm)
+            self._show_plot(fig, 'Slip angle / load / lateral force')
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage(f'Slip/load/force plot error: {e}', 5000)
+
+    def _on_plot_ackermann_pair(self):
+        """Milliken pair analysis (RCVD ch.7) — axle force vs reference steer,
+        one curve per Ackermann setting.  Kept on its own button alongside the
+        Fz-Fy map: the map shows WHERE each wheel operates, this shows what the
+        AXLE can deliver."""
+        try:
+            from vahan.analysis_plots import plot_ackermann_pair_potential
+            if self._tire_model is None:
+                self.statusBar().showMessage(
+                    'Pair analysis needs TTC data loaded', 5000)
+                return
+            solver = self._build_dynamics_solver()
+            inp = self._analysis_plots_panel.ackermann_pair_inputs()
+            fig = plot_ackermann_pair_potential(
+                tire_model=self._tire_model, solver=solver, **inp)
+            self._show_plot(fig, 'Ackermann Pair Analysis (RCVD ch.7)')
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage(f'Pair analysis error: {e}', 5000)
 
     def _on_rack_zero_ackermann(self):
         """Sweep tie_rod_inner Y (fore-aft) to find the rack position that
@@ -9118,98 +10127,261 @@ class MainWindow(QMainWindow):
                 return _ackermann_from_pair(toes['FL'], toes['FR'], wb, ft)
 
             current_ack = _ack_at_y_offset(0.0)
+            # Target comes from the panel's Ackermann % spinbox — this tool
+            # used to be hard-wired to 0% (parallel steer).  Any target in the
+            # reachable band works now that the probe reports reverse readings
+            # honestly (they were mirrored into pro until 2026-07-28, which
+            # made the whole negative branch invisible to this bisection).
+            target = float(self._analysis_plots_panel._ack_demand_pct.value())
 
-            # Binary-search for 0% Ackermann over ±300 mm fore-aft range
-            lo, hi = -0.300, 0.300   # metres
-            ack_lo = _ack_at_y_offset(lo)
-            ack_hi = _ack_at_y_offset(hi)
+            # Survey the range that actually SOLVES before bisecting.  ±300 mm
+            # is measured from the CURRENT rack, and on a config that already
+            # sits far forward (v56 is -168 mm from v55) the far end puts the
+            # tie rod where the kinematics cannot exist — the corner solver
+            # rightly refuses, and this function used to crash with it.
+            def _ack_safe(dy):
+                try:
+                    return _ack_at_y_offset(dy)
+                except Exception:
+                    return float('nan')
 
-            # Check which direction 0% lives
-            if ack_lo * ack_hi > 0:
+            span = np.arange(-0.300, 0.3001, 0.025)
+            vals = np.array([_ack_safe(float(d)) for d in span])
+            ok = np.isfinite(vals)
+            if not ok.any():
+                QMessageBox.warning(self, 'Rack Position',
+                                    'No rack position in ±300 mm solves — '
+                                    'check the geometry.')
+                return
+            lo, hi = float(span[ok][0]), float(span[ok][-1])
+            ack_lo, ack_hi = float(vals[ok][0]), float(vals[ok][-1])
+
+            if (ack_lo - target) * (ack_hi - target) > 0:
                 QMessageBox.warning(self, 'Rack Position',
                     f'Current Ackermann: {current_ack:.1f}%\n'
-                    f'0% Ackermann not found within ±300 mm fore-aft range.\n'
-                    f'(ack at −300 mm: {ack_lo:.1f}%, at +300 mm: {ack_hi:.1f}%)')
+                    f'{target:+.0f}% is not reachable by the rack on this '
+                    f'steering-arm geometry.\n'
+                    f'Reachable band: {ack_lo:.1f}% (rack {lo*1000:+.0f} mm) '
+                    f'to {ack_hi:.1f}% (rack {hi*1000:+.0f} mm).\n'
+                    f'Outside it, the steering arm (tie_rod_outer) has to '
+                    f'move, not the rack.')
                 return
 
             for _ in range(40):        # bisect to <0.01 mm precision
                 mid = (lo + hi) / 2.0
-                if _ack_at_y_offset(mid) * ack_lo < 0:
+                v = _ack_safe(mid)
+                if not np.isfinite(v):
+                    # ran into a non-solving pocket: shrink toward the side
+                    # that still solves rather than dying mid-bisection
+                    hi = mid if abs(hi - mid) > abs(mid - lo) else hi
+                    lo = mid if hi != mid else lo
+                    continue
+                if (v - target) * (ack_lo - target) < 0:
                     hi = mid
                 else:
                     lo = mid
 
             dy_mm  = mid * 1000.0
-            dy_in  = dy_mm / 25.4
             direction = 'rearward' if dy_mm < 0 else 'forward'
-            QMessageBox.information(self, 'Rack Position for 0% Ackermann',
-                f'Current Ackermann:  {current_ack:.1f}%\n'
-                f'Target:             0%  (parallel steering)\n\n'
-                f'Move rack {direction} by:\n'
-                f'  {abs(dy_mm):.1f} mm\n'
-                f'  {abs(dy_in):.2f} in\n\n'
-                f'(tie_rod_inner Y shift = {dy_mm:+.1f} mm)')
+            # THE PASTE-READY NUMBER: the absolute Y coordinate the hardpoint
+            # box on the right wants, not just the delta.  FR mirrors itself.
+            y_new_mm = (float(hp_fl['tie_rod_inner'][1]) + mid) * 1000.0
+            y_cur_mm = float(hp_fl['tie_rod_inner'][1]) * 1000.0
+            self._show_text_popup(
+                f'Rack position for {target:+.0f}% Ackermann',
+                f'Current Ackermann : {current_ack:+.1f} %\n'
+                f'Target            : {target:+.1f} %\n\n'
+                f'Move the rack {direction} {abs(dy_mm):.1f} mm '
+                f'({abs(dy_mm)/25.4:.2f} in)\n\n'
+                f'PASTE THIS into tie_rod_inner Y:\n'
+                f'  {y_new_mm:.2f}\n'
+                f'  (currently {y_cur_mm:.2f} mm; FR mirrors automatically)\n\n'
+                f'Reachable band on this steering arm, rack-only:\n'
+                f'  {ack_lo:+.1f} % (at −300 mm)  to  {ack_hi:+.1f} % (at +300 mm)\n\n'
+                f'WARNING: a fore-aft rack move de-nulls BUMP STEER — re-null '
+                f'with tie_rod_inner Z afterwards and re-check.  (The −168 mm '
+                f'move for v56 needed Z −2.3 mm and left 0.010° over ±25 mm.)\n'
+                f'Also re-check tie-rod clearance: fore-aft moves are the '
+                f'classic way to put the rod through the pushrod or ball '
+                f'joint — run the interference view before accepting.')
         except Exception as e:
             import traceback; traceback.print_exc()
-            self.statusBar().showMessage(f'Rack 0% search error: {e}', 5000)
+            self.statusBar().showMessage(f'Rack position search error: {e}', 5000)
+
+    def _mmd_kwargs(self):
+        """Assemble the FULL plot_mmd kwargs from the solved car + the
+        analysis panel — shared by the single-MMD button and the Ackermann
+        MMD sweep so both always show the identical car."""
+        if self._tire_model is None:
+            raise RuntimeError('MMD plot needs TTC data loaded')
+        solver = self._build_dynamics_solver()
+        veh = solver._veh
+        wf = (veh.cg_to_rear_axle_m / veh.wheelbase_m) if hasattr(veh, 'cg_to_rear_axle_m') else 0.45
+        tf = veh.front_track_m if hasattr(veh, 'front_track_m') else veh.track_front_m
+        tr = veh.rear_track_m  if hasattr(veh, 'rear_track_m')  else veh.track_rear_m
+
+        inp = self._analysis_plots_panel.mmd_inputs()
+
+        # ── Convert lever arm Δ → ARB wheel-rate Δ ──────────────────────
+        # K_arb ∝ 1 / L²  (K_t fixed, arm changes leverage)
+        # K_new = K_base * (L_base / (L_base + ΔL))²
+        # delta_arb = K_new − K_base = K_base * [(L_base / L_new)² − 1]
+        dL_f_m = inp.pop('delta_arm_front_mm', 0.0) / 1000.0
+        dL_r_m = inp.pop('delta_arm_rear_mm',  0.0) / 1000.0
+
+        # Base lever arm from kinematic hardpoints (arb_pivot → arb_arm_end)
+        def _arm_len(arb_hp):
+            try:
+                return float(np.linalg.norm(
+                    arb_hp['arb_arm_end'] - arb_hp['arb_pivot']))
+            except (KeyError, TypeError):
+                return 0.0
+
+        L_f_base = _arm_len(self._front_arb)
+        L_r_base = _arm_len(self._rear_arb)
+
+        def _darb(K_base, L_base, dL):
+            if L_base < 1e-4 or K_base <= 0:
+                return 0.0
+            L_new = max(L_base + dL, 1e-4)
+            return K_base * ((L_base / L_new) ** 2 - 1.0)
+
+        inp['delta_arb_front_Npm'] = _darb(veh.arb_rate_front_Npm, L_f_base, dL_f_m)
+        inp['delta_arb_rear_Npm']  = _darb(veh.arb_rate_rear_Npm,  L_r_base, dL_r_m)
+
+        return dict(
+            tire_model=self._tire_model,
+            total_mass_kg=veh.total_mass_kg,
+            weight_dist_front=wf,
+            wheelbase_m=veh.wheelbase_m,
+            cg_height_m=veh.cg_height_m,
+            track_front_m=tf,
+            track_rear_m=tr,
+            roll_stiffness_front_Npm_rad=veh.roll_stiffness_front_Npm_rad,
+            roll_stiffness_rear_Npm_rad=veh.roll_stiffness_rear_Npm_rad,
+            **inp,
+        )
 
     def _on_plot_mmd(self):
         try:
             from vahan.analysis_plots import plot_mmd
-            if self._tire_model is None:
-                self.statusBar().showMessage('MMD plot needs TTC data loaded', 5000)
-                return
-            solver = self._build_dynamics_solver()
-            veh = solver._veh
-            wf = (veh.cg_to_rear_axle_m / veh.wheelbase_m) if hasattr(veh, 'cg_to_rear_axle_m') else 0.45
-            tf = veh.front_track_m if hasattr(veh, 'front_track_m') else veh.track_front_m
-            tr = veh.rear_track_m  if hasattr(veh, 'rear_track_m')  else veh.track_rear_m
-
-            inp = self._analysis_plots_panel.mmd_inputs()
-
-            # ── Convert lever arm Δ → ARB wheel-rate Δ ──────────────────────
-            # K_arb ∝ 1 / L²  (K_t fixed, arm changes leverage)
-            # K_new = K_base * (L_base / (L_base + ΔL))²
-            # delta_arb = K_new − K_base = K_base * [(L_base / L_new)² − 1]
-            dL_f_m = inp.pop('delta_arm_front_mm', 0.0) / 1000.0
-            dL_r_m = inp.pop('delta_arm_rear_mm',  0.0) / 1000.0
-
-            # Base lever arm from kinematic hardpoints (arb_pivot → arb_arm_end)
-            def _arm_len(arb_hp):
-                try:
-                    return float(np.linalg.norm(
-                        arb_hp['arb_arm_end'] - arb_hp['arb_pivot']))
-                except (KeyError, TypeError):
-                    return 0.0
-
-            L_f_base = _arm_len(self._front_arb)
-            L_r_base = _arm_len(self._rear_arb)
-
-            def _darb(K_base, L_base, dL):
-                if L_base < 1e-4 or K_base <= 0:
-                    return 0.0
-                L_new = max(L_base + dL, 1e-4)
-                return K_base * ((L_base / L_new) ** 2 - 1.0)
-
-            inp['delta_arb_front_Npm'] = _darb(veh.arb_rate_front_Npm, L_f_base, dL_f_m)
-            inp['delta_arb_rear_Npm']  = _darb(veh.arb_rate_rear_Npm,  L_r_base, dL_r_m)
-
-            fig = plot_mmd(
-                tire_model=self._tire_model,
-                total_mass_kg=veh.total_mass_kg,
-                weight_dist_front=wf,
-                wheelbase_m=veh.wheelbase_m,
-                cg_height_m=veh.cg_height_m,
-                track_front_m=tf,
-                track_rear_m=tr,
-                roll_stiffness_front_Npm_rad=veh.roll_stiffness_front_Npm_rad,
-                roll_stiffness_rear_Npm_rad=veh.roll_stiffness_rear_Npm_rad,
-                **inp,
-            )
+            fig = plot_mmd(**self._mmd_kwargs())
             self._show_plot(fig, 'Milliken Moment Diagram')
         except Exception as e:
             import traceback; traceback.print_exc()
             self.statusBar().showMessage(f'MMD plot error: {e}', 5000)
+
+    def _on_plot_mmd_ack_sweep(self,
+                               pct_list=(100, 70, 50, 30, 0, -30, -70)):
+        """THE app MMD, once per Ackermann setting — same car, same panel
+        inputs, only ackermann_pct varies.  Figures land in a tabbed dialog
+        and are saved to figs/mmd_ack_{pct}.png."""
+        try:
+            from vahan.analysis_plots import plot_mmd
+            from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QTabWidget,
+                                         QApplication as _QA)
+            from matplotlib.backends.backend_qtagg import (
+                FigureCanvasQTAgg as _Canvas)
+            kw = self._mmd_kwargs()
+            dlg = QDialog(self)
+            dlg.setWindowTitle('MMD vs Ackermann — full diagrams')
+            dlg.resize(1500, 1150)
+            lay = QVBoxLayout(dlg)
+            tabs = QTabWidget()
+            lay.addWidget(tabs)
+            numbers = []
+            for pct in pct_list:
+                self.statusBar().showMessage(
+                    f'MMD sweep: solving Ackermann {pct:+.0f}% …', 0)
+                _QA.processEvents()
+                kw['ackermann_pct'] = float(pct)
+                fig = plot_mmd(**kw)
+                fig.suptitle(f'Ackermann {pct:+.0f}%', fontsize=13, y=0.998)
+                try:
+                    fig.savefig(f'figs/mmd_ack_{pct:+.0f}.png', dpi=110)
+                except Exception:
+                    pass
+                if getattr(fig, '_mmd_numbers', None):
+                    numbers.append(fig._mmd_numbers)
+                tabs.addTab(_Canvas(fig), f'{pct:+.0f}%')
+            # NUMBERS tab first: every important value, side by side.
+            if numbers:
+                from PyQt6.QtWidgets import QPlainTextEdit
+                best = max(n['ay_trim_limit_g'] for n in numbers)
+                rows = ['  ACK%   TRIM LIMIT   vs BEST    BODY SLIP   STEER'
+                        '    CONTROL      STABILITY    MAX REACH',
+                        '         (g, N=0)     (g)        (deg)      (deg)'
+                        '   (N·m/deg)    (N·m/deg)      (g)']
+                for n in numbers:
+                    rows.append(
+                        f"  {n['ackermann_pct']:+5.0f}   "
+                        f"{n['ay_trim_limit_g']:+7.3f}   "
+                        f"{n['ay_trim_limit_g'] - best:+7.3f}   "
+                        f"{n['beta_at_limit_deg']:+8.1f}   "
+                        f"{n['delta_at_limit_deg']:+6.1f}   "
+                        f"{n['control_Nm_per_deg']:+8.0f}   "
+                        f"{n['stability_Nm_per_deg']:+10.0f}   "
+                        f"{n['ay_reach_g']:+7.3f}")
+                # SECOND FRAME, same table: the constant-speed numbers
+                # above run at RAW BELT grip (the MMD's convention).  The
+                # road answer is the constant-radius trim sweep at the
+                # asphalt derate -- run it too and print the verdict, so
+                # the software itself states which claims survive at road
+                # grip instead of leaving the frames to be confused.
+                try:
+                    from vahan.ymd import trim_sweep_ackermann as _tsa
+                    self.statusBar().showMessage(
+                        'MMD sweep: road-grip trim comparison…', 0)
+                    _QA.processEvents()
+                    _ss = self._build_dynamics_solver()
+                    _rows2 = _tsa(self._tire_model, _ss, 8.0,
+                                  [n['ackermann_pct'] for n in numbers],
+                                  grip_multiplier=0.70)
+                    rows.append('')
+                    rows.append('  ROAD FRAME - constant radius 8 m, '
+                                'asphalt 0.70x rig grip (trimmed limit):')
+                    _ay2 = [r.get('Ay_trim_max', float('nan'))
+                            for r in _rows2]
+                    for r in _rows2:
+                        rows.append(
+                            f"  {r['pct']:+5.0f}   "
+                            f"{r.get('Ay_trim_max', float('nan')):+7.3f} g   "
+                            f"control {r.get('N_delta', float('nan')):+7.0f}   "
+                            f"stability {r.get('N_beta', float('nan')):+8.0f}"
+                            "  N·m/deg")
+                    import numpy as _np
+                    _sp2 = float(_np.nanmax(_ay2) - _np.nanmin(_ay2))
+                    _sp1 = float(max(n['ay_trim_limit_g'] for n in numbers)
+                                 - min(n['ay_trim_limit_g'] for n in numbers))
+                    rows.append('')
+                    rows.append(f'  VERDICT: belt-frame spread {_sp1:.3f} g; '
+                                f'road-frame spread {_sp2:.3f} g vs the '
+                                f'0.006 g measured noise floor -> '
+                                + ('settings SEPARATE at road grip'
+                                   if _sp2 > 0.012 else
+                                   'NO WINNER at road grip - choose on '
+                                   'control retention, scrub and wear'))
+                except Exception as _e:
+                    rows.append(f'  (road-frame comparison failed: {_e})')
+                txt = QPlainTextEdit('\n'.join(rows))
+                txt.setReadOnly(True)
+                txt.setStyleSheet('font-family: Consolas, monospace; '
+                                  'font-size: 12px;')
+                tabs.insertTab(0, txt, 'NUMBERS')
+                tabs.setCurrentIndex(0)
+                try:
+                    io_open = open('figs/mmd_ack_numbers.txt', 'w',
+                                   encoding='utf-8')
+                    io_open.write('\n'.join(rows) + '\n')
+                    io_open.close()
+                except Exception:
+                    pass
+            self.statusBar().showMessage('MMD sweep done — figs/ has the PNGs',
+                                         8000)
+            dlg.show()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage(f'MMD sweep error: {e}', 8000)
 
     # ==========================================================================
     #  AERO DOWNFORCE
@@ -9256,14 +10428,20 @@ class MainWindow(QMainWindow):
         g_ref = r.lateral_g
         if g_ref < 0.01:
             return None
-        # Use axle-level need (symmetric: max of left/right per axle)
+        # Use axle-level need (symmetric: max of left/right per axle).
+        # front_axle_need_N / rear_axle_need_N are AXLE totals — the solver's own
+        # per-corner field is need[axle]/2.0 (vahan/dynamics.py:2776) and
+        # total_downforce_N is F + R.  Handing the axle total to EACH wheel
+        # applied exactly 2x the downforce the aero solver had computed, and
+        # disagreed by 2x with the _custom_aero_Fz_per_g branch below, which
+        # does divide by 2.  Gated in test_one_model.py ("aero per-corner sum").
         fn = r.front_axle_need_N
         rn = r.rear_axle_need_N
         if fn + rn < 0.1:
             return None
         return {
-            'FL': fn / g_ref, 'FR': fn / g_ref,
-            'RL': rn / g_ref, 'RR': rn / g_ref,
+            'FL': fn / 2.0 / g_ref, 'FR': fn / 2.0 / g_ref,
+            'RL': rn / 2.0 / g_ref, 'RR': rn / 2.0 / g_ref,
         }
 
     def _custom_aero_Fz_per_g(self) -> dict | None:
@@ -9705,10 +10883,10 @@ class MainWindow(QMainWindow):
         sig_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         sig_list.setFixedWidth(220)
         sig_list.setStyleSheet(
-            'QListWidget { background: #0a0a0a; color: #e0e0e0; '
-            'border: 1px solid #222; font-size: 13px; }'
+            'QListWidget { background: #101013; color: #e8e8ea; '
+            'border: 1px solid #222228; border-radius: 4px; font-size: 13px; }'
             'QListWidget::item { padding: 4px; }'
-            'QListWidget::item:selected { background: #333; color: white; }'
+            'QListWidget::item:selected { background: #2e2e38; color: white; }'
         )
         for key, label in SIGS:
             item = QListWidgetItem(label)
@@ -9722,11 +10900,7 @@ class MainWindow(QMainWindow):
 
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(dlg.hide)
-        close_btn.setStyleSheet(
-            'QPushButton { background: #1a5276; color: white; padding: 6px 20px; '
-            'border-radius: 3px; font-weight: bold; }'
-            'QPushButton:hover { background: #2474a6; }'
-        )
+        close_btn.setStyleSheet(BTN_PRIMARY)
         left.addWidget(close_btn)
 
         root.addLayout(left)
@@ -10373,92 +11547,199 @@ class MainWindow(QMainWindow):
     # ==========================================================================
 
     def _apply_style(self):
+        # Minimal dark theme.  One quiet accent (amber #FFB74D) reserved for
+        # checked/active state; every other distinction is luminance-based so
+        # it stays colorblind-safe (no red/green or purple/blue pairs).
+        # Consistent 4px radii, hairline borders, slim scrollbars.
         self.setStyleSheet("""
+        /* -- base ------------------------------------------------------- */
         QMainWindow, QWidget, QScrollArea {
-            background-color: #000000;
-            color: #e0e0e0;
+            background-color: #0b0b0d;
+            color: #e8e8ea;
             font-family: 'Segoe UI', Arial, sans-serif;
             font-size: 13px;
         }
+        QScrollArea { border: none; }
+        QToolTip {
+            background-color: #1c1c21;
+            color: #e8e8ea;
+            border: 1px solid #3a3a42;
+            padding: 5px 8px;
+            font-size: 12px;
+        }
+        /* -- menus ------------------------------------------------------ */
+        QMenuBar {
+            background-color: #0b0b0d;
+            color: #c9c9cf;
+            border-bottom: 1px solid #1c1c20;
+        }
+        QMenuBar::item { background: transparent; padding: 4px 10px; border-radius: 4px; }
+        QMenuBar::item:selected { background: #1e1e24; color: #ffffff; }
+        QMenu {
+            background-color: #141418;
+            color: #e8e8ea;
+            border: 1px solid #2a2a30;
+            padding: 4px;
+        }
+        QMenu::item { padding: 5px 24px 5px 14px; border-radius: 4px; }
+        QMenu::item:selected { background-color: #26262e; }
+        QMenu::separator { height: 1px; background: #26262c; margin: 4px 8px; }
+        /* -- tables / lists --------------------------------------------- */
         QTableWidget {
-            background-color: #0a0a0a;
-            alternate-background-color: #0f0f0f;
-            gridline-color: #2a2a2a;
-            color: #e0e0e0;
+            background-color: #101013;
+            alternate-background-color: #15151a;
+            gridline-color: #1e1e23;
+            color: #e8e8ea;
             border: none;
             font-size: 12px;
         }
+        QTableWidget::item { padding: 2px 4px; }
+        QTableWidget::item:selected { background-color: #2e2e38; color: #ffffff; }
         QHeaderView::section {
-            background-color: #111111;
-            color: #cccccc;
-            border: 1px solid #2a2a2a;
-            padding: 4px;
-            font-size: 12px;
-            font-weight: bold;
+            background-color: #15151a;
+            color: #b4b4bc;
+            border: none;
+            border-bottom: 1px solid #2a2a32;
+            border-right: 1px solid #1c1c21;
+            padding: 5px 6px;
+            font-size: 11px;
+            font-weight: 600;
         }
-        QTableWidget::item:selected { background-color: #333333; color: white; }
+        QTableCornerButton::section { background-color: #15151a; border: none; }
         QListWidget {
-            background-color: #0a0a0a;
-            alternate-background-color: #0f0f0f;
-            color: #e0e0e0;
-            border: 1px solid #2a2a2a;
+            background-color: #101013;
+            alternate-background-color: #15151a;
+            color: #e8e8ea;
+            border: 1px solid #222228;
+            border-radius: 4px;
             font-size: 12px;
         }
-        QListWidget::item:selected { background-color: #333333; }
-        QRadioButton { spacing: 5px; font-size: 13px; }
-        QCheckBox    { spacing: 5px; font-size: 13px; }
-        QLabel       { color: #e0e0e0; font-size: 13px; }
-        QSlider::groove:horizontal {
-            height: 5px; background: #2a2a2a; border-radius: 2px;
+        QListWidget::item { padding: 3px 4px; }
+        QListWidget::item:selected { background-color: #2e2e38; color: #ffffff; }
+        /* -- text + toggles --------------------------------------------- */
+        QLabel       { color: #e8e8ea; font-size: 13px; background: transparent; }
+        /* padding = bigger hit target: the click area extends past the
+           glyph+label so toggles don't demand pixel-precise aim */
+        QRadioButton { spacing: 5px; font-size: 13px; padding: 3px 2px; }
+        QCheckBox    { spacing: 5px; font-size: 13px; padding: 3px 2px; }
+        /* Checkbox indicators: NATIVE, deliberately unstyled.  The restyle
+           shipped custom rounded indicators and the user called that panel
+           WORSE ("restore old check boxes, rest is fine") — the native check
+           glyph carries more state information than a filled rounded square,
+           and a checkbox is the one control where familiarity beats theme
+           consistency.  Style the LABEL spacing only. */
+        QRadioButton::indicator {
+            width: 13px; height: 13px;
+            border: 1px solid #3a3a42;
+            border-radius: 7px;
+            background: #101013;
         }
+        QRadioButton::indicator:hover { border-color: #55555f; }
+        QRadioButton::indicator:checked {
+            width: 5px; height: 5px;
+            border: 5px solid #FFB74D;
+            border-radius: 7px;
+            background: #0b0b0d;
+        }
+        /* -- slider ----------------------------------------------------- */
+        QSlider::groove:horizontal { height: 4px; background: #26262c; border-radius: 2px; }
         QSlider::handle:horizontal {
-            background: #888888; width: 15px; height: 15px;
-            margin: -5px 0; border-radius: 8px;
+            background: #d8d8dc; width: 14px; height: 14px;
+            margin: -5px 0; border-radius: 7px;
         }
-        QSlider::sub-page:horizontal { background: #666666; border-radius: 2px; }
-        QDoubleSpinBox, QSpinBox {
-            background-color: #0a0a0a;
-            border: 1px solid #2a2a2a;
-            color: #e0e0e0;
+        QSlider::handle:horizontal:hover { background: #FFB74D; }
+        QSlider::sub-page:horizontal { background: #4a4a54; border-radius: 2px; }
+        /* -- inputs ----------------------------------------------------- */
+        QDoubleSpinBox, QSpinBox, QLineEdit {
+            background-color: #101013;
+            border: 1px solid #2a2a31;
+            color: #e8e8ea;
             padding: 3px 5px;
-            border-radius: 3px;
+            border-radius: 4px;
             font-size: 12px;
+            selection-background-color: #3a3a46;
+        }
+        QDoubleSpinBox:hover, QSpinBox:hover, QLineEdit:hover { border-color: #3c3c46; }
+        QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus { border-color: #8f6a2e; }
+        QDoubleSpinBox:disabled, QSpinBox:disabled, QLineEdit:disabled {
+            color: #63636b; background-color: #0e0e10; border-color: #202026;
         }
         QComboBox {
-            background-color: #0a0a0a;
-            border: 1px solid #2a2a2a;
-            color: #e0e0e0;
+            background-color: #16161b;
+            border: 1px solid #2a2a31;
+            color: #e8e8ea;
             padding: 3px 5px;
-            border-radius: 3px;
+            border-radius: 4px;
             font-size: 12px;
         }
+        QComboBox:hover { border-color: #3c3c46; }
+        QComboBox:focus { border-color: #8f6a2e; }
         QComboBox::drop-down { border: none; }
         QComboBox QAbstractItemView {
-            background-color: #1a1a1a;
-            color: #e0e0e0;
-            selection-background-color: #333333;
+            background-color: #17171c;
+            color: #e8e8ea;
+            border: 1px solid #2e2e36;
+            selection-background-color: #2e2e38;
         }
+        /* -- buttons ---------------------------------------------------- */
         QPushButton {
-            background-color: #1a1a1a;
-            border: 1px solid #444444;
-            color: #e0e0e0;
+            background-color: #1a1a1f;
+            border: 1px solid #2e2e36;
+            color: #e8e8ea;
             padding: 4px 10px;
-            border-radius: 3px;
+            border-radius: 4px;
             font-size: 12px;
         }
-        QPushButton:hover { background-color: #333333; }
-        QScrollBar:vertical   { background: #050505; width: 8px; }
-        QScrollBar::handle:vertical { background: #2a2a2a; border-radius: 4px; }
-        QStatusBar { color: #888888; font-size: 11px; }
-        QSplitter::handle { background: #2a2a2a; }
+        QPushButton:hover { background-color: #232329; border-color: #40404a; }
+        /* pressed = instant darken + 1px translate (padding trick).
+           No animations — Qt QSS has none anyway; snappy = immediate. */
+        QPushButton:pressed { background-color: #101014; padding: 5px 10px 3px 10px; }
+        QPushButton:disabled { color: #63636b; background-color: #141418; border-color: #222228; }
+        QPushButton:checked { background-color: #26262e; border-color: #8f6a2e; }
+        QToolButton {
+            background-color: #1a1a1f;
+            border: 1px solid #2e2e36;
+            color: #e8e8ea;
+            border-radius: 4px;
+            padding: 3px 6px;
+        }
+        QToolButton:hover { background-color: #232329; border-color: #40404a; }
+        QToolButton:pressed { background-color: #101014; padding: 4px 6px 2px 6px; }
+        /* -- scrollbars ------------------------------------------------- */
+        QScrollBar:vertical { background: transparent; width: 9px; margin: 0; }
+        QScrollBar::handle:vertical { background: #2c2c34; border-radius: 4px; min-height: 30px; }
+        QScrollBar::handle:vertical:hover { background: #45454f; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        QScrollBar:horizontal { background: transparent; height: 9px; margin: 0; }
+        QScrollBar::handle:horizontal { background: #2c2c34; border-radius: 4px; min-width: 30px; }
+        QScrollBar::handle:horizontal:hover { background: #45454f; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+        QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
+        /* -- chrome ----------------------------------------------------- */
+        QStatusBar { color: #9a9aa2; font-size: 11px; border-top: 1px solid #1c1c20; }
+        QStatusBar::item { border: none; }
+        QSplitter::handle { background: #131316; }
+        QSplitter::handle:hover { background: #26262c; }
         QGroupBox {
-            border: 1px solid #2a2a2a;
-            margin-top: 6px;
-            padding-top: 6px;
+            border: 1px solid #232329;
+            border-radius: 6px;
+            margin-top: 8px;
+            padding-top: 8px;
         }
         QGroupBox::title {
-            color: #cccccc;
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 8px;
+            padding: 0 4px;
+            color: #b4b4bc;
+            background-color: #0b0b0d;
         }
+        QProgressBar {
+            background: #101013; border: 1px solid #2a2a31; border-radius: 4px;
+            text-align: center; color: #e8e8ea; font-size: 11px;
+        }
+        QProgressBar::chunk { background: #8f6a2e; border-radius: 4px; }
         """)
 
 
@@ -10466,7 +11747,9 @@ class MainWindow(QMainWindow):
 
 def launch():
     app = QApplication.instance() or QApplication(sys.argv)
-    app.setStyle('Fusion')
+    # Fusion base wrapped in _SnappyStyle: 150 ms tooltips + pointing-hand
+    # cursors on every clickable control, app-wide (incl. later dialogs).
+    app.setStyle(_SnappyStyle('Fusion'))
 
     # ── Startup wizard: open existing file OR pick a new topology ────────
     from gui.startup_dialog import StartupDialog

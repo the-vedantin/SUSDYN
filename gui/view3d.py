@@ -218,15 +218,113 @@ def _norm(v):
     return v / n if n > 1e-12 else v
 
 
+def _cross3(a, b):
+    """Single-3-vector cross without numpy's moveaxis overhead (same
+    formula and evaluation order as numpy -- bit-identical results).
+    Profiled 2026-07-30: np.cross bookkeeping was a measurable slice of
+    every live-motion frame (1020 calls per 20 frames via _perp_frame)."""
+    return np.array([a[1] * b[2] - a[2] * b[1],
+                     a[2] * b[0] - a[0] * b[2],
+                     a[0] * b[1] - a[1] * b[0]])
+
+
+# Release-mode GL: vispy brackets EVERY draw call with glGetError round-trips
+# (gloo/glir.py check_error before+after each visual) -- 142 driver syncs per
+# frame, 43 ms of a 110 ms live-motion frame on this machine (profiled
+# 2026-07-30).  We do not ship shader edits at runtime; silence the checks.
+try:
+    from vispy.gloo import gl as _vispy_gl
+    _vispy_gl.check_error = lambda *a, **k: None
+except Exception:
+    pass
+
+# Don't let the GL swap block on the monitor's vertical sync: at sub-60-FPS
+# animation rates the vsync wait only ADDS latency (up to 16 ms a frame),
+# it cannot smooth anything.  Must be set before the first canvas exists.
+try:
+    from PyQt6.QtGui import QSurfaceFormat as _QSF
+    _fmt = _QSF.defaultFormat()
+    _fmt.setSwapInterval(0)
+    _QSF.setDefaultFormat(_fmt)
+except Exception:
+    pass
+
+
+_POSE_STATE = {}
+
+
+def _pose_mesh(mesh, vertices=None, faces=None, vertex_colors=None,
+               color_sig=None):
+    """Frame-rate-critical replacement for MeshVisual.set_data.
+
+    vispy 0.16's MeshVisual._update_data re-attaches a fresh color_transform
+    function on EVERY set_data call, which invalidates the shader program and
+    forces a full GLSL recompile -- profiled 2026-07-30 at 57 recompiles per
+    animation frame, ~1.3 s of a 2.8 s on-screen paint.  When only the POSE
+    changes (same vertex/face counts, same colors), write the vertex buffer
+    in place and leave the program alone.  Any topology or color change
+    (guarded by counts + color_sig) falls back to the stock rebuilding path.
+
+    vispy visuals are FROZEN (no new attributes), so per-visual bookkeeping
+    lives in _POSE_STATE keyed by id(mesh); visuals are created once at
+    startup and live for the whole app, so id() keys are stable.
+    """
+    v = np.ascontiguousarray(vertices, np.float32)
+    f = np.ascontiguousarray(faces, np.uint32)
+    key = id(mesh)
+    # A degenerate placeholder (the zero-area triangle used to "blank" a
+    # visual) still costs a full program draw through vispy's Python GLIR
+    # pipeline every frame.  Hide it instead -- the scene skips non-visible
+    # nodes entirely.  ~15 of the ~71 per-frame draws were such blanks.
+    _empty = f.shape[0] <= 1
+    try:
+        if mesh.visible == _empty:      # visible while empty, or hidden while real
+            mesh.visible = not _empty
+    except Exception:
+        pass
+    if _empty:
+        _POSE_STATE[key] = (-1, -1, None, None)   # force full path on refill
+        return
+    st = _POSE_STATE.get(key)
+    try:
+        if (st is not None
+                and st[0] == f.shape[0] and st[1] == v.shape[0]
+                and st[2] == color_sig
+                and st[3] == (vertex_colors is not None)):
+            md = mesh._meshdata
+            md.set_vertices(v)
+            md.set_faces(f)
+            # same color signature -> same color VALUES; the program's
+            # color buffer already holds them, only positions move.
+            mesh._vertices.set_data(
+                md.get_vertices(indexed='faces').astype(np.float32),
+                convert=True)
+            mesh.update()
+            return
+    except Exception:
+        pass
+    # Full (program-rebuilding) path -- topology or colors changed.
+    # NOTE: this must call the visual's own set_data, never _pose_mesh.
+    if vertex_colors is not None:
+        mesh.set_data(vertices=v, faces=f, vertex_colors=vertex_colors)
+    else:
+        mesh.set_data(vertices=v, faces=f)
+    _POSE_STATE[key] = (f.shape[0], v.shape[0], color_sig,
+                        vertex_colors is not None)
+
+
 def _perp_frame(axis):
     s = _norm(np.asarray(axis, float))
     ref = np.array([0., 1., 0.]) if abs(s[1]) < 0.9 else np.array([1., 0., 0.])
-    u = _norm(np.cross(s, ref))
-    v = np.cross(s, u)
+    u = _norm(_cross3(s, ref))
+    v = _cross3(s, u)
     return u, v
 
 
 # ── mesh builders ─────────────────────────────────────────────────────────────
+
+_TORUS_CACHE = {}
+
 
 def _torus_section_mesh(center, axis, r_outer, half_width, n=48):
     """
@@ -235,30 +333,46 @@ def _torus_section_mesh(center, axis, r_outer, half_width, n=48):
     """
     u, v = _perp_frame(axis)
     w = _norm(np.asarray(axis, float))
-    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    ring = r_outer * (np.outer(np.cos(theta), u) + np.outer(np.sin(theta), v))
+    if n not in _TORUS_CACHE:
+        theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        faces = []
+        for i in range(n):
+            j = (i + 1) % n
+            faces += [[i, j, n + j], [i, n + j, n + i]]
+        _TORUS_CACHE[n] = (np.cos(theta), np.sin(theta),
+                           np.array(faces, np.uint32))
+    ct, st, faces = _TORUS_CACHE[n]
+    ring = r_outer * (np.outer(ct, u) + np.outer(st, v))
     r0 = (center - half_width * w) + ring
     r1 = (center + half_width * w) + ring
     verts = np.vstack([r0, r1]).astype(np.float32)
-    faces = []
-    for i in range(n):
-        j = (i + 1) % n
-        faces += [[i, j, n + j], [i, n + j, n + i]]
-    return verts, np.array(faces, np.uint32)
+    return verts, faces
+
+
+# Per-frame mesh rebuilds were the single biggest cost of live 3-D motion
+# (profiled 2026-07-30: 24 ball-joint spheres re-tessellated in Python
+# loops EVERY frame = 42 ms of a 172 ms frame).  Unit geometry never
+# changes -- cache it per tessellation and pose it with a scale + add.
+_ANNULUS_CACHE = {}
 
 
 def _annulus_mesh(center, axis, r_inner, r_outer, n=48):
     """Sidewall annulus."""
     u, v = _perp_frame(axis)
-    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    inner = center + r_inner * (np.outer(np.cos(theta), u) + np.outer(np.sin(theta), v))
-    outer = center + r_outer * (np.outer(np.cos(theta), u) + np.outer(np.sin(theta), v))
+    if n not in _ANNULUS_CACHE:
+        theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        faces = []
+        for i in range(n):
+            j = (i + 1) % n
+            faces += [[i, j, n + j], [i, n + j, n + i]]
+        _ANNULUS_CACHE[n] = (np.cos(theta), np.sin(theta),
+                             np.array(faces, np.uint32))
+    ct, st, faces = _ANNULUS_CACHE[n]
+    ring = np.outer(ct, u) + np.outer(st, v)
+    inner = center + r_inner * ring
+    outer = center + r_outer * ring
     verts = np.vstack([inner, outer]).astype(np.float32)
-    faces = []
-    for i in range(n):
-        j = (i + 1) % n
-        faces += [[i, j, n + j], [i, n + j, n + i]]
-    return verts, np.array(faces, np.uint32)
+    return verts, faces
 
 
 def _merge(meshes):
@@ -285,7 +399,7 @@ def build_tire_mesh(center, spin_axis, outer_r, rim_r, half_w, n=48):
     return _merge(parts)
 
 
-def build_cylinder_between(p0, p1, radius, n=20):
+def build_cylinder_between(p0, p1, radius, n=14):
     """Closed cylinder (with end caps) spanning p0 → p1 at given radius.
 
     Used for spring / damper rendering: pass the spring's two endpoints
@@ -342,7 +456,7 @@ def build_prism(poly, half_t):
     n = len(poly)
     if n < 3:
         return (np.zeros((3, 3), np.float32), np.array([[0, 1, 2]], np.uint32))
-    nz = np.cross(poly[1] - poly[0], poly[2] - poly[0])
+    nz = _cross3(poly[1] - poly[0], poly[2] - poly[0])
     ln = np.linalg.norm(nz)
     nz = nz / ln if ln > 1e-12 else np.array([0.0, 0.0, 1.0])
     front = poly + nz * half_t
@@ -360,28 +474,38 @@ def build_prism(poly, half_t):
     return verts, np.array(faces, np.uint32)
 
 
-def build_sphere(center, radius, n_lat=12, n_lon=16):
+_SPHERE_CACHE = {}
+
+
+def build_sphere(center, radius, n_lat=10, n_lon=14):
     """UV-sphere mesh (verts, faces) — draws a ball joint's spherical envelope
-    as a real solid so it is visible and can be clash-checked."""
+    as a real solid so it is visible and can be clash-checked.
+
+    The unit sphere (verts + faces) is cached per tessellation; each call
+    is one vectorized scale-and-translate instead of a Python double loop."""
     center = np.asarray(center, float)
-    verts = []
-    for i in range(n_lat + 1):
-        theta = np.pi * i / n_lat                       # 0..pi  (pole to pole)
-        st, ct = np.sin(theta), np.cos(theta)
-        for j in range(n_lon):
-            phi = 2.0 * np.pi * j / n_lon
-            verts.append(center + radius * np.array([st * np.cos(phi),
-                                                     st * np.sin(phi), ct]))
-    verts = np.array(verts, np.float32)
-    faces = []
-    for i in range(n_lat):
-        for j in range(n_lon):
-            a = i * n_lon + j
-            b = i * n_lon + (j + 1) % n_lon
-            c = (i + 1) * n_lon + j
-            d = (i + 1) * n_lon + (j + 1) % n_lon
-            faces.append([a, c, d]); faces.append([a, d, b])
-    return verts, np.array(faces, np.uint32)
+    key = (n_lat, n_lon)
+    if key not in _SPHERE_CACHE:
+        unit = []
+        for i in range(n_lat + 1):
+            theta = np.pi * i / n_lat                   # 0..pi  (pole to pole)
+            st, ct = np.sin(theta), np.cos(theta)
+            for j in range(n_lon):
+                phi = 2.0 * np.pi * j / n_lon
+                unit.append([st * np.cos(phi), st * np.sin(phi), ct])
+        faces = []
+        for i in range(n_lat):
+            for j in range(n_lon):
+                a = i * n_lon + j
+                b = i * n_lon + (j + 1) % n_lon
+                c = (i + 1) * n_lon + j
+                d = (i + 1) * n_lon + (j + 1) % n_lon
+                faces.append([a, c, d]); faces.append([a, d, b])
+        _SPHERE_CACHE[key] = (np.array(unit, float),
+                              np.array(faces, np.uint32))
+    unit, faces = _SPHERE_CACHE[key]
+    verts = (center + radius * unit).astype(np.float32)
+    return verts, faces
 
 
 def build_tetra(p0, p1, p2, p3):
@@ -393,7 +517,7 @@ def build_tetra(p0, p1, p2, p3):
     return verts, faces
 
 
-def _tube_segments(segs, radius, n=10):
+def _tube_segments(segs, radius, n=8):
     """Merge a list of (p0, p1, rgba) into one (verts, faces, vertex_colors)
     mesh of solid cylinders — used to give the suspension members real 3-D
     thickness in ONE draw call."""
@@ -519,6 +643,7 @@ class View3D:
         # View mode: 'normal' | 'load' (desaturate links) | 'interference'
         # (desaturate + show all thicknesses + highlight clashes).
         self._view_mode = 'normal'
+        self._motion_lod = False
         # Load-mode force vectors: coloured arrows at the load points (shaft +
         # 3-D arrowhead barbs).  Populated by set_load_vectors().
         self._loadvec_vis = scene.Line(
@@ -997,14 +1122,14 @@ class View3D:
             # corner isolation (wheel-package view): hide the other corners
             if self._isolate and corner.get('label') != self._isolate:
                 _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
-                self._tire_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._upright_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._rocker_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._spring_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._rotor_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._caliper_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._balljoint_meshes[ci].set_data(vertices=_z, faces=_t)
-                self._uprightvol_meshes[ci].set_data(vertices=_z, faces=_t)
+                _pose_mesh(self._tire_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._upright_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._rocker_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._spring_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._rotor_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._caliper_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._balljoint_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._uprightvol_meshes[ci], vertices=_z, faces=_t)
                 continue
 
             # control-arm / pushrod / tie-rod members: drawn as SOLID TUBES
@@ -1020,7 +1145,7 @@ class View3D:
             # upright polygon (UCA BJ, LCA BJ, tie rod outer)
             uv = np.array([pts['uca_outer'], pts['lca_outer'],
                            pts['tie_rod_outer']], np.float32)
-            self._upright_meshes[ci].set_data(
+            _pose_mesh(self._upright_meshes[ci],
                 vertices=uv, faces=np.array([[0,1,2]], np.uint32))
             for pa2, pb2 in [('uca_outer','lca_outer'),
                               ('lca_outer','tie_rod_outer'),
@@ -1031,18 +1156,33 @@ class View3D:
             # ball-joint spheres (1" dia) at the lower + upper ball joints, and a
             # coarse upright mounting VOLUME (tetra over the 4 upright hardpoints).
             _bjr = 0.0127   # 1 inch diameter -> 12.7 mm radius
-            if (np.all(np.isfinite(pts['lca_outer']))
-                    and np.all(np.isfinite(pts['uca_outer']))):
-                sv0, sf0 = build_sphere(pts['lca_outer'], _bjr)
-                sv1, sf1 = build_sphere(pts['uca_outer'], _bjr)
-                bv = np.vstack([sv0, sv1]).astype(np.float32)
-                bf = np.vstack([sf0, sf1 + len(sv0)]).astype(np.uint32)
-                self._balljoint_meshes[ci].set_data(vertices=bv, faces=bf)
-            if all(pk in pts and np.all(np.isfinite(pts[pk]))
-                   for pk in ('lca_outer', 'uca_outer', 'tie_rod_outer', 'wheel_center')):
+            # ROCKER hardware drawn at true size as well, so the bellcrank is
+            # not three dimensionless points on screen: the pivot BEARING and
+            # the rod end / ball joint at each pickup.  Without these the eye
+            # cannot judge whether a tab and its bearing actually fit — the ARB
+            # rod end once sat 14.9 mm INSIDE the pivot bearing and looked fine.
+            _rer = 0.315 * 0.0254        # drop-link ball joint radius (user)
+            _brg = 0.5 * 0.0381          # 1.5" rocker pivot bearing radius
+            _spheres = []
+            for _k, _r in (('lca_outer', _bjr), ('uca_outer', _bjr),
+                           ('rocker_pivot', _brg), ('pushrod_inner', _rer),
+                           ('rocker_spring_pt', _rer), ('arb_drop_top', _rer)):
+                _p = None if self._motion_lod else pts.get(_k)
+                if _p is not None and np.all(np.isfinite(_p)):
+                    _spheres.append(build_sphere(_p, _r))
+            if _spheres:
+                _vs, _fs, _off = [], [], 0
+                for _v, _f in _spheres:
+                    _vs.append(_v); _fs.append(_f + _off); _off += len(_v)
+                _pose_mesh(self._balljoint_meshes[ci],
+                    vertices=np.vstack(_vs).astype(np.float32),
+                    faces=np.vstack(_fs).astype(np.uint32))
+            if (not self._motion_lod) and all(
+                    pk in pts and np.all(np.isfinite(pts[pk]))
+                    for pk in ('lca_outer', 'uca_outer', 'tie_rod_outer', 'wheel_center')):
                 tv, tf = build_tetra(pts['lca_outer'], pts['uca_outer'],
                                      pts['tie_rod_outer'], pts['wheel_center'])
-                self._uprightvol_meshes[ci].set_data(vertices=tv, faces=tf)
+                _pose_mesh(self._uprightvol_meshes[ci], vertices=tv, faces=tf)
 
             # rocker polygon: pivot at centre, 3 arms (pushrod, spring, ARB drop)
             # order by angle so the fan covers the whole rocker plate.
@@ -1083,7 +1223,7 @@ class View3D:
                     pts['pushrod_inner'] - pts['rocker_spring_pt'])) > 1e-4)
             if _rocker_collapsed:
                 # Hide the rocker mesh entirely; clear it to a zero triangle.
-                self._rocker_meshes[ci].set_data(
+                _pose_mesh(self._rocker_meshes[ci],
                     vertices=np.zeros((3, 3), np.float32),
                     faces=np.array([[0, 1, 2]], np.uint32))
             elif _have(rk4) and _rocker_has_spread:
@@ -1093,20 +1233,20 @@ class View3D:
                 _ht = self._rocker_half_t if self._thick_on else 0.0004
                 _poly = [pts[k] for k in rk4]
                 rv, rf = build_prism(_poly, _ht)
-                self._rocker_meshes[ci].set_data(vertices=rv, faces=rf)
+                _pose_mesh(self._rocker_meshes[ci], vertices=rv, faces=rf)
                 _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
             elif _have(rk3):
                 _ht = self._rocker_half_t if self._thick_on else 0.0004
                 _poly = [pts[k] for k in rk3]
                 rv, rf = build_prism(_poly, _ht)
-                self._rocker_meshes[ci].set_data(vertices=rv, faces=rf)
+                _pose_mesh(self._rocker_meshes[ci], vertices=rv, faces=rf)
                 _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
             else:
                 # No valid per-corner rocker (DECOUPLED — pushrod goes to the
                 # shared cradle — or missing/NaN rocker points).  Clear the
                 # mesh so a bellcrank drawn for a prior topology disappears
                 # instead of lingering on screen.
-                self._rocker_meshes[ci].set_data(
+                _pose_mesh(self._rocker_meshes[ci],
                     vertices=np.zeros((3, 3), np.float32),
                     faces=np.array([[0, 1, 2]], np.uint32))
 
@@ -1114,10 +1254,10 @@ class View3D:
             tv, tf = build_tire_mesh(
                 wc, spin,
                 self._tire_outer_r, self._tire_rim_r, self._tire_half_w)
-            self._tire_meshes[ci].set_data(vertices=tv, faces=tf)
+            _pose_mesh(self._tire_meshes[ci], vertices=tv, faces=tf)
 
             # brake rotor (disc coaxial with the wheel) + caliper block at top
-            if ci < len(self._rotor_meshes):
+            if ci < len(self._rotor_meshes) and not self._motion_lod:
                 _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
                 if self._show_brakes:
                     s = _norm(np.asarray(spin, float))
@@ -1126,7 +1266,7 @@ class View3D:
                     # rotor: disc, thickness = GP200 0.25 in rotor width
                     rv, rf = build_cylinder_between(
                         wcv - s * self._rotor_hw, wcv + s * self._rotor_hw, rr, n=32)
-                    self._rotor_meshes[ci].set_data(vertices=rv, faces=rf)
+                    _pose_mesh(self._rotor_meshes[ci], vertices=rv, faces=rf)
                     # caliper body, placed at the SAME angle and the SAME bolt-line
                     # radius the LOAD model uses.  This used to be hardcoded
                     # rearward at rr-6 mm and ignored caliper_angle_deg entirely,
@@ -1147,16 +1287,16 @@ class View3D:
                         phi = np.radians(float(self._caliper_angle_deg))
                         rad = vup * np.cos(phi) + fwd * np.sin(phi)
                     rad = rad / max(np.linalg.norm(rad), 1e-9)
-                    tan = np.cross(s, rad)
+                    tan = _cross3(s, rad)
                     # Body centred just outboard of the bolt line, straddling the
                     # disc: drawing mount height sets how far below the OD it sits.
                     cal_c = wcv + rad * (self._caliper_bolt_r + 0.014)
                     cv, cf = build_box(cal_c, s, rad, tan,
                                        half_ax=0.020, half_rad=0.0140, half_tan=0.0489)
-                    self._caliper_meshes[ci].set_data(vertices=cv, faces=cf)
+                    _pose_mesh(self._caliper_meshes[ci], vertices=cv, faces=cf)
                 else:
-                    self._rotor_meshes[ci].set_data(vertices=_z, faces=_t)
-                    self._caliper_meshes[ci].set_data(vertices=_z, faces=_t)
+                    _pose_mesh(self._rotor_meshes[ci], vertices=_z, faces=_t)
+                    _pose_mesh(self._caliper_meshes[ci], vertices=_z, faces=_t)
 
             # markers
             #
@@ -1231,19 +1371,26 @@ class View3D:
             grey = np.array([0.78, 0.78, 0.80, 1.0], np.float32)
             mc = mc * 0.30 + grey * 0.70
             mc[:, 3] = 0.55
-        self._member_mesh.set_data(vertices=mv, faces=mf, vertex_colors=mc)
+        _pose_mesh(self._member_mesh, vertices=mv, faces=mf, vertex_colors=mc,
+                              color_sig=(self._view_mode, self._member_r))
 
         # ── desaturate every solid car part in Load / Interference mode so
         #    ONLY the force vectors / clash highlights keep colour ──────────
+        # Assigning MeshVisual.color calls mesh_data_changed() -> full shader
+        # recompile.  Doing it unconditionally here recompiled EVERY car mesh
+        # EVERY frame (111 rebuilds/frame -- THE cause of 2 FPS live motion,
+        # profiled 2026-07-30).  Only touch colors when the mode flips.
         _des = self._view_mode in ('load', 'interference')
-        for _m, _base in self._car_meshes:
-            try:
-                _m.color = (0.5, 0.5, 0.52, 0.30) if _des else _base
-            except Exception:
-                pass
+        if _des != getattr(self, '_car_meshes_desat', None):
+            for _m, _base in self._car_meshes:
+                try:
+                    _m.color = (0.5, 0.5, 0.52, 0.30) if _des else _base
+                except Exception:
+                    pass
+            self._car_meshes_desat = _des
 
-        # upload markers
-        if mk_pos:
+        # upload markers (skipped while animating -- motion LOD)
+        if mk_pos and not self._motion_lod:
             self._markers.set_data(
                 pos=np.array(mk_pos, np.float32),
                 face_color=np.array(mk_col, np.float32),
@@ -1269,14 +1416,15 @@ class View3D:
             if self._thick_on:
                 _asegs = [(seg[0], seg[1], _acol) for seg in arb_segs]
                 av, af, ac = _tube_segments(_asegs, self._member_r, n=10)
-                self._arb_mesh.set_data(vertices=av, faces=af, vertex_colors=ac)
+                _pose_mesh(self._arb_mesh, vertices=av, faces=af, vertex_colors=ac,
+                           color_sig=(self._view_mode,))
             else:
-                self._arb_mesh.set_data(vertices=np.zeros((3, 3), np.float32),
+                _pose_mesh(self._arb_mesh, vertices=np.zeros((3, 3), np.float32),
                                         faces=np.array([[0, 1, 2]], np.uint32))
                 self._arb_vis.set_data(pos=ap, color=_acol)
         else:
             self._last_arb_pos = None
-            self._arb_mesh.set_data(vertices=np.zeros((3, 3), np.float32),
+            _pose_mesh(self._arb_mesh, vertices=np.zeros((3, 3), np.float32),
                                     faces=np.array([[0, 1, 2]], np.uint32))
 
         # ── Spring / damper cylinders (per corner) ───────────────────────
@@ -1289,7 +1437,7 @@ class View3D:
                 break
             pts = corner['pts']
             if self._isolate and corner.get('label') != self._isolate:
-                self._spring_meshes[ci].set_data(
+                _pose_mesh(self._spring_meshes[ci],
                     vertices=np.zeros((3, 3), np.float32),
                     faces=np.array([[0, 1, 2]], np.uint32))
                 continue
@@ -1310,10 +1458,10 @@ class View3D:
                 v, f = build_cylinder_between(
                     pts['rocker_spring_pt'], pts['spring_chassis_pt'],
                     radius=0.5 * od_m, n=20)
-                self._spring_meshes[ci].set_data(vertices=v, faces=f)
+                _pose_mesh(self._spring_meshes[ci], vertices=v, faces=f)
             else:
                 # No spring on this corner (e.g. DECOUPLED corner has none)
-                self._spring_meshes[ci].set_data(
+                _pose_mesh(self._spring_meshes[ci],
                     vertices=np.zeros((3, 3), np.float32),
                     faces=np.array([[0, 1, 2]], np.uint32))
 
@@ -1368,11 +1516,11 @@ class View3D:
 
             # Clear if this axle isn't decoupled
             if not d or 'rocker_pivot_left' not in d:
-                left_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
-                right_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
-                heave_coil_mesh.set_data(vertices=empty_v, faces=empty_f)
+                _pose_mesh(left_bell_mesh, vertices=empty_v, faces=empty_f)
+                _pose_mesh(right_bell_mesh, vertices=empty_v, faces=empty_f)
+                _pose_mesh(heave_coil_mesh, vertices=empty_v, faces=empty_f)
                 if hasattr(self, '_cradle_roll_damper_meshes'):
-                    self._cradle_roll_damper_meshes[slot].set_data(
+                    _pose_mesh(self._cradle_roll_damper_meshes[slot],
                         vertices=empty_v, faces=empty_f)
                 continue
 
@@ -1386,11 +1534,11 @@ class View3D:
                 rollL  = np.asarray(d['roll_damper_left'],   float)
                 rollR  = np.asarray(d['roll_damper_right'],  float)
             except KeyError:
-                left_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
-                right_bell_mesh.set_data(vertices=empty_v, faces=empty_f)
-                heave_coil_mesh.set_data(vertices=empty_v, faces=empty_f)
+                _pose_mesh(left_bell_mesh, vertices=empty_v, faces=empty_f)
+                _pose_mesh(right_bell_mesh, vertices=empty_v, faces=empty_f)
+                _pose_mesh(heave_coil_mesh, vertices=empty_v, faces=empty_f)
                 if hasattr(self, '_cradle_roll_damper_meshes'):
-                    self._cradle_roll_damper_meshes[slot].set_data(
+                    _pose_mesh(self._cradle_roll_damper_meshes[slot],
                         vertices=empty_v, faces=empty_f)
                 continue
 
@@ -1416,22 +1564,22 @@ class View3D:
 
             vL, fL = _bell_quad(pivL, pinL, heaveL, rollL)
             vR, fR = _bell_quad(pivR, pinR, heaveR, rollR)
-            left_bell_mesh.set_data(vertices=vL, faces=fL)
-            right_bell_mesh.set_data(vertices=vR, faces=fR)
+            _pose_mesh(left_bell_mesh, vertices=vL, faces=fL)
+            _pose_mesh(right_bell_mesh, vertices=vR, faces=fR)
 
             # Heave coilover cylinder (cross-car) — use DAMPER OD so it
             # looks distinct from the spring; renders in the obl_spring
             # slot which has a blue tint.
             v, f = build_cylinder_between(
                 heaveL, heaveR, radius=0.5 * self._damper_od_m, n=20)
-            heave_coil_mesh.set_data(vertices=v, faces=f)
+            _pose_mesh(heave_coil_mesh, vertices=v, faces=f)
 
             # Roll coilover cylinder (cross-car, diagonal) — separate
             # mesh slot so it renders with its own colour.
             if hasattr(self, '_cradle_roll_damper_meshes'):
                 v, f = build_cylinder_between(
                     rollL, rollR, radius=0.5 * self._spring_od_m, n=20)
-                self._cradle_roll_damper_meshes[slot].set_data(
+                _pose_mesh(self._cradle_roll_damper_meshes[slot],
                     vertices=v, faces=f)
 
     # ── HEAVE_TBAR third-element shock rendering ─────────────────────────
@@ -1456,16 +1604,16 @@ class View3D:
             mesh = self._heave_tbar_shock_meshes[slot]
             if not d or 'heave_spring_tbar_pt' not in d \
                     or 'heave_spring_chassis_pt' not in d:
-                mesh.set_data(vertices=empty_v, faces=empty_f)
+                _pose_mesh(mesh, vertices=empty_v, faces=empty_f)
                 continue
             p0 = np.asarray(d['heave_spring_tbar_pt'],    float)
             p1 = np.asarray(d['heave_spring_chassis_pt'], float)
             if not (np.all(np.isfinite(p0)) and np.all(np.isfinite(p1))):
-                mesh.set_data(vertices=empty_v, faces=empty_f)
+                _pose_mesh(mesh, vertices=empty_v, faces=empty_f)
                 continue
             v, f = build_cylinder_between(p0, p1,
                                           radius=0.5 * self._damper_od_m, n=20)
-            mesh.set_data(vertices=v, faces=f)
+            _pose_mesh(mesh, vertices=v, faces=f)
 
     # ── HEAVE_TBAR full mechanism (coloured linkage + plates + dampers) ──
     @staticmethod
@@ -1519,8 +1667,8 @@ class View3D:
             bL, bR = 2 * slot, 2 * slot + 1
             if not p:
                 for mi in (bL, bR):
-                    self._htb_bell_meshes[mi].set_data(vertices=empty_v, faces=empty_f)
-                    self._htb_coil_meshes[mi].set_data(vertices=empty_v, faces=empty_f)
+                    _pose_mesh(self._htb_bell_meshes[mi], vertices=empty_v, faces=empty_f)
+                    _pose_mesh(self._htb_coil_meshes[mi], vertices=empty_v, faces=empty_f)
                 continue
             for a, b, c in LINE_SPEC:
                 pa, pb = p.get(a), p.get(b)
@@ -1531,7 +1679,7 @@ class View3D:
             for mi, keys in ((bL, ('rocker_pivot_L', 'pushrod_inner_L', 'drop_foot_L', 'coil_rocker_L')),
                              (bR, ('rocker_pivot_R', 'pushrod_inner_R', 'drop_foot_R', 'coil_rocker_R'))):
                 v, f = self._plate_mesh([p.get(k) for k in keys])
-                self._htb_bell_meshes[mi].set_data(vertices=v, faces=f)
+                _pose_mesh(self._htb_bell_meshes[mi], vertices=v, faces=f)
             # corner-damper cylinders (L + R)
             for mi, (rk, ch) in ((bL, ('coil_rocker_L', 'coil_chassis_L')),
                                  (bR, ('coil_rocker_R', 'coil_chassis_R'))):
@@ -1539,9 +1687,9 @@ class View3D:
                 if (rkp is not None and chp is not None
                         and np.all(np.isfinite(rkp)) and np.all(np.isfinite(chp))):
                     v, f = build_cylinder_between(rkp, chp, radius=0.5 * self._damper_od_m, n=18)
-                    self._htb_coil_meshes[mi].set_data(vertices=v, faces=f)
+                    _pose_mesh(self._htb_coil_meshes[mi], vertices=v, faces=f)
                 else:
-                    self._htb_coil_meshes[mi].set_data(vertices=empty_v, faces=empty_f)
+                    _pose_mesh(self._htb_coil_meshes[mi], vertices=empty_v, faces=empty_f)
         if pos:
             self._last_htb_pos = np.array(pos, np.float32)
             self._htb_link_vis.set_data(pos=self._last_htb_pos,
@@ -1606,7 +1754,7 @@ class View3D:
                            (self._bearing_mesh, bearing_cyls)):
             v, f = self._combine_cyls(cyls) if (visible and cyls) else (None, None)
             if v is not None:
-                mesh.set_data(vertices=v, faces=f); mesh.visible = True
+                _pose_mesh(mesh, vertices=v, faces=f); mesh.visible = True
             else:
                 mesh.visible = False
 
@@ -1756,11 +1904,11 @@ class View3D:
                 if L < 1e-6:
                     continue
                 u = d / L
-                perp = np.cross(u, [0, 0, 1.0])
+                perp = _cross3(u, np.array([0., 0., 1.0]))
                 if np.linalg.norm(perp) < 1e-6:
-                    perp = np.cross(u, [0, 1.0, 0])
+                    perp = _cross3(u, np.array([0., 1.0, 0.]))
                 perp = perp / np.linalg.norm(perp)
-                perp2 = np.cross(u, perp)
+                perp2 = _cross3(u, perp)
                 hl = min(0.02, 0.32 * L)
                 # a MOMENT vector (label carries N·m) gets a DOUBLE arrowhead so it
                 # reads as a torque, not a force.
@@ -1785,7 +1933,7 @@ class View3D:
         isolated wheel-package view.
         """
         def _clear(m):
-            m.set_data(vertices=np.zeros((3, 3), np.float32),
+            _pose_mesh(m, vertices=np.zeros((3, 3), np.float32),
                        faces=np.array([[0, 1, 2]], np.uint32))
         # record what this frame draws (meshes → invisible to a Line capture, so
         # the HTML binder dump reads this to stay 1:1 with the GUI)
@@ -1809,7 +1957,7 @@ class View3D:
         else:
             dv, df = build_cylinder_between(c + np.array([-body_w / 2, 0, 0]),
                                             c + np.array([body_w / 2, 0, 0]), diff_r, n=20)
-            self._diff_mesh.set_data(vertices=dv, faces=df)
+            _pose_mesh(self._diff_mesh, vertices=dv, faces=df)
             self._last_ds_segs.append((c + np.array([-body_w / 2, 0, 0]),
                                        c + np.array([body_w / 2, 0, 0])))
         for i, corner in enumerate(('RL', 'RR')):
@@ -1821,15 +1969,45 @@ class View3D:
             outer = np.asarray(seg['outer'], float)
             axis = np.asarray(seg['axis'], float)
             sv, sf = build_cylinder_between(inner, outer, shaft_r, n=16)
-            self._driveshaft_meshes[i].set_data(vertices=sv, faces=sf)
+            _pose_mesh(self._driveshaft_meshes[i], vertices=sv, faces=sf)
             self._last_ds_segs.append((inner.copy(), outer.copy()))
             # tripod = stubby cylinder at the inner (diff) end, along the shaft
             t = float(pkg['tripod_od_mm']) / 1000.0
             tv, tf = build_cylinder_between(inner - axis * 0.5 * t,
                                             inner + axis * 0.5 * t, tri_r, n=16)
-            self._tripod_meshes[i].set_data(vertices=tv, faces=tf)
+            _pose_mesh(self._tripod_meshes[i], vertices=tv, faces=tf)
 
     # ── internal ─────────────────────────────────────────────────────────────
+
+    def set_motion_lod(self, on: bool):
+        """Motion level-of-detail: while the model is animating (slider drag,
+        dance) the detail chrome -- ball-joint spheres, upright volumes,
+        brake rotors and calipers -- is hidden and not re-posed, roughly
+        halving the per-frame draw list (profiled 2026-07-30: the paint,
+        not the solve, capped live motion at ~10 FPS).  The settle frame
+        turns it back off; _pose_mesh unhides any mesh that receives real
+        geometry again."""
+        on = bool(on)
+        if on == self._motion_lod:
+            return
+        self._motion_lod = on
+        if on:
+            for lst in (self._balljoint_meshes, self._uprightvol_meshes,
+                        self._rotor_meshes, self._caliper_meshes):
+                for m in lst:
+                    try:
+                        m.visible = False
+                    except Exception:
+                        pass
+            try:
+                self._markers.visible = False
+            except Exception:
+                pass
+        else:
+            try:
+                self._markers.visible = True
+            except Exception:
+                pass
 
     def _new_mesh(self, color):
         return scene.Mesh(

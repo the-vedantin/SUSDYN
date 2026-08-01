@@ -20,6 +20,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QDoubleSpinBox, QSpinBox, QCheckBox, QScrollArea, QFrame, QComboBox,
+    QLineEdit,
 )
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -38,7 +39,12 @@ _TRACKS = [
 # RUNTIME, so no TTC tire names / run numbers are hard-coded in this (public)
 # source file.  See LaptimePage._discover_tires().
 
-from vahan.laptime import Track, LapSimulator
+from vahan.laptime import Track, LapSimulator, assumed_torque_curve
+
+# What the torque-curve box says when the user has no dyno sheet.  The word
+# ASSUMED is the switch: leave it and the generic restrictor-limited 600 SHAPE
+# (scaled to this car's own peak power) is used and LABELLED as assumed.
+_ASSUMED_CURVE_HINT = 'ASSUMED  (generic restricted-600 shape)'
 
 # colour-blind-safe corner colours (matches the suspension page)
 _CC = {'FL': '#FFD600', 'FR': '#E53935', 'RL': '#FFFFFF', 'RR': '#42A5F5'}
@@ -105,8 +111,18 @@ class LaptimePage(QWidget):
             veh = main._build_dynamics_solver()._veh
             self._cda.setValue(float(veh.cda_m2))
             self._rho.setValue(float(veh.air_density_kg_m3))
+            # rotating inertia + shift model live on the CAR (VehicleParams);
+            # these boxes are sim-local overrides seeded from it.
+            self._I_wf.setValue(float(veh.wheel_inertia_front_kgm2))
+            self._I_wr.setValue(float(veh.wheel_inertia_rear_kgm2))
+            self._I_eng.setValue(float(veh.engine_inertia_kgm2))
+            self._shift_time.setValue(float(veh.shift_time_s))
+            self._shift_int.setValue(float(veh.min_shift_interval_s))
+            self._shift_hyst.setValue(float(veh.shift_hysteresis_frac) * 100.0)
         except Exception:
             pass
+        self._update_inertia_note()
+        self._update_tq_note()
         self._refresh_tire_active()
         self._on_diff_changed()
 
@@ -262,6 +278,86 @@ class LaptimePage(QWidget):
                       'Gearbox internal ratio.  0 = gear not fitted.')
             self._gear_spins.append(sb)
 
+        # ── ROTATING INERTIA ────────────────────────────────────────────
+        # The single biggest known bias in this lap number, and it always
+        # flattered us: MEASURED +2.00 s on a 41.90 s lap of autocross26.
+        hdr('ROTATING INERTIA  (ASSUMED — measure it)')
+        g = grid()
+        self._I_wf = spin(g, 0, 0, 'Wheel F (each):', 0.0, 2.0, 0.19, 3, 0.01,
+                          ' kg·m²',
+                          'ONE front wheel: tyre + rim + hub + rotor, about '
+                          'the axle.  ASSUMED 0.19 for a 10-inch FSAE wheel — '
+                          'measure it with a bifilar (two-string) swing.')
+        self._I_wr = spin(g, 1, 0, 'Wheel R (each):', 0.0, 2.0, 0.19, 3, 0.01,
+                          ' kg·m²', 'ONE rear wheel, same basis as the front.')
+        self._I_eng = spin(g, 2, 0, 'Engine+clutch:', 0.0, 1.0, 0.05, 3, 0.005,
+                           ' kg·m²',
+                           'Crank + primary gear + clutch basket.  This one '
+                           'DOMINATES: it is referred through the total gear '
+                           'ratio SQUARED (9.75² = 95 in 1st).  ASSUMED 0.05 '
+                           'for a 600 cc four — get it from the engine '
+                           'manufacturer or a run-down test.')
+        self._inertia_readout = QLabel('')
+        self._inertia_readout.setStyleSheet('color:#8a8a92; font-size:10px;')
+        self._inertia_readout.setWordWrap(True)
+        side.addWidget(self._inertia_readout)
+
+        # ── SHIFT MODEL ─────────────────────────────────────────────────
+        hdr('GEARSHIFT  (driver, ASSUMED)')
+        g = grid()
+        self._shift_time = spin(g, 0, 0, 'Dead time:', 0.0, 0.60, 0.10, 3,
+                                0.01, ' s',
+                                'Torque is CUT for this long, end to end: drop '
+                                'drive, select, pick drive back up.  0 = the '
+                                'old free instantaneous shift.')
+        self._shift_int = spin(g, 1, 0, 'Min interval:', 0.0, 3.0, 0.60, 2,
+                               0.05, ' s',
+                               'Shortest allowed gap between two shifts.  This '
+                               'is what bounds CHATTER: without it the picker '
+                               'used 2nd gear for 0.08 s (one station) at the '
+                               'top of a straight, five times a lap.')
+        self._shift_hyst = spin(g, 2, 0, 'Hysteresis:', 0.0, 50.0, 4.0, 0, 1.0,
+                                ' %',
+                                'How much more wheel force the next gear must '
+                                'make before the driver takes it.  On this '
+                                'gearbox the 1-2 force step is about 37%, so '
+                                'any sane hysteresis is inactive — the minimum '
+                                'interval is the knob that does the work.')
+
+        # ── ENGINE TORQUE MODEL ─────────────────────────────────────────
+        hdr('ENGINE TORQUE')
+        self._tq_use = QCheckBox('Use a torque curve instead of the plateau')
+        # ON BY DEFAULT: the engine is a Honda CBR600RR behind the 20 mm
+        # restrictor (user, 2026-07-30), and the plateau is measured 48% high
+        # at 2300 rpm.  The active curve is still the ASSUMED restricted-600
+        # SHAPE scaled to this car's own peak power — the engine's IDENTITY is
+        # known, its dyno sheet is not.  Two columns from a dyno replace it.
+        self._tq_use.setChecked(True)
+        self._tq_use.setToolTip(
+            'OFF = the two-segment model: flat torque below peak-power rpm, '
+            'constant power above.  That plateau reads about 48% high on wheel '
+            'force at 2300 rpm — the whole 75 m acceleration event lives '
+            'there.\nON = the table below, interpolated (held flat outside its '
+            'range, never extrapolated).')
+        self._tq_use.stateChanged.connect(lambda *_: self._update_tq_note())
+        side.addWidget(self._tq_use)
+        self._tq_text = QLineEdit(_ASSUMED_CURVE_HINT)
+        self._tq_text.setToolTip(
+            'CRANK torque against engine speed: "rpm:Nm, rpm:Nm, …".  Two '
+            'columns off a dyno sheet.  Leave it on the word ASSUMED to use '
+            'the generic restrictor-limited 600 SHAPE scaled to this car’s own '
+            'peak power — a placeholder, not a measurement.')
+        self._tq_text.editingFinished.connect(self._update_tq_note)
+        side.addWidget(self._tq_text)
+        self._tq_note = QLabel('')
+        self._tq_note.setStyleSheet('color:#8a8a92; font-size:10px;')
+        self._tq_note.setWordWrap(True)
+        side.addWidget(self._tq_note)
+        for sb in (self._I_wf, self._I_wr, self._I_eng):
+            sb.valueChanged.connect(lambda *_: self._update_inertia_note())
+        for sb in (self._primary, self._final, *self._gear_spins):
+            sb.valueChanged.connect(lambda *_: self._update_inertia_note())
+
         # ── DIFFERENTIAL (corner entry/exit balance via locking %) ────────
         from vahan.differential import DREXLER_OPTIONS, Differential
         # header with an info (ⓘ) button — same style as the suspension panels
@@ -274,10 +370,11 @@ class LaptimePage(QWidget):
         dinfo.setFixedSize(20, 20)
         dinfo.setCursor(Qt.CursorShape.PointingHandCursor)
         dinfo.setStyleSheet(
-            'QPushButton { background:#111111; color:#4FC3F7; '
+            'QPushButton { background:#111111; color:#FFB74D; '
             'border:1px solid #2a2a2a; border-radius:10px; font-weight:bold; '
             'font-size:12px; }'
-            'QPushButton:hover { background:#14344a; border-color:#4FC3F7; }')
+            'QPushButton:hover { background:#241c0e; border-color:#FFB74D; }'
+            'QPushButton:pressed { background:#171208; }')
         dinfo.setToolTip('What does the differential do? Click for detail.')
         dinfo.clicked.connect(self._show_diff_info)
         drow.addWidget(dinfo)
@@ -671,10 +768,8 @@ class LaptimePage(QWidget):
         tb = QTextBrowser(); tb.setOpenExternalLinks(False); tb.setHtml(html)
         lay.addWidget(tb)
         btn = QPushButton('Close'); btn.clicked.connect(dlg.accept)
-        btn.setStyleSheet(
-            'QPushButton { background:#1a5276; color:white; padding:6px 20px; '
-            'border-radius:3px; font-weight:bold; }'
-            'QPushButton:hover { background:#1f6da0; }')
+        from gui.panels import BTN_PRIMARY
+        btn.setStyleSheet(BTN_PRIMARY)
         lay.addWidget(btn)
         dlg.exec()
 
@@ -796,6 +891,19 @@ class LaptimePage(QWidget):
             final_drive=float(self._final.value()),
             redline_rpm=float(self._redline.value()),
         )
+        # 1a rotating inertia, 1b shift realism, 1c torque curve — all three
+        # are sim-local overrides seeded from the car, exactly like Cd·A.
+        sim.set_rotating_inertia(float(self._I_wf.value()),
+                                 float(self._I_wr.value()),
+                                 float(self._I_eng.value()))
+        sim.set_shift_model(float(self._shift_time.value()),
+                            float(self._shift_int.value()),
+                            float(self._shift_hyst.value()) / 100.0)
+        curve = self._torque_curve()
+        if curve is not None:
+            sim.set_torque_curve(curve[0], curve[1], curve[2])
+        else:
+            sim.set_torque_curve(None, None)
         self._btn.setEnabled(False)
         self._status.setText('Simulating…')
         self._worker = _SimWorker(sim, self._track,
@@ -805,6 +913,72 @@ class LaptimePage(QWidget):
         self._worker.finished_ok.connect(self._on_done)
         self._worker.failed.connect(self._on_fail)
         self._worker.start()
+
+    # ── powertrain-realism helpers (1a / 1b / 1c) ────────────────────────
+    def _total_ratio_1st(self) -> float:
+        gs = [sb.value() for sb in self._gear_spins if sb.value() > 0]
+        return (float(self._primary.value()) * float(self._final.value())
+                * (max(gs) if gs else 1.0))
+
+    def _update_inertia_note(self):
+        """Show the equivalent mass the inertias amount to in FIRST gear —
+        the number that makes the engine term's ratio-squared amplification
+        visible instead of buried."""
+        try:
+            veh = self._main._build_dynamics_solver()._veh
+            m, r = float(veh.total_mass_kg), float(veh.tire_radius_m)
+        except Exception:
+            m, r = 286.0, 0.203
+        ratio = self._total_ratio_1st()
+        I = 2.0 * (self._I_wf.value() + self._I_wr.value())
+        m_eq = (I + self._I_eng.value() * ratio ** 2) / max(r * r, 1e-6)
+        self._inertia_readout.setText(
+            f'≈ {m_eq:.0f} kg equivalent mass in 1st ({100 * m_eq / m:.0f}% of '
+            f'the car), of which the engine is '
+            f'{100 * (self._I_eng.value() * ratio ** 2) / max(I + self._I_eng.value() * ratio ** 2, 1e-9):.0f}% '
+            f'(ratio {ratio:.2f}, squared = {ratio ** 2:.0f}).  ASSUMED until '
+            f'measured.')
+
+    def _torque_curve(self):
+        """(rpm[], Nm[], label) or None — parsed from the box, or the ASSUMED
+        generic shape scaled to this car's own peak power."""
+        if not self._tq_use.isChecked():
+            return None
+        txt = self._tq_text.text().strip()
+        pairs = []
+        for tok in txt.replace(';', ',').split(','):
+            if ':' not in tok:
+                continue
+            a, b = tok.split(':', 1)
+            try:
+                pairs.append((float(a), float(b)))
+            except ValueError:
+                continue
+        if len(pairs) >= 2:
+            pairs.sort()
+            return ([p[0] for p in pairs], [p[1] for p in pairs],
+                    'user-entered dyno points')
+        try:
+            veh = self._main._build_dynamics_solver()._veh
+            P_eng = float(veh.wheel_power_W) / max(
+                float(veh.drivetrain_efficiency), 1e-3)
+            rpm, tq = assumed_torque_curve(P_eng, float(veh.engine_rpm))
+            return list(rpm), list(tq), 'CBR600RR 20mm-restricted — ASSUMED shape, scaled to this car'
+        except Exception:
+            return None
+
+    def _update_tq_note(self):
+        c = self._torque_curve()
+        if c is None:
+            self._tq_note.setText(
+                'IN USE: torque plateau then constant power (ASSUMED shape — '
+                'no measured curve).')
+            return
+        rpm, tq, lbl = c
+        self._tq_note.setText(
+            f'IN USE: {lbl} — {len(rpm)} points, {min(rpm):.0f}–{max(rpm):.0f} '
+            f'rpm, peak {max(tq):.1f} N·m at '
+            f'{rpm[int(np.argmax(tq))]:.0f} rpm.')
 
     def _on_fail(self, msg: str):
         self._btn.setEnabled(True)
@@ -844,13 +1018,18 @@ class LaptimePage(QWidget):
         self._readout.setText(
             f'LAP TIME   {int(m)}:{s:05.2f}{delta}\n'
             f'sectors    {sect}\n'
-            f'avg speed  {res.avg_speed_kph:6.1f} kph\n'
+            f'avg speed  {res.avg_speed_kph:6.1f} kph   min {res.min_speed_kph:5.1f} / max {res.max_speed_kph:5.1f} kph\n'
+            f'corners    avg {res.avg_corner_lat_g:4.2f} g   peak {res.peak_lat_g:4.2f} g   {res.time_cornering_pct:4.1f}% of lap\n'
+            f'long accel peak {res.peak_accel_g:4.2f} g   brake peak {res.peak_brake_g:4.2f} g\n'
             f'max speed  {res.max_speed_kph:6.1f} kph\n'
             f'peak lat   {np.nanmax(res.lat_g):6.2f} g\n'
             f'peak brake {np.nanmin(res.lon_g):6.2f} g\n'
             f'peak accel {np.nanmax(res.lon_g):6.2f} g\n'
             f'top gear   {top_gear}   (geared top {v_top:.0f} kph '
-            f'@ {self._redline.value():.0f})')
+            f'@ {self._redline.value():.0f})\n'
+            f'shifts     {res.n_upshifts} up / {res.n_downshifts} down, '
+            f'{res.shift_time_lost_s:.2f} s of torque cut\n'
+            f'rot inertia{max(res.equiv_mass_kg.values()) if res.equiv_mass_kg else 0.0:7.0f} kg equivalent (ASSUMED)')
         # min ride height (aero squat) — the "don't bottom out" number
         try:
             rf, rr = res.rh_front_mm, res.rh_rear_mm
@@ -1028,6 +1207,17 @@ class LaptimePage(QWidget):
                     ax2.tick_params(colors='#42A5F5', labelsize=8)
                     ax2.set_yticks(range(0, int(np.nanmax(res.gear)) + 2))
                     ax2.set_ylim(0, np.nanmax(res.gear) + 1)
+                # SHOW the shift dead time: the stations where drive torque is
+                # cut.  Without this the gear trace looks free, which is the
+                # thing the shift model exists to stop it claiming.
+                sh = getattr(res, 'shifting', None)
+                if sh is not None and np.any(sh):
+                    first = True
+                    for i in np.where(np.asarray(sh) > 0)[0]:
+                        ax.axvspan(s[max(i - 1, 0)], s[min(i + 1, len(s) - 1)],
+                                   color='#E53935', alpha=0.30, lw=0,
+                                   label='torque cut (shift)' if first else None)
+                        first = False
                 self._legend(ax)
             elif key == 'power':
                 self._style(ax, 's (m)', 'hp', 'Power used (drive)')

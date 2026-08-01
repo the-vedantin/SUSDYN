@@ -846,8 +846,10 @@ class TransientSolver:
 
         # --- Unsprung LT -------------------------------------------------
         h_us = v.unsprung_cg_height_m
-        uns_f = (v.unsprung_mass_front_kg / 2) * ay * h_us / v.front_track_m
-        uns_r = (v.unsprung_mass_rear_kg / 2)  * ay * h_us / v.rear_track_m
+        # NO /2: the mass fields are per AXLE (both wheels).  Same bug as
+        # vahan/dynamics.py had — the transient model carried its own copy.
+        uns_f = v.unsprung_mass_front_kg * ay * h_us / v.front_track_m
+        uns_r = v.unsprung_mass_rear_kg  * ay * h_us / v.rear_track_m
 
         # --- Elastic LT (via roll angle, NOT ay!) ------------------------
         # This is the dynamics — elastic LT lags ay with roll dynamics.

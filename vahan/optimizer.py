@@ -553,7 +553,12 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
             if has_arb and _arb_keys_needed:
                 try:
                     pv = st.rocker_pivot
-                    ax_pt = pv + np.array([0., 0.0254, 0.])
+                    # REAL rocker axis, not a hardcoded +Y (84.4 deg off at the
+                    # front).  This feeds IK target evaluation, so a wrong axis
+                    # here optimises against a fictitious ARB.
+                    _axp = getattr(hp, 'rocker_axis_pt', None)
+                    ax_pt = (np.asarray(_axp, float) if _axp is not None
+                             else pv + np.array([0., 0.0254, 0.]))
                     r_axis = ax_pt - pv
                     rn = np.linalg.norm(r_axis)
                     if rn > 1e-9:

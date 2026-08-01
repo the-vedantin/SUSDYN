@@ -51,6 +51,19 @@ def _norm(v: np.ndarray) -> np.ndarray:
     return v / np.linalg.norm(v)
 
 
+def _cross3(a, b):
+    """Cross product for single 3-vectors without numpy's axis bookkeeping.
+
+    Profiled 2026-07-30: the live-motion pipeline spent more time inside
+    numpy cross's moveaxis overhead than in the actual arithmetic (40k calls
+    per animation second).  Same formula, same evaluation order as numpy --
+    results are bit-identical.
+    """
+    return np.array([a[1] * b[2] - a[2] * b[1],
+                     a[2] * b[0] - a[0] * b[2],
+                     a[0] * b[1] - a[1] * b[0]])
+
+
 def _build_frame(origin: np.ndarray,
                  pt1: np.ndarray,
                  pt2: np.ndarray) -> np.ndarray:
@@ -66,15 +79,15 @@ def _build_frame(origin: np.ndarray,
     """
     e1 = _norm(pt1 - origin)
     v2 = pt2 - origin
-    e3 = _norm(np.cross(e1, v2))
-    e2 = np.cross(e3, e1)
+    e3 = _norm(_cross3(e1, v2))
+    e2 = _cross3(e3, e1)
     return np.column_stack([e1, e2, e3])   # shape (3, 3)
 
 
 def _rodrigues(v: np.ndarray, axis: np.ndarray, theta: float) -> np.ndarray:
     """Rotate vector v by angle theta (rad) about unit axis using Rodrigues."""
     c, s = np.cos(theta), np.sin(theta)
-    return c * v + s * np.cross(axis, v) + (1.0 - c) * np.dot(axis, v) * axis
+    return c * v + s * _cross3(axis, v) + (1.0 - c) * np.dot(axis, v) * axis
 
 
 # ─── bellcrank coplanarity check ─────────────────────────────────────────────
@@ -119,7 +132,7 @@ def bellcrank_plane_residual(hp_like) -> dict:
     P = np.asarray(pivot, float)
     arm_push   = np.asarray(a_in, float) - P
     arm_spring = np.asarray(a_sp, float) - P
-    n = np.cross(arm_push, arm_spring)
+    n = _cross3(arm_push, arm_spring)
     nn = float(np.linalg.norm(n))
     if nn < 1e-12:
         # Colinear arms -- plane undefined.  Flag as non-coplanar (degenerate).
@@ -247,7 +260,7 @@ class SuspensionConstraints:
             # and pull the pushrod / spring out of plane (the "skewed
             # pullrod" failure).  The previous code trusted rocker_axis_pt
             # outright, which silently allowed exactly that.
-            plane_n = np.cross(arm_push, arm_spring)
+            plane_n = _cross3(arm_push, arm_spring)
             axis_pt = getattr(hp, 'rocker_axis_pt', None)
             if np.linalg.norm(plane_n) < 1e-12:
                 # Degenerate (arms colinear) -- no plane to be normal to.
@@ -430,7 +443,7 @@ class SuspensionConstraints:
                 residual = float(r @ r) - L2_pr
                 if abs(residual) < 1e-12:
                     break
-                d_arm = np.cross(axis, arm_rot)
+                d_arm = _cross3(axis, arm_rot)
                 drdt  = float(2.0 * r @ d_arm)
                 if abs(drdt) < 1e-14:
                     break

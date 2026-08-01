@@ -11,11 +11,12 @@ The goal is that every box explains, in engineering terms:
   * units + sign conventions,
   * gotchas.
 
-Colour palette is colour-blind-safe (blue / yellow / white / red — no
-orange, green, or purple), matching the user's vision profile.
-    H_TITLE  blue    #4FC3F7   section title
-    H_SUB    yellow  #FFD54F   sub-headings
-    K        blue    #4FC3F7   field / key names
+Colour palette is colour-blind-safe and BLUE-FREE chrome (user request:
+no blue UI chrome; blue remains only as corner-data / plot-series coding).
+    H_TITLE  amber   #FFB74D   section title
+    H_SUB    yellow  #FFD54F   sub-headings (size/weight separate it from
+                               amber — hue alone is never the only cue)
+    K        amber   #FFB74D   field / key names (bold)
     WARN     red     #EF5350   warnings / limits
     body     white   #e0e0e0   (default text colour)
 
@@ -24,9 +25,9 @@ Axis convention everywhere: X = lateral (outboard +), Y = longitudinal
 """
 
 # ── shared style tokens ───────────────────────────────────────────────────────
-_TITLE = 'color:#4FC3F7;'
+_TITLE = 'color:#FFB74D;'
 _SUB   = 'color:#FFD54F;'
-_K     = 'color:#4FC3F7;font-weight:bold;'
+_K     = 'color:#FFB74D;font-weight:bold;'
 _WARN  = 'color:#EF5350;font-weight:bold;'
 
 

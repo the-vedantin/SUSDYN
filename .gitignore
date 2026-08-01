@@ -58,3 +58,12 @@ designs_city/
 
 # Local launcher (machine-specific interpreter path)
 run.bat
+
+# Third-party VD software shared team-to-team (Lotus Engineering Software,
+# received from San Jose State).  158 MB of binaries + licensed docs — this
+# repo is PUBLIC and none of it is ours to redistribute.  Study only.
+lesoft/
+
+# Reference books / personal working files — never publish
+*.pdf
+*.xlsx
