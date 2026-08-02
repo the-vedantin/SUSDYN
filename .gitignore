@@ -71,3 +71,7 @@ screenshots/ackermann_page.png
 
 # RCVD reference extraction — copyrighted source, local only
 docs/rcvd_ref/
+
+# Obsidian local vault config
+.obsidian/
+docs/NAVIGATION.md
