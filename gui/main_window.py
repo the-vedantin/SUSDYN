@@ -6330,6 +6330,7 @@ class MainWindow(QMainWindow):
 
             # Roll-centre construction is derived overlay geometry -- skip
             # it on light (animating) frames; the settle frame refreshes it.
+            front_rc = rear_rc = None
             if not light:
                 front_rc = _axle_rc('FL', 'FR')
                 rear_rc  = _axle_rc('RL', 'RR')
@@ -10286,6 +10287,18 @@ class MainWindow(QMainWindow):
             dlg = QDialog(self)
             dlg.setWindowTitle('MMD vs Ackermann — full diagrams')
             dlg.resize(1500, 1150)
+            # Dark-dialog chrome; tab tokens derived from the global QSS
+            # button styles (selected = the :checked treatment).
+            dlg.setStyleSheet(
+                'QDialog { background: #0e0e11; } '
+                'QTabWidget::pane { border: 1px solid #2a2a31; } '
+                'QTabBar::tab { background: #1a1a1f; color: #e8e8ea; '
+                'border: 1px solid #2e2e36; border-bottom: none; '
+                'padding: 5px 14px; '
+                'border-top-left-radius: 4px; border-top-right-radius: 4px; } '
+                'QTabBar::tab:hover { background: #232329; } '
+                'QTabBar::tab:selected { background: #26262e; '
+                'border-color: #8f6a2e; }')
             lay = QVBoxLayout(dlg)
             tabs = QTabWidget()
             lay.addWidget(tabs)
@@ -10365,8 +10378,10 @@ class MainWindow(QMainWindow):
                     rows.append(f'  (road-frame comparison failed: {_e})')
                 txt = QPlainTextEdit('\n'.join(rows))
                 txt.setReadOnly(True)
-                txt.setStyleSheet('font-family: Consolas, monospace; '
-                                  'font-size: 12px;')
+                txt.setStyleSheet(
+                    "font-family:'Consolas','SF Mono',monospace; "
+                    'font-size:12px; background:#0e0e10; color:#e8e8ec; '
+                    'border:none;')
                 tabs.insertTab(0, txt, 'NUMBERS')
                 tabs.setCurrentIndex(0)
                 try:

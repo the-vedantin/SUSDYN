@@ -27,25 +27,20 @@ from vahan.topology import (
 )
 
 
-# Default values DERIVED from the legacy hard-coded hardpoint geometry
-# (DEFAULT_FRONT_HP / DEFAULT_REAR_HP in gui/main_window.py).  These are the
-# numbers that drop straight onto those coordinates with zero scaling, so a
-# user who hits Continue without changing anything gets the legacy state
-# byte-for-byte.  Computed:
-#   wheelbase_mm  = DEFAULT_REAR_HP['wheel_center'].Y  * 1000  =  1536.7 mm
-#   track_f_mm    = 2 × DEFAULT_FRONT_HP['wheel_center'].X * 1000  =  1117.6 mm
-#   track_r_mm    = 2 × DEFAULT_REAR_HP ['wheel_center'].X * 1000  =  1117.6 mm
-#   rack_length   = 2 × DEFAULT_FRONT_HP['tie_rod_inner'].X * 1000 =   438.16 mm
-# Note: the older self._car panel default was 1222 mm front track, which
-# silently disagreed with the geometry-side wheel_center.X = 0.5588 m
-# (= 1117.6 mm).  The wizard now exposes the geometry as the single
-# source of truth (poka-yoke).
+# Default values match the CURRENT car (2027 v61 config lineage), not the
+# legacy hard-coded hardpoint geometry — the wizard should start a new design
+# at the real vehicle's dimensions:
+#   wheelbase 1537.0 mm, front track 1222.0 mm, rear track 1200.0 mm,
+#   rack length 464.1 mm tip-to-tip (18.27" real rack, pinned ±232.0 mm),
+#   rack total travel 97.0 mm (TOTAL bump-to-bump stroke, not mm/rev).
+# The wizard remains the single source of truth for these dimensions
+# (poka-yoke): tie_rod_inner X = ±rack_length/2 is derived, never re-entered.
 _DEFAULT_DIMS = {
-    'wheelbase_mm':         1536.7,
-    'track_f_mm':           1117.6,
-    'track_r_mm':           1117.6,
-    'rack_length_mm':        438.16,
-    'total_rack_travel_mm':  100.0,
+    'wheelbase_mm':         1537.0,
+    'track_f_mm':           1222.0,
+    'track_r_mm':           1200.0,
+    'rack_length_mm':        464.1,
+    'total_rack_travel_mm':   97.0,
     # Spring / damper outside diameter (mm).  Used by view3d to render
     # the spring stack at a realistic visible width and for clash checks
     # against the rocker plate / chassis tube routing.

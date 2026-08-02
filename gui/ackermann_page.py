@@ -150,9 +150,9 @@ class _Slot(QFrame):
 
         self._sum = QLabel('—')
         self._sum.setStyleSheet(
-            "color:#d8d2c8; font-family:'Consolas','SF Mono',monospace;"
-            'font-size:11px; background:#0e0d10; padding:5px;'
-            'border:1px solid #2a2823; border-radius:3px;')
+            "color:#e8e8ec; font-family:'Consolas','SF Mono',monospace;"
+            'font-size:11px; background:#0e0e10; padding:5px;'
+            'border:1px solid #2a2a2a; border-radius:4px;')
         self._sum.setWordWrap(True)
         lay.addWidget(self._sum)
 
@@ -425,7 +425,7 @@ class AckermannPage(QWidget):
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _build(self):
-        from gui.panels import _spin
+        from gui.panels import _spin, BTN_SECONDARY, BTN_INFO_ROUND
         root = QHBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
 
@@ -438,7 +438,7 @@ class AckermannPage(QWidget):
         sub = QLabel('Five methods, one page.  Degrees are the answer; the '
                      'percentage is only shown while its reference means '
                      'anything.')
-        sub.setStyleSheet('color:#8a8177; font-size:10px;')
+        sub.setStyleSheet('color:#8a8a92; font-size:10px;')
         sub.setWordWrap(True)
         side.addWidget(sub)
 
@@ -484,6 +484,7 @@ class AckermannPage(QWidget):
                            'transfer, and therefore the two front wheel '
                            'loads, from the solved car.')
         self._aero = QCheckBox('Include aero downforce')
+        self._aero.setStyleSheet('QCheckBox { font-size:11px; }')
         self._aero.setToolTip(
             'Adds downforce at each row’s speed (speed follows from radius + '
             'lateral g) using the SAME aero package the Dynamics panel '
@@ -524,6 +525,7 @@ class AckermannPage(QWidget):
 
         hdr('LAP TIME CHAIN  (graph 5)')
         self._do_lap = QCheckBox('Run the lap-time chain (~15 min)')
+        self._do_lap.setStyleSheet('QCheckBox { font-size:11px; }')
         self._do_lap.setChecked(True)
         self._do_lap.setToolTip(
             'The RAW lap simulator is blind to Ackermann — it is not in '
@@ -552,6 +554,7 @@ class AckermannPage(QWidget):
         side.addWidget(self._btn)
 
         self._ymd_btn = QPushButton('YMD GRID  +100% → −70%')
+        self._ymd_btn.setStyleSheet(BTN_SECONDARY)
         self._ymd_btn.setToolTip(
             'Yaw-moment diagrams at eight Ackermann settings on the chosen '
             'radius, plus trimmed-g / control / stability vs Ackermann with '
@@ -563,6 +566,7 @@ class AckermannPage(QWidget):
 
         mmd_row = QHBoxLayout()
         self._mmd_btn = QPushButton('FULL MMD SWEEP  (+100% ... -70%)')
+        self._mmd_btn.setStyleSheet(BTN_SECONDARY)
         self._mmd_btn.setToolTip(
             'The Milliken Moment Diagram exactly as the Analysis panel '
             'draws it (same car, same speed/toe/ARB inputs), one tab per '
@@ -571,34 +575,34 @@ class AckermannPage(QWidget):
         self._mmd_btn.clicked.connect(
             lambda: self._main._on_plot_mmd_ack_sweep())
         mmd_row.addWidget(self._mmd_btn, 1)
-        self._mmd_info = QPushButton('i')
-        self._mmd_info.setFixedSize(22, 22)
+        self._mmd_info = QPushButton('ⓘ')
+        self._mmd_info.setFixedSize(26, 26)
+        self._mmd_info.setCursor(Qt.CursorShape.PointingHandCursor)
         self._mmd_info.setToolTip('How to read the MMD')
-        self._mmd_info.setStyleSheet(
-            'QPushButton { border-radius: 11px; background: #FFD600; '
-            'color: #0a0a0a; font-weight: bold; }')
+        self._mmd_info.setStyleSheet(BTN_INFO_ROUND.format(r=13))
         self._mmd_info.clicked.connect(self._show_mmd_help)
         mmd_row.addWidget(self._mmd_info, 0)
         side.addLayout(mmd_row)
 
         self._save_btn = QPushButton('Save all five figures to figs/')
+        self._save_btn.setStyleSheet(BTN_SECONDARY)
         self._save_btn.clicked.connect(self._on_save)
         side.addWidget(self._save_btn)
 
         self._status = QLabel('')
-        self._status.setStyleSheet('color:#FFB74D; font-size:11px;')
+        self._status.setStyleSheet('color:#8a8a92; font-size:11px;')
         self._status.setWordWrap(True)
         side.addWidget(self._status)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet('color:#2a2823;')
+        sep.setStyleSheet('color:#2a2a2a;')
         side.addWidget(sep)
 
         self._tire_note = QLabel('')
         self._tire_note.setStyleSheet(
-            "color:#d8d2c8; font-family:'Consolas','SF Mono',monospace;"
-            'font-size:11px; background:#0e0d10; padding:6px;'
-            'border:1px solid #2a2823; border-radius:3px;')
+            "color:#e8e8ec; font-family:'Consolas','SF Mono',monospace;"
+            'font-size:11px; background:#0e0e10; padding:6px;'
+            'border:1px solid #2a2a2a; border-radius:4px;')
         self._tire_note.setWordWrap(True)
         self._tire_note.setToolTip(
             'The tyre and its PRESSURE are set on the Dynamics panel '
@@ -827,6 +831,7 @@ class AckermannPage(QWidget):
             dlg.setWindowTitle('YMD vs Ackermann — balance, control, '
                                'stability')
             dlg.resize(1400, 900)
+            dlg.setStyleSheet('QDialog { background:#0e0e11; }')
             lay = QVBoxLayout(dlg)
             from PyQt6.QtWidgets import QPlainTextEdit
             rows = [' RCVD Fig 8.26 limit parameters (printed p334-335) '
@@ -864,8 +869,10 @@ class AckermannPage(QWidget):
             txt = QPlainTextEdit(chr(10).join(rows))
             txt.setReadOnly(True)
             txt.setMaximumHeight(230)
-            txt.setStyleSheet('font-family: Consolas, monospace; '
-                              'font-size: 12px;')
+            txt.setStyleSheet(
+                "font-family:'Consolas','SF Mono',monospace; font-size:12px; "
+                'background:#0e0e10; color:#e8e8ec; '
+                'border:1px solid #2a2a2a; border-radius:4px;')
             lay.addWidget(txt)
             lay.addWidget(FigureCanvas(fig))
             dlg.show()

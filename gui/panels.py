@@ -4,6 +4,8 @@ gui/panels.py — All Qt sidebar panels for Vahan
 Axis convention: X=lateral(outboard), Y=longitudinal(fwd), Z=up
 """
 
+import math
+
 import numpy as np
 from PyQt6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,

@@ -67,3 +67,4 @@ lesoft/
 # Reference books / personal working files — never publish
 *.pdf
 *.xlsx
+screenshots/ackermann_page.png

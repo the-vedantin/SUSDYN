@@ -3,7 +3,7 @@ Hardpoint definitions for double wishbone + pushrod/rocker suspension.
 
 All coordinates are in the chassis frame (meters):
     X  ->  lateral (outboard = +X for the corner being modelled)
-    Y  ->  longitudinal (forward = +Y)
+    Y  ->  longitudinal (rearward = +Y: front axle Y = 0, rear axle at +wheelbase)
     Z  ->  up
 
 Origin convention: vehicle centerline (X=0), front axle (Y=0), ground (Z=0).
