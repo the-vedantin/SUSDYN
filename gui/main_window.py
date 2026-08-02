@@ -10250,6 +10250,18 @@ class MainWindow(QMainWindow):
         inp['delta_arb_front_Npm'] = _darb(veh.arb_rate_front_Npm, L_f_base, dL_f_m)
         inp['delta_arb_rear_Npm']  = _darb(veh.arb_rate_rear_Npm,  L_r_base, dL_r_m)
 
+        # The asphalt derate MUST reach the diagram.  Without it plot_mmd ran
+        # at raw belt grip (default 1.0) and drew a car 57-68% grippier than
+        # every other Ackermann answer -- retracted 2026-08-02.  Source of
+        # truth is the Ackermann page's grip spin when that page exists.
+        if 'grip_multiplier' not in inp:
+            _gm = 0.70
+            try:
+                _gm = float(self._ackermann_page._grip.value())
+            except Exception:
+                pass
+            inp['grip_multiplier'] = _gm
+
         return dict(
             tire_model=self._tire_model,
             total_mass_kg=veh.total_mass_kg,

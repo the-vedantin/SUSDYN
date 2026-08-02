@@ -837,7 +837,7 @@ class AckermannPage(QWidget):
             rows = [' RCVD Fig 8.26 limit parameters (printed p334-335) '
                     'per Ackermann setting:',
                     ' ACK%   TRIM LIMIT   SI dCN/dAy      APEX Ay   '
-                    'LIMIT CHARACTER          CONTROL @trim',
+                    'LIMIT CHARACTER',
                     '        (g, N=0)     (neg=stable)    (g)       '
                     '(race target: NEUTRAL)   (N·m/deg)']
             ays = [r.get('Ay_trim_max', float('nan')) for r in trim]
@@ -852,7 +852,46 @@ class AckermannPage(QWidget):
                     f"{r.get('SI_CN_per_g', float('nan')):+10.4f}      "
                     f"{r.get('Ay_apex_g', float('nan')):+7.3f}   "
                     f"{r.get('limit_character', '?'):24s} "
-                    f"{r.get('N_delta', float('nan')):+8.0f}")
+                    "")
+            # CONTROL, READ WHERE IT MEANS SOMETHING.  dN/ddelta at a
+            # max-trim point is 0 by construction, so the old '@trim' column
+            # was numerical artifact (quoted as a design discriminator and
+            # retracted 2026-08-02).  Read it instead at ONE COMMON (beta,
+            # delta) for every setting, at two intensities, and refuse to
+            # rank when the difference-step spread swamps the between-setting
+            # spread.
+            try:
+                from vahan.ymd import control_at_point, build_loads_table
+                _ss2 = mw._build_dynamics_solver()
+                _tbl = build_loads_table(_ss2)
+                _pcts = [r['pct'] for r in trim]
+                rows.append('')
+                rows.append(' CONTROL dN/d(steer), at ONE COMMON operating '
+                            'point (0 by construction at max trim, so it is '
+                            'NOT read there):')
+                for _tag, _g in (('sub-limit', 1.10), ('near-limit', 1.42)):
+                    _cr = control_at_point(
+                        tm, _ss2, _pcts, radius_m=float(self._radius.value()),
+                        beta_deg=-1.0, lat_g=_g,
+                        grip_multiplier=float(self._grip.value()),
+                        loads_table=_tbl)
+                    _nd = _np.array([x['N_delta'] for x in _cr])
+                    _sp = max(x['step_spread'] for x in _cr)
+                    _spread = float(_nd.max() - _nd.min())
+                    rows.append(
+                        f'  {_tag:>10s} (beta -1.0 deg, steer '
+                        f'{_cr[0]["delta_deg"]:.2f} deg, Ay {_cr[0]["Ay_g"]:.2f} g): '
+                        + '  '.join(f'{x["pct"]:+.0f}%:{x["N_delta"]:+.0f}'
+                                    for x in _cr))
+                    rows.append(
+                        f'  {"":>10s}  spread {_spread:.1f} vs step-noise '
+                        f'{_sp:.1f} N.m/deg -> '
+                        + ('RESOLVABLE, rank on it'
+                           if _spread > 3 * _sp else
+                           'NOT RESOLVABLE, settings are equal here'))
+            except Exception as _e:
+                rows.append(f'  (common-point control failed: {_e})')
+
             rows.append('')
             rows.append(' How to judge (RCVD): trim limit bigger is better '
                         'ONLY beyond the 0.006 g noise band; SI must be '

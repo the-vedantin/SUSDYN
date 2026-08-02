@@ -1162,6 +1162,7 @@ def plot_mmd(
     toe_rear_deg: float = 0.0,
     velocity_mps: float = 13.4,
     ackermann_pct: float = 0.0,
+    grip_multiplier: float = 1.0,
     beta_range_deg: tuple = (-8, 8), beta_n: int = 9,
     delta_range_deg: tuple = (-20, 20), delta_n: int = 11,
 ) -> Figure:
@@ -1207,6 +1208,7 @@ def plot_mmd(
             tire_model, car, beta_deg, delta_deg, V_mps=velocity_mps,
             ackermann_pct=ackermann_pct, toe_front_deg=toe_front_deg,
             toe_rear_deg=toe_rear_deg, loads_table=_loads,
+            grip_multiplier=grip_multiplier,
             Ay0=_prev_ay['ay'])
         _prev_ay['ay'] = st['Ay_g']
         return st['Ay_g'], st['N_Nm']
@@ -1356,9 +1358,12 @@ def plot_mmd(
 
     ax.set_xlabel('Lateral acceleration  A_y  (g)', fontsize=10)
     ax.set_ylabel('Yaw moment  N  about CG  (N·m)', fontsize=10)
+    _grip_str = ('RAW BELT GRIP (x1.00) — NOT road' if grip_multiplier >= 0.999
+                 else f'asphalt x{grip_multiplier:.2f}')
     ax.set_title(
         f'Milliken Moment Diagram — Pure Cornering  |  '
-        f'{velocity_mps * 3.6:.0f} km/h  ({velocity_mps / 0.44704:.0f} mph)',
+        f'{velocity_mps * 3.6:.0f} km/h  ({velocity_mps / 0.44704:.0f} mph)  |  '
+        f'{_grip_str}',
         fontsize=11, color=_TEXT)
     # Only the trim point in the legend — the isolines are labelled for the
     # hover readout, not the legend (20 entries would swamp it).

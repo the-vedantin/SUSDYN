@@ -374,6 +374,75 @@ def trim_point(tire_model, solver, beta_deg, *,
     return st
 
 
+
+def control_at_point(tire_model, solver, ackermann_list, *, radius_m=None,
+                     V_mps=None, beta_deg=-1.0, delta_deg=None, lat_g=None,
+                     grip_multiplier=1.0, aero_Fz_per_g=None,
+                     loads_table=None, steps=(0.10, 0.25, 0.50)):
+    """Control and stability derivatives at ONE COMMON operating point.
+
+    WHY THIS EXISTS.  `trim_sweep_ackermann` reports dN/ddelta at each
+    setting's own maximum-trim point, where it is zero by construction —
+    finite values there are numerical artifact (see this module's header).
+    Comparing settings needs the derivatives read at the SAME (beta, delta)
+    for every setting, away from the maximum, with the difference step shown
+    not to change the answer.
+
+    Two ways to fix the point:
+      * `delta_deg` given  — that steer angle, that body slip, all settings.
+      * `lat_g` given      — the steer angle that puts THE FIRST setting in
+                             the list at that lateral g (bisection), then the
+                             SAME angle for every other setting, so the
+                             comparison is at one operating point rather than
+                             one performance level.
+
+    Returns one row per setting: N_delta, N_beta, Ay_g, plus `step_spread`
+    (max minus min of N_delta across `steps`).  A step_spread comparable to
+    the between-setting spread means the number is not resolvable — the
+    caller must say so rather than rank on it.
+    """
+    kw = dict(grip_multiplier=grip_multiplier, aero_Fz_per_g=aero_Fz_per_g,
+              loads_table=loads_table)
+    if (radius_m is None) == (V_mps is None):
+        raise ValueError('give exactly one of radius_m or V_mps')
+    kw['radius_m' if V_mps is None else 'V_mps'] = (radius_m if V_mps is None
+                                                    else V_mps)
+
+    def _ay(pct, b, d, seed=0.75):
+        st = ymd_state(tire_model, solver, b, d, ackermann_pct=float(pct),
+                       Ay0=seed, **kw)
+        return st['Ay_g'], st['N_Nm']
+
+    if delta_deg is None:
+        if lat_g is None:
+            raise ValueError('give delta_deg or lat_g')
+        lo, hi = 0.5, 25.0
+        ref = float(ackermann_list[0])
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            lo, hi = ((mid, hi) if _ay(ref, beta_deg, mid)[0] < lat_g
+                      else (lo, mid))
+        delta_deg = 0.5 * (lo + hi)
+
+    out = []
+    for pct in ackermann_list:
+        ay0, _ = _ay(pct, beta_deg, delta_deg)
+        nd = []
+        for h in steps:
+            _, n_p = _ay(pct, beta_deg, delta_deg + h, ay0)
+            _, n_m = _ay(pct, beta_deg, delta_deg - h, ay0)
+            nd.append((n_p - n_m) / (2.0 * h))
+        hb = steps[1] if len(steps) > 1 else steps[0]
+        _, nb_p = _ay(pct, beta_deg + hb, delta_deg, ay0)
+        _, nb_m = _ay(pct, beta_deg - hb, delta_deg, ay0)
+        out.append({'pct': float(pct), 'Ay_g': ay0,
+                    'beta_deg': float(beta_deg), 'delta_deg': float(delta_deg),
+                    'N_delta': float(np.median(nd)),
+                    'N_delta_by_step': dict(zip(steps, [float(x) for x in nd])),
+                    'step_spread': float(max(nd) - min(nd)),
+                    'N_beta': float((nb_p - nb_m) / (2.0 * hb))})
+    return out
+
 def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
                          grip_multiplier=1.0, aero_Fz_per_g=None,
                          beta_range=None, beta_step=1.5,
@@ -515,7 +584,17 @@ def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
         rows.append({'pct': pct,
                      'Ay_trim_max': best['Ay_g'],
                      'beta_at': b0, 'delta_at': d0,
+                     # KEPT FOR CONTINUITY, NOT FOR PHYSICS.  At a maximum-trim
+                     # point dN/ddelta is 0 by construction (else it was not the
+                     # maximum), so this number is step-size and tyre-grid
+                     # artifact — the docstring at the top of this file has said
+                     # so since 2026-07-28, and it was quoted as a design
+                     # discriminator anyway (+24 vs +7 Nm/deg "control collapse
+                     # at deep reverse", retracted 2026-08-02: at a common
+                     # SUB-LIMIT point the ordering reverses).  Read
+                     # control_at_point() instead.
                      'N_delta': (N_dp - N_dm) / (2.0 * h),
+                     'N_delta_valid': False,
                      'N_beta': (N_bp - N_bm) / (2.0 * h),
                      'converged': bool(best['converged'])})
     return rows
