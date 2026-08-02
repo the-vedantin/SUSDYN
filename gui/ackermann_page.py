@@ -834,77 +834,43 @@ class AckermannPage(QWidget):
             dlg.setStyleSheet('QDialog { background:#0e0e11; }')
             lay = QVBoxLayout(dlg)
             from PyQt6.QtWidgets import QPlainTextEdit
-            rows = [' RCVD Fig 8.26 limit parameters (printed p334-335) '
-                    'per Ackermann setting:',
-                    ' ACK%   TRIM LIMIT   SI dCN/dAy      APEX Ay   '
-                    'LIMIT CHARACTER',
-                    '        (g, N=0)     (neg=stable)    (g)       '
-                    '(race target: NEUTRAL)   (N·m/deg)']
-            ays = [r.get('Ay_trim_max', float('nan')) for r in trim]
             import numpy as _np
-            best = _np.nanmax(ays) if _np.isfinite(ays).any() else float('nan')
-            for r in trim:
-                a = r.get('Ay_trim_max', float('nan'))
-                tie = (' (all TIE: spread inside 0.006 g noise)'
-                       if _np.isfinite(a) and best - a <= 0.006 else '')
+            # Book-defined MMD readings per Ackermann setting (RCVD Ch 8,
+            # docs/rcvd_ref/ch08).  Replaces the retracted dN/ddelta-at-max-
+            # trim column (which the book says is 0 by construction, p320-321).
+            from vahan.ymd import mmm_metrics_sweep, build_loads_table
+            _ss2 = mw._build_dynamics_solver()
+            _tbl = build_loads_table(_ss2)
+            _pcts = [r['pct'] for r in trim]
+            mm = mmm_metrics_sweep(
+                tm, _ss2, _pcts, radius_m=float(self._radius.value()),
+                grip_multiplier=float(self._grip.value()),
+                aero_Fz_per_g=aero, loads_table=_tbl)
+            rows = [' RCVD Chapter 8 moment-diagram readings per Ackermann '
+                    'setting (docs/rcvd_ref/ch08):',
+                    '',
+                    ' ACK%   TRIM g (T)   STABILITY idx   CONTROL avail   '
+                    'LIMIT CHARACTER',
+                    '        max trimmed  dCN/dAy         moment up the   '
+                    'apex P vs axis',
+                    '        (p306)       (neg=stable,p308) beta-line (Nm,p321)']
+            _t = _np.array([r['ay_trim_max'] for r in mm])
+            for r in mm:
                 rows.append(
-                    f" {r['pct']:+5.0f}   {a:+8.3f}{tie[:1] and '':s}   "
-                    f"{r.get('SI_CN_per_g', float('nan')):+10.4f}      "
-                    f"{r.get('Ay_apex_g', float('nan')):+7.3f}   "
-                    f"{r.get('limit_character', '?'):24s} "
-                    "")
-            # CONTROL, READ WHERE IT MEANS SOMETHING.  dN/ddelta at a
-            # max-trim point is 0 by construction, so the old '@trim' column
-            # was numerical artifact (quoted as a design discriminator and
-            # retracted 2026-08-02).  Read it instead at ONE COMMON (beta,
-            # delta) for every setting, at two intensities, and refuse to
-            # rank when the difference-step spread swamps the between-setting
-            # spread.
-            try:
-                from vahan.ymd import control_at_point, build_loads_table
-                _ss2 = mw._build_dynamics_solver()
-                _tbl = build_loads_table(_ss2)
-                _pcts = [r['pct'] for r in trim]
-                rows.append('')
-                rows.append(' CONTROL dN/d(steer), at ONE COMMON operating '
-                            'point (0 by construction at max trim, so it is '
-                            'NOT read there):')
-                for _tag, _g in (('sub-limit', 1.10), ('near-limit', 1.42)):
-                    _cr = control_at_point(
-                        tm, _ss2, _pcts, radius_m=float(self._radius.value()),
-                        beta_deg=-1.0, lat_g=_g,
-                        grip_multiplier=float(self._grip.value()),
-                        loads_table=_tbl)
-                    _nd = _np.array([x['N_delta'] for x in _cr])
-                    _sp = max(x['step_spread'] for x in _cr)
-                    _spread = float(_nd.max() - _nd.min())
-                    rows.append(
-                        f'  {_tag:>10s} (beta -1.0 deg, steer '
-                        f'{_cr[0]["delta_deg"]:.2f} deg, Ay {_cr[0]["Ay_g"]:.2f} g): '
-                        + '  '.join(f'{x["pct"]:+.0f}%:{x["N_delta"]:+.0f}'
-                                    for x in _cr))
-                    rows.append(
-                        f'  {"":>10s}  spread {_spread:.1f} vs step-noise '
-                        f'{_sp:.1f} N.m/deg -> '
-                        + ('RESOLVABLE, rank on it'
-                           if _spread > 3 * _sp else
-                           'NOT RESOLVABLE, settings are equal here'))
-            except Exception as _e:
-                rows.append(f'  (common-point control failed: {_e})')
-
+                    f" {r['ackermann_pct']:+5.0f}   {r['ay_trim_max']:8.3f}    "
+                    f"{r['stability_index']:+10.4f}     "
+                    f"{r['control_moment_avail_Nm']:8.0f}       "
+                    f"{r['limit_character']}")
             rows.append('')
-            rows.append(' How to judge (RCVD): trim limit bigger is better '
-                        'ONLY beyond the 0.006 g noise band; SI must be '
-                        'negative (zero = divergence boundary, p205); '
-                        'apex character should be NEUTRAL or mild PLOW '
-                        '(race cars are tuned neutral at the limit, p320); '
-                        'control at trim is ~zero BY DEFINITION at max trim '
-                        '(p321) — judge it before the limit, not at it.')
-            _sp = (best - _np.nanmin([r.get('Ay_trim_max', _np.nan)
-                                      for r in trim]))
-            rows.append(f' Trim spread this sweep: {_sp:.3f} g vs 0.006 g '
-                        'noise -> ' + ('settings SEPARATE'
-                                       if _sp > 0.012 else 'TIE on grip'))
+            rows.append(' How to read (RCVD Ch 8): T = max grip on the trim '
+                        'line; stability index must be NEGATIVE (p308); '
+                        'control-avail = yaw the steering can still command '
+                        '(bigger = more authority, p321); character from the '
+                        'apex point P (p306): PLOW is the safe race target.')
+            _spread = float(_np.nanmax(_t) - _np.nanmin(_t))
+            rows.append(f' Trim-grip spread across the sweep: {_spread:.3f} g '
+                        + ('(settings SEPARATE on grip)' if _spread > 0.012
+                           else '(grip TIES; decide on control + character)'))
             txt = QPlainTextEdit(chr(10).join(rows))
             txt.setReadOnly(True)
             txt.setMaximumHeight(230)

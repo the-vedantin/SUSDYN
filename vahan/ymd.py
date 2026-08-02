@@ -443,6 +443,139 @@ def control_at_point(tire_model, solver, ackermann_list, *, radius_m=None,
                     'N_beta': float((nb_p - nb_m) / (2.0 * hb))})
     return out
 
+
+def mmm_metrics(tire_model, solver, ackermann_pct, *, radius_m=None,
+                V_mps=None, grip_multiplier=1.0, aero_Fz_per_g=None,
+                loads_table=None, control_frac=0.85):
+    """The four quantities RCVD Chapter 8 reads off a CN-Ay moment diagram,
+    computed the way the book defines them (docs/rcvd_ref/ch08 + ch05).
+
+    Every earlier Ackermann "control" number was dN/ddelta read AT the
+    maximum-trim point, where the book states it is zero by construction
+    (control moment goes to zero at max trim, printed p320-321).  This
+    function replaces that with the book's own diagram readings:
+
+      1. ay_trim_max        RCVD point T (printed p306): the largest lateral g
+                            on the trim line CN=0 (fronts saturated).  The grip
+                            number.
+      2. stability_index    RCVD printed p308: slope of a constant-STEER line
+                            through trim, dCN/dAy.  Negative = stable.  Read at
+                            a well-conditioned SUB-LIMIT trim, not at T.
+      3. control_moment_avail  RCVD printed p320-321: from the trim point, the
+                            CN height gained up the constant-BODY-SLIP line to
+                            the front-tyre boundary — how much yaw the steering
+                            can still command.  Read at the same sub-limit trim.
+                            Returned as a coefficient (CN) and as N*m.
+      4. limit_character    RCVD printed p306: sign of the apex point P
+                            (max untrimmed force) relative to the Ay axis.
+                            apex CN < 0 = PLOW (final understeer), ~0 = neutral
+                            drift, > 0 = SPIN (final oversteer).  The car's Ay>0
+                            is a left turn (module header): nose-out at the apex
+                            (CN<0) is the plow direction.
+
+    CN = N / (W*wheelbase), matching the book (printed p301) and plot_mmd.
+
+    Physics is all ymd_state; this only sweeps the diagram and reads it.
+    """
+    kw = dict(radius_m=radius_m, V_mps=V_mps, ackermann_pct=float(ackermann_pct),
+              grip_multiplier=grip_multiplier, aero_Fz_per_g=aero_Fz_per_g,
+              loads_table=loads_table)
+    m, L, l_f, l_r, t_f, t_r = _dims(solver)
+    W = m * 9.80665
+    WL = W * L
+
+    # ---- point T: sweep body slip, trim at each, take the max-Ay trim -------
+    kin = (math.degrees(l_r / float(radius_m)) if radius_m else 3.0)
+    betas = np.arange(-kin - 8.0, 3.01, 0.5)
+    trims = []
+    for b in betas:
+        tp = trim_point(tire_model, solver, float(b),
+                        radius_m=radius_m, V_mps=V_mps,
+                        ackermann_pct=float(ackermann_pct),
+                        grip_multiplier=grip_multiplier,
+                        aero_Fz_per_g=aero_Fz_per_g, loads_table=loads_table)
+        if tp.get('has_trim') and np.isfinite(tp['Ay_g']):
+            trims.append((tp['Ay_g'], tp['beta_deg'], tp['delta_deg']))
+    if not trims:
+        return {'ackermann_pct': float(ackermann_pct),
+                'ay_trim_max': float('nan'), 'stability_index': float('nan'),
+                'control_moment_avail_CN': float('nan'),
+                'control_moment_avail_Nm': float('nan'),
+                'apex_ay': float('nan'), 'apex_cn': float('nan'),
+                'limit_character': 'no trim'}
+    trims.sort()
+    ay_T, b_T, d_T = trims[-1]
+
+    # ---- sub-limit operating trim (well-conditioned) -----------------------
+    ay_op_target = control_frac * ay_T
+    ay_op, b_op, d_op = min(trims, key=lambda x: abs(x[0] - ay_op_target))
+
+    def _state(b, d):
+        st = ymd_state(tire_model, solver, float(b), float(d), Ay0=ay_op, **kw)
+        return st['Ay_g'], st['N_Nm']
+
+    # ---- (2) stability index: dCN/dAy along constant STEER through trim -----
+    hb = 0.5
+    ay_bp, n_bp = _state(b_op + hb, d_op)
+    ay_bm, n_bm = _state(b_op - hb, d_op)
+    d_ay = ay_bp - ay_bm
+    stability_index = ((n_bp - n_bm) / d_ay / WL) if abs(d_ay) > 1e-9         else float('nan')
+
+    # ---- (3) control moment available: up the constant-BODY-SLIP line ------
+    # from the trim point (CN=0), increase steer at fixed body slip until the
+    # front saturates; the peak CN reached is the control moment available.
+    d_hi = d_op + max(8.0, abs(d_op))
+    ds = np.linspace(d_op, d_hi, 22)
+    cns = []
+    for d in ds:
+        _, n = _state(b_op, d)
+        cns.append(n / WL)
+    cn_peak = float(np.max(cns)) if cns else float('nan')
+    control_cn = max(cn_peak, 0.0)          # gained above the CN=0 trim
+    control_nm = control_cn * WL
+
+    # ---- (4) apex P + limit character --------------------------------------
+    # max-Ay state over a beta x steer grid = vector sum of front+rear
+    # saturation (the book's point P).
+    ap_ay, ap_cn = -1e9, float('nan')
+    for b in np.arange(b_T - 4.0, b_T + 4.01, 1.0):
+        for d in np.arange(d_T - 2.0, d_T + 8.01, 1.0):
+            ay, n = _state(b, d)
+            if ay > ap_ay:
+                ap_ay, ap_cn = ay, n / WL
+    if not np.isfinite(ap_cn):
+        char = 'unknown'
+    elif ap_cn < -0.004:
+        char = 'PLOW (final understeer)'
+    elif ap_cn > 0.004:
+        char = 'SPIN (final oversteer)'
+    else:
+        char = 'NEUTRAL drift (race target)'
+
+    return {'ackermann_pct': float(ackermann_pct),
+            'ay_trim_max': float(ay_T),
+            'beta_at_T': float(b_T), 'delta_at_T': float(d_T),
+            'ay_op': float(ay_op), 'beta_op': float(b_op), 'delta_op': float(d_op),
+            'stability_index': float(stability_index),
+            'control_moment_avail_CN': float(control_cn),
+            'control_moment_avail_Nm': float(control_nm),
+            'apex_ay': float(ap_ay), 'apex_cn': float(ap_cn),
+            'limit_character': char}
+
+
+def mmm_metrics_sweep(tire_model, solver, ackermann_list, *, radius_m=None,
+                      V_mps=None, grip_multiplier=1.0, aero_Fz_per_g=None,
+                      loads_table=None, control_frac=0.85):
+    """mmm_metrics for each Ackermann setting; shares one loads table."""
+    if loads_table is None:
+        loads_table = build_loads_table(solver, aero_Fz_per_g)
+    return [mmm_metrics(tire_model, solver, float(p), radius_m=radius_m,
+                        V_mps=V_mps, grip_multiplier=grip_multiplier,
+                        aero_Fz_per_g=aero_Fz_per_g, loads_table=loads_table,
+                        control_frac=control_frac)
+            for p in ackermann_list]
+
+
 def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
                          grip_multiplier=1.0, aero_Fz_per_g=None,
                          beta_range=None, beta_step=1.5,
