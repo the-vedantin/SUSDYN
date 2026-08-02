@@ -178,7 +178,8 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
               radius_m=None, V_mps=None, ackermann_pct=0.0,
               grip_multiplier=1.0, aero_Fz_per_g=None,
               toe_front_deg=0.0, toe_rear_deg=0.0,
-              loads_table=None, max_iter=40, tol_g=1e-4, Ay0=0.0):
+              loads_table=None, max_iter=40, tol_g=1e-4, Ay0=0.0,
+              include_mz=True):
     """One quasi-steady operating point (beta, delta) -> converged Ay and N.
 
     Modes (exactly one):
@@ -247,9 +248,23 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
         # WHEEL, toward the inside of the turn.
         ft = -np.atleast_1d(np.asarray(
             tire_model.Fy(s, fz, cam), float)).ravel() * gm
-        return V, r, s, fz, ft
+        # Tyre self-aligning moment about each wheel's own vertical axis.
+        # RCVD Ch 5 lists "aligning torque on rigid body" as a real line in
+        # the understeer budget (printed p172, docs/rcvd_ref/ch05), and
+        # RCVD Ch 2 defines Mz = Fy * pneumatic trail (p22/p30).  It is a FREE
+        # moment (couple), so it adds straight into the car yaw sum with no
+        # moment arm.  Derated with the same grip factor as Fy, since
+        # Mz = Fy * trail scales with the derated force.  SAE Mz is negated
+        # once to match this module's y-left / z-up convention (same single
+        # negation Fy gets).
+        if include_mz:
+            mz = -np.atleast_1d(np.asarray(
+                tire_model.Mz(s, fz, cam), float)).ravel() * gm
+        else:
+            mz = np.zeros_like(ft)
+        return V, r, s, fz, ft, mz
 
-    def _sums(ft):
+    def _sums(ft, mz):
         # Resolve each wheel's force into the BODY frame (RCVD ch.7 resolves
         # axle force by cos(reference steer); same thing per wheel here):
         #   F_y,i = F_t,i cos(ang_i)         lateral, does the cornering
@@ -262,20 +277,22 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
         fy_body = ft * cos_a
         fx_body = -ft * sin_a
         Ay_g = float(fy_body.sum()) / (m * G)
-        N = float((x_w * fy_body - y_w * fx_body).sum())
+        # yaw moment = force couples about the CG + each tyre's self-aligning
+        # moment (a free couple, added directly).
+        N = float((x_w * fy_body - y_w * fx_body).sum() + float(mz.sum()))
         return Ay_g, N, fy_body
 
     Ay, converged = float(Ay0), False
     for _ in range(int(max_iter)):
-        V, r, s, fz, ft = _eval(Ay)
-        Ay_new, _, _ = _sums(ft)
+        V, r, s, fz, ft, mz = _eval(Ay)
+        Ay_new, _, _ = _sums(ft, mz)
         if abs(Ay_new - Ay) < tol_g:
             Ay = Ay_new
             converged = True
             break
         Ay = 0.5 * Ay + 0.5 * Ay_new        # damped, same scheme plot_mmd used
-    V, r, s, fz, ft = _eval(Ay)
-    _, N, fy_body = _sums(ft)
+    V, r, s, fz, ft, mz = _eval(Ay)
+    _, N, fy_body = _sums(ft, mz)
     lab = dict(zip(_CORNERS, range(4)))
     return {
         'Ay_g': float(Ay), 'N_Nm': float(N),
@@ -285,6 +302,7 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
         'slip_deg': {k: float(s[i]) for k, i in lab.items()},
         'Fy_N': {k: float(fy_body[i]) for k, i in lab.items()},
         'Fz_N': {k: float(fz[i]) for k, i in lab.items()},
+        'Mz_Nm': {k: float(mz[i]) for k, i in lab.items()},
         'converged': bool(converged),
     }
 
