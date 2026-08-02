@@ -189,17 +189,23 @@ Two of the central-spring options have dedicated solvers:
 - Percentages use the standard construction: 0% = parallel steer, 100% = turn centre on the rear-axle line, negative = reverse Ackermann (the outer wheel steers more than the inner).
 - The demand is capped at the both-wheels-at-own-peak physical bound.
 - **Force-ceiling sweep** — front-axle capability vs Ackermann setting with plateau tie bands (no winner declared inside measured noise) and censored-data flags.
-- **Full MMD sweep** — a Milliken Moment Diagram per Ackermann setting, each with a numbers box (trimmed limit, attitude/steer at the limit, control, stability, max reach), plus a NUMBERS tab comparing belt-grip and road-grip frames with an explicit verdict line.
-- **YMD view** — trim-region zoom reporting RCVD Fig. 8.26 limit parameters per setting (stability index, apex lateral g, plow/neutral/spin character).
+- **Full MMD sweep** — a Milliken Moment Diagram per Ackermann setting, drawn at the same asphalt grip as every other answer, with the grip stated on the figure.
+- **YMD grid** — the four quantities RCVD Chapter 8 reads off a CN-Ay diagram, per Ackermann setting, each with its printed-page citation:
+  - Point T: maximum trimmed lateral g (the grip number).
+  - Stability index: slope of a constant-steer line through trim, dCN/dAy; negative = stable.
+  - Control moment available: yaw moment the steering can still command from trim, up the constant-body-slip line to the front-tire boundary (N·m).
+  - Limit character: sign of the apex point P — plow / neutral drift / spin.
+- Control is read at a stated sub-limit operating point, not at maximum trim (where it is zero by construction).
 - Convention: an unqualified Ackermann % is quoted **at full lock** (the ratio drifts with steer angle).
 
 *Ackermann-page screenshot excluded from the repository — the page displays curves derived from FSAE TTC data, which are not redistributed.*
 
 ### One yaw-moment engine
 
-- Every yaw-moment number in the tool — MMD, trim sweeps, comparisons — comes from `vahan/ymd.py`.
+- Every yaw-moment number in the tool — MMD, trim sweeps, YMD grid — comes from `vahan/ymd.py`.
 - Double-track: per-wheel loads and slip angles including yaw-rate terms.
-- Forces are resolved per wheel with the induced-drag couple at ±track/2, the pathway by which steer geometry yaws the car.
+- Yaw moment CN = N/(W·wheelbase), matching RCVD (printed page 301).
+- Forces are resolved per wheel with the induced-drag couple at ±track/2, plus each tire's self-aligning moment (Mz = Fy × pneumatic trail) as a free couple — both are pathways by which steer geometry yaws the car.
 
 ## Lap Time Simulator (Ctrl+2)
 
