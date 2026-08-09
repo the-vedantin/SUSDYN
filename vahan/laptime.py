@@ -244,7 +244,16 @@ class AckermannStationModel:
         self._ceil = np.full((nR, nG, nP), np.nan)   # axle force ceiling, N
         self._scrub = np.full((nR, nG, nP), np.nan)  # trim scrub drag, N
         self._demand = np.full((nR, nG), np.nan)     # m*g*wf*ay, N
-        self._ay_cap = np.full((nR, nP), np.nan)     # front-limited ay, g
+        self._ay_cap = np.full((nR, nP), np.nan)     # front-limited ay, g (legacy/diag)
+        # WHOLE-CAR trimmed grip per (radius, pct) — the CORRECT lap cap.  The
+        # front-axle ceiling above over-credits +Ackermann because the tight
+        # corners that bind are REAR/BALANCE-limited (rear util 1.00 vs front
+        # 0.99), and Ackermann only touches the front.  Capping the lap by the
+        # front ceiling manufactured a fake +100%-is-fastest verdict; the fair
+        # instrument is the both-axle trim (RCVD Ch 8 point T, ymd ay_trim_max),
+        # the SAME quantity the DECIDE view uses.  (Roster adjudication
+        # 2026-08-03; see [[project_laptime_ackermann]].)
+        self._trim_ay = np.full((nR, nP), np.nan)    # whole-car trimmed ay, g
 
     # ── build ────────────────────────────────────────────────────────────
     def build(self, progress_cb=None):
@@ -293,6 +302,29 @@ class AckermannStationModel:
         for i in range(len(self.RADII_M)):
             for k in range(len(self.pct)):
                 self._ay_cap[i, k] = self._cross(i, k)
+        # WHOLE-CAR trimmed grip per (radius, pct) — the fair lap cap (both
+        # axles), only where Ackermann has any effect (R < 10 m; beyond that
+        # the docstring's measured spread is < 1%, so leave it flat = no cap).
+        try:
+            from vahan.ymd import mmm_metrics_sweep, build_loads_table
+            _tbl = build_loads_table(self.solver)
+            _aero_fz = self.aero if isinstance(self.aero, dict) else None
+            for i, R in enumerate(self.RADII_M):
+                if R >= 10.0:
+                    continue
+                try:
+                    mm = mmm_metrics_sweep(
+                        self.tire, self.solver, [float(p) for p in self.pct],
+                        radius_m=float(R), grip_multiplier=self.gm,
+                        aero_Fz_per_g=_aero_fz, loads_table=_tbl)
+                    _by = {round(float(r['ackermann_pct']), 3): float(r['ay_trim_max'])
+                           for r in mm}
+                    for k, p in enumerate(self.pct):
+                        self._trim_ay[i, k] = _by.get(round(float(p), 3), np.nan)
+                except Exception as e:
+                    self.notes.append(f'trim cap R={R:.1f} m: {e}')
+        except Exception as e:
+            self.notes.append(f'whole-car trim cap unavailable: {e}')
         self.built = True
         if self.n_failed_cells:
             self.notes.insert(0, f'{self.n_failed_cells}/{total} capability '
@@ -355,6 +387,31 @@ class AckermannStationModel:
         lo = np.where(np.isfinite(lo), lo, NO_CAP)
         hi = np.where(np.isfinite(hi), hi, NO_CAP)
         return self._pct_interp(lo, hi, t, pct)
+
+    def ay_trim_scale(self, radius_m, pct) -> float:
+        """WHOLE-CAR trimmed-grip cap as a MULTIPLIER on the lap's own grip,
+        relative to neutral (0%) Ackermann.  This REPLACES the front-axle
+        ceiling for setting corner speed: the binding tight corners are
+        rear/balance-limited, so the fair instrument is the both-axle trim
+        (ymd ay_trim_max, RCVD point T) — the same quantity the DECIDE view
+        uses.  Returns 1.0 (no modifier) beyond the effect radius or if the
+        trim cap did not solve, so the lap falls back to its own grip."""
+        if not self.built:
+            return 1.0
+        w = self._r_weights(radius_m)
+        if w is None:
+            return 1.0
+        a, b, t = w
+        row = self._trim_ay[a, :] * (1.0 - t) + self._trim_ay[b, :] * t
+        if not np.all(np.isfinite(row)):
+            return 1.0
+        ay_pct = float(np.interp(float(pct), self.pct, row))
+        ay_0 = float(np.interp(0.0, self.pct, row))
+        if ay_0 <= 1e-6:
+            return 1.0
+        # clamp: the Ackermann trim modulation is a few % — never let a solve
+        # glitch swing corner speed by more than +/-15%.
+        return float(min(1.15, max(0.85, ay_pct / ay_0)))
 
     def scrub_drag_N(self, radius_m, lat_g, pct) -> float:
         """Longitudinal loss (N) from the front tyres pointing across the
@@ -511,6 +568,8 @@ class LapResult:
     min_speed_kph: float = 0.0
     peak_lat_g: float = 0.0
     avg_corner_lat_g: float = 0.0
+    avg_corner_speed_kph: float = 0.0   # mean speed while cornering (>0.30 g)
+    avg_corner_radius_m: float = 0.0    # mean path radius while cornering
     time_cornering_pct: float = 0.0
     peak_accel_g: float = 0.0
     peak_brake_g: float = 0.0
@@ -940,20 +999,24 @@ class LapSimulator:
         self._ack_pct = float(pct)
 
     def _ay_max_local(self, v: float, kappa: float) -> float:
-        """Lateral ceiling at this station: the car's own grip limit, capped
-        by the FRONT AXLE's capability at this station's RADIUS and this
-        Ackermann setting.  A 3 m hairpin and a 30 m sweeper get different
-        caps from the same setting — that is the whole point."""
+        """Lateral ceiling at this station: the car's own (both-axle) grip
+        limit, modulated by how WHOLE-CAR trimmed grip changes with Ackermann
+        at this station's RADIUS.  FIXED 2026-08-03: the old code capped by the
+        FRONT-AXLE force ceiling, which over-credited +Ackermann because the
+        tight corners that bind are rear/balance-limited — it manufactured a
+        fake "+100% is fastest" lap verdict.  The fair cap is the both-axle
+        trim (ymd ay_trim_max, RCVD point T), applied as a relative multiplier
+        so neutral (0%) is unchanged and only the small real Ackermann effect
+        (a few %, biggest under ~5 m) moves the lap.  See DECIDE view + the
+        roster adjudication in [[project_laptime_ackermann]]."""
         base = self._ay_max(v)
         if self._ack_model is None:
             return base
         ak = abs(float(kappa))
         if ak < 1e-5:
             return base                    # straight: no steer, no Ackermann
-        cap = self._ack_model.ay_front_cap_g(1.0 / ak, self._ack_pct)
-        if not np.isfinite(cap):
-            return base
-        return min(base, float(cap) * G)
+        scale = self._ack_model.ay_trim_scale(1.0 / ak, self._ack_pct)
+        return base * float(scale)
 
     def scrub_drag_N(self, v: float, kappa: float) -> float:
         """Front-tyre scrub as a retarding force (N) at this station.  It is
@@ -1146,6 +1209,16 @@ class LapSimulator:
         res.peak_lat_g = float(np.max(lat_g))
         res.avg_corner_lat_g = (float(np.sum(_latm[_corner] * dt[_corner])
                                       / _t_c) if _t_c > 0 else 0.0)
+        # mean cornering SPEED and path RADIUS, time-weighted over corner
+        # stations only (straights excluded) — the representative condition to
+        # design the car (and Ackermann) for.
+        _vm = 0.5 * (v[1:] + v[:-1])
+        _kapm = 0.5 * (kap[1:] + kap[:-1])
+        _radm = 1.0 / np.maximum(np.abs(_kapm), 1e-6)
+        res.avg_corner_speed_kph = (float(np.sum(_vm[_corner] * dt[_corner])
+                                          / _t_c) * 3.6 if _t_c > 0 else 0.0)
+        res.avg_corner_radius_m = (float(np.sum(_radm[_corner] * dt[_corner])
+                                         / _t_c) if _t_c > 0 else 0.0)
         res.time_cornering_pct = float(100.0 * _t_c / t[-1])
         res.peak_accel_g = float(np.max(_lonm))
         res.peak_brake_g = float(-np.min(_lonm))

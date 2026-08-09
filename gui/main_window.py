@@ -3486,7 +3486,7 @@ class MainWindow(QMainWindow):
 
         note = QLabel('FL and RL are input values.  FR and RR are X-mirrored.  '
                        'Save Project exports all hardpoints + vehicle params to JSON.')
-        note.setStyleSheet('color: #FFA726; font-size: 11px; padding: 4px;')
+        note.setStyleSheet('color: #E23B48; font-size: 11px; padding: 4px;')
         note.setWordWrap(True)
         lay.addWidget(note)
 
@@ -3507,9 +3507,10 @@ class MainWindow(QMainWindow):
         tbl.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
 
         # Color the corner headers
-        # Colorblind-safe corner coding — same yellow/red/white/blue
-        # convention as CORNER_PLOT_COLORS (the kinematic graphs).
-        corner_colors = {'FL': '#FFD600', 'FR': '#E53935', 'RL': '#FFFFFF', 'RR': '#42A5F5'}
+        # Corner coding for the coord TABLE — no yellow, no blue (docs/DESIGN.md;
+        # the column header already names the corner, so colour is only a cue).
+        # NOT the graph palette (CORNER_PLOT_COLORS is untouched).
+        corner_colors = {'FL': '#E0DAD0', 'FR': '#E23B48', 'RL': '#FFFFFF', 'RR': '#AEB4BC'}
 
         for ri, name in enumerate(names):
             it = QTableWidgetItem(name)
@@ -3690,6 +3691,10 @@ class MainWindow(QMainWindow):
         self.view3d.set_on_increment(self._on_edit_increment_changed)
 
         self.curves = CurvesCanvas()
+        # Hover-to-read on the main kinematic/dynamics graph surface (Fz, roll,
+        # utilization, camber, ...).  HoverAnnotator re-scans axes/lines every
+        # move, so this single attach survives every sweep/solve redraw.
+        self._curves_hover = HoverAnnotator(self.curves)
 
         left_split = QSplitter(Qt.Orientation.Vertical)
         left_split.addWidget(self.view3d.native)
@@ -6272,7 +6277,18 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                         _byn = {m['name']: (m['a'], m['b']) for m in mem}
-                        for cl in _clashfn(mem):
+                        # REAR lower A-arm + toe link are ONE fabricated welded
+                        # part (user DFM, 2026-08-05), so their mutual interference
+                        # is physically impossible — exempt it on the REAR corners
+                        # only.  The FRONT tie rod is the steering rack (a separate
+                        # part), so it stays checked against the front arms.
+                        from vahan.interference import DEFAULT_CONNECTED as _DC
+                        _conn = _DC
+                        if c['label'] in ('RL', 'RR'):
+                            _conn = _DC | {
+                                frozenset({'lower arm front', 'tie / toe rod'}),
+                                frozenset({'lower arm rear', 'tie / toe rod'})}
+                        for cl in _clashfn(mem, connected=_conn):
                             _clash_segs.append(_byn[cl['a']])
                             _clash_segs.append(_byn[cl['b']])
                 self.view3d.set_clashes(_clash_segs)
@@ -8937,8 +8953,20 @@ class MainWindow(QMainWindow):
             tire = LinearTireModel()
         # Rear tire = front unless a split front/rear setup is active.
         tire_rear = self._tire_model_rear
-        return SteadyStateSolver(veh, self._solvers, tire,
-                                 tire_model_rear=tire_rear)
+        ss = SteadyStateSolver(veh, self._solvers, tire,
+                               tire_model_rear=tire_rear)
+        # Grip multiplier (belt→road) is a PANEL INPUT: it scales the tyre μ
+        # used for the friction-circle utilization.  Default 1.0 = raw belt μ;
+        # set <1 (≈0.70 asphalt) for honest utilization.  The lap-time sim
+        # overrides _mu_scale locally and restores it, so this is only the
+        # dynamics-page value.
+        try:
+            gm = getattr(self._dynamics_panel, '_grip_mult', None)
+            if gm is not None:
+                ss._mu_scale = float(gm.value())
+        except Exception:
+            pass
+        return ss
 
     def _refresh_vehicle_constants(self):
         """Rebuild VehicleParams and push to the constants popup.
@@ -8972,8 +9000,8 @@ class MainWindow(QMainWindow):
         # The PROJECT chooses its tire; the source still names no dataset, so the
         # public repo implies nothing (the filename lives in the gitignored
         # config).  Falling back to files[0] picked purely by ALPHABETICAL order
-        # silently ran the car on the wrong compound for months — B1965* (LCO)
-        # sorts ahead of B2356* (R20), and nothing ever said so.
+        # silently ran the car on the wrong compound for months — one dataset
+        # sorts ahead of another alphabetically, and nothing ever said so.
         want = str(self._car.get('tire_file', '') or '').strip()
         if want:
             for f in files:
@@ -10310,7 +10338,7 @@ class MainWindow(QMainWindow):
                 'border-top-left-radius: 4px; border-top-right-radius: 4px; } '
                 'QTabBar::tab:hover { background: #232329; } '
                 'QTabBar::tab:selected { background: #26262e; '
-                'border-color: #8f6a2e; }')
+                'border-color: #8f2730; }')
             lay = QVBoxLayout(dlg)
             tabs = QTabWidget()
             lay.addWidget(tabs)
@@ -10328,7 +10356,12 @@ class MainWindow(QMainWindow):
                     pass
                 if getattr(fig, '_mmd_numbers', None):
                     numbers.append(fig._mmd_numbers)
-                tabs.addTab(_Canvas(fig), f'{pct:+.0f}%')
+                _mc = _Canvas(fig)
+                # hover-to-read on every MMD tab (item 7)
+                if not hasattr(self, '_mmd_hovers'):
+                    self._mmd_hovers = []
+                self._mmd_hovers.append(HoverAnnotator(_mc))
+                tabs.addTab(_mc, f'{pct:+.0f}%')
             # NUMBERS tab first: every important value, side by side.
             if numbers:
                 from PyQt6.QtWidgets import QPlainTextEdit
@@ -10417,7 +10450,7 @@ class MainWindow(QMainWindow):
     _last_aero_result = None  # most recent AeroResult (stores deficit per corner + g_ref)
     _aero_active = False      # True when "Apply Aero" is toggled on
 
-    def _get_aero_Fz_per_g(self) -> dict | None:
+    def _get_aero_Fz_per_g(self, radius_m: float | None = None) -> dict | None:
         """Per-corner aero Fz normalised to 1g (V²-scaled).
 
         At constant turn radius R,  V² = g · g_earth · R,  so downforce
@@ -10435,6 +10468,11 @@ class MainWindow(QMainWindow):
             CFD: "my CFD says I produce X N at Y km/h with CoP at Z%
             rear — what does that do to handling?"
 
+        ``radius_m`` — optional corner radius (m) to size the V²-scaling at.
+            The aero-per-g is radius-dependent (V² = g·g_earth·R), so a caller
+            analysing at a specific corner (e.g. the Ackermann page) passes its
+            own radius; None falls back to the Dynamics panel's turn radius.
+
         Returns dict with per-corner Fz at 1g, or None if aero is OFF
         or the active source has no usable data.
         """
@@ -10446,12 +10484,20 @@ class MainWindow(QMainWindow):
             source = self._dynamics_panel.get_aero_source()
 
         if source == 'custom':
-            return self._custom_aero_Fz_per_g()
+            return self._custom_aero_Fz_per_g(radius_m=radius_m)
 
         # Default: solved-deficit path (legacy behaviour).
         r = self._last_aero_result
         if r is None:
-            return None
+            # ROOT CAUSE of the aero-blind Ackermann bug: in 'solved' mode the
+            # per-corner aero came ONLY from the inverse aero-target solver's
+            # last result, which is None until that solver is run by hand.  So a
+            # config with apply_aero=True (this car: F_ref 350 N) applied ZERO
+            # downforce in every Ackermann analysis on load.  The loaded config
+            # still carries the car's REAL aero package on the Dynamics panel
+            # (F_ref / V_ref / CoP), so fall back to THAT — the physical package
+            # the car actually has — instead of silently returning no aero.
+            return self._custom_aero_Fz_per_g(radius_m=radius_m)
         g_ref = r.lateral_g
         if g_ref < 0.01:
             return None
@@ -10471,7 +10517,7 @@ class MainWindow(QMainWindow):
             'RL': rn / 2.0 / g_ref, 'RR': rn / 2.0 / g_ref,
         }
 
-    def _custom_aero_Fz_per_g(self) -> dict | None:
+    def _custom_aero_Fz_per_g(self, radius_m: float | None = None) -> dict | None:
         """Per-corner aero Fz at 1g from the DynamicsPanel's user-typed
         CFD numbers.  Returns None if the inputs are degenerate (zero
         downforce, zero ref-speed, etc.).
@@ -10495,7 +10541,8 @@ class MainWindow(QMainWindow):
         if F_ref <= 0.0 or V_ref_kph <= 0.0 or rho <= 0.0:
             return None
 
-        R = float(self._dynamics_panel._turn_radius.value())
+        R = (float(radius_m) if radius_m is not None
+             else float(self._dynamics_panel._turn_radius.value()))
         if R <= 0.0:
             return None
 
@@ -10903,7 +10950,7 @@ class MainWindow(QMainWindow):
         left = QVBoxLayout()
         left.setSpacing(4)
         hdr = QLabel('Signals')
-        hdr.setStyleSheet('color: #FFB74D; font-weight: bold; font-size: 13px;')
+        hdr.setStyleSheet('color: #E23B48; font-weight: bold; font-size: 13px;')
         left.addWidget(hdr)
 
         sig_list = QListWidget()
@@ -11574,16 +11621,16 @@ class MainWindow(QMainWindow):
     # ==========================================================================
 
     def _apply_style(self):
-        # Minimal dark theme.  One quiet accent (amber #FFB74D) reserved for
-        # checked/active state; every other distinction is luminance-based so
-        # it stays colorblind-safe (no red/green or purple/blue pairs).
+        # Impeccable dark theme (docs/DESIGN.md).  One accent — RED #E23B48 —
+        # for checked/active state; NO yellow/amber in text/UI (user hates
+        # yellow, colourblind); every other distinction is luminance-based.
         # Consistent 4px radii, hairline borders, slim scrollbars.
         self.setStyleSheet("""
         /* -- base ------------------------------------------------------- */
         QMainWindow, QWidget, QScrollArea {
             background-color: #0b0b0d;
-            color: #e8e8ea;
-            font-family: 'Segoe UI', Arial, sans-serif;
+            color: #ECECEE;
+            font-family: 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif;
             font-size: 13px;
         }
         QScrollArea { border: none; }
@@ -11664,7 +11711,7 @@ class MainWindow(QMainWindow):
         QRadioButton::indicator:hover { border-color: #55555f; }
         QRadioButton::indicator:checked {
             width: 5px; height: 5px;
-            border: 5px solid #FFB74D;
+            border: 5px solid #E23B48;
             border-radius: 7px;
             background: #0b0b0d;
         }
@@ -11674,7 +11721,7 @@ class MainWindow(QMainWindow):
             background: #d8d8dc; width: 14px; height: 14px;
             margin: -5px 0; border-radius: 7px;
         }
-        QSlider::handle:horizontal:hover { background: #FFB74D; }
+        QSlider::handle:horizontal:hover { background: #E23B48; }
         QSlider::sub-page:horizontal { background: #4a4a54; border-radius: 2px; }
         /* -- inputs ----------------------------------------------------- */
         QDoubleSpinBox, QSpinBox, QLineEdit {

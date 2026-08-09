@@ -9,6 +9,7 @@ form; build_dialog() is a small control that drives the MAIN 3-D view into
 Load mode with a chosen corner isolated.
 """
 import numpy as np
+from vahan import loads as _loads
 
 # (label, lat g, lon g)   +lon = accel, -lon = braking
 CASES = [('Max cornering 2.0 g', 2.0, 0.0),
@@ -199,61 +200,14 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
         items.append((patch, Fpatch, _C_UP,
                       f'{lbl} TYRE · contact patch into hub · {np.linalg.norm(Fpatch):,.0f} N'))
 
-        # ── MOMENTS at the hub (N·m, drawn double-headed along the moment axis) ──
-        # The contact-patch forces act R_r below the axle, so they apply moments
-        # on the wheel/upright (Seward Ch.6):
-        #   * Fx (long) × R_r = the wheel BRAKE / DRIVE torque about the spin axis
-        #     (reacted by the caliper couple front / the driveshaft rear).
-        #   * Fy (lat)  × R_r = the OVERTURNING moment about the fore-aft axis
-        #     (reacted by the two wheel bearings as a V force couple).
-        R_r = max(float(wc[2]), 1e-3)                     # loaded rolling radius
-        Fx = float(res.Fx.get(lbl, 0.0)); Fy = float(res.Fy.get(lbl, 0.0))
-        fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
-        fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
-        T_hub = Fx * R_r
-        M_ot = Fy * R_r
-        if abs(T_hub) > 1.0:
-            items.append((wc, T_hub * spin, _C_MOM,
-                          f'{lbl} HUB · brake/drive torque (about axle) · {abs(T_hub):,.0f} N·m'))
-        if abs(M_ot) > 1.0:
-            items.append((wc, M_ot * fwd, _C_MOM,
-                          f'{lbl} BEARINGS · overturning moment · {abs(M_ot):,.0f} N·m'))
-
-        # ── STEERING (kingpin) moment: the contact-patch force system taken about
-        #    the steering axis through the two ball joints.  This is the torque the
-        #    steering rack / toe link has to react (scrub radius + trail effects).
-        try:
-            kp_a = np.asarray(st.lca_outer, float)
-            kp_b = np.asarray(st.uca_outer, float)
-            k = kp_b - kp_a
-            k = k / max(np.linalg.norm(k), 1e-9)
-            M_kp = float(np.dot(k, np.cross(patch - kp_a, Fpatch)))
-            if abs(M_kp) > 1.0:
-                items.append((kp_a, M_kp * k, _C_MOM,
-                              f'{lbl} STEERING · moment about kingpin axis · '
-                              f'{abs(M_kp):,.0f} N·m'))
-        except Exception:
-            pass
-
-        # ── TYRE self-aligning torque Mz (about the vertical), straight from the
-        #    tyre model: back out the slip angle that produces this Fy at this Fz
-        #    and camber, then read the tyre's Mz there.
-        try:
-            _tm = getattr(dyn, '_tire' if lbl[0] == 'F' else '_tire_rear', None)
-            if _tm is not None:
-                _cam = float(res.camber.get(lbl, 0.0))
-                _Fz = float(res.Fz.get(lbl, 0.0))
-                _sa = _tm.slip_angle_for_Fy(Fy, _Fz, _cam)
-                _mz = float(_tm.Mz(_sa, _Fz, _cam))
-                if abs(_mz) > 1.0:
-                    items.append((patch, np.array([0.0, 0.0, _mz]), _C_MOM,
-                                  f'{lbl} TYRE · self-aligning torque Mz · '
-                                  f'{abs(_mz):,.0f} N·m'))
-        except Exception:
-            pass
-
-        # ── ROCKER / ARB free body: pushrod, spring, ARB drop-link (axial),
-        #    and the rocker PIVOT reaction (the only moment reaction) ──
+        # ── ROCKER / ARB free body: pushrod, spring, ARB drop-link (axial), the
+        #    rocker PIVOT reaction, AND the ARB bar torsion — ALL computed in the
+        #    core solver (vahan.loads.rocker_arb_freebody).  This view only
+        #    assembles the world-frame geometry (mirroring per corner) and DRAWS
+        #    the forces + torsion it reads back; no free-body physics runs here.
+        fb = None
+        rows = []
+        arb_piv = None
         try:
             arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
             hp = win._front_hp if lbl[0] == 'F' else win._rear_hp
@@ -261,30 +215,25 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else 1.0
             axis = (np.asarray(hp['rocker_axis_pt'], float)
                     - np.asarray(hp['rocker_pivot'], float)) * mir
-            axis = axis / max(np.linalg.norm(axis), 1e-9)
             pi = np.asarray(st.pushrod_inner, float); po = np.asarray(st.pushrod_outer, float)
-            u_push = (po - pi) / max(np.linalg.norm(po - pi), 1e-9)
-            F_push = float(c.pushrod_N) * u_push
             sp = np.asarray(st.rocker_spring_pt, float); sc = np.asarray(st.spring_chassis_pt, float)
-            u_sp = (sc - sp) / max(np.linalg.norm(sc - sp), 1e-9)
-            F_spr = -float(c.spring_force_N) * u_sp
             dt = win._arb_drop_top_world(lbl, st)
             ae = np.asarray(arb['arb_arm_end'], float)
             if lbl in ('FR', 'RR'):
                 ae = ae * np.array([-1.0, 1.0, 1.0])
-            u_arb = (ae - dt) / max(np.linalg.norm(ae - dt), 1e-9)
-            m0 = (np.cross(pi - P, F_push) + np.cross(sp - P, F_spr)) @ axis
-            lever = np.cross(dt - P, u_arb) @ axis
-            F_arb = (-m0 / lever if abs(lever) > 1e-9 else 0.0) * u_arb
-            F_pivot = -(F_push + F_spr + F_arb)
-            # ARB blade reacts the drop-link force into the CHASSIS at its pivot
-            # mount (the torsion bar carries the moment; the pivot carries the
-            # force) — sum of forces on the blade => pivot force = +F_arb.
             arb_piv = arb.get('arb_pivot')
             if arb_piv is not None:
                 arb_piv = np.asarray(arb_piv, float)
                 if lbl in ('FR', 'RR'):
                     arb_piv = arb_piv * np.array([-1.0, 1.0, 1.0])
+            fb = _loads.rocker_arb_freebody(
+                pushrod_inner=pi, pushrod_outer=po, pushrod_N=float(c.pushrod_N),
+                rocker_pivot=P, rocker_axis=axis,
+                rocker_spring_pt=sp, spring_chassis_pt=sc,
+                spring_force_N=float(c.spring_force_N),
+                arb_drop_top=dt, arb_arm_end=ae, arb_pivot=arb_piv)
+            F_push = fb['F_push']; F_spr = fb['F_spr']
+            F_arb = fb['F_arb']; F_pivot = fb['F_pivot']
             rows = [(pi, F_push, 'ROCKER · pushrod force', _C_RK),
                     (sp, F_spr, 'ROCKER · spring force', _C_RK),
                     (sc, -F_spr, 'CHASSIS · spring mount', _C_TEN),
@@ -296,33 +245,69 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
                     # chassis group is on, per the request.
                     (P, F_pivot, 'CHASSIS · rocker pivot mount', _C_TEN)]
             if arb_piv is not None:
+                # ARB blade reacts the drop-link force into the CHASSIS at its
+                # pivot mount (the torsion bar carries the moment; the pivot
+                # carries the force) — sum of forces on the blade => +F_arb.
                 rows.append((arb_piv, F_arb, 'ARB · chassis pivot mount', _C_ARB))
-            for pt, v, nm, col in rows:
-                if np.linalg.norm(v) < 1.0 or not np.all(np.isfinite(pt)):
-                    continue
-                items.append((np.asarray(pt, float), v, col,
-                              f'{lbl} {nm} · {np.linalg.norm(v):,.0f} N'))
-
-            # ── ARB BAR TORSION ────────────────────────────────────────────
-            # The only moment on this car that does NOT act at the wheel.
-            # Everywhere else the links end in spherical joints, which by
-            # definition carry no moment — that is exactly what makes the arms
-            # two-force members.  The anti-roll bar is the exception: it IS a
-            # torsion spring, so the drop-link force acting at the end of the
-            # arm twists the bar about its own axis.  The comment above already
-            # said "the torsion bar carries the moment"; it was just never
-            # emitted, which is why moments appeared only at the wheel.
-            if arb_piv is not None and np.linalg.norm(F_arb) > 1.0:
-                r_arm = np.asarray(ae, float) - arb_piv
-                M_arb = np.cross(r_arm, -F_arb)
-                bar_axis = np.array([1.0, 0.0, 0.0])   # the bar runs laterally
-                T_arb = float(M_arb @ bar_axis)
-                if abs(T_arb) > 1.0:
-                    items.append((arb_piv, T_arb * bar_axis, _C_MOM,
-                                  f'{lbl} ARB · bar TORSION about its own axis '
-                                  f'· {abs(T_arb):,.0f} N·m'))
         except Exception:
             pass
+        for pt, v, nm, col in rows:
+            if np.linalg.norm(v) < 1.0 or not np.all(np.isfinite(pt)):
+                continue
+            items.append((np.asarray(pt, float), v, col,
+                          f'{lbl} {nm} · {np.linalg.norm(v):,.0f} N'))
+
+        # ── MOMENTS (N·m, drawn double-headed along the moment axis) — ALL five
+        #    read from the core solver (vahan.loads.corner_moments).  The load
+        #    view only supplies the drawing DIRECTIONS (spin/fore-aft/kingpin/
+        #    vertical/bar axes); every VALUE comes from core (ONE MODEL), so the
+        #    binder and this view show identical numbers.
+        Fx = float(res.Fx.get(lbl, 0.0)); Fy = float(res.Fy.get(lbl, 0.0))
+        fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
+        fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
+        _tm = getattr(dyn, '_tire' if lbl[0] == 'F' else '_tire_rear', None)
+        mom = _loads.corner_moments(
+            Fx=Fx, Fy=Fy, Fz=float(res.Fz.get(lbl, 0.0)),
+            camber_deg=float(res.camber.get(lbl, 0.0)),
+            wheel_center=wc, spin_axis=spin,
+            lca_outer=st.lca_outer, uca_outer=st.uca_outer,
+            tire_model=_tm, freebody=fb)
+
+        # HUB brake/drive torque about the spin axis (reacted by the caliper
+        # couple front / the driveshaft rear).
+        T_hub = float(mom.get('hub_torque_Nm', 0.0))
+        if abs(T_hub) > 1.0:
+            items.append((wc, T_hub * spin, _C_MOM,
+                          f'{lbl} HUB · brake/drive torque (about axle) · {abs(T_hub):,.0f} N·m'))
+        # OVERTURNING moment about the fore-aft axis (reacted by the two wheel
+        # bearings as a vertical force couple).
+        M_ot = float(mom.get('overturning_Nm', 0.0))
+        if abs(M_ot) > 1.0:
+            items.append((wc, M_ot * fwd, _C_MOM,
+                          f'{lbl} BEARINGS · overturning moment · {abs(M_ot):,.0f} N·m'))
+        # STEERING moment about the kingpin axis through the two ball joints.
+        M_kp = mom.get('kingpin_Nm')
+        if M_kp is not None and abs(M_kp) > 1.0:
+            kp_a = np.asarray(st.lca_outer, float)
+            k = np.asarray(st.uca_outer, float) - kp_a
+            k = k / max(np.linalg.norm(k), 1e-9)
+            items.append((kp_a, float(M_kp) * k, _C_MOM,
+                          f'{lbl} STEERING · moment about kingpin axis · '
+                          f'{abs(M_kp):,.0f} N·m'))
+        # TYRE self-aligning torque Mz about the vertical.
+        _mz = mom.get('mz_Nm')
+        if _mz is not None and abs(_mz) > 1.0:
+            items.append((patch, np.array([0.0, 0.0, float(_mz)]), _C_MOM,
+                          f'{lbl} TYRE · self-aligning torque Mz · '
+                          f'{abs(_mz):,.0f} N·m'))
+        # ARB bar TORSION about its own (lateral) axis — the only moment on the
+        # car that does not act at the wheel.
+        T_arb = mom.get('arb_torsion_Nm')
+        if T_arb is not None and abs(T_arb) > 1.0 and arb_piv is not None:
+            bar_axis = np.array([1.0, 0.0, 0.0])   # the bar runs laterally
+            items.append((arb_piv, float(T_arb) * bar_axis, _C_MOM,
+                          f'{lbl} ARB · bar TORSION about its own axis '
+                          f'· {abs(T_arb):,.0f} N·m'))
     return items
 
 

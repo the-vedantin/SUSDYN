@@ -22,6 +22,12 @@ TTC/
 screenshots/tire_plots.png
 screenshots/*tire*grip*.png
 
+# Render/verify scratch dir.  It was untracked but NOT ignored — a public-repo
+# push hazard — and it holds TTC-DERIVED renders (Ackermann/MMD/Fy-vs-SA figures,
+# e.g. figs/ackpage_*.png, figs/mmd_*.png, figs/fzfy_*.png, figs/slip_load_force.png)
+# that must NOT ship.  Publishable, tyre-free app screenshots live in screenshots/.
+figs/
+
 # Reference spreadsheets (local only)
 sus_calc_ref/
 

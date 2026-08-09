@@ -163,15 +163,29 @@ def build_loads_table(solver, aero_Fz_per_g=None, ay_max=3.0, n=13):
 
 
 def _ackermann_split(delta_deg, ackermann_pct, t_f, L):
-    """Front steer split.  The 100% (kinematic) spread grows with the square
-    of steer:  spread ~ (t_f/L)*delta^2  [radians]; ackermann_pct scales it,
-    negative = reverse (outer steered more).  delta >= 0 = left turn = FL
-    inner."""
+    """Front steer split.  The 100% (kinematic) spread is the EXACT Ackermann
+    geometry — invert cot(d_out) - cot(d_in) = t_f/L about the mean steer, the
+    same relation vahan/ackermann._turn_geometry enforces, so YMD and the core
+    solver share ONE geometry (was a (t_f/L)*delta^2 small-angle stand-in that
+    drifted ~1% at 10 deg and more at the limit).  ackermann_pct scales the
+    spread, negative = reverse (outer steered more).  delta >= 0 = left turn =
+    FL inner."""
     d = float(delta_deg)
-    spread = (math.degrees((t_f / L) * math.radians(abs(d)) ** 2)
-              * (float(ackermann_pct) / 100.0) * (1.0 if d >= 0.0 else -1.0))
-    d_in, d_out = d + spread / 2.0, d - spread / 2.0
-    return (d_in, d_out) if d >= 0.0 else (d_out, d_in)     # (FL, FR)
+    ad = abs(d)
+    if ad < 1e-9:
+        return (d, d)
+    # Split in the COTANGENT domain about the mean steer (the domain
+    # _turn_geometry works in): cot(d_in) = cot(d) - off, cot(d_out) =
+    # cot(d) + off, with off = (t_f/2L)*(pct/100).  Then
+    # cot(d_out) - cot(d_in) = (t_f/L)*(pct/100) EXACTLY — the kinematic
+    # Ackermann relation at 100%, parallel at 0%, reverse (outer steered more)
+    # when negative.  The inner wheel turns the larger angle for +pct.
+    cot_m = 1.0 / math.tan(math.radians(ad))
+    off = (t_f / (2.0 * L)) * (float(ackermann_pct) / 100.0)
+    d_in = math.degrees(math.atan2(1.0, cot_m - off))     # inner (larger @ +pct)
+    d_out = math.degrees(math.atan2(1.0, cot_m + off))    # outer (smaller @ +pct)
+    # sign/side: left turn (d >= 0) -> FL is inner; right turn -> FR is inner.
+    return (d_in, d_out) if d >= 0.0 else (-d_out, -d_in)   # (FL, FR)
 
 
 def ymd_state(tire_model, solver, beta_deg, delta_deg, *,

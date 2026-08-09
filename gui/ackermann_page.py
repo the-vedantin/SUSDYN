@@ -57,6 +57,11 @@ _TICK = '#8a8177'
 _TEXT = '#d8d2c8'
 _FIG_BG = '#0b0b0c'
 _AX_BG = '#111014'
+# Impeccable TEXT/UI accent (docs/DESIGN.md) — used for page title, section
+# eyebrows, captions and the primary button.  NOT a plot colour: _YEL stays on
+# the graph LINES (the user asked to change fonts/text only, not graph colours).
+_ACCENT = '#E23B48'     # Impeccable red — text/UI emphasis (replaces yellow text)
+_INK    = '#ECECEE'     # primary text
 
 # Fixed radii for the per-corner demand plot: FSAE hairpins are 3-9 m, the
 # skidpad path is about 8 m, and 12 m stands in for a fast sweeper.  Colour
@@ -135,7 +140,7 @@ class _Slot(QFrame):
         lay.setSpacing(2)
 
         self._cap = QLabel(caption)
-        self._cap.setStyleSheet('color:#FFD600; font-size:11px; '
+        self._cap.setStyleSheet(f'color:{_ACCENT}; font-size:11px; '
                                 'font-weight:bold;')
         self._cap.setWordWrap(True)
         lay.addWidget(self._cap)
@@ -431,9 +436,22 @@ class AckermannPage(QWidget):
 
         side = QVBoxLayout(); side.setSpacing(6)
 
+        title_row = QHBoxLayout(); title_row.setSpacing(6)
         title = QLabel('ACKERMANN')
-        title.setStyleSheet('color:#FFD600; font-size:15px; font-weight:bold;')
-        side.addWidget(title)
+        title.setStyleSheet(f'color:{_ACCENT}; font-size:15px; font-weight:bold; '
+                            'letter-spacing:1px;')
+        title_row.addWidget(title)
+        beta = QLabel('BETA')
+        beta.setStyleSheet(
+            f'color:#ffffff; background:{_ACCENT}; font-size:9px; '
+            'font-weight:bold; letter-spacing:1px; padding:1px 6px; '
+            'border-radius:3px;')
+        beta.setToolTip('This whole page is BETA — the slip-matched ideal, the '
+                        'per-station lap cap and the aero coupling are under '
+                        'active validation. Read the numbers as directional.')
+        title_row.addWidget(beta)
+        title_row.addStretch(1)
+        side.addLayout(title_row)
 
         sub = QLabel('Five methods, one page.  Degrees are the answer; the '
                      'percentage is only shown while its reference means '
@@ -444,8 +462,8 @@ class AckermannPage(QWidget):
 
         def hdr(text):
             l = QLabel(text)
-            l.setStyleSheet('color:#FFD600; font-size:11px; font-weight:bold;'
-                            'padding-top:6px;')
+            l.setStyleSheet(f'color:{_ACCENT}; font-size:11px; font-weight:bold;'
+                            'letter-spacing:0.5px; padding-top:6px;')
             side.addWidget(l)
 
         def grid():
@@ -484,6 +502,12 @@ class AckermannPage(QWidget):
                            'transfer, and therefore the two front wheel '
                            'loads, from the solved car.')
         self._aero = QCheckBox('Include aero downforce')
+        # Aero ON by default: the car's real package (F_ref from config) is part
+        # of the car, so every Ackermann analysis should carry it unless the
+        # user deliberately turns it off.  The helper it routes through
+        # (main_window._get_aero_Fz_per_g) now falls back to that real package
+        # even when the inverse aero solver has not been run.
+        self._aero.setChecked(True)
         self._aero.setStyleSheet('QCheckBox { font-size:11px; }')
         self._aero.setToolTip(
             'Adds downforce at each row’s speed (speed follows from radius + '
@@ -546,12 +570,46 @@ class AckermannPage(QWidget):
 
         self._btn = QPushButton('►  ANALYSE')
         self._btn.setStyleSheet(
-            'QPushButton { background:#FFD600; color:#0a0a0a; padding:10px;'
+            f'QPushButton {{ background:{_ACCENT}; color:#ffffff; padding:10px;'
             ' font-weight:bold; font-size:13px; border-radius:4px; }'
-            'QPushButton:hover { background:#FFEB3B; }'
+            'QPushButton:hover { background:#ef5867; }'
             'QPushButton:disabled { background:#3a3a3a; color:#777; }')
         self._btn.clicked.connect(self._on_analyse)
         side.addWidget(self._btn)
+
+        # THE decision view — reads every metric at ONE honest operating point
+        # and tells you which Ackermann to run + debunks the 100%-at-limit scam.
+        self._decide_btn = QPushButton('◆  DECIDE ACKERMANN  ◆')
+        self._decide_btn.setStyleSheet(
+            f'QPushButton {{ background:{_ACCENT}; color:#ffffff; padding:9px;'
+            ' font-weight:bold; font-size:12px; border-radius:4px; }'
+            'QPushButton:hover { background:#ef5867; }'
+            'QPushButton:disabled { background:#3a3a3a; color:#777; }')
+        self._decide_btn.setToolTip(
+            'The ideal Ackermann % vs lateral g (aero applied), with the g band '
+            'this car actually pulls in corners shaded (avg→peak, from a '
+            'no-Ackermann lap sim), plus grip ceiling and self-recovery per '
+            'setting. Read the ideal % at your band. RCVD Ch 8/19.  BETA.')
+        self._decide_btn.clicked.connect(self._on_decide_ackermann)
+        side.addWidget(self._decide_btn)
+
+        # THE written justification — the DECIDE reading turned into a
+        # self-contained, RCVD-cited HTML report a scrutineer/teammate can read
+        # without the app.  Every number recomputed live (one model); TTC-clean.
+        self._report_btn = QPushButton('■  GENERATE JUSTIFICATION REPORT')
+        self._report_btn.setStyleSheet(
+            f'QPushButton {{ background:{_ACCENT}; color:#ffffff; padding:9px;'
+            ' font-weight:bold; font-size:12px; border-radius:4px; }'
+            'QPushButton:hover { background:#ef5867; }'
+            'QPushButton:disabled { background:#3a3a3a; color:#777; }')
+        self._report_btn.setToolTip(
+            'Writes figs/ackermann_justification.html — the KEEP-slight-reverse '
+            'decision with every number recomputed live from this car (ideal '
+            'Ackermann vs g, grip-ceiling tie, per-tyre limit slip), RCVD-cited, '
+            'and a self-consistency check that refuses to assert the conclusion '
+            'if the live limit-want is not reverse. Opens when done.  BETA.')
+        self._report_btn.clicked.connect(self._on_generate_report)
+        side.addWidget(self._report_btn)
 
         self._ymd_btn = QPushButton('YMD GRID  +100% → −70%')
         self._ymd_btn.setStyleSheet(BTN_SECONDARY)
@@ -572,8 +630,7 @@ class AckermannPage(QWidget):
             'draws it (same car, same speed/toe/ARB inputs), one tab per '
             'Ackermann setting: +100 / +70 / +50 / +30 / 0 / -30 / -70 %. '
             'PNGs saved to figs/.')
-        self._mmd_btn.clicked.connect(
-            lambda: self._main._on_plot_mmd_ack_sweep())
+        self._mmd_btn.clicked.connect(self._on_mmd_sweep)
         mmd_row.addWidget(self._mmd_btn, 1)
         self._mmd_info = QPushButton('ⓘ')
         self._mmd_info.setFixedSize(26, 26)
@@ -593,6 +650,18 @@ class AckermannPage(QWidget):
         self._status.setStyleSheet('color:#8a8a92; font-size:11px;')
         self._status.setWordWrap(True)
         side.addWidget(self._status)
+
+        # Operating-point readout: the g the car ACTUALLY pulls in corners,
+        # from a no-Ackermann lap sim (LapResult.avg_corner_lat_g / peak_lat_g).
+        # Filled the first time DECIDE runs; that is the g band the money graph
+        # shades, so the user reads "for the g I pull, run this Ackermann".
+        self._opband_lbl = QLabel('operating g: press ◆ DECIDE ◆ to measure')
+        self._opband_lbl.setStyleSheet(
+            "color:#e8e8ec; font-family:'Consolas','SF Mono',monospace;"
+            'font-size:11px; background:#0e0e10; padding:6px;'
+            'border:1px solid #2a2a2a; border-radius:4px;')
+        self._opband_lbl.setWordWrap(True)
+        side.addWidget(self._opband_lbl)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet('color:#2a2a2a;')
@@ -694,18 +763,10 @@ class AckermannPage(QWidget):
             [-100, -60, -30, 0, 30, 45, 60, 100])))[:10]
         aero = None
         if self._aero.isChecked():
-            # ONE aero path: the getter the dynamics view uses.  It gates on
-            # the Apply Aero toggle; the checkbox HERE is the user asking for
-            # aero, so lift the gate just for the read (same as
+            # ONE aero path: the car's real package, sized at the analysis
+            # radius (_ack_aero lifts the Apply-Aero gate for the read, same as
             # main_window._on_solve_ackermann).
-            was = getattr(self._main, '_aero_active', False)
-            try:
-                self._main._aero_active = True
-                aero = self._main._get_aero_Fz_per_g()
-            except Exception:
-                aero = None
-            finally:
-                self._main._aero_active = was
+            aero = self._ack_aero(float(self._radius.value()))
             if not aero:
                 self._status.setText(
                     'Aero requested but no package data — run the aero target '
@@ -804,6 +865,104 @@ class AckermannPage(QWidget):
             traceback.print_exc()
             self._status.setText(f'Draw failed on {key}: {e}')
 
+    # ── reusable popup plumbing (hover, BETA title, aero, operating g) ────
+    @staticmethod
+    def _beta_title(base: str) -> str:
+        """Every popup on this BETA page wears the badge in its title bar."""
+        return f'[BETA]  {base}'
+
+    def _attach_hover(self, canvas):
+        """Attach the ONE reusable value-readout hover helper (HoverAnnotator,
+        gui/main_window) to a popup canvas: on mouse-move it snaps to the
+        nearest sample and shows x + every curve's y, with the axis-label units.
+        The instance is stashed so Qt/GC does not collect it while the dialog
+        lives."""
+        try:
+            from gui.main_window import HoverAnnotator
+        except Exception:
+            return
+        if not hasattr(self, '_popup_hovers'):
+            self._popup_hovers = []
+        self._popup_hovers.append(HoverAnnotator(canvas))
+
+    def _ack_aero(self, radius_m: float):
+        """The car's REAL aero, sized at this corner radius, applied BY DEFAULT
+        on this page.  Lifts the Apply-Aero gate for the read exactly like
+        _cfg()/main_window._on_solve_ackermann, so aero couples in even when the
+        Dynamics toggle is off on load.  Returns the per-corner N-per-g dict or
+        None."""
+        mw = self._main
+        was = getattr(mw, '_aero_active', False)
+        try:
+            mw._aero_active = True
+            aero = mw._get_aero_Fz_per_g(radius_m=float(radius_m))
+        except Exception:
+            aero = None
+        finally:
+            mw._aero_active = was
+        return aero or None
+
+    def _measure_corner_g_band(self, solver):
+        """The g the car ACTUALLY pulls, from a NO-ACKERMANN lap sim: mean
+        cornering lateral g (LapResult.avg_corner_lat_g, straights excluded)
+        and peak (peak_lat_g), averaged/maxed over every track.  Cached — the
+        lap sim is blind to Ackermann, so this band does not move with the
+        setting and is computed once per session.  Returns (avg_g, peak_g, n)
+        or None."""
+        cached = getattr(self, '_corner_g_band', None)
+        if cached is not None:
+            return cached
+        from vahan.laptime import Track, LapSimulator
+        from gui.laptime_page import _TRACKS
+        veh = solver._veh
+        base = float(self._lap_grip.value())
+        avgs, peaks = [], []
+        for _label, fname in _TRACKS:
+            path = os.path.join(_repo_root(), 'tracks', fname)
+            if not os.path.isfile(path):
+                continue
+            tr = Track.from_json(path)
+            sim = LapSimulator(
+                solver, cla_m2=0.0, cda_m2=float(veh.cda_m2),
+                air_density=float(veh.air_density_kg_m3),
+                aero_cop_rear_frac=0.5, grip_scale=base,
+                static_rh_front_mm=50.0, static_rh_rear_mm=50.0)
+            sim.set_gearbox([2.750, 2.000, 1.667, 1.444, 1.304, 1.208],
+                            primary_ratio=1.0, final_drive=3.545,
+                            redline_rpm=11000.0)
+            r = sim.simulate(tr, n_detail=8)
+            if np.isfinite(r.avg_corner_lat_g) and r.avg_corner_lat_g > 0:
+                avgs.append(float(r.avg_corner_lat_g))
+                peaks.append(float(r.peak_lat_g))
+        if not avgs:
+            return None
+        band = (float(np.mean(avgs)), float(np.max(peaks)), len(avgs))
+        self._corner_g_band = band
+        self._opband_lbl.setText(
+            f'operating g (no-Ackermann lap, {band[2]} track'
+            f'{"s" if band[2] != 1 else ""}):\n'
+            f'  corner avg {band[0]:.2f} g   ·   peak {band[1]:.2f} g\n'
+            'this is the band the money graph shades')
+        return band
+
+    def _on_mmd_sweep(self):
+        """Run the app MMD sweep (owned by main_window) then DECORATE the dialog
+        it opens: prepend the BETA badge to the title and attach the hover
+        readout to every tab's canvas — without editing the MMD method."""
+        from PyQt6.QtWidgets import QDialog
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as _C
+        before = set(self._main.findChildren(QDialog))
+        self._main._on_plot_mmd_ack_sweep()
+        for dlg in self._main.findChildren(QDialog):
+            if dlg in before:
+                continue
+            if 'MMD' not in dlg.windowTitle():
+                continue
+            if not dlg.windowTitle().startswith('[BETA]'):
+                dlg.setWindowTitle(self._beta_title(dlg.windowTitle()))
+            for cv in dlg.findChildren(_C):
+                self._attach_hover(cv)
+
     def _on_ymd_grid(self):
         """Run vahan.analysis_plots.plot_ymd_ackermann_grid on the ONE
         solved model and show it in a dialog.  Heavy (~1-2 min)."""
@@ -816,8 +975,9 @@ class AckermannPage(QWidget):
             tm = mw._tire_model
             if tm is None:
                 raise RuntimeError('no tyre model loaded')
-            aero = (mw._get_aero_Fz_per_g()
-                    if self._aero.isChecked() else None)
+            # Aero applied BY DEFAULT (the car's real package, sized at this
+            # radius) — no longer gated on the sidebar checkbox.
+            aero = self._ack_aero(float(self._radius.value()))
             self._ymd_btn.setEnabled(False)
             self._ymd_btn.setText('solving… (~1-2 min)')
             from PyQt6.QtWidgets import QApplication as _QA
@@ -828,8 +988,8 @@ class AckermannPage(QWidget):
                 grip_multiplier=float(self._grip.value()),
                 aero_Fz_per_g=aero, fig=fig)
             dlg = QDialog(self)
-            dlg.setWindowTitle('YMD vs Ackermann — balance, control, '
-                               'stability')
+            dlg.setWindowTitle(self._beta_title(
+                'YMD vs Ackermann — balance, control, stability'))
             dlg.resize(1400, 900)
             dlg.setStyleSheet('QDialog { background:#0e0e11; }')
             lay = QVBoxLayout(dlg)
@@ -862,11 +1022,18 @@ class AckermannPage(QWidget):
                     f"{r['control_moment_avail_Nm']:8.0f}       "
                     f"{r['limit_character']}")
             rows.append('')
-            rows.append(' How to read (RCVD Ch 8): T = max grip on the trim '
-                        'line; stability index must be NEGATIVE (p308); '
-                        'control-avail = yaw the steering can still command '
-                        '(bigger = more authority, p321); character from the '
-                        'apex point P (p306): PLOW is the safe race target.')
+            rows.append(' WHAT EACH DOES (RCVD Ch 8): TRIM g = the most cornering '
+                        'the setting can hold (bigger = more grip). STABILITY idx '
+                        '= how hard the car straightens out of a slide (more '
+                        'negative = straightens harder, needs more lock to '
+                        'rotate; p308). CONTROL avail = yaw the steering can still '
+                        'add near the limit to rotate/correct (bigger = more '
+                        'authority; p321). LIMIT CHARACTER = which end lets go '
+                        'first (PLOW = runs wide/front, safe; SPIN = snaps '
+                        'oversteer/rear; NEUTRAL = all four slide).')
+            rows.append(' NOTE: "100% best at the limit" is a myth — at the limit '
+                        'the fronts saturate and every setting ties; use ◆ DECIDE '
+                        'ACKERMANN ◆ for the honest sub-limit read.')
             _spread = float(_np.nanmax(_t) - _np.nanmin(_t))
             rows.append(f' Trim-grip spread across the sweep: {_spread:.3f} g '
                         + ('(settings SEPARATE on grip)' if _spread > 0.012
@@ -879,7 +1046,9 @@ class AckermannPage(QWidget):
                 'background:#0e0e10; color:#e8e8ec; '
                 'border:1px solid #2a2a2a; border-radius:4px;')
             lay.addWidget(txt)
-            lay.addWidget(FigureCanvas(fig))
+            _cv = FigureCanvas(fig)
+            lay.addWidget(_cv)
+            self._attach_hover(_cv)
             dlg.show()
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -887,6 +1056,359 @@ class AckermannPage(QWidget):
         finally:
             self._ymd_btn.setEnabled(True)
             self._ymd_btn.setText('YMD GRID  +100% → −70%')
+
+    def _on_decide_ackermann(self):
+        """THE decision panel (BETA).  PRIMARY graph: the slip-matched ideal
+        Ackermann % vs lateral g (aero-correct), with the car's ACTUAL corner-g
+        band (avg→peak, from a no-Ackermann lap sim) shaded so the reader lands
+        on "for the g I pull, run this Ackermann".  Two supporting panels: grip
+        ceiling and self-recovery per setting.  Everything is a Vahan feature
+        that CALLS the solver (ackermann_bucket + mmm_metrics_sweep, aero
+        threaded; RCVD Ch 8/19) — nothing hardcoded.  The caption states the
+        CONDITIONS only; the graphs give the reading, not advice."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel,
+                                     QApplication as _QA)
+        from matplotlib.figure import Figure
+        from vahan.ackermann import ackermann_bucket
+        from vahan.ymd import mmm_metrics_sweep, build_loads_table
+        import numpy as _np
+        mw = self._main
+        try:
+            ss = mw._build_dynamics_solver()
+            tm = mw._tire_model
+            if tm is None:
+                raise RuntimeError('no tyre model loaded')
+            grip = float(self._grip.value())
+            R = float(self._radius.value())
+            pcts = [-100, -60, -30, 0, 30, 60, 100]
+            # Fine g sweep for a smooth ideal curve; runs past the grip limit so
+            # the saturated tail shows up as a NaN gap, not a fabricated point.
+            glist = [float(g) for g in _np.round(_np.arange(0.4, 2.001, 0.1), 2)]
+            self._decide_btn.setEnabled(False)
+            self._decide_btn.setText('deciding… (~1 min)')
+            _QA.processEvents()
+
+            # Aero applied BY DEFAULT — the car's real package, sized at R.
+            aero = self._ack_aero(R)
+
+            # (1) THE money graph: slip-matched ideal Ackermann % vs g (aero on)
+            bucket = ackermann_bucket(tm, ss, radius_m=R, lat_g_list=tuple(glist),
+                                      grip_multiplier=grip, aero=aero or False)
+            want_g, want_pct = [], []
+            sat_from = None
+            for g, row in zip(glist, bucket):
+                if (row.get('valid', True)
+                        and _np.isfinite(row.get('ackermann_pct', _np.nan))):
+                    want_g.append(g); want_pct.append(float(row['ackermann_pct']))
+                elif sat_from is None:
+                    sat_from = g
+
+            # (2)+(3) grip ceiling + self-recovery per setting (aero on)
+            tbl = build_loads_table(ss, aero_Fz_per_g=aero)
+            mm = mmm_metrics_sweep(tm, ss, pcts, radius_m=R,
+                                   grip_multiplier=grip, aero_Fz_per_g=aero,
+                                   loads_table=tbl)
+            ay = _np.array([r['ay_trim_max'] for r in mm], float)
+            stab = _np.array([r['stability_index'] for r in mm], float)
+            mpct = _np.array([r['ackermann_pct'] for r in mm], float)
+
+            # (4) operating band: the g the car actually pulls (no-Ackermann lap)
+            self._status.setText('DECIDE: measuring corner g (lap sim)…')
+            _QA.processEvents()
+            band = self._measure_corner_g_band(ss)
+
+            # ── THE ONE RANKED CALL, computed live (RCVD Ch 19 p716) ─────────
+            # Reconciles the three panels: grip ceiling (is Ackermann a grip
+            # lever?), ideal-vs-g (what the tyres want at avg vs limit), and
+            # self-recovery (character).  Nothing here is hardcoded — every
+            # number is read from the sweeps above.
+            # TIE TEST — is Ackermann a GRIP lever?  RELATIVE to the ceiling,
+            # not an absolute solver-jitter floor: the audit's basis is the
+            # FLAT tyre peak (peak-slip rises ~2 deg over 1000 N), so a span
+            # that is a few % of a ~1.5 g ceiling is within skidpad run-to-run
+            # scatter — no real grip to chase (RCVD Ch 19 p716).  10% of grip
+            # is the "worth chasing" line; below it the settings tie.
+            GRIP_TIE_FRAC = 0.10
+            grip_span = float(_np.nanmax(ay) - _np.nanmin(ay))
+            grip_ceil = float(_np.nanmean(ay))
+            grip_span_pct = 100.0 * grip_span / max(grip_ceil, 1e-9)
+            grip_ties = grip_span <= GRIP_TIE_FRAC * grip_ceil
+            # ideal % the tyres want at the two operating points: pro at the
+            # sub-limit average, reverse near the limit (this car).
+            ideal_avg = ideal_peak = None
+            avg_g = peak_g = None
+            peak_saturated = False
+            if band is not None and want_g:
+                avg_g, peak_g, _ntr = band
+                ideal_avg = float(_np.interp(avg_g, want_g, want_pct))
+                # the peak can sit PAST the saturation edge (tyres let go
+                # before that g) — then the honest "limit want" is the last g
+                # the tyres can still hold, not an extrapolated point.
+                _pk = peak_g
+                if peak_g > want_g[-1]:
+                    peak_saturated = True
+                    _pk = want_g[-1]
+                ideal_peak = float(_np.interp(_pk, want_g, want_pct))
+                peak_g_used = _pk
+            # as-built setting, probed live (not hardcoded) so the call can say
+            # whether the car already sits in the defensible band.
+            try:
+                asb = float(mw._probe_static_ackermann())
+            except Exception:
+                asb = float('nan')
+            # limit character from the self-recovery sweep: does reverse
+            # straighten harder than pro (more-negative stability index)?
+            try:
+                _stab_rev = float(stab[int(_np.nanargmin(mpct))])
+                _stab_pro = float(stab[int(_np.nanargmax(mpct))])
+            except Exception:
+                _stab_rev = _stab_pro = float('nan')
+
+            fig = Figure(figsize=(15.0, 6.4), facecolor=_FIG_BG)
+            gs = fig.add_gridspec(2, 3, hspace=0.42, wspace=0.30)
+
+            def _style(ax, xlab, ylab, title):
+                ax.set_facecolor(_AX_BG)
+                ax.set_title(title, color=_TEXT, fontsize=10.5,
+                             fontweight='bold')
+                ax.set_xlabel(xlab, color=_TICK, fontsize=9)
+                ax.set_ylabel(ylab, color=_TICK, fontsize=9)
+                ax.tick_params(colors=_TICK, labelsize=8)
+                ax.grid(True, color=_GRID, lw=0.6)
+                for sp in ax.spines.values():
+                    sp.set_color(_GRID)
+
+            # ── PRIMARY: ideal Ackermann vs g, with the operating band ────────
+            axm = fig.add_subplot(gs[:, 0:2])
+            _style(axm, 'lateral acceleration (g)',
+                   'ideal Ackermann the tyres want (%)',
+                   'IDEAL ACKERMANN vs HOW HARD YOU CORNER')
+            axm.axhline(100, color=_RED, ls='--', lw=1.2)
+            axm.text(glist[0], 100, ' 100% = zero-slip (parking-lot) ideal',
+                     color=_RED, fontsize=8, va='bottom')
+            axm.axhline(0, color=_DIM, lw=1.0)
+            axm.text(glist[-1], 0, 'parallel steer (0%) ', color=_DIM,
+                     fontsize=8, ha='right', va='bottom')
+            if want_g:
+                axm.plot(want_g, want_pct, color=_WHT, lw=2.0, marker='o',
+                         ms=3, label='ideal (slip-matched)')
+            # operating-g band (avg→peak) shaded, with BOTH operating points
+            # marked: the sub-limit AVERAGE (pro) and the LIMIT/peak (reverse).
+            # Neither is headlined as "the" answer — the tyres want opposite
+            # things at the two ends, which is the whole point of the call box.
+            if band is not None:
+                avg_g, peak_g, ntr = band
+                axm.axvspan(avg_g, peak_g, color=_WGY, alpha=0.16, lw=0,
+                            zorder=0)
+                axm.axvline(avg_g, color=_WHT, ls=':', lw=1.4)
+                axm.axvline(peak_g, color=_RED, ls=':', lw=1.4)
+                axm.text(avg_g, axm.get_ylim()[0], f' avg {avg_g:.2f} g',
+                         color=_WHT, fontsize=8, ha='left', va='bottom')
+                axm.text(peak_g, axm.get_ylim()[0], f'peak {peak_g:.2f} g ',
+                         color=_RED, fontsize=8, ha='right', va='bottom')
+                if want_g:
+                    # AVG point (sub-limit): pro — but RCVD says this regime
+                    # barely sets lap time, so it is drawn plainly, not in red.
+                    if ideal_avg is not None:
+                        axm.plot([avg_g], [ideal_avg], 'o', color=_WHT, ms=6,
+                                 zorder=6)
+                        axm.annotate(f'avg → {ideal_avg:+.0f}% (sub-limit)',
+                                     xy=(avg_g, ideal_avg), xytext=(8, 0),
+                                     textcoords='offset points', color=_WHT,
+                                     fontsize=8.5, va='center')
+                    # LIMIT point: the character-setting want (reverse here).
+                    if ideal_peak is not None:
+                        _pg = peak_g_used
+                        axm.plot([_pg], [ideal_peak], 'o', color=_RED, ms=7,
+                                 zorder=7)
+                        _lbl = (f'limit → {ideal_peak:+.0f}%'
+                                + (' (tyres saturate here)' if peak_saturated
+                                   else ''))
+                        axm.annotate(_lbl, xy=(_pg, ideal_peak), xytext=(8, 0),
+                                     textcoords='offset points', color=_RED,
+                                     fontsize=9, fontweight='bold', va='center')
+            if sat_from is not None:
+                axm.axvspan(sat_from, glist[-1] + 0.02, color=_RED, alpha=0.09,
+                            zorder=0)
+                axm.text(0.5 * (sat_from + glist[-1]), axm.get_ylim()[1],
+                         'beyond here tyres saturate', color=_RED, fontsize=8,
+                         ha='center', va='top')
+            axm.set_xlim(glist[0] - 0.02, glist[-1] + 0.02)
+
+            # ── grip ceiling ────────────────────────────────────────────────
+            axg = fig.add_subplot(gs[0, 2])
+            _style(axg, 'Ackermann %', 'max cornering it holds (g)',
+                   'GRIP CEILING per setting')
+            axg.plot(mpct, ay, color=_WGY, lw=1.8, marker='s', ms=3)
+            _spread = float(_np.nanmax(ay) - _np.nanmin(ay))
+            _mid = float(_np.nanmean(ay))
+            axg.set_ylim(_mid - 0.25, _mid + 0.25)
+            axg.text(0.5, 0.93,
+                     f'span {_spread:.3f} g = {grip_span_pct:.0f}% of grip, '
+                     f'−100..+100%',
+                     transform=axg.transAxes, ha='center', va='top',
+                     color=_TEXT, fontsize=8)
+            # State the tie explicitly — a near-flat curve is the WHOLE argument
+            # that Ackermann is not a grip lever (RCVD Ch 19 p716).
+            axg.text(0.5, 0.80,
+                     (f'TIE ({grip_span_pct:.0f}% ≤ {GRIP_TIE_FRAC*100:.0f}%) '
+                      '— NOT a grip lever' if grip_ties
+                      else 'settings SEPARATE on grip'),
+                     transform=axg.transAxes, ha='center', va='top',
+                     color=_RED if grip_ties else _WHT, fontsize=8.5,
+                     fontweight='bold')
+
+            # ── self-recovery ───────────────────────────────────────────────
+            axs = fig.add_subplot(gs[1, 2])
+            _style(axs, 'Ackermann %', 'stability index dCN/dAy',
+                   'SELF-RECOVERY per setting')
+            axs.plot(mpct, stab, color=_WHT, lw=1.8, marker='o', ms=3)
+            axs.axhline(0, color=_RED, lw=0.9)
+            axs.text(0.02, 0.06, 'more negative = straightens harder (RCVD p308)',
+                     transform=axs.transAxes, color=_WGY, fontsize=7.5)
+
+            # ── CONDITIONS caption (facts only — no advice) ──────────────────
+            tid = str(getattr(tm, 'tire_id', '?'))
+            psi = float(getattr(tm, 'pressure_psi', 0.0) or 0.0)
+            psi_s = f'{psi:.1f} psi' if psi > 0 else 'blended psi'
+            if aero:
+                cap = mw._dynamics_panel.get_custom_aero_params()
+                aero_s = (f'aero ON — ref {cap["F_ref_N"]:.0f} N @ '
+                          f'{cap["V_ref_kph"]:.0f} km/h, '
+                          f'{cap["cop_rear_pct"]:.0f}% rear (V²-scaled to R)')
+            else:
+                aero_s = 'aero OFF (no package data)'
+            if band is not None:
+                op_s = (f'operating point: corner avg {band[0]:.2f} g, '
+                        f'peak {band[1]:.2f} g (no-Ackermann lap, '
+                        f'{band[2]} track{"s" if band[2] != 1 else ""})')
+            else:
+                op_s = 'operating point: lap sim unavailable'
+            caption = (
+                f'CONDITIONS — radius {R:.0f} m  ·  tyre {tid} @ {psi_s}  ·  '
+                f'grip road ×{grip:.2f} (belt→asphalt derate)  ·  {aero_s}  ·  '
+                f'{op_s}  ·  slip-matched ideal per RCVD Ch 8 (Ackermann '
+                f'geometry) + Ch 19 (pair/slip).  The shaded band is the g this '
+                f'car pulls; read the ideal % there.  '
+                f'RIGID-SYSTEM numbers — measure steer–steer compliance on the '
+                f'car before committing (RCVD Ch 19 p717).')
+
+            # ── THE ONE RANKED CALL (reconciles all three panels, live) ──────
+            _asb_s = (f'{asb:+.1f}%' if _np.isfinite(asb) else 'probe failed')
+            if grip_ties:
+                # grip is silent → weigh limit character vs pit-pushability
+                if ideal_peak is not None and ideal_peak < -3.0:
+                    _call = 'PARALLEL to SLIGHT-REVERSE'
+                    _why = ('limit corners want reverse; zero-speed/parking '
+                            'wants pro — split the difference toward the limit')
+                elif ideal_peak is not None and ideal_peak > 3.0:
+                    _call = 'SLIGHT-PRO to PARALLEL'
+                    _why = ('even the limit still wants a little pro; keep it '
+                            'modest for pit pushability')
+                else:
+                    _call = 'PARALLEL (near 0%)'
+                    _why = 'the limit want sits on parallel'
+            else:
+                _kbest = int(_np.nanargmax(ay))
+                _call = f'{mpct[_kbest]:+.0f}% (grip SEPARATES — follow the ceiling)'
+                _why = 'the grip ceiling is not flat here, so grip decides'
+            _avg_s = (f'{ideal_avg:+.0f}% at avg {avg_g:.2f} g'
+                      if ideal_avg is not None else 'n/a')
+            _lim_s = (f'{ideal_peak:+.0f}% at limit '
+                      f'{peak_g_used:.2f} g{" (saturated)" if peak_saturated else ""}'
+                      if ideal_peak is not None else 'n/a')
+            verdict = (
+                f'RANKED CALL  →  {_call}\n'
+                f'1. GRIP is a {"TIE" if grip_ties else "SPLIT"} — max cornering '
+                f'spans only {grip_span:.3f} g = {grip_span_pct:.0f}% of the '
+                f'{grip_ceil:.2f} g ceiling across −100..+100% '
+                f'({"within skidpad scatter, flat tyre peak" if grip_ties else "a real, chase-able grip difference"}). '
+                f'{"Ackermann is NOT a grip lever (RCVD Ch 19 p716)." if grip_ties else "Grip decides here."}\n'
+                f'2. The tyres want OPPOSITE things by regime: sub-limit {_avg_s} '
+                f'(pro) vs {_lim_s} (reverse). RCVD Ch 19 p716: the sub-limit '
+                f'regime barely sets lap time — do NOT headline the avg-g pro number.\n'
+                f'3. Decide on CHARACTER + USE — {_why}. As-built probes '
+                f'{_asb_s}.')
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle(self._beta_title(
+                'Decide Ackermann — ideal % for the g you actually pull'))
+            dlg.resize(1500, 900)
+            dlg.setStyleSheet('QDialog { background:#0e0e11; }')
+            lay = QVBoxLayout(dlg)
+            cap_lbl = QLabel(caption)
+            cap_lbl.setWordWrap(True)
+            cap_lbl.setStyleSheet(
+                "color:#d8d2c8; font-family:'Consolas','SF Mono',monospace;"
+                'font-size:11px; background:#0e0e10; padding:8px;'
+                'border:1px solid #2a2a2a; border-radius:4px;')
+            lay.addWidget(cap_lbl)
+            # The ranked call sits BETWEEN the conditions and the graphs: it is
+            # the reconciled reading, not another condition, so it is styled as
+            # a verdict (warm border) and kept separate from the facts caption.
+            verdict_lbl = QLabel(verdict)
+            verdict_lbl.setWordWrap(True)
+            verdict_lbl.setStyleSheet(
+                "color:#f0ece4; font-family:'Consolas','SF Mono',monospace;"
+                'font-size:11.5px; background:#161310; padding:9px;'
+                'border:1px solid #E53935; border-radius:4px;')
+            lay.addWidget(verdict_lbl)
+            _cv = FigureCanvas(fig)
+            lay.addWidget(_cv, 1)
+            self._attach_hover(_cv)
+            dlg.show()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            mw.statusBar().showMessage(f'Decide Ackermann: {e}', 8000)
+        finally:
+            self._decide_btn.setEnabled(True)
+            self._decide_btn.setText('◆  DECIDE ACKERMANN  ◆')
+
+    def _on_generate_report(self):
+        """Build the Ackermann JUSTIFICATION REPORT (self-contained HTML) from
+        THIS car and open it.  Every number is recomputed live by the generator
+        (vahan.ackermann_report, which only calls the solver — one model); the
+        report itself prints a PREMISE FAILED box if the live limit-want is not
+        reverse, so nothing here needs to pre-judge the outcome."""
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtWidgets import QApplication as _QA
+        from vahan.ackermann_report import build_ackermann_report
+        mw = self._main
+        if getattr(mw, '_tire_model', None) is None:
+            self._status.setText('Load tyre data on the Dynamics panel first — '
+                                 'the report recomputes the measured curve.')
+            return
+        try:
+            self._report_btn.setEnabled(False)
+            self._report_btn.setText('generating… (~1 min)')
+            self._status.setText('Generating the Ackermann justification report '
+                                 '(recomputing every number live)…')
+            _QA.processEvents()
+            out = os.path.join(_repo_root(), 'figs',
+                               'ackermann_justification.html')
+            res = build_ackermann_report(
+                mw, out_html=out,
+                radius_m=float(self._radius.value()),
+                grip_multiplier=float(self._grip.value()))
+            ev = res['evidence']
+            if res['premise_holds']:
+                self._status.setText(
+                    f'Report written to {res["html_path"]} — as built '
+                    f'{ev["as_built_pct"]:+.1f}%, limit want '
+                    f'{ev["limit_ideal_pct"]:+.0f}% (reverse confirmed live).')
+            else:
+                self._status.setText(
+                    'Report written — but the LIVE PREMISE CHECK FAILED (limit '
+                    'want is not reverse on this car). The report shows a '
+                    'PREMISE FAILED box; re-decide before quoting it.')
+            QDesktopServices.openUrl(QUrl.fromLocalFile(res['html_path']))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._status.setText(f'Report failed: {e}')
+        finally:
+            self._report_btn.setEnabled(True)
+            self._report_btn.setText('■  GENERATE JUSTIFICATION REPORT')
 
     def _show_mmd_help(self):
         self._main._show_text_popup(
@@ -1360,29 +1882,38 @@ class AckermannPage(QWidget):
         ax.set_ylabel('Lap time above the best setting (milliseconds)',
                       fontsize=8.5)
         ax.set_title('MEAN LAP TIME vs ACKERMANN\n'
-                     'per-station: each corner gets the capability its OWN '
-                     'radius earns', fontsize=8.5)
+                     'each corner capped by WHOLE-CAR trimmed grip at its '
+                     'radius (both axles) — lap time barely moves',
+                     fontsize=8.5)
 
-        # ── the verdict: is the mean spread outside the method's noise? ────
+        # ── the verdict: LAP-TIME channel only, whole-car trimmed-grip cap ──
+        # FIXED 2026-08-03: the cap was the FRONT-AXLE force ceiling, which
+        # crowned +100% because the tight corners that bind are rear/balance-
+        # limited (Ackermann is front-only).  Cap is now the both-axle trim
+        # (ymd ay_trim_max) — the SAME instrument as DECIDE, so the panels agree.
         spread_ms = float(np.nanmax(mean) - np.nanmin(mean))
         tie = spread_ms <= 2.0 * band
         if tie:
-            msg = ('THE SETTINGS TIE\nthe whole mean spread '
-                   f'({spread_ms:.0f} ms) is inside this method’s own\n'
-                   f'noise (±{band:.0f} ms) — this plot picks NO winner')
+            msg = ('LAP TIME TIES ACROSS ACKERMANN\n'
+                   f'whole mean spread ({spread_ms:.0f} ms) is inside the '
+                   f'method noise (±{band:.0f} ms)\n'
+                   'the both-axle lap is nearly blind to Ackermann — decide on '
+                   'control:  ◆ DECIDE ACKERMANN ◆')
         else:
             sep = [f'{pct[j]:+.0f}%' for j in range(len(pct))
                    if mean[j] - mean[k_best] > 2.0 * band]
-            msg = (f'BEST: {pct[k_best]:+.0f}%   '
-                   f'(mean spread {spread_ms:.0f} ms, noise ±{band:.0f} ms)\n'
-                   f'{len(sep)} of {len(pct)} settings are a real loss '
-                   f'against it')
+            msg = (f'LAP-TIME optimum ~{pct[k_best]:+.0f}%   '
+                   f'(spread {spread_ms:.0f} ms, noise ±{band:.0f} ms)\n'
+                   'both extremes slower; cap = whole-car trimmed grip (same as '
+                   'DECIDE)\n'
+                   'LAP TIME only — for control / feel / tyre-matching see '
+                   '◆ DECIDE ACKERMANN ◆')
         y0, y1 = ax.get_ylim()
         ax.set_ylim(y0, y1 + 0.34 * (y1 - y0))
         ax.text(0.5, 0.98, msg, transform=ax.transAxes, ha='center', va='top',
-                fontsize=8, color=_RED if tie else _YEL, fontweight='bold',
+                fontsize=8, color=_RED if tie else _WHT, fontweight='bold',
                 linespacing=1.4,
-                bbox=dict(facecolor='#1a1210', edgecolor=_RED if tie else _YEL,
+                bbox=dict(facecolor='#1a1210', edgecolor=_RED if tie else _WHT,
                           lw=1.0, boxstyle='round,pad=0.4'))
         # "this car" label pinned in blended coords at mid-height: the curves
         # all run high-left to low-right, so the middle of the right half is

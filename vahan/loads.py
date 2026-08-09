@@ -476,6 +476,151 @@ def _compute_brake_forces(result: ComponentLoads, bp: BrakeParams):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  CORNER MOMENTS  (the load-view moments — ONE place, read by GUI + binder)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These used to be computed inline in gui/wheel_package.py, which duplicated
+# physics into the presentation layer.  They now live here so the 3-D load view
+# AND the binder read the SAME moment values (ONE MODEL).  The formulas are
+# identical to the old inline ones — this is a MOVE, not a recalculation.
+
+def rocker_arb_freebody(
+    *,
+    pushrod_inner, pushrod_outer, pushrod_N: float,
+    rocker_pivot, rocker_axis,
+    rocker_spring_pt, spring_chassis_pt, spring_force_N: float,
+    arb_drop_top, arb_arm_end, arb_pivot=None,
+    bar_axis=(1.0, 0.0, 0.0),
+) -> dict:
+    """Rocker / ARB bellcrank free body, in WORLD coordinates.
+
+    Every point and the rocker axis are world-frame vectors the CALLER has
+    already mirrored for the corner side (left/right).  This is a pure
+    vector free body — no topology, no GUI state — so the load view and any
+    other consumer get identical forces and the identical bar-torsion moment.
+
+    Reproduces exactly the free body gui/wheel_package used inline:
+      * F_push  = pushrod_N * unit(pushrod_outer - pushrod_inner)
+      * F_spr   = -spring_force_N * unit(spring_chassis_pt - rocker_spring_pt)
+      * F_arb   solved from moment balance about the rocker axis
+      * F_pivot = -(F_push + F_spr + F_arb)
+      * arb_torsion_Nm = component of the drop-link moment about the bar axis
+        (None when there is no ARB pivot or the drop-link force is negligible).
+
+    Returns a dict of {'F_push','F_spr','F_arb','F_pivot','u_arb',
+    'arb_torsion_Nm'} — force vectors in N, torsion in N·m.
+    """
+    pi = np.asarray(pushrod_inner, dtype=float)
+    po = np.asarray(pushrod_outer, dtype=float)
+    P = np.asarray(rocker_pivot, dtype=float)
+    axis = np.asarray(rocker_axis, dtype=float)
+    axis = axis / max(np.linalg.norm(axis), 1e-9)
+    sp = np.asarray(rocker_spring_pt, dtype=float)
+    sc = np.asarray(spring_chassis_pt, dtype=float)
+    dt = np.asarray(arb_drop_top, dtype=float)
+    ae = np.asarray(arb_arm_end, dtype=float)
+
+    u_push = (po - pi) / max(np.linalg.norm(po - pi), 1e-9)
+    F_push = float(pushrod_N) * u_push
+    u_sp = (sc - sp) / max(np.linalg.norm(sc - sp), 1e-9)
+    F_spr = -float(spring_force_N) * u_sp
+    u_arb = (ae - dt) / max(np.linalg.norm(ae - dt), 1e-9)
+    m0 = (np.cross(pi - P, F_push) + np.cross(sp - P, F_spr)) @ axis
+    lever = np.cross(dt - P, u_arb) @ axis
+    F_arb = (-m0 / lever if abs(lever) > 1e-9 else 0.0) * u_arb
+    F_pivot = -(F_push + F_spr + F_arb)
+
+    out = {'F_push': F_push, 'F_spr': F_spr, 'F_arb': F_arb,
+           'F_pivot': F_pivot, 'u_arb': u_arb, 'arb_torsion_Nm': None}
+
+    # ── ARB BAR TORSION: the only moment on the car that does NOT act at the
+    #    wheel.  Every link ends in a spherical joint (carries no moment); the
+    #    anti-roll bar is the exception — it is a torsion spring, so the
+    #    drop-link force at the arm end twists the bar about its own axis.
+    if arb_pivot is not None and np.linalg.norm(F_arb) > 1.0:
+        ap = np.asarray(arb_pivot, dtype=float)
+        r_arm = ae - ap
+        M_arb = np.cross(r_arm, -F_arb)
+        out['arb_torsion_Nm'] = float(M_arb @ np.asarray(bar_axis, dtype=float))
+    return out
+
+
+def corner_moments(
+    *,
+    Fx: float, Fy: float, Fz: float, camber_deg: float = 0.0,
+    wheel_center, spin_axis,
+    lca_outer=None, uca_outer=None,
+    tire_model=None,
+    freebody: dict | None = None,
+    rocker_arb: dict | None = None,
+) -> dict:
+    """All five load-view moments at one corner, in N·m.
+
+    Axis convention matches the kinematic solver: X = lateral, Y = longitudinal
+    (fwd+), Z = up.  The contact-patch forces act one rolling radius below the
+    axle, so they apply moments on the wheel / upright (Seward Ch.6).
+
+    Returned keys (present only when computable):
+      hub_torque_Nm   = Fx * R_r  — brake / drive torque about the spin axis.
+      overturning_Nm  = Fy * R_r  — overturning moment about the fore-aft axis.
+      kingpin_Nm      = moment of the contact-patch force system about the
+                        steering axis through the two ball joints (needs both
+                        lca_outer and uca_outer).
+      mz_Nm           = tyre self-aligning torque: back out the slip angle that
+                        produces this Fy at this Fz + camber, read the tyre's Mz
+                        there (needs a tire_model).
+      arb_torsion_Nm  = ARB bar torsion (needs `freebody` from
+                        rocker_arb_freebody, or `rocker_arb` geometry kwargs to
+                        compute it here).
+
+    R_r is the loaded rolling radius = wheel_center[2] (identical to the old
+    inline convention, NOT the nominal tyre radius).
+    """
+    wc = np.asarray(wheel_center, dtype=float)
+    spin = np.asarray(spin_axis, dtype=float)
+    spin = spin / max(np.linalg.norm(spin), 1e-9)
+    Fx = float(Fx); Fy = float(Fy); Fz = float(Fz)
+
+    R_r = max(float(wc[2]), 1e-3)               # loaded rolling radius
+    out = {
+        'hub_torque_Nm': Fx * R_r,
+        'overturning_Nm': Fy * R_r,
+    }
+
+    # ── STEERING (kingpin) moment about the steering axis through the joints ──
+    if lca_outer is not None and uca_outer is not None:
+        try:
+            kp_a = np.asarray(lca_outer, dtype=float)
+            kp_b = np.asarray(uca_outer, dtype=float)
+            k = kp_b - kp_a
+            k = k / max(np.linalg.norm(k), 1e-9)
+            patch = np.array([wc[0], wc[1], 0.0])
+            Fpatch = np.array([Fy, Fx, Fz])          # X=lat=Fy, Y=long=Fx, Z=Fz
+            out['kingpin_Nm'] = float(np.dot(k, np.cross(patch - kp_a, Fpatch)))
+        except Exception:
+            pass
+
+    # ── TYRE self-aligning torque Mz, straight from the tyre model ──
+    if tire_model is not None:
+        try:
+            sa = tire_model.slip_angle_for_Fy(Fy, Fz, float(camber_deg))
+            out['mz_Nm'] = float(tire_model.Mz(sa, Fz, float(camber_deg)))
+        except Exception:
+            pass
+
+    # ── ARB bar torsion (from the rocker/ARB free body) ──
+    if freebody is None and rocker_arb is not None:
+        try:
+            freebody = rocker_arb_freebody(**rocker_arb)
+        except Exception:
+            freebody = None
+    if freebody is not None and freebody.get('arb_torsion_Nm') is not None:
+        out['arb_torsion_Nm'] = float(freebody['arb_torsion_Nm'])
+
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  BRAKE SYSTEM CALCULATOR
 # ═══════════════════════════════════════════════════════════════════════════
 

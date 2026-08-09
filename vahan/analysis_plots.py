@@ -35,6 +35,8 @@ _BLUE = '#42A5F5'
 _RED = '#EF5350'
 _YELLOW = '#FFD600'
 _WHITE = '#ffffff'
+_AMBER = '#b8860b'   # deliverable palette, colorblind-safe (no blue)
+_GREY = '#9a9a9e'    # rear-axle / low-bias indicator, readable on dark panels
 _TEAL = '#26C6DA'
 
 
@@ -467,7 +469,7 @@ def plot_ackermann_demand(
 
         # Peak slip angle from the TIRE MODEL's fitted value, not a local
         # argmax over this sweep.  These curves are flat near the peak, so an
-        # argmax reads noise: on the R20 data it scatters with R2 = 0.07 and
+        # argmax reads noise: on this data it scatters with R2 = 0.07 and
         # slopes the WRONG WAY, which made this demand curve point backwards.
         # The model's fitted peak gives R2 = 0.83, rising with load.
         Fy_i = np.array([abs(float(tire_model.Fy(s, fz_i, 0.0))) for s in sa_sweep])
@@ -1616,9 +1618,9 @@ def plot_lateral_load_transfer(
                label='FL (inner front)')
     ax_fz.plot(ay, Fz_FR / g_acc, color=_YELLOW,  lw=2.0, ls='-',
                label='FR (outer front)')
-    ax_fz.plot(ay, Fz_RL / g_acc, color=_BLUE,    lw=2.0, ls='--',
+    ax_fz.plot(ay, Fz_RL / g_acc, color=_GREY,    lw=2.0, ls='--',
                label='RL (inner rear)')
-    ax_fz.plot(ay, Fz_RR / g_acc, color=_BLUE,    lw=2.0, ls='-',
+    ax_fz.plot(ay, Fz_RR / g_acc, color=_GREY,    lw=2.0, ls='-',
                label='RR (outer rear)')
 
     # Wheel-lift line
@@ -1627,7 +1629,7 @@ def plot_lateral_load_transfer(
 
     # Static load annotations
     ax_fz.axhline(Fz0['FL'] / g_acc, color=_YELLOW, lw=0.5, ls=':', alpha=0.4)
-    ax_fz.axhline(Fz0['RL'] / g_acc, color=_BLUE,   lw=0.5, ls=':', alpha=0.4)
+    ax_fz.axhline(Fz0['RL'] / g_acc, color=_GREY,   lw=0.5, ls=':', alpha=0.4)
 
     ax_fz.set_xlabel('Lateral acceleration  (g)', fontsize=10)
     ax_fz.set_ylabel('Vertical load  (kg-force)', fontsize=10)
@@ -1647,11 +1649,11 @@ def plot_lateral_load_transfer(
 
     # Rear axle — stacked downward (negative so it reads as "below")
     ax_lt.fill_between(ay, 0,              -geo_R,
-                       color=_BLUE, alpha=0.30, label='Rear geometric')
+                       color=_GREY, alpha=0.30, label='Rear geometric')
     ax_lt.fill_between(ay, -geo_R,         -(geo_R + ela_R),
-                       color=_BLUE, alpha=0.55, label='Rear elastic')
+                       color=_GREY, alpha=0.55, label='Rear elastic')
     ax_lt.fill_between(ay, -(geo_R+ela_R), -(geo_R + ela_R + uns_R),
-                       color=_BLUE, alpha=0.80, label='Rear unsprung')
+                       color=_GREY, alpha=0.80, label='Rear unsprung')
 
     # LLTD % curve as secondary axis
     ax2 = ax_lt.twinx()
@@ -1669,9 +1671,19 @@ def plot_lateral_load_transfer(
                  fontsize=7.5, loc='lower left', ncol=2)
     ax_lt.set_xlim(0, ay_max)
 
-    # Summary annotation
-    lltd_at_1g_idx = int(np.argmin(np.abs(ay - 1.0)))
-    lltd_1g = float(lltd_pct[lltd_at_1g_idx])
+    # Summary annotation.  Drive LLTD@1g from the SAME component sum the binder
+    # headline uses (solver.solve(1.0): elastic+geometric+unsprung per axle), so
+    # this figure can never contradict the ~38.6%-front value reported elsewhere.
+    try:
+        _r1 = solver.solve(1.0)
+        _fa = (_r1.elastic_lt_front_N + _r1.geometric_lt_front_N
+               + _r1.unsprung_lt_front_N)
+        _re = (_r1.elastic_lt_rear_N + _r1.geometric_lt_rear_N
+               + _r1.unsprung_lt_rear_N)
+        lltd_1g = 100.0 * _fa / (_fa + _re) if (_fa + _re) != 0 else 50.0
+    except Exception:
+        lltd_at_1g_idx = int(np.argmin(np.abs(ay - 1.0)))
+        lltd_1g = float(lltd_pct[lltd_at_1g_idx])
     veh = solver._veh
     wf_pct = veh.front_weight_fraction * 100
     K_f = veh.roll_stiffness_front_Npm_rad
@@ -1683,7 +1695,9 @@ def plot_lateral_load_transfer(
         f'Elastic LLTD:   {ela_lltd:.1f}% front\n'
         f'LLTD @ 1g:       {lltd_1g:.1f}% front'
     )
-    delta_col = _YELLOW if lltd_1g > wf_pct + 1 else (_BLUE if lltd_1g < wf_pct - 1 else _WHITE)
+    # Colour by bias — amber if front-biased, grey if rear-biased, white if flat.
+    # No blue (colorblind-safe deliverable palette).
+    delta_col = _AMBER if lltd_1g > wf_pct + 1 else (_GREY if lltd_1g < wf_pct - 1 else _WHITE)
     ax_lt.text(0.98, 0.98, note,
                transform=ax_lt.transAxes, ha='right', va='top',
                fontsize=8.5, color=delta_col,
@@ -2076,8 +2090,6 @@ def plot_ymd_ackermann_grid(tire_model, solver, radius_m=8.0,
     # RIGHT: metrics vs Ackermann
     pc = np.array([r['pct'] for r in trim], float)
     ay = np.array([r.get('Ay_trim_max', float('nan')) for r in trim], float)
-    ct = np.array([r.get('N_delta', float('nan')) for r in trim], float)
-    sb = np.array([r.get('N_beta', float('nan')) for r in trim], float)
     o = np.argsort(pc)
     axR.plot(pc[o], ay[o], 'o-', color='#1a1a1a', lw=2.2,
              label='max trimmed g')
@@ -2085,11 +2097,32 @@ def plot_ymd_ackermann_grid(tire_model, solver, radius_m=8.0,
         axR.axhspan(np.nanmax(ay) - NOISE_G, np.nanmax(ay),
                     color='#D99000', alpha=0.25,
                     label='tie band (0.006 g noise)')
+    # Control + stability read at a COMMON SUB-LIMIT point, NOT at max trim.
+    # The max-trim dN/d(steer) is ~0 by construction (fronts saturated —
+    # ymd.py header, RCVD p320-321), a mystery number; control_at_point reads
+    # both derivatives at ~0.85x the lowest setting's limit where they are real.
     ax2 = axR.twinx()
-    ax2.plot(pc[o], ct[o], 's--', color='#C43B3B', lw=1.6,
-             label='control dN/d(steer) @trim')
+    try:
+        from vahan.ymd import control_at_point
+        _subg = 0.85 * float(np.nanmin(ay)) if np.isfinite(ay).any() else None
+        cap = (control_at_point(
+                   tire_model, solver, [float(p) for p in pc],
+                   radius_m=radius_m, grip_multiplier=grip_multiplier,
+                   aero_Fz_per_g=aero_Fz_per_g, lat_g=_subg)
+               if _subg else [])
+        _cm = {round(r['pct'], 3): r for r in cap}
+        ct = np.array([_cm.get(round(float(p), 3), {}).get('N_delta', float('nan'))
+                       for p in pc], float)
+        sb = np.array([_cm.get(round(float(p), 3), {}).get('N_beta', float('nan'))
+                       for p in pc], float)
+        _clbl = 'control dN/d(steer) @0.85x limit (RCVD p320)'
+    except Exception:
+        ct = np.array([r.get('N_delta', float('nan')) for r in trim], float)
+        sb = np.array([r.get('N_beta', float('nan')) for r in trim], float)
+        _clbl = 'control dN/d(steer)'
+    ax2.plot(pc[o], ct[o], 's--', color='#C43B3B', lw=1.6, label=_clbl)
     ax2.plot(pc[o], sb[o], '^:', color='#8a8a8a', lw=1.6,
-             label='stability dN/d(body slip) @trim')
+             label='stability dN/d(body slip) @sub-limit')
     ax2.set_ylabel('N·m per deg', fontsize=9)
     axR.set_xlabel('Ackermann %')
     axR.set_ylabel('trimmed lateral g')

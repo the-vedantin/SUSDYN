@@ -136,7 +136,7 @@ class LaptimePage(QWidget):
         side.setSpacing(6)
 
         title = QLabel('LAP TIME SIM')
-        title.setStyleSheet('color:#FFD600; font-size:15px; font-weight:bold;')
+        title.setStyleSheet('color:#E23B48; font-size:15px; font-weight:bold;')
         side.addWidget(title)
 
         self._track_lbl = QLabel('— no track —')
@@ -146,7 +146,7 @@ class LaptimePage(QWidget):
 
         def hdr(text):
             l = QLabel(text)
-            l.setStyleSheet('color:#FFD600; font-size:11px; font-weight:bold;'
+            l.setStyleSheet('color:#E23B48; font-size:11px; font-weight:bold;'
                             'padding-top:6px;')
             side.addWidget(l)
 
@@ -363,17 +363,17 @@ class LaptimePage(QWidget):
         # header with an info (ⓘ) button — same style as the suspension panels
         drow = QHBoxLayout(); drow.setSpacing(6)
         dlbl = QLabel('DIFFERENTIAL  (Drexler LSD)')
-        dlbl.setStyleSheet('color:#FFD600; font-size:11px; font-weight:bold;'
+        dlbl.setStyleSheet('color:#E23B48; font-size:11px; font-weight:bold;'
                            'padding-top:6px;')
         drow.addWidget(dlbl)
         dinfo = QPushButton('ⓘ')
         dinfo.setFixedSize(20, 20)
         dinfo.setCursor(Qt.CursorShape.PointingHandCursor)
         dinfo.setStyleSheet(
-            'QPushButton { background:#111111; color:#FFB74D; '
+            'QPushButton { background:#111111; color:#E23B48; '
             'border:1px solid #2a2a2a; border-radius:10px; font-weight:bold; '
             'font-size:12px; }'
-            'QPushButton:hover { background:#241c0e; border-color:#FFB74D; }'
+            'QPushButton:hover { background:#2a1013; border-color:#E23B48; }'
             'QPushButton:pressed { background:#171208; }')
         dinfo.setToolTip('What does the differential do? Click for detail.')
         dinfo.clicked.connect(self._show_diff_info)
@@ -441,9 +441,9 @@ class LaptimePage(QWidget):
 
         self._btn = QPushButton('►  Sim Current Car')
         self._btn.setStyleSheet(
-            'QPushButton { background:#FFD600; color:#0a0a0a; padding:10px;'
+            'QPushButton { background:#E23B48; color:#ffffff; padding:10px;'
             ' font-weight:bold; font-size:13px; border-radius:4px; }'
-            'QPushButton:hover { background:#FFEB3B; }'
+            'QPushButton:hover { background:#ef5867; }'
             'QPushButton:disabled { background:#3a3a3a; color:#777; }')
         self._btn.clicked.connect(self._on_sim)
         side.addWidget(self._btn)
@@ -1020,6 +1020,7 @@ class LaptimePage(QWidget):
             f'sectors    {sect}\n'
             f'avg speed  {res.avg_speed_kph:6.1f} kph   min {res.min_speed_kph:5.1f} / max {res.max_speed_kph:5.1f} kph\n'
             f'corners    avg {res.avg_corner_lat_g:4.2f} g   peak {res.peak_lat_g:4.2f} g   {res.time_cornering_pct:4.1f}% of lap\n'
+            f'  cornering-only (straights excluded):  avg speed {res.avg_corner_speed_kph:5.1f} kph   avg radius {res.avg_corner_radius_m:5.1f} m\n'
             f'long accel peak {res.peak_accel_g:4.2f} g   brake peak {res.peak_brake_g:4.2f} g\n'
             f'max speed  {res.max_speed_kph:6.1f} kph\n'
             f'peak lat   {np.nanmax(res.lat_g):6.2f} g\n'

@@ -35,10 +35,10 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 # ── print-friendly colours ────────────────────────────────────────────────────
-_FL  = '#1565C0'   # dark blue
-_FR  = '#42A5F5'   # sky blue
-_RL  = '#C62828'   # dark red
-_RR  = '#EF5350'   # medium red
+_FL  = '#b8860b'   # dark amber  (front-left)  — colorblind-safe, no blue
+_FR  = '#cc1f2d'   # red         (front-right)
+_RL  = '#1b1b1e'   # near-black  (rear-left)
+_RR  = '#9a9a9e'   # grey        (rear-right)
 _ELF = '#1565C0'   # elastic LT front
 _ELR = '#C62828'   # elastic LT rear
 _GLF = '#F57F17'   # geometric LT front

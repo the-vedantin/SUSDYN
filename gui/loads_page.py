@@ -20,9 +20,12 @@ from PyQt6.QtGui import QColor
 
 from gui.wheel_package import CASES, _load_items
 
-_CAT_COLOR = {'CHASSIS': QColor(235, 235, 245), 'UPRIGHT': QColor(240, 190, 60),
-              'ROCKER': QColor(180, 195, 235), 'ARB': QColor(180, 195, 235),
-              'TYRE': QColor(240, 190, 60)}
+# Colourblind-safe category text (docs/DESIGN.md): NO yellow/amber, NO blue.
+# Distinguished by luminance + the Impeccable red on the tyre row; the category
+# NAME already carries the identity, so colour is only a light grouping cue.
+_CAT_COLOR = {'CHASSIS': QColor(236, 236, 238), 'UPRIGHT': QColor(205, 200, 196),
+              'ROCKER': QColor(200, 200, 204), 'ARB': QColor(200, 200, 204),
+              'TYRE': QColor(226, 59, 72)}
 
 # corner selector entries ('All' -> no isolation)
 _CORNERS = ['All corners', 'FL', 'FR', 'RL', 'RR']
@@ -138,7 +141,9 @@ class LoadsPage(QWidget):
         self._split.addWidget(self._view_host)
 
         self._tbl = QTableWidget(0, 5)
-        self._tbl.setHorizontalHeaderLabels(['Category', 'Point / member', 'Magnitude (N)',
+        # Magnitude column mixes forces (N) and moments (N·m); the Type column
+        # carries the unit per row, so the header names BOTH rather than lying (N).
+        self._tbl.setHorizontalHeaderLabels(['Category', 'Point / member', 'Magnitude (N / N·m)',
                                              'Direction (lat / fore-aft / vert)', 'Type'])
         self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)

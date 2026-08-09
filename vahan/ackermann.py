@@ -604,16 +604,26 @@ def ackermann_bucket(tire_model, solver, radius_m=10.0,
             p2 = solve_ackermann_force(tire_model, solver, radius_m, g,
                                        grip_multiplier=grip_multiplier,
                                        aero=aero)
-            best2, dem, met = (p2['best']['ackermann_pct'], p2['demand_N'],
-                               p2['meets_demand'])
+            # `meets_demand` was retired from solve_ackermann_force (it was
+            # vacuously True at every g); read the keys that replaced it.
+            best2, dem = p2['best']['ackermann_pct'], p2['demand_N']
             uz = p2['best']['useful_N']
             extra = {'force_spread_pct': p2['spread_pct'],
                      'force_decisive': p2['decisive'],
-                     'force_at_bound': p2['at_bound']}
-        except Exception:
-            best2, dem, met, uz = float('nan'), float('nan'), False, float('nan')
+                     'force_at_bound': p2['at_bound'],
+                     'any_setting_fails': p2['any_setting_fails'],
+                     'demand_margin_worst': p2['demand_margin_worst']}
+        except RuntimeError as _skip:
+            # ONLY the include_force gate is swallowed; a real solver failure
+            # (any other RuntimeError, or any other exception type) propagates
+            # instead of being silently turned into a NaN row.
+            if str(_skip) != 'skipped':
+                raise
+            best2, dem, uz = float('nan'), float('nan'), float('nan')
             extra = {'force_spread_pct': float('nan'),
-                     'force_decisive': False, 'force_at_bound': False}
+                     'force_decisive': False, 'force_at_bound': False,
+                     'any_setting_fails': False,
+                     'demand_margin_worst': float('nan')}
         out.append({**p1, 'force_best_pct': best2, 'demand_N': dem,
-                    'best_useful_N': uz, 'meets_demand': met, **extra})
+                    'best_useful_N': uz, **extra})
     return out

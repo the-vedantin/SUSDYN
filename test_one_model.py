@@ -671,7 +671,7 @@ print('-' * 64)
 # Load the DESIGN config first, so these gates test the tyre the car actually
 # runs.  Without it `win` is the startup default, which names no tyre file, and
 # `_try_autoload_tire` then falls back to alphabetical order — which picks the
-# LCO (B1965*) ahead of the R20 (B2356*).  Every tyre gate below was silently
+# the wrong compound (alphabetical order, not the configured one).  Every tyre gate below was silently
 # validating a compound the car does not use.
 # Pick the HIGHEST VERSION NUMBER, not the lexicographic last: sorting strings
 # puts '2027_v5_(claude_arb)' after '2027_v55' because '_' beats digits, so the
@@ -962,7 +962,7 @@ else:
 
 # ── TYRE PRESSURE IS AN INPUT, not an assumption.  A TTC cornering run sweeps
 #    several pressures and blending them is an average of several tyres, not a
-#    tyre: on this R20 the low-pressure sweep passes its peak inside the rig's
+#    tyre: on this dataset the low-pressure sweep passes its peak inside the rig's
 #    +-12 deg while the high-pressure one never reaches it.  Guard: the file's
 #    pressures are discoverable, selecting one actually filters, and asking for
 #    a pressure the file lacks RAISES instead of silently returning the blend.
@@ -1828,6 +1828,100 @@ except Exception as _e:
     fails += 1
     import traceback as _tb7; _tb7.print_exc()
     print(f'ackermann sweep  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── LAP-CAP fix (2026-08-03): the Ackermann lap chain must cap each station by
+#    WHOLE-CAR trimmed grip (ymd ay_trim_max, both axles), NOT the front-axle
+#    force ceiling.  The old ceiling cap over-credited +100% because the tight
+#    corners that bind are REAR/balance-limited, manufacturing a fake "+100% is
+#    fastest" lap verdict that contradicted the DECIDE view.  FAILING-THEN-
+#    PASSING: the structural check below FAILS on the old front-ceiling code
+#    (_ay_max_local called ay_front_cap_g) and PASSES on the trim cap.
+try:
+    from vahan.laptime import LapSimulator as _LS8
+    import inspect as _insp8
+    _src8 = _insp8.getsource(_LS8._ay_max_local)
+    _uses_trim = ('ay_trim_scale' in _src8) and ('ay_front_cap_g' not in _src8)
+    _f8 = []
+    if not _uses_trim:
+        _f8.append('_ay_max_local still caps by the front-axle ceiling '
+                   '(ay_front_cap_g) — the +100% lap artifact is back')
+    if _tm is not None:
+        from vahan.ymd import mmm_metrics as _mmm8, build_loads_table as _blt8
+        _ss8 = win._build_dynamics_solver(); _tbl8 = _blt8(_ss8)
+        _ay0 = float(_mmm8(_tm, _ss8, 0.0, radius_m=3.0, grip_multiplier=0.65,
+                           loads_table=_tbl8)['ay_trim_max'])
+        _ay100 = float(_mmm8(_tm, _ss8, 100.0, radius_m=3.0, grip_multiplier=0.65,
+                             loads_table=_tbl8)['ay_trim_max'])
+        _no_reward = _ay100 <= _ay0 + 0.02   # +100% must NOT get MORE whole-car grip
+        if not _no_reward:
+            _f8.append(f'whole-car trim at 3 m REWARDS +100% '
+                       f'({_ay100:.3f} > {_ay0:.3f} g) — cap would re-crown +100%')
+        _msg8 = (f'cap uses whole-car trim={_uses_trim}; ay_trim_max@3m '
+                 f'0%={_ay0:.3f} +100%={_ay100:.3f} g (+100 not rewarded={_no_reward})')
+    else:
+        _msg8 = f'cap uses whole-car trim={_uses_trim}; (no TTC tyre — numeric part skipped)'
+    if _f8:
+        fails += 1
+    print(f'ackermann lap cap: {_msg8}   '
+          + ('pass' if not _f8 else 'UNEXPECTED FAIL: ' + '; '.join(_f8)))
+except Exception as _e8:
+    fails += 1
+    import traceback as _tb8; _tb8.print_exc()
+    print(f'ackermann lap cap: UNEXPECTED FAIL ({type(_e8).__name__}: {_e8})')
+
+# ── CORNER MOMENTS live in the CORE solver (vahan.loads), read by GUI+binder ──
+#    The load-view moments (hub torque, overturning, kingpin, Mz, ARB torsion)
+#    used to be computed inline in gui/wheel_package.py, duplicating physics into
+#    the presentation layer.  They now come from vahan.loads.corner_moments /
+#    rocker_arb_freebody so the 3-D view AND the binder read ONE set of values.
+#    Guards: the core formulas are right (hub=Fx*R_r under braking, overturning=
+#    Fy*R_r under cornering, Mz present only with a tyre model) AND the moment
+#    physics no longer lives in wheel_package (grep, so it can't silently return).
+print('-' * 64)
+try:
+    from vahan import loads as _lm
+    import inspect as _inspm
+    import gui.wheel_package as _wpm
+    _wp_src = _inspm.getsource(_wpm)
+    _mfail = []
+    # STRUCTURAL: no inline moment physics may remain in the presentation layer.
+    for _pat in ('Fx * R_r', 'Fy * R_r', 'slip_angle_for_Fy'):
+        if _pat in _wp_src:
+            _mfail.append(f'wheel_package still computes "{_pat}" inline')
+    # NUMERIC: pure braking -> hub torque = Fx*R_r, overturning ~ 0.
+    _wc = np.array([0.6, 0.0, 0.20]); _spin = np.array([1.0, 0.0, 0.0]); _Rr = 0.20
+    _mb = _lm.corner_moments(Fx=-3000.0, Fy=0.0, Fz=2000.0,
+                             wheel_center=_wc, spin_axis=_spin)
+    if abs(_mb['hub_torque_Nm'] - (-3000.0 * _Rr)) > 1e-6:
+        _mfail.append(f'hub torque {_mb["hub_torque_Nm"]:.3f} != Fx*R_r {-3000.0*_Rr:.3f}')
+    if abs(_mb['overturning_Nm']) > 1e-6:
+        _mfail.append('overturning nonzero under pure braking')
+    # NUMERIC: pure cornering -> overturning = Fy*R_r, hub ~ 0.
+    _mc = _lm.corner_moments(Fx=0.0, Fy=2500.0, Fz=2000.0,
+                             wheel_center=_wc, spin_axis=_spin)
+    if abs(_mc['overturning_Nm'] - 2500.0 * _Rr) > 1e-6:
+        _mfail.append(f'overturning {_mc["overturning_Nm"]:.3f} != Fy*R_r {2500.0*_Rr:.3f}')
+    # Mz omitted with no tyre model, present with one.
+    if 'mz_Nm' in _mc:
+        _mfail.append('mz_Nm returned without a tyre model')
+    _tmm = getattr(win, '_tire_model', None)
+    _mz_present = None
+    if _tmm is not None:
+        _mm = _lm.corner_moments(Fx=0.0, Fy=1500.0, Fz=1500.0, camber_deg=0.5,
+                                 wheel_center=_wc, spin_axis=_spin, tire_model=_tmm)
+        _mz_present = 'mz_Nm' in _mm
+        if not _mz_present:
+            _mfail.append('mz_Nm missing when a tyre model is supplied')
+    if _mfail:
+        fails += 1
+    print(f'corner moments   : hub {_mb["hub_torque_Nm"]:.0f} N·m (=Fx*R_r), '
+          f'overturning {_mc["overturning_Nm"]:.0f} N·m (=Fy*R_r), '
+          f'Mz w/tyre={_mz_present}, core-only={not any("wheel_package" in m for m in _mfail)}   '
+          + ('pass' if not _mfail else 'UNEXPECTED FAIL: ' + '; '.join(_mfail)))
+except Exception as _em:
+    fails += 1
+    import traceback as _tbm; _tbm.print_exc()
+    print(f'corner moments   : UNEXPECTED FAIL ({type(_em).__name__}: {_em})')
 
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')

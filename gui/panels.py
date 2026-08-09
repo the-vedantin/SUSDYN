@@ -42,18 +42,18 @@ C_TEXT = '#e8e8ea'
 C_SUB  = '#9a9aa2'
 
 # ── shared chrome styles (ONE definition, used app-wide) ─────────────────────
-# Approved chrome palette: near-black/slate surfaces, white/warm-grey text,
-# AMBER (#FFB74D family) for primary/active emphasis, RED for destructive.
-# NO blue chrome (user request); blue stays ONLY as corner-data / plot-series
-# coding.  Every style has an INSTANT :pressed state (1px translate via the
-# padding trick — no animations, snappy = immediate).
-ACCENT       = '#FFB74D'   # amber — primary emphasis / info glyphs
-ACCENT_DIM   = '#8f6a2e'   # darker amber — borders/focus (matches global QSS)
+# IMPECCABLE palette (docs/DESIGN.md): near-black surfaces, ink/warm-grey text,
+# RED (#E23B48) for primary/active emphasis.  YELLOW/AMBER are BANNED from
+# text/UI (user hates yellow + colourblind yellow/orange confusion) — they
+# survive ONLY as plot-series line colours.  Every style has an INSTANT
+# :pressed state (1px translate via the padding trick — snappy = immediate).
+ACCENT       = '#E23B48'   # Impeccable red — primary emphasis / info glyphs
+ACCENT_DIM   = '#8f2730'   # darker red — borders/focus
 BTN_PRIMARY = (
-    'QPushButton { background: #FFB74D; color: #141414; padding: 6px 16px; '
+    'QPushButton { background: #E23B48; color: #ffffff; padding: 6px 16px; '
     'border-radius: 4px; font-weight: bold; border: none; } '
-    'QPushButton:hover { background: #ffc875; } '
-    'QPushButton:pressed { background: #d99a3c; padding: 7px 16px 5px 16px; } '
+    'QPushButton:hover { background: #ef5867; } '
+    'QPushButton:pressed { background: #b81f2d; padding: 7px 16px 5px 16px; } '
     'QPushButton:disabled { background: #3a3a42; color: #63636b; }')
 BTN_SECONDARY = (
     'QPushButton { background: #2c2c34; color: #e8e8ea; padding: 6px 16px; '
@@ -62,13 +62,13 @@ BTN_SECONDARY = (
     'QPushButton:pressed { background: #1e1e24; padding: 7px 16px 5px 16px; } '
     'QPushButton:disabled { background: #17171b; color: #63636b; '
     'border-color: #26262c; }')
-# Round ⓘ/? info buttons — amber glyph, amber-tinted hover
+# Round ⓘ/? info buttons — Impeccable red glyph, red-tinted hover
 BTN_INFO_ROUND = (
-    'QPushButton {{ background: transparent; color: #FFB74D; '
+    'QPushButton {{ background: transparent; color: #E23B48; '
     'border: 1px solid #26262c; border-radius: {r}px; '
     'font-weight: bold; font-size: 14px; }} '
-    'QPushButton:hover {{ background: #241c0e; border-color: #FFB74D; }} '
-    'QPushButton:pressed {{ background: #171208; }}')
+    'QPushButton:hover {{ background: #2a1013; border-color: #E23B48; }} '
+    'QPushButton:pressed {{ background: #1a0a0c; }}')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -524,7 +524,7 @@ class MotionPanel(CollapsibleSection):
         self._sag_lbl.setText('\n'.join(lines))
         if warn_list:
             self._sag_lbl.setStyleSheet(
-                'color: #ffaa33; font-family: Consolas, monospace; '
+                'color: #E23B48; font-family: Consolas, monospace; '
                 'font-size: 11px; padding: 2px 0; font-weight: bold;')
         else:
             self._sag_lbl.setStyleSheet(
@@ -607,7 +607,7 @@ class SteeringPanel(CollapsibleSection):
         # lock-to-lock = 2 × max_hw_deg
         self._max_hw_lbl = QLabel()
         self._max_hw_lbl.setStyleSheet(
-            'color: #FFB74D; font-size: 11px; font-weight: bold;'
+            'color: #E23B48; font-size: 11px; font-weight: bold;'
             ' padding: 2px 4px;')
         self._max_hw_lbl.setWordWrap(True)
         self.add_widget(self._max_hw_lbl)
@@ -2183,15 +2183,15 @@ class InverseKinematicsPanel(CollapsibleSection):
 #  DYNAMICS PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
-_DYNAMICS_HELP = """<h3 style="color:#FFB74D;">Dynamics Panel Reference</h3>
+_DYNAMICS_HELP = """<h3 style="color:#E23B48;">Dynamics Panel Reference</h3>
 
 <h4 style="color:#e07b30;">Buttons</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;font-weight:bold;">Solve</td>
+<tr><td style="color:#E23B48;font-weight:bold;">Solve</td>
 <td>Computes the steady-state equilibrium at the specified lateral/longitudinal g.
 Iterates: roll angle &rarr; per-corner travel &rarr; kinematic solve (RC migration,
 camber change) &rarr; load transfer &rarr; updated roll. Converges in 2-3 iterations.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">Sweep</td>
+<tr><td style="color:#E23B48;font-weight:bold;">Sweep</td>
 <td>Runs Solve at many g-levels (default 0&ndash;2 g, 41 points) and plots
 all outputs vs. acceleration. Select <b>Lateral</b> or <b>Longitudinal</b> sweep mode.
 Lateral sweep = load transfer diagram for understeer/oversteer tuning.
@@ -2200,95 +2200,95 @@ Longitudinal sweep = pitch, front/rear load shift under braking/accel.</td></tr>
 
 <h4 style="color:#e07b30;">Input Parameters</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;">Total mass</td>
+<tr><td style="color:#E23B48;">Total mass</td>
 <td>Car + driver, fully loaded (kg).</td></tr>
-<tr><td style="color:#FFB74D;">Sprung mass</td>
+<tr><td style="color:#E23B48;">Sprung mass</td>
 <td>Everything supported by the springs: chassis, engine, driver, etc. Total mass minus all 4 unsprung corners.</td></tr>
-<tr><td style="color:#FFB74D;">Unsprung F/R (axle)</td>
+<tr><td style="color:#E23B48;">Unsprung F/R (axle)</td>
 <td>Mass of both wheels + uprights + hubs + brakes + half-links on one axle (kg). Acts at wheel-center height.</td></tr>
-<tr><td style="color:#FFB74D;">Spring rate F/R</td>
+<tr><td style="color:#E23B48;">Spring rate F/R</td>
 <td>Linear spring rate at the spring itself (lbf/in). Wheel rate = spring rate &times; MR&sup2;. MR is read from your geometry automatically. Converted to N/m internally (1 lbf/in = 175.127 N/m).</td></tr>
-<tr><td style="color:#FFB74D;">Tire rate</td>
+<tr><td style="color:#E23B48;">Tire rate</td>
 <td>Vertical stiffness of the tire carcass (lbf/in). In series with the spring: ride rate = (wheel rate &times; tire rate) / (wheel rate + tire rate).</td></tr>
-<tr><td style="color:#FFB74D;">ARB rate F/R</td>
+<tr><td style="color:#E23B48;">ARB rate F/R</td>
 <td>Anti-roll bar equivalent wheel rate (lbf/in). Force at one wheel per inch of single-side deflection (other side fixed). Set to 0 for no ARB.</td></tr>
-<tr><td style="color:#FFB74D;">Lateral g</td>
+<tr><td style="color:#E23B48;">Lateral g</td>
 <td>Centripetal acceleration in units of g (9.81 m/s&sup2;). 1.0 g = steady-state cornering at roughly 1.0 &times; 9.81 m/s&sup2;.</td></tr>
-<tr><td style="color:#FFB74D;">Longitudinal g</td>
+<tr><td style="color:#E23B48;">Longitudinal g</td>
 <td>Braking (negative) or acceleration (positive) in g. Shifts load front/rear via pitch load transfer.</td></tr>
-<tr><td style="color:#FFB74D;">Power (wheel)</td>
+<tr><td style="color:#E23B48;">Power (wheel)</td>
 <td>Peak wheel horsepower (hp). After all drivetrain losses. Used to compute torque, drive force, and power-limited max acceleration.</td></tr>
-<tr><td style="color:#FFB74D;">Engine RPM</td>
+<tr><td style="color:#E23B48;">Engine RPM</td>
 <td>Engine RPM at the operating point. With gear ratio and tire radius, this gives vehicle speed. Speed + turn radius &rarr; lateral g is auto-calculated.</td></tr>
-<tr><td style="color:#FFB74D;">Total ratio</td>
+<tr><td style="color:#E23B48;">Total ratio</td>
 <td>Overall drivetrain ratio from engine to wheel. For single-speed FSAE: primary &times; final. E.g. if primary = 2.8 and sprocket = 3.6, total = 10.08.</td></tr>
-<tr><td style="color:#FFB74D;">Tire radius</td>
+<tr><td style="color:#E23B48;">Tire radius</td>
 <td>Loaded tire radius (mm). For FSAE 10&rdquo; wheels: ~203 mm. Used in speed and force calculations.</td></tr>
-<tr><td style="color:#FFB74D;">Turn radius</td>
+<tr><td style="color:#E23B48;">Turn radius</td>
 <td>Corner radius (m). With speed from RPM, this auto-calculates lateral g = v&sup2;/(R&times;9.81). FSAE hairpin ~4.5m, skidpad ~7.6m.</td></tr>
-<tr><td style="color:#FFB74D;">Max steer</td>
+<tr><td style="color:#E23B48;">Max steer</td>
 <td>Maximum front wheel steer angle (deg, not rack). Used to compute minimum turn radius: R_min = wheelbase / tan(steer_max).</td></tr>
-<tr><td style="color:#FFB74D;">Drivetrain</td>
+<tr><td style="color:#E23B48;">Drivetrain</td>
 <td>RWD, FWD, or AWD. Determines which tires provide traction force. RWD = rear axle only, FWD = front axle, AWD = all four.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Auto-sourced (not entered here)</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;">Motion ratio</td>
+<tr><td style="color:#E23B48;">Motion ratio</td>
 <td>Computed from your pushrod/rocker geometry at design position. d(spring length)/d(wheel travel).</td></tr>
-<tr><td style="color:#FFB74D;">Track, wheelbase, CG</td>
+<tr><td style="color:#E23B48;">Track, wheelbase, CG</td>
 <td>Read from the Car Parameters panel on the left sidebar.</td></tr>
-<tr><td style="color:#FFB74D;">Roll centre height</td>
+<tr><td style="color:#E23B48;">Roll centre height</td>
 <td>Queried from the kinematic solver at each iteration's travel. Migrates with roll.</td></tr>
-<tr><td style="color:#FFB74D;">Camber at load</td>
+<tr><td style="color:#E23B48;">Camber at load</td>
 <td>Queried from the kinematic solver at the operating travel.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Results Table</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;">Fz (N)</td>
+<tr><td style="color:#E23B48;">Fz (N)</td>
 <td>Vertical load on each tire. Positive = compression. Sum of all 4 = total weight.</td></tr>
-<tr><td style="color:#FFB74D;">Travel (mm)</td>
+<tr><td style="color:#E23B48;">Travel (mm)</td>
 <td>Suspension travel at each corner from body roll. Positive = bump (compression).</td></tr>
-<tr><td style="color:#FFB74D;">Camber (deg)</td>
+<tr><td style="color:#E23B48;">Camber (deg)</td>
 <td>Wheel camber at the operating travel. Negative = top of wheel leans inboard.</td></tr>
-<tr><td style="color:#FFB74D;">Utilization</td>
+<tr><td style="color:#E23B48;">Utilization</td>
 <td>Fraction of available tire grip used. &gt;1.0 means that corner has exceeded its peak lateral force &mdash; the car is sliding.</td></tr>
-<tr><td style="color:#FFB74D;">LT Geo (N)</td>
+<tr><td style="color:#E23B48;">LT Geo (N)</td>
 <td><b>Geometric load transfer.</b> Force path through the roll centre directly to the chassis &mdash; no body roll needed. Proportional to RC height. Higher RC = more geometric LT = less roll, but less tunability.</td></tr>
-<tr><td style="color:#FFB74D;">LT Elastic (N)</td>
+<tr><td style="color:#E23B48;">LT Elastic (N)</td>
 <td><b>Elastic load transfer.</b> Force path through springs + ARB. Proportional to each axle's share of total roll stiffness. <b>This is what you tune with ARBs.</b> More front elastic LT = more understeer.</td></tr>
-<tr><td style="color:#FFB74D;">LT Unsprung (N)</td>
+<tr><td style="color:#E23B48;">LT Unsprung (N)</td>
 <td><b>Unsprung load transfer.</b> Direct inertia of unsprung mass (wheels, uprights, brakes) at axle height. Small but not negligible.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Sweep Controls</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;">Sweep axes</td>
+<tr><td style="color:#E23B48;">Sweep axes</td>
 <td><b>Lateral</b> = sweep cornering g. <b>Longitudinal</b> = sweep braking/accel g.
 <b>Both checked</b> = combined: sweeps lateral g while also applying the longitudinal g from the spinner.
 This is the real peak load case &mdash; trail braking into a corner, or accelerating out.</td></tr>
-<tr><td style="color:#FFB74D;">Graphs</td>
+<tr><td style="color:#E23B48;">Graphs</td>
 <td>Check/uncheck which plots to show. Pitch and Understeer Gradient are new additions.</td></tr>
-<tr><td style="color:#FFB74D;">Corners</td>
+<tr><td style="color:#E23B48;">Corners</td>
 <td>Toggle FL/FR/RL/RR visibility on per-corner plots (Fz, Travel, Camber, Utilization).</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">New Plots</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;">Pitch Angle</td>
+<tr><td style="color:#E23B48;">Pitch Angle</td>
 <td>Nose-down (braking) or nose-up (accel) angle from longitudinal load transfer through pitch stiffness. K_pitch = 2 &times; (K_wheel_F &times; a&sup2; + K_wheel_R &times; b&sup2;).</td></tr>
-<tr><td style="color:#FFB74D;">Understeer Gradient</td>
+<tr><td style="color:#E23B48;">Understeer Gradient</td>
 <td>Front avg slip angle minus rear avg slip angle (deg). Positive = understeer (front tires need more SA for the same g). Computed by inverting the tire model: given the required Fy at each corner's Fz and camber, find what SA the tire needs. Requires tire data loaded.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Summary Line</h4>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;">Roll</td>
+<tr><td style="color:#E23B48;">Roll</td>
 <td>Body roll angle (deg). Roll = (sprung mass &times; ay &times; moment arm) / total roll stiffness.</td></tr>
-<tr><td style="color:#FFB74D;">LLTD</td>
+<tr><td style="color:#E23B48;">LLTD</td>
 <td>Lateral Load Transfer Distribution (% front). The fraction of total lateral LT carried by the front axle. Higher LLTD = front tires saturate first = understeer. Typical FSAE target: 50&ndash;58%.</td></tr>
-<tr><td style="color:#FFB74D;">RC</td>
+<tr><td style="color:#E23B48;">RC</td>
 <td>Roll centre height front/rear (mm) at the current operating point.</td></tr>
 </table>
 
@@ -2296,21 +2296,21 @@ This is the real peak load case &mdash; trail braking into a corner, or accelera
 <p>Your tire data file (.mat, .csv, or .xlsx) should contain these columns.
 The TTC .mat files from your zip already have all of them.</p>
 <table cellspacing="4">
-<tr><td style="color:#FFB74D;font-weight:bold;">SA</td>
+<tr><td style="color:#E23B48;font-weight:bold;">SA</td>
 <td><b>Slip Angle</b> (deg). The angle between where the tire is pointing and where it is actually traveling. This generates lateral force. Positive = tire pointing inboard of travel direction.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">FZ</td>
+<tr><td style="color:#E23B48;font-weight:bold;">FZ</td>
 <td><b>Normal Load</b> (N). Vertical force pushing the tire into the ground. In TTC raw data, FZ is negative (compression = downward). The loader auto-detects this and flips it to positive.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">FY</td>
+<tr><td style="color:#E23B48;font-weight:bold;">FY</td>
 <td><b>Lateral Force</b> (N). The cornering force the tire generates perpendicular to its heading. This is what keeps you on the track in a turn.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">IA</td>
+<tr><td style="color:#E23B48;font-weight:bold;">IA</td>
 <td><b>Inclination Angle / Camber</b> (deg). Tilt of the wheel from vertical. 0 = perfectly upright. Affects the shape of the Fy vs SA curve and peak grip.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">MZ</td>
+<tr><td style="color:#E23B48;font-weight:bold;">MZ</td>
 <td><b>Aligning Moment</b> (Nm). Torque about the tire's vertical axis &mdash; what you feel through the steering wheel as self-aligning torque. Optional.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">MX</td>
+<tr><td style="color:#E23B48;font-weight:bold;">MX</td>
 <td><b>Overturning Moment</b> (Nm). Torque about the tire's longitudinal axis from lateral force offset. Optional.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">V</td>
+<tr><td style="color:#E23B48;font-weight:bold;">V</td>
 <td><b>Velocity</b> (kph). Test speed. Used to filter out stationary data points at the start of the test run. Optional &mdash; if missing, no filter applied.</td></tr>
-<tr><td style="color:#FFB74D;font-weight:bold;">P</td>
+<tr><td style="color:#E23B48;font-weight:bold;">P</td>
 <td><b>Pressure</b> (kPa). Tire inflation pressure during the test. Optional.</td></tr>
 </table>
 """
@@ -2331,7 +2331,7 @@ class DynamicsPanel(CollapsibleSection):
     apply_aero_toggled     = pyqtSignal(bool)    # True = aero on
 
     def __init__(self):
-        super().__init__('Dynamics', header_color='#FFB74D')
+        super().__init__('Dynamics', header_color='#E23B48')
         self.set_info(section_info.DYNAMICS)
         self._tire_path = ''
         self._build()
@@ -2367,7 +2367,7 @@ class DynamicsPanel(CollapsibleSection):
         # ── Tyre PRESSURE ────────────────────────────────────────────────
         # A TTC cornering run sweeps several pressures.  Blending them is not a
         # tyre, it is an average of several different tyres, and it changes the
-        # answer: on this R20 the low-pressure sweep passes its peak inside the
+        # answer: on this tyre the low-pressure sweep passes its peak inside the
         # rig's +/-12 deg of slip while the high-pressure one never reaches it.
         # So the pressure the car actually runs is an INPUT, not an assumption.
         p_row = QHBoxLayout()
@@ -2448,6 +2448,21 @@ class DynamicsPanel(CollapsibleSection):
         self._spring_f        = row('Spring rate F:',      0.1, 1e6, 200,   ' lbf/in', r, dec=0, step=10); r += 1
         self._spring_r        = row('Spring rate R:',      0.1, 1e6, 200,   ' lbf/in', r, dec=0, step=10); r += 1
         self._tire_rate       = row('Tire rate:',          0.1, 1e6, 909,   ' lbf/in', r, dec=0, step=25); r += 1
+        # Grip multiplier: friction-circle scale on the tyre mu used for
+        # utilization.  1.00 = raw belt/TTC mu ("what the tyre data says",
+        # optimistic); ~0.65-0.75 = real asphalt (belt grip runs 30-50% high).
+        # Lower it to read HONEST utilization — at 0.70 the car reaches util 1.0
+        # near its true grip-limited lateral g, not the inflated belt number.
+        self._grip_mult       = row('Grip multiplier:',    0.10, 1.50, 1.00, '×', r, dec=2, step=0.05); r += 1
+        self._grip_mult.setToolTip(
+            'Friction-circle grip scale applied to the tyre mu when computing '
+            'tire utilization.\n'
+            '  1.00 = raw belt / TTC mu (what the tyre data says — optimistic).\n'
+            '  0.65-0.75 = typical real asphalt (belt grip is ~30-50% high).\n'
+            'Lower this for honest utilization: at 0.70 the car hits util 1.0 '
+            'around its TRUE grip-limited lateral g, not the belt-grip value.\n'
+            '(The lap-time sim already derates internally; this sets the '
+            'dynamics page.)')
         # ── DECOUPLED-only damper rates ─────────────────────────────────
         # Only consumed when the topology is DECOUPLED.  Otherwise these
         # values are ignored.  Labels say "DECOUPLED" so the user knows
@@ -2527,7 +2542,7 @@ class DynamicsPanel(CollapsibleSection):
         # other auto-info labels in the panel.
         self._arb_geom_label = QLabel('')
         self._arb_geom_label.setStyleSheet(
-            f'color: #FFB74D; font-size: 10px; font-style: italic;')
+            f'color: #E23B48; font-size: 10px; font-style: italic;')
         self._arb_geom_label.setWordWrap(True)
         self._refresh_arb_geom_label()
         self.add_widget(self._arb_geom_label)
@@ -2610,19 +2625,19 @@ class DynamicsPanel(CollapsibleSection):
 
         # Computed driving readout
         self._driving_info = QLabel('')
-        self._driving_info.setStyleSheet(f'color: #FFB74D; font-size: 10px; font-style: italic;')
+        self._driving_info.setStyleSheet(f'color: #E23B48; font-size: 10px; font-style: italic;')
         self._driving_info.setWordWrap(True)
         self.add_widget(self._driving_info)
 
         # Note about auto-sourced params
         auto_note = QLabel('MR from geometry. Track/WB/CG from Car Params.')
-        auto_note.setStyleSheet(f'color: #FFB74D; font-size: 10px; font-style: italic;')
+        auto_note.setStyleSheet(f'color: #E23B48; font-size: 10px; font-style: italic;')
         self.add_widget(auto_note)
 
         # ── Computed dynamics constants (auto-updated) ───────────────────
         self._dyn_constants = QLabel('')
         self._dyn_constants.setStyleSheet(
-            'color: #FFB74D; font-size: 10px; font-family: monospace;'
+            'color: #E23B48; font-size: 10px; font-family: monospace;'
             'background: #0a0a0a; padding: 4px; border: 1px solid #1a1a1a;'
             'border-radius: 4px;')
         self._dyn_constants.setWordWrap(True)
@@ -2721,7 +2736,7 @@ class DynamicsPanel(CollapsibleSection):
         self._apply_aero_btn.setStyleSheet(
             'QPushButton { background: #1a1a1f; color: #9a9aa2; padding: 5px 14px; '
             'border: 1px solid #2e2e36; border-radius: 4px; font-weight: bold; }'
-            'QPushButton:checked { background: #8f6a2e; color: white; border-color: #FFB74D; }'
+            'QPushButton:checked { background: #8f2730; color: white; border-color: #E23B48; }'
             'QPushButton:hover { background: #232329; }'
             'QPushButton:pressed { background: #131316; }')
         self._apply_aero_btn.setToolTip(
@@ -3454,6 +3469,7 @@ class DynamicsPanel(CollapsibleSection):
             # the file moved between save & load)
             'tire_path':           str(self._tire_path),
             'tire_pressure_psi':   float(self._tire_psi.value()),
+            'grip_multiplier':     float(self._grip_mult.value()),
         }
 
     def set_state(self, d: dict) -> None:
@@ -3480,7 +3496,7 @@ class DynamicsPanel(CollapsibleSection):
         # bulk load is atomic from the controller's perspective.
         widgets = [
             self._sprung_mass, self._us_front, self._us_rear,
-            self._spring_f, self._spring_r, self._tire_rate,
+            self._spring_f, self._spring_r, self._tire_rate, self._grip_mult,
             self._decoupled_heave_f, self._decoupled_roll_f,
             self._decoupled_heave_r, self._decoupled_roll_r,
             self._heave_3rd_f, self._heave_3rd_r,
@@ -3506,6 +3522,7 @@ class DynamicsPanel(CollapsibleSection):
             _set_spin(self._spring_f,        'spring_front_lbfin')
             _set_spin(self._spring_r,        'spring_rear_lbfin')
             _set_spin(self._tire_rate,       'tire_rate_lbfin')
+            _set_spin(self._grip_mult,       'grip_multiplier')
             _set_spin(self._decoupled_heave_f, 'decoupled_heave_f_lbfin')
             _set_spin(self._decoupled_roll_f,  'decoupled_roll_f_lbfin')
             _set_spin(self._decoupled_heave_r, 'decoupled_heave_r_lbfin')
@@ -3759,7 +3776,7 @@ class DynamicsPanel(CollapsibleSection):
         if blended and len(psi_list) > 1:
             self._tire_psi_avail.setText(txt + '  ⚠ BLENDED')
             self._tire_psi_avail.setStyleSheet(
-                'color: #FFA726; font-size: 11px; font-weight: bold;')
+                'color: #E23B48; font-size: 11px; font-weight: bold;')
         else:
             self._tire_psi_avail.setText(txt)
             self._tire_psi_avail.setStyleSheet(
@@ -3956,14 +3973,14 @@ class DynamicsPanel(CollapsibleSection):
         self.apply_aero_toggled.emit(checked)
         if checked:
             self._apply_aero_btn.setStyleSheet(
-                'QPushButton { background: #8f6a2e; color: white; padding: 5px 14px; '
-                'border: 1px solid #FFB74D; border-radius: 4px; font-weight: bold; }'
+                'QPushButton { background: #8f2730; color: white; padding: 5px 14px; '
+                'border: 1px solid #E23B48; border-radius: 4px; font-weight: bold; }'
                 'QPushButton:hover { background: #a87f3a; }')
         else:
             self._apply_aero_btn.setStyleSheet(
                 'QPushButton { background: #1a1a1f; color: #9a9aa2; padding: 5px 14px; '
                 'border: 1px solid #2e2e36; border-radius: 4px; font-weight: bold; }'
-                'QPushButton:checked { background: #8f6a2e; color: white; border-color: #FFB74D; }'
+                'QPushButton:checked { background: #8f2730; color: white; border-color: #E23B48; }'
                 'QPushButton:hover { background: #232329; }')
             self._aero_label.setText('OFF')
             self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
@@ -3972,7 +3989,7 @@ class DynamicsPanel(CollapsibleSection):
         """Called by main_window when aero state changes."""
         if self._apply_aero_btn.isChecked() and total_N > 0:
             self._aero_label.setText(f'+{total_N:.0f} N applied')
-            self._aero_label.setStyleSheet('color: #FFB74D; font-size: 10px; font-weight: bold;')
+            self._aero_label.setStyleSheet('color: #E23B48; font-size: 10px; font-weight: bold;')
         else:
             self._aero_label.setText('OFF')
             self._aero_label.setStyleSheet('color: #666; font-size: 10px;')
@@ -4454,7 +4471,7 @@ class LoadsPanel(CollapsibleSection):
         """Build a grid of brake-parameter spinners, return (layout, dict_of_spins)."""
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel(title)
-        lbl.setStyleSheet('font-weight: bold; color: #FFA726;')
+        lbl.setStyleSheet('font-weight: bold; color: #E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
 
         s = {}
@@ -4547,7 +4564,7 @@ class LoadsPanel(CollapsibleSection):
         # ── Upright / bearing geometry ───────────────────────────────
         upr = QGridLayout(); upr.setSpacing(4)
         lbl = QLabel('Upright / Bearings')
-        lbl.setStyleSheet('font-weight: bold; color: #FFA726;')
+        lbl.setStyleSheet('font-weight: bold; color: #E23B48;')
         upr.addWidget(lbl, 0, 0, 1, 4)
 
         r = 1
@@ -4796,7 +4813,7 @@ class LoadsPanel(CollapsibleSection):
             lon_desc = f', {lon_g:.2f}g acceleration'
         cond = QLabel(f'Operating point:  {lat_g:.2f}g lateral{lon_desc}')
         cond.setStyleSheet(
-            'color: #FFA726; font-size: 14px; font-weight: bold; padding: 6px;')
+            'color: #E23B48; font-size: 14px; font-weight: bold; padding: 6px;')
         lay.addWidget(cond)
 
         # Table
@@ -4814,7 +4831,7 @@ class LoadsPanel(CollapsibleSection):
                 for c in range(4):
                     it = QTableWidgetItem(attr if c == 0 else '')
                     if c == 0:
-                        it.setForeground(QColor('#FFA726'))
+                        it.setForeground(QColor('#E23B48'))
                         f = it.font(); f.setBold(True); it.setFont(f)
                     it.setBackground(QColor('#111111'))
                     tbl.setItem(ri, c, it)
@@ -4969,7 +4986,7 @@ class BrakeCalcPanel(CollapsibleSection):
         # ── System-level params ──────────────────────────────────────
         sys_grid = QGridLayout(); sys_grid.setSpacing(4)
         lbl = QLabel('Brake System')
-        lbl.setStyleSheet('font-weight: bold; color: #FFA726;')
+        lbl.setStyleSheet('font-weight: bold; color: #E23B48;')
         sys_grid.addWidget(lbl, 0, 0, 1, 4)
 
         r = 1
@@ -4999,7 +5016,7 @@ class BrakeCalcPanel(CollapsibleSection):
         # ── Rotor thermal ────────────────────────────────────────────
         th_grid = QGridLayout(); th_grid.setSpacing(4)
         th_lbl = QLabel('Rotor Thermal')
-        th_lbl.setStyleSheet('font-weight: bold; color: #FFA726;')
+        th_lbl.setStyleSheet('font-weight: bold; color: #E23B48;')
         th_grid.addWidget(th_lbl, 0, 0, 1, 4)
 
         r = 1
@@ -5165,7 +5182,7 @@ class BrakeCalcPanel(CollapsibleSection):
             lon_desc = f', {lon_g:.2f}g acceleration'
         cond = QLabel(f'Operating point:  {lat_g:.2f}g lateral{lon_desc}')
         cond.setStyleSheet(
-            'color: #FFA726; font-size: 14px; font-weight: bold; padding: 6px;')
+            'color: #E23B48; font-size: 14px; font-weight: bold; padding: 6px;')
         lay.addWidget(cond)
 
         # Show system summary
@@ -5198,7 +5215,7 @@ class BrakeCalcPanel(CollapsibleSection):
                 for c in range(4):
                     it = QTableWidgetItem(attr if c == 0 else '')
                     if c == 0:
-                        it.setForeground(QColor('#FFA726'))
+                        it.setForeground(QColor('#E23B48'))
                         f = it.font(); f.setBold(True); it.setFont(f)
                     it.setBackground(QColor('#111111'))
                     tbl.setItem(ri, c, it)
@@ -5268,7 +5285,7 @@ class BrakeCalcPanel(CollapsibleSection):
             if front_avg > 0 and rear_avg > 0:
                 if front_avg < rear_avg:
                     balance = f'Fronts lock first ({front_avg:.0f} vs {rear_avg:.0f} N)'
-                    color = '#FFA726'
+                    color = '#E23B48'
                 else:
                     balance = f'Rears lock first ({rear_avg:.0f} vs {front_avg:.0f} N)'
                     color = '#EF5350'
@@ -5348,7 +5365,7 @@ class DynamicsOptPanel(CollapsibleSection):
     analyze_requested = pyqtSignal(dict)  # {lateral_g, longitudinal_g}
 
     def __init__(self):
-        super().__init__('Dynamics Optimizer', header_color='#FFA726')
+        super().__init__('Dynamics Optimizer', header_color='#E23B48')
         self.set_info(section_info.DYNAMICS_OPT)
         self._analysis = None
         self._build()
@@ -5386,7 +5403,7 @@ class DynamicsOptPanel(CollapsibleSection):
 
         # ── Baseline readout ─────────────────────────────────────────
         self._baseline_label = QLabel('')
-        self._baseline_label.setStyleSheet('color: #FFA726; font-size: 11px;')
+        self._baseline_label.setStyleSheet('color: #E23B48; font-size: 11px;')
         self._baseline_label.setWordWrap(True)
         self.add_widget(self._baseline_label)
 
@@ -5412,7 +5429,7 @@ class DynamicsOptPanel(CollapsibleSection):
 
         # Direction label — shows exactly what the target means
         self._target_dir_label = QLabel('')
-        self._target_dir_label.setStyleSheet('color: #FFA726; font-size: 11px; font-weight: bold;')
+        self._target_dir_label.setStyleSheet('color: #E23B48; font-size: 11px; font-weight: bold;')
         self._target_dir_label.setWordWrap(True)
         tgt_grid.addWidget(self._target_dir_label, 2, 0, 1, 2)
         self.add_layout(tgt_grid)
@@ -5569,7 +5586,7 @@ class DynamicsOptPanel(CollapsibleSection):
         for i, rec in enumerate(recs):
             # Knob name
             item = QTableWidgetItem(rec['knob'])
-            cat_color = '#FFB74D' if rec['category'] == 'parameter' else '#4FC3F7'
+            cat_color = '#E23B48' if rec['category'] == 'parameter' else '#4FC3F7'
             item.setForeground(QColor(cat_color))
             self._sens_table.setItem(i, 0, item)
 
@@ -5658,13 +5675,13 @@ class DynamicsOptPanel(CollapsibleSection):
         # Copy baseline + target info
         lay.addWidget(QLabel(self._baseline_label.text()))
         lay.lastWidget = lay.itemAt(0).widget()
-        lay.lastWidget.setStyleSheet('color: #FFA726; font-size: 12px;')
+        lay.lastWidget.setStyleSheet('color: #E23B48; font-size: 12px;')
         lay.lastWidget.setWordWrap(True)
 
         dir_txt = self._target_dir_label.text()
         if dir_txt:
             dir_lbl = QLabel(dir_txt)
-            dir_lbl.setStyleSheet('color: #FFA726; font-size: 12px; font-weight: bold;')
+            dir_lbl.setStyleSheet('color: #E23B48; font-size: 12px; font-weight: bold;')
             lay.addWidget(dir_lbl)
 
         # Clone the recommendation table content into a bigger table
@@ -5751,7 +5768,7 @@ class SkidpadPanel(CollapsibleSection):
     signals_changed    = pyqtSignal(list)    # selected plot signals
 
     def __init__(self):
-        super().__init__('Skidpad / Transient', header_color='#FFB74D')
+        super().__init__('Skidpad / Transient', header_color='#E23B48')
         self.set_info(section_info.SKIDPAD)
         self._build()
 
@@ -5849,7 +5866,7 @@ class SkidpadPanel(CollapsibleSection):
         # workbook).
         gg = QGroupBox('Damper rates & steer lag')
         gg.setStyleSheet(
-            'QGroupBox { color: #FFB74D; font-size: 11px; border: 1px solid #333; '
+            'QGroupBox { color: #E23B48; font-size: 11px; border: 1px solid #333; '
             'border-radius: 4px; margin-top: 6px; padding: 6px; }'
             'QGroupBox::title { left: 6px; padding: 0 4px; }')
         gl = QGridLayout(gg); gl.setSpacing(4)
@@ -5906,7 +5923,7 @@ class SkidpadPanel(CollapsibleSection):
         # ── Results readout ──────────────────────────────────────────────
         self._results_lbl = QLabel('')
         self._results_lbl.setStyleSheet(
-            'color: #FFB74D; font-size: 11px; font-family: monospace; '
+            'color: #E23B48; font-size: 11px; font-family: monospace; '
             'background: #0a0a0a; padding: 6px; border: 1px solid #1a1a1a; '
             'border-radius: 4px;')
         self._results_lbl.setWordWrap(True)
@@ -6252,7 +6269,7 @@ class VehicleConstantsPanel(CollapsibleSection):
     """
 
     def __init__(self):
-        super().__init__('Vehicle Constants', header_color='#FFB74D')
+        super().__init__('Vehicle Constants', header_color='#E23B48')
         self.set_info(section_info.VEHICLE_CONSTANTS)
         self._last_veh = None
         self._dlg: QDialog | None = None
@@ -6260,10 +6277,10 @@ class VehicleConstantsPanel(CollapsibleSection):
 
         btn = QPushButton('Show Computed Constants')
         btn.setStyleSheet(
-            'QPushButton { background: #1a1a1a; color: #FFB74D; '
+            'QPushButton { background: #1a1a1a; color: #E23B48; '
             'border: 1px solid #444; padding: 6px 16px; border-radius: 4px; '
             'font-weight: bold; }'
-            'QPushButton:hover { background: #2a2a2a; border-color: #8f6a2e; }'
+            'QPushButton:hover { background: #2a2a2a; border-color: #8f2730; }'
             'QPushButton:pressed { background: #101013; }')
         btn.clicked.connect(self._show_popup)
         self.add_widget(btn)
@@ -6467,7 +6484,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # Brake capacity inputs
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Brake-torque capacity')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Pad mu:'), 1, 0)
         self._pad_mu = _spin(0.1, 0.7, 0.45, '', dec=2, step=0.01)
@@ -6495,7 +6512,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # Wheel-rate linearity inputs
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Wheel-rate linearity across travel')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Travel ±:'), 1, 0)
         self._wr_travel_mm = _spin(10, 100, 50, ' mm', dec=0, step=5)
@@ -6523,7 +6540,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # Ride freq inputs
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Ride frequency - pitch over a bump')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('zeta (damping):'), 1, 0)
         self._damping_ratio = _spin(0.1, 1.5, 0.5, '', dec=2, step=0.05)
@@ -6545,7 +6562,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # RC vs body roll
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Roll-centre height vs body roll')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Max lat g:'), 1, 0)
         self._rc_max_g = _spin(0.5, 4.0, 2.0, ' g', dec=1, step=0.1)
@@ -6561,7 +6578,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # torque, mechanical trail, pinion mm/rev from the steer block.
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Steering effort (torque at the driver\'s hands)')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         sp = QLabel('probed arm + solved loads + config rack — no inputs needed')
         sp.setStyleSheet('color:#888;font-size:10px;')
@@ -6575,7 +6592,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # Ackermann demand vs supply
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Ackermann slip-angle budget')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Ackermann %:'), 1, 0)
         # Range is deliberately wider than +/-100: 100% is only the KINEMATIC
@@ -6708,7 +6725,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # MMD
         g = QGridLayout(); g.setSpacing(4)
         lbl = QLabel('Milliken Moment Diagram (pure cornering)')
-        lbl.setStyleSheet('font-weight:bold;color:#FFA726;')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Speed:'), 1, 0)
         self._mmd_speed = _spin(5, 40, 13.4, ' m/s', dec=1, step=0.5)
@@ -7194,7 +7211,7 @@ class DirectEditPanel(CollapsibleSection):
             'pivots about a pin that MUST be normal to its plate.')
         btn_snap.clicked.connect(self._emit_snap_axis)
         btn_snap.setStyleSheet("""
-            QPushButton { background:#2a2a2a; color:#FFB74D;
+            QPushButton { background:#2a2a2a; color:#E23B48;
                           border:1px solid #3a3a3a; border-radius:4px;
                           padding:5px 10px; }
             QPushButton:hover { background:#3a3a3a; color:#FFC875; }

@@ -12,8 +12,8 @@
 > - The **stable, fully-validated** configuration is **pushrod actuation + bellcrank ARB, front pushrod on the UCA, rear pushrod on the LCA**. Every metric, sweep, dynamics and loads path has been exhaustively tested against this topology.
 > - **Every other topology is UNDER DEVELOPMENT / BETA**:
 >   - Actuation: direct-acting damper, pullrod
->   - ARB: control-arm (drop-link-on-LCA), T-bar
->   - Springing: decoupled twin-bellcrank (heave + roll coilovers), heave-spring + T-bar (3rd spring)
+>   - ARB: control-arm (drop-link-on-LCA)
+>   - Springing: decoupled twin-bellcrank (heave + roll coilovers)
 > - Beta topologies have kinematics, 3D, dynamics and loads wired, and they pass the regression net. Hand-calc validation is incomplete. Treat their numbers as indicative.
 > - Contributors are encouraged to test these topologies — open an issue or PR.
 
@@ -51,6 +51,13 @@ python test_one_model.py
 | Ctrl+4 | Loads | full-window component-loads page with a live, hoverable 3D force view |
 | Ctrl+5 | Ackermann | Ackermann demand / capability / MMD analysis suite |
 
+### Design City (Ctrl+3)
+
+![Design City page](screenshots/city_page.png)
+
+- A gallery of candidate designs produced by an optimizer run (`designs_city/run_*`), each card showing that design's axle-utilization, camber/toe and roll-centre sweeps plus its key stats (max lateral g, LLTD, roll gradient, bump steer, ride frequencies, sag, clearance).
+- Sort by any figure of merit; click a card to load that design straight into the main window.
+
 ---
 
 ## Kinematics
@@ -82,25 +89,18 @@ python test_one_model.py
 
 ![Topology selection wizard](screenshots/topology_wizard.png)
 
-- Every car is defined by four independent per-axle choices: **DamperActuation** {direct, pushrod, pullrod} × **DamperMount** {UCA, LCA, upright} × **ARBType** {bellcrank, control-arm, T-bar, none} × **SpringConfig** {corner, decoupled, heave-T-bar}.
-- Front and rear can differ; 69 valid configurations are regression-tested.
-- Invalid combinations are rejected with a stated reason: a heave-T-bar spring needs a T-bar ARB, decoupled springs need rocker actuation, and a bellcrank ARB needs a damper rocker for its drop link.
+- Every car is defined by four independent per-axle choices: **DamperActuation** {direct, pushrod, pullrod} × **DamperMount** {UCA, LCA, upright} × **ARBType** {bellcrank, control-arm, none} × **SpringConfig** {corner, decoupled}.
+- Front and rear can differ; every valid combination is regression-tested.
+- Invalid combinations are rejected with a stated reason: decoupled springs need rocker actuation, and a bellcrank ARB needs a damper rocker for its drop link.
 - The startup wizard (or File → New Project) picks the configuration and repopulates default hardpoints, ARB hardware and central mechanisms.
 
-Two of the central-spring options have dedicated solvers:
+The decoupled central-spring option has a dedicated solver:
 
 - **Decoupled twin-bellcrank** (`vahan/monoshock.py`):
   - Each pushrod feeds its own bellcrank; a cross-car heave coilover and a cross-car roll coilover separate the two modes (2-DOF Newton-Raphson).
   - Graph, dynamics and loads rebuild the cradle fresh from current geometry.
 
   ![Decoupled twin-bellcrank schematic (X-Z projection)](screenshots/decoupled_3d.png)
-
-- **Heave-spring + T-bar** (`vahan/heave_tbar.py`):
-  - One physical T-bar does both jobs: it pivots about its lateral axis (heave → 3rd spring) and twists about its shaft axis (roll → torsion).
-  - Full chain: wheel → pushrod → skewed-plane rocker → drop link → T-bar → 3rd spring.
-  - The roll rate derives from the same bar's geometry.
-
-  ![Heave + T-bar linkage schematic (2D projections)](screenshots/heave_tbar_3d.png)
 
 ## Hardpoint Editing
 
@@ -248,6 +248,8 @@ Two of the central-spring options have dedicated solvers:
 - **Brake calculator**: per-corner lockup analysis (which corner locks first, pedal force at lockup) with tire μ pulled from TTC data per corner, plus single-event adiabatic rotor temperature rise.
 - The **Loads page** (Ctrl+4) shows all of this on a live 3D force view — select a load case and corner, hover any arrow to read its load; inputs, table and picture all read the same solved model.
 
+![Loads page — 3D force view and results table](screenshots/loads_page.png)
+
 ## Report Export
 
 - **File → Export Report…** generates a `.docx` of the current solver state (opens cleanly in Google Docs).
@@ -284,9 +286,9 @@ vahan/  (pure computation, no GUI imports)     gui/  (PyQt6)
   dynamics.py     transient.py                   wheel_package.py startup_dialog.py
   ymd.py          ackermann.py
   laptime.py      loads.py
-  monoshock.py    heave_tbar.py   tbar.py
-  interference.py driveshaft.py   differential.py
-  force_opt.py    analysis_plots.py  report_gen.py
+  monoshock.py    driveshaft.py   differential.py
+  interference.py analysis_plots.py
+  force_opt.py    report_gen.py
 ```
 
 - The `vahan/` package can be used standalone as a library.
