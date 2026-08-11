@@ -8817,10 +8817,10 @@ class MainWindow(QMainWindow):
         self._run_sweep()    # rebuilds sweep with new camber/toe offsets
         self._update_3d()   # rotates tire spin axis visually
         self.statusBar().showMessage(
-            f'Alignment: front {params["front_camber_deg"]:+.2f}° camber  '
-            f'{params["front_toe_deg"]:+.2f}° toe  |  '
-            f'rear {params["rear_camber_deg"]:+.2f}° camber  '
-            f'{params["rear_toe_deg"]:+.2f}° toe', 5000)
+            f'Alignment: front {params["front_camber_deg"]:+.3f}° camber  '
+            f'{params["front_toe_deg"]:+.3f}° toe  |  '
+            f'rear {params["rear_camber_deg"]:+.3f}° camber  '
+            f'{params["rear_toe_deg"]:+.3f}° toe', 5000)
 
     # ==========================================================================
     #  DYNAMICS
@@ -10220,11 +10220,11 @@ class MainWindow(QMainWindow):
                 f'Rack position for {target:+.0f}% Ackermann',
                 f'Current Ackermann : {current_ack:+.1f} %\n'
                 f'Target            : {target:+.1f} %\n\n'
-                f'Move the rack {direction} {abs(dy_mm):.1f} mm '
+                f'Move the rack {direction} {abs(dy_mm):.5f} mm '
                 f'({abs(dy_mm)/25.4:.2f} in)\n\n'
                 f'PASTE THIS into tie_rod_inner Y:\n'
-                f'  {y_new_mm:.2f}\n'
-                f'  (currently {y_cur_mm:.2f} mm; FR mirrors automatically)\n\n'
+                f'  {y_new_mm:.5f}\n'
+                f'  (currently {y_cur_mm:.5f} mm; FR mirrors automatically)\n\n'
                 f'Reachable band on this steering arm, rack-only:\n'
                 f'  {ack_lo:+.1f} % (at −300 mm)  to  {ack_hi:+.1f} % (at +300 mm)\n\n'
                 f'WARNING: a fore-aft rack move de-nulls BUMP STEER — re-null '

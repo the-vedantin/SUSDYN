@@ -278,11 +278,11 @@ class MotionPanel(CollapsibleSection):
         self._stroke.setToolTip('Total damper stroke (shock-frame mm)')
         dlim.addWidget(self._stroke, 0, 1)
         dlim.addWidget(QLabel('Preload F:'), 0, 2)
-        self._preload_f = _spin(0, 1e6, 0, ' mm', dec=1, step=0.5)
+        self._preload_f = _spin(0, 1e6, 0, ' mm', dec=5, step=0.5)
         self._preload_f.valueChanged.connect(self._on_damper)
         dlim.addWidget(self._preload_f, 0, 3)
         dlim.addWidget(QLabel('Preload R:'), 1, 2)
-        self._preload_r = _spin(0, 1e6, 0, ' mm', dec=1, step=0.5)
+        self._preload_r = _spin(0, 1e6, 0, ' mm', dec=5, step=0.5)
         self._preload_r.valueChanged.connect(self._on_damper)
         dlim.addWidget(self._preload_r, 1, 3)
 
@@ -293,7 +293,7 @@ class MotionPanel(CollapsibleSection):
         # to the actual hardpoints (the pushrod / rocker / wheel points
         # are NEVER moved just because damper params changed).
         dlim.addWidget(QLabel('Fully ext.:'), 1, 0)
-        self._fully_extended = _spin(0, 1e6, 210.0, ' mm', dec=1, step=0.5)
+        self._fully_extended = _spin(0, 1e6, 210.0, ' mm', dec=5, step=0.5)
         self._fully_extended.valueChanged.connect(self._on_damper)
         self._fully_extended.setToolTip(
             'Damper length at ZERO compression (from damper spec). '
@@ -707,48 +707,48 @@ class CarParamsPanel(CollapsibleSection):
             return sb
         r = 0
         # Geometry: axle spacing vs wheelbase (separated)
-        self._axle_sp    = row('Axle spacing:',          0.1, 1e6, 1537, ' mm', r); r += 1
-        self._wb         = row('Wheelbase:',             0.1, 1e6, 1537, ' mm', r); r += 1
-        self._track_f    = row('Track width F:',         0.1, 1e6, 1222, ' mm', r); r += 1
-        self._track_r    = row('Track width R:',         0.1, 1e6, 1200, ' mm', r); r += 1
-        self._woff_f     = row('Wheel offset F:',       -1e6, 1e6,   25, ' mm', r, dec=1, step=1); r += 1
-        self._woff_r     = row('Wheel offset R:',       -1e6, 1e6,   25, ' mm', r, dec=1, step=1); r += 1
+        self._axle_sp    = row('Axle spacing:',          0.1, 1e6, 1537, ' mm', r, dec=5); r += 1
+        self._wb         = row('Wheelbase:',             0.1, 1e6, 1537, ' mm', r, dec=5); r += 1
+        self._track_f    = row('Track width F:',         0.1, 1e6, 1222, ' mm', r, dec=5); r += 1
+        self._track_r    = row('Track width R:',         0.1, 1e6, 1200, ' mm', r, dec=5); r += 1
+        self._woff_f     = row('Wheel offset F:',       -1e6, 1e6,   25, ' mm', r, dec=5, step=1); r += 1
+        self._woff_r     = row('Wheel offset R:',       -1e6, 1e6,   25, ' mm', r, dec=5, step=1); r += 1
         # Tire dimensions
-        self._t_outer    = row('Tyre OD:',               0.1, 1e6,  406, ' mm', r); r += 1
-        self._t_rim      = row('Rim dia:',               0.1, 1e6,  330, ' mm', r); r += 1
-        self._t_width    = row('Tyre width:',            0.1, 1e6,  200, ' mm', r); r += 1
+        self._t_outer    = row('Tyre OD:',               0.1, 1e6,  406, ' mm', r, dec=5); r += 1
+        self._t_rim      = row('Rim dia:',               0.1, 1e6,  330, ' mm', r, dec=5); r += 1
+        self._t_width    = row('Tyre width:',            0.1, 1e6,  200, ' mm', r, dec=5); r += 1
         # CG position
-        self._cg_x       = row('CG X (lateral):',       -1e6, 1e6,    0, ' mm', r, dec=1, step=1); r += 1
-        self._cg_y       = row('CG Y (longitudinal):',   0,   1e6, 1100, ' mm', r, dec=1, step=5); r += 1
-        self._cg_z       = row('CG Z (height):',         0,   1e6,  280, ' mm', r, dec=1, step=1); r += 1
+        self._cg_x       = row('CG X (lateral):',       -1e6, 1e6,    0, ' mm', r, dec=5, step=1); r += 1
+        self._cg_y       = row('CG Y (longitudinal):',   0,   1e6, 1100, ' mm', r, dec=5, step=5); r += 1
+        self._cg_z       = row('CG Z (height):',         0,   1e6,  280, ' mm', r, dec=5, step=1); r += 1
         self._brake_bias = row('Front Brake Bias:',      0,   100,   65, ' %',  r,
                                dec=0, step=1); r += 1
         # Rack + spring/damper hardware widths (set from wizard but live-editable)
         self._rack_len   = row('Rack length:',           0.1, 2000, 438.16, ' mm', r,
-                               dec=2, step=5); r += 1
+                               dec=5, step=5); r += 1
         self._spring_od  = row('Spring OD:',             1,   300,   63, ' mm', r,
-                               dec=1, step=1); r += 1
+                               dec=5, step=1); r += 1
         self._damper_od  = row('Damper OD:',             1,   300,   50, ' mm', r,
-                               dec=1, step=1); r += 1
+                               dec=5, step=1); r += 1
         # Rear driveshaft / differential packaging (rear-only, RWD).  Diff
         # default sits on the rear axle line, mid-height, on the centreline.
         # "Effective spacing" = diff HOUSING WIDTH (tripod centres at the
         # housing faces + a small stub).  Tripod OD / shaft dia are PLACEHOLDERS.
         self._diff_long  = row('Diff long (Y, fore-aft):', 0,  1e6, 1537, ' mm', r,
-                               dec=1, step=5); r += 1
+                               dec=5, step=5); r += 1
         self._diff_vert  = row('Diff vert (Z, height):',   0,  1e6,  150, ' mm', r,
-                               dec=1, step=5); r += 1
+                               dec=5, step=5); r += 1
         self._diff_offset = row('Diff lateral offset (+ = left):', -1e6, 1e6, 57.15,
-                               ' mm', r, dec=2, step=1); r += 1
+                               ' mm', r, dec=5, step=1); r += 1
         self._diff_hw    = row('Inboard pivot spacing:',   1, 1000, 292.1, ' mm', r,
-                               dec=1, step=5); r += 1
+                               dec=5, step=5); r += 1
         self._tripod_od  = row('Tripod OD (placeholder):', 1, 1000,   90, ' mm', r,
-                               dec=1, step=1); r += 1
+                               dec=5, step=1); r += 1
         self._ds_dia     = row('Driveshaft OD:',           1, 300, 25.4, ' mm', r,
-                               dec=2, step=1); r += 1
+                               dec=5, step=1); r += 1
         # Brake rotor diameter (Wilwood GP200 max rotor dia = 11 in = 279 mm).
         self._rotor_dia  = row('Rotor dia:',               1, 279, 240, ' mm', r,
-                               dec=1, step=5); r += 1
+                               dec=5, step=5); r += 1
         self.add_layout(g)
 
         # Info: axle spacing vs wheelbase
@@ -1701,10 +1701,10 @@ class InverseKinematicsPanel(CollapsibleSection):
 
         # Range — auto-clamps to damper limits when set_damper_limits() called
         grid.addWidget(QLabel('Min:'), r, 0)
-        self._range_lo = _spin(-1e6, 1e6, -18, ' mm', dec=0, step=5)
+        self._range_lo = _spin(-1e6, 1e6, -18, ' mm', dec=5, step=5)
         grid.addWidget(self._range_lo, r, 1); r += 1
         grid.addWidget(QLabel('Max:'), r, 0)
-        self._range_hi = _spin(-1e6, 1e6, 42, ' mm', dec=0, step=5)
+        self._range_hi = _spin(-1e6, 1e6, 42, ' mm', dec=5, step=5)
         grid.addWidget(self._range_hi, r, 1); r += 1
 
         # Metric selector
@@ -1750,7 +1750,7 @@ class InverseKinematicsPanel(CollapsibleSection):
 
         # Bound (how far points can move)
         grid.addWidget(QLabel('Max Movement:'), r, 0)
-        self._bound = _spin(0.01, 1e6, 10, ' mm', dec=1, step=1)
+        self._bound = _spin(0.01, 1e6, 10, ' mm', dec=5, step=1)
         grid.addWidget(self._bound, r, 1); r += 1
 
         # Method
@@ -1838,7 +1838,7 @@ class InverseKinematicsPanel(CollapsibleSection):
         ]
         for i, (label, keys, default_mm) in enumerate(_tube_defaults):
             tube_grid.addWidget(QLabel(label), i, 0)
-            sp = _spin(0, 1e6, default_mm, ' mm', dec=1, step=1.0)
+            sp = _spin(0, 1e6, default_mm, ' mm', dec=5, step=1.0)
             sp.setMaximumWidth(80)
             tube_grid.addWidget(sp, i, 1)
             for k in keys:
@@ -2042,7 +2042,7 @@ class InverseKinematicsPanel(CollapsibleSection):
             mr_safe = max(mr, 1e-6)
             lo = -sag / mr_safe               # max droop (wheel drops this much)
             hi = (stroke_mm - sag) / mr_safe  # max bump  (wheel rises this much)
-            suffix, dec = ' mm', 0
+            suffix, dec = ' mm', 5
         for spin, val in ((self._range_lo, lo), (self._range_hi, hi)):
             spin.blockSignals(True)
             try:
@@ -2501,19 +2501,19 @@ class DynamicsPanel(CollapsibleSection):
         #
         # Hollow bars: ID > 0 switches the cross-section to a tube.
         # Default ID = 0 (solid) preserves the workbook reference rates.
-        self._arb_OD_f = row('ARB F bar OD:', 0.1, 1e6,  12.70,   ' mm',    r, dec=2, step=0.1);  r += 1
-        self._arb_ID_f = row('ARB F bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=2, step=0.1);  r += 1
-        self._arb_OD_r = row('ARB R bar OD:', 0.1, 1e6,  12.70,   ' mm',    r, dec=2, step=0.1);  r += 1
-        self._arb_ID_r = row('ARB R bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=2, step=0.1);  r += 1
+        self._arb_OD_f = row('ARB F bar OD:', 0.1, 1e6,  12.70,   ' mm',    r, dec=5, step=0.1);  r += 1
+        self._arb_ID_f = row('ARB F bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=5, step=0.1);  r += 1
+        self._arb_OD_r = row('ARB R bar OD:', 0.1, 1e6,  12.70,   ' mm',    r, dec=5, step=0.1);  r += 1
+        self._arb_ID_r = row('ARB R bar ID:', 0.0, 1e6,   9.65,   ' mm',    r, dec=5, step=0.1);  r += 1
         self._arb_G    = row('Bar G (shear):', 1, 1e9, 79300.0, ' N/mm²', r, dec=0, step=500);  r += 1
         self._arb_E    = row('Bar E (Young):', 1, 1e9, 207000.0,' N/mm²', r, dec=0, step=500);  r += 1
         # Blade-type ARB arms: a flat leaf whose WEAK-AXIS bending is the
         # dominant series compliance (and the trackside adjuster).  w or t
         # = 0 keeps the legacy model (arm bends with the BAR tube section).
-        self._arb_blade_w_f = row('ARB F blade width:', 0.0, 1e6, 0.0, ' mm', r, dec=1, step=0.5); r += 1
-        self._arb_blade_t_f = row('ARB F blade thick:', 0.0, 1e6, 0.0, ' mm', r, dec=2, step=0.1); r += 1
-        self._arb_blade_w_r = row('ARB R blade width:', 0.0, 1e6, 0.0, ' mm', r, dec=1, step=0.5); r += 1
-        self._arb_blade_t_r = row('ARB R blade thick:', 0.0, 1e6, 0.0, ' mm', r, dec=2, step=0.1); r += 1
+        self._arb_blade_w_f = row('ARB F blade width:', 0.0, 1e6, 0.0, ' mm', r, dec=5, step=0.5); r += 1
+        self._arb_blade_t_f = row('ARB F blade thick:', 0.0, 1e6, 0.0, ' mm', r, dec=5, step=0.1); r += 1
+        self._arb_blade_w_r = row('ARB R blade width:', 0.0, 1e6, 0.0, ' mm', r, dec=5, step=0.5); r += 1
+        self._arb_blade_t_r = row('ARB R blade thick:', 0.0, 1e6, 0.0, ' mm', r, dec=5, step=0.1); r += 1
         for _bw in (self._arb_blade_w_f, self._arb_blade_w_r):
             _bw.setToolTip('Blade (bar arm) flat width.\n0 = legacy model: '
                            'the arm bends with the bar tube section.')
@@ -2582,8 +2582,8 @@ class DynamicsPanel(CollapsibleSection):
         self._peak_torque     = prow('Peak motor torque:',0,  1e6,    0.0, ' Nm',  pr, dec=1, step=1); pr += 1
         self._final_ratio     = prow('Final drive ratio:',0.01,1e6, 12.59, ':1',   pr, dec=2, step=0.1); pr += 1
         self._drivetrain_eff  = prow('Drivetrain eff:',   0.01,1.0,  0.92, '',     pr, dec=2, step=0.01); pr += 1
-        self._tire_radius     = prow('Tire radius:',    0.1,1e6,   203,    ' mm', pr, dec=0, step=1); pr += 1
-        self._rim_clear_dia   = prow('Rim clear dia:',  0.1,1e6,   241.3,  ' mm', pr, dec=1, step=1); pr += 1
+        self._tire_radius     = prow('Tire radius:',    0.1,1e6,   203,    ' mm', pr, dec=5, step=1); pr += 1
+        self._rim_clear_dia   = prow('Rim clear dia:',  0.1,1e6,   241.3,  ' mm', pr, dec=5, step=1); pr += 1
         self._rim_clear_dia.setToolTip(
             'Clear inner diameter of the wheel rim (interference envelope).\n'
             'The kingpin ball joints + tie-rod end must fit within this circle\n'
@@ -3849,7 +3849,7 @@ class DynamicsPanel(CollapsibleSection):
         self._summary.setText(
             f'Roll: {result.roll_angle_deg:.3f} deg{pitch_str}  |  '
             f'LLTD: {lltd:.1f}% front{us_str}  |  '
-            f'RC: {result.rc_height_front_m*1000:.1f}/{result.rc_height_rear_m*1000:.1f} mm  |  '
+            f'RC: {result.rc_height_front_m*1000:.5f}/{result.rc_height_rear_m*1000:.5f} mm  |  '
             f'{result.iterations} iter')
 
     def show_max_g(self, info: dict):
@@ -4485,7 +4485,7 @@ class LoadsPanel(CollapsibleSection):
 
         r += 1
         g.addWidget(QLabel('Pad radius:'), r, 0)
-        s['pad_radius'] = _spin(0.1, 1e6, 94.4, ' mm', dec=1, step=5)
+        s['pad_radius'] = _spin(0.1, 1e6, 94.4, ' mm', dec=5, step=5)
         g.addWidget(s['pad_radius'], r, 1)
         g.addWidget(QLabel('Pistons/cal:'), r, 2)
         s['num_pistons'] = _spin(1, 99, 1, '', dec=0, step=1)
@@ -4501,21 +4501,21 @@ class LoadsPanel(CollapsibleSection):
         # which put the bolt line 23 mm from where the drawing puts it.
         r += 1
         g.addWidget(QLabel('Rotor dia:'), r, 0)
-        s['rotor_dia'] = _spin(1, 1e6, 240.0, ' mm', dec=1, step=5)
+        s['rotor_dia'] = _spin(1, 1e6, 240.0, ' mm', dec=5, step=5)
         g.addWidget(s['rotor_dia'], r, 1)
         g.addWidget(QLabel('Mount centre l5:'), r, 2)
-        s['bolt_spacing'] = _spin(0.1, 1e6, 60.5, ' mm', dec=1, step=5)
+        s['bolt_spacing'] = _spin(0.1, 1e6, 60.5, ' mm', dec=5, step=5)
         g.addWidget(s['bolt_spacing'], r, 3)
 
         r += 1
         g.addWidget(QLabel('Mount height:'), r, 0)
-        s['mount_height'] = _spin(0.0, 1e6, 27.9, ' mm', dec=1, step=1)
+        s['mount_height'] = _spin(0.0, 1e6, 27.9, ' mm', dec=5, step=1)
         s['mount_height'].setToolTip(
             'Drawing MOUNT HEIGHT — the caliper bolt line sits this far BELOW the '
             'disc outside diameter. Bolt-line radius D1 = rotor_dia/2 - this.')
         g.addWidget(s['mount_height'], r, 1)
         g.addWidget(QLabel('Mount offset:'), r, 2)
-        s['mount_offset'] = _spin(0.0, 1e6, 21.8, ' mm', dec=1, step=1)
+        s['mount_offset'] = _spin(0.0, 1e6, 21.8, ' mm', dec=5, step=1)
         s['mount_offset'].setToolTip(
             'Drawing MOUNT OFFSET — lateral offset of the bolt plane from the '
             'disc face.')
@@ -4523,7 +4523,7 @@ class LoadsPanel(CollapsibleSection):
 
         r += 1
         g.addWidget(QLabel('Rotor thickness:'), r, 0)
-        s['rotor_thickness'] = _spin(0.5, 100.0, 6.35, ' mm', dec=2, step=1)
+        s['rotor_thickness'] = _spin(0.5, 100.0, 6.35, ' mm', dec=5, step=1)
         s['rotor_thickness'].setToolTip(
             'Disc width. Does NOT change lockup torque or line pressure — it sets '
             'thermal mass, so a thicker rotor runs proportionally cooler per stop.')
@@ -4569,12 +4569,12 @@ class LoadsPanel(CollapsibleSection):
 
         r = 1
         upr.addWidget(QLabel('Bearing spacing:'), r, 0)
-        self._brg_spacing = _spin(0.1, 1e6, 50.8, ' mm', dec=1, step=5)
+        self._brg_spacing = _spin(0.1, 1e6, 50.8, ' mm', dec=5, step=5)
         self._brg_spacing.setToolTip('Bearing center-to-center along the spindle '
                                      '(2.00 in on the outgoing car)')
         upr.addWidget(self._brg_spacing, r, 1)
         upr.addWidget(QLabel('Bearing inboard:'), r, 2)
-        self._brg_inboard = _spin(0, 1e6, 39.4, ' mm', dec=1, step=2)
+        self._brg_inboard = _spin(0, 1e6, 39.4, ' mm', dec=5, step=2)
         self._brg_inboard.setToolTip(
             'How far the NEAR (outer) bearing sits inboard of the wheel '
             'centre-line. Both bearings are inboard, so the tyre load is '
@@ -5002,12 +5002,12 @@ class BrakeCalcPanel(CollapsibleSection):
 
         r += 1
         sys_grid.addWidget(QLabel('MC bore F:'), r, 0)
-        self._mc_bore_f = _spin(5.0, 40.0, 15.87, ' mm', dec=2, step=0.5)
+        self._mc_bore_f = _spin(5.0, 40.0, 15.87, ' mm', dec=5, step=0.5)
         self._mc_bore_f.setToolTip('Front master cylinder bore diameter (5/8" = 15.87mm)')
         sys_grid.addWidget(self._mc_bore_f, r, 1)
 
         sys_grid.addWidget(QLabel('MC bore R:'), r, 2)
-        self._mc_bore_r = _spin(5.0, 40.0, 15.87, ' mm', dec=2, step=0.5)
+        self._mc_bore_r = _spin(5.0, 40.0, 15.87, ' mm', dec=5, step=0.5)
         self._mc_bore_r.setToolTip('Rear master cylinder bore diameter')
         sys_grid.addWidget(self._mc_bore_r, r, 3)
 
@@ -6515,11 +6515,11 @@ class AnalysisPlotsPanel(CollapsibleSection):
         lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Travel ±:'), 1, 0)
-        self._wr_travel_mm = _spin(10, 100, 50, ' mm', dec=0, step=5)
+        self._wr_travel_mm = _spin(10, 100, 50, ' mm', dec=5, step=5)
         self._wr_travel_mm.setToolTip('Half-range of wheel travel swept (mm)')
         g.addWidget(self._wr_travel_mm, 1, 1)
         g.addWidget(QLabel('Operating ±:'), 1, 2)
-        self._wr_op_mm = _spin(5, 60, 25, ' mm', dec=0, step=5)
+        self._wr_op_mm = _spin(5, 60, 25, ' mm', dec=5, step=5)
         self._wr_op_mm.setToolTip('Typical operating travel band (highlighted)')
         g.addWidget(self._wr_op_mm, 1, 3)
         g.addWidget(QLabel('Resolution:'), 2, 0)
@@ -6547,7 +6547,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         self._damping_ratio.setToolTip('Critical damping ratio. ~0.3-0.5 lively. ~0.5-0.7 race typical.')
         g.addWidget(self._damping_ratio, 1, 1)
         g.addWidget(QLabel('Bump:'), 1, 2)
-        self._bump_h = _spin(5, 50, 20, ' mm', dec=0, step=5)
+        self._bump_h = _spin(5, 50, 20, ' mm', dec=5, step=5)
         g.addWidget(self._bump_h, 1, 3)
         g.addWidget(QLabel('Speeds (m/s):'), 2, 0)
         sp = QLabel('5, 10, 15, 20')
@@ -6741,10 +6741,10 @@ class AnalysisPlotsPanel(CollapsibleSection):
         lbl_arm.setStyleSheet('color:#888;font-size:10px;')
         g.addWidget(lbl_arm, 3, 0, 1, 4)
         g.addWidget(QLabel('ΔArm front:'), 4, 0)
-        self._mmd_darm_f = _spin(-80, 80, 0, ' mm', dec=0, step=5.0)
+        self._mmd_darm_f = _spin(-80, 80, 0, ' mm', dec=5, step=5.0)
         g.addWidget(self._mmd_darm_f, 4, 1)
         g.addWidget(QLabel('ΔArm rear:'), 4, 2)
-        self._mmd_darm_r = _spin(-80, 80, 0, ' mm', dec=0, step=5.0)
+        self._mmd_darm_r = _spin(-80, 80, 0, ' mm', dec=5, step=5.0)
         g.addWidget(self._mmd_darm_r, 4, 3)
         # Static toe (deg, + = toe-in)
         lbl_toe = QLabel('Static toe  (+ = toe-in):')
@@ -6864,7 +6864,7 @@ class FrameInterferencePanel(CollapsibleSection):
         def _dim(key, label, default, lo, hi):
             row = QHBoxLayout(); row.setSpacing(4)
             row.addWidget(QLabel(label))
-            sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setDecimals(1)
+            sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setDecimals(5)
             sb.setSingleStep(0.5); sb.setValue(default); sb.setSuffix(' mm')
             sb.valueChanged.connect(lambda _=0.0: self.frame_changed.emit())
             row.addWidget(sb); row.addStretch(1)
@@ -7032,7 +7032,10 @@ class DirectEditPanel(CollapsibleSection):
             pos_row.addWidget(QLabel(axis))
             sb = _NoScrollSpin()
             sb.setRange(-5000.0, 5000.0)
-            sb.setDecimals(2)
+            # 5 decimals: setDecimals rounds the value ON EDIT, not just on
+            # display — a hardpoint coordinate typed here must not lose the
+            # sub-100-micron precision the solver carries.
+            sb.setDecimals(5)
             sb.setSingleStep(1.0)
             sb.setSuffix(' mm')
             sb.setEnabled(False)
@@ -7352,7 +7355,9 @@ class DirectEditPanel(CollapsibleSection):
         def _len(label, lo, hi, tip):
             row = QHBoxLayout(); row.setSpacing(4)
             lab = QLabel(label); lab.setToolTip(tip); row.addWidget(lab)
-            sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setDecimals(1)
+            # 5 decimals: this is a mm DIMENSION editor (damper mount-to-mount);
+            # setDecimals rounds on edit, so keep full solved precision.
+            sb = QDoubleSpinBox(); sb.setRange(lo, hi); sb.setDecimals(5)
             sb.setSingleStep(1.0); sb.setSuffix(' mm'); sb.setToolTip(tip)
             row.addWidget(sb); row.addStretch(1)
             self.add_layout(row)
