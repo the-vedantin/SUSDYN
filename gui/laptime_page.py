@@ -958,6 +958,13 @@ class LaptimePage(QWidget):
             pairs.sort()
             return ([p[0] for p in pairs], [p[1] for p in pairs],
                     'user-entered dyno points')
+        # Default engine = the SDM26 1-D solver curve (Sun Devil Motorsports),
+        # the ONE engine source.  Only if that curve file is missing do we fall
+        # back to the ASSUMED generic shape scaled to this car's peak power.
+        from vahan.engine import sdm26_engine_curve
+        c = sdm26_engine_curve()
+        if c is not None:
+            return list(c[0]), list(c[1]), c[2]
         try:
             veh = self._main._build_dynamics_solver()._veh
             P_eng = float(veh.wheel_power_W) / max(

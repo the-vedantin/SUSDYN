@@ -630,10 +630,24 @@ class LapSimulator:
             float(getattr(v_, 'min_shift_interval_s', 0.0) or 0.0), 0.0)
         self._shift_hyst = max(
             float(getattr(v_, 'shift_hysteresis_frac', 0.0) or 0.0), 0.0)
-        # ── tabulated torque curve (optional; plateau is the fallback) ────
+        # ── tabulated torque curve — the SDM26 1-D solver curve is the DEFAULT
+        # engine (the ONE engine source, backbone for every consumer that sets
+        # a gearbox).  A measured dyno curve via set_torque_curve() overrides
+        # it; if the solver curve file is missing, the plateau is the fallback.
         self._tq_rpm = None
         self._tq_Nm = None
         self._tq_label = ''
+        self._default_tq = None
+        try:
+            from vahan.engine import sdm26_engine_curve
+            _c = sdm26_engine_curve()
+            if _c is not None:
+                self._default_tq = _c
+                self._tq_rpm = np.asarray(_c[0], float)
+                self._tq_Nm = np.asarray(_c[1], float)
+                self._tq_label = _c[2]
+        except Exception:
+            pass
         # ── per-station Ackermann (optional) ─────────────────────────────
         self._ack_model = None
         self._ack_pct = 0.0
@@ -680,8 +694,14 @@ class LapSimulator:
         applied on top (the plateau model gets it through wheel_power_W).
         Pass None/empty to go back to the plateau."""
         if rpm is None or torque_Nm is None or len(rpm) < 2:
-            self._tq_rpm = self._tq_Nm = None
-            self._tq_label = ''
+            # revert to the DEFAULT engine (SDM26 solver curve), not the plateau
+            if self._default_tq is not None:
+                self._tq_rpm = np.asarray(self._default_tq[0], float)
+                self._tq_Nm = np.asarray(self._default_tq[1], float)
+                self._tq_label = self._default_tq[2]
+            else:
+                self._tq_rpm = self._tq_Nm = None
+                self._tq_label = ''
             return
         r = np.asarray(rpm, float)
         t = np.asarray(torque_Nm, float)
