@@ -692,6 +692,7 @@ class CarParamsPanel(CollapsibleSection):
             'driveshaft_dia_mm':     self._ds_dia.value(),
             'rotor_dia_mm':          self._rotor_dia.value(),
             'show_driveshaft':       self._show_driveshaft.isChecked(),
+            'show_diff_body':        self._show_diff_body.isChecked(),
             'show_brakes':           self._show_brakes.isChecked(),
             'show_shock_thickness':  self._show_shock_thick.isChecked(),
             'view_mode':             self._view_mode_combo.currentText().lower(),
@@ -799,10 +800,22 @@ class CarParamsPanel(CollapsibleSection):
         self._show_driveshaft.setToolTip(
             'Draw the rear differential body, tripods and driveshafts (with '
             'thickness) so you can check packaging and interference and move '
-            'the diff. Rear-only (RWD).')
+            'the diff. Rear-only (RWD).  UNCHECK this to hide the placeholder '
+            'diff/tripods when you have imported a real diff STEP file '
+            '(File > Import STEP).')
         self._show_driveshaft.stateChanged.connect(
             lambda _: self.params_changed.emit(self.get_params()))
         self.add_widget(self._show_driveshaft)
+
+        self._show_diff_body = QCheckBox('Show diff + tripods (placeholder)')
+        self._show_diff_body.setChecked(True)
+        self._show_diff_body.setToolTip(
+            'Uncheck to hide the placeholder diff body AND tripods while KEEPING '
+            'the driveshafts — for checking a real imported diff/tripod STEP file '
+            'against the live driveshafts.')
+        self._show_diff_body.stateChanged.connect(
+            lambda _: self.params_changed.emit(self.get_params()))
+        self.add_widget(self._show_diff_body)
 
         self._show_brakes = QCheckBox('Show brake rotors + calipers')
         self._show_brakes.setChecked(True)
@@ -892,6 +905,7 @@ class CarParamsPanel(CollapsibleSection):
             self._show_ground.setChecked(d['show_ground'])
             self._show_ground.blockSignals(False)
         for key, chk in (('show_driveshaft', self._show_driveshaft),
+                         ('show_diff_body', self._show_diff_body),
                          ('show_brakes', self._show_brakes),
                          ('show_shock_thickness', self._show_shock_thick)):
             if key in d:

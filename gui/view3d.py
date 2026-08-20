@@ -715,6 +715,19 @@ class View3D:
             + [(m, (0.95, 0.85, 0.25, 0.95)) for m in self._tripod_meshes]
             + [(m, (0.32, 0.32, 0.35, 0.85)) for m in self._rotor_meshes]
             + [(m, (0.62, 0.64, 0.68, 0.95)) for m in self._caliper_meshes])
+        # Imported STEP parts (differential, engine, …) shown for packaging /
+        # clearance.  Kept OUT of _car_meshes so they stay visible (not greyed)
+        # in Interference mode, where the whole point is to see them clash.
+        self._imported_meshes = []
+        # Wheel-bearing markers (2 per corner, on the spin axis): the loads
+        # model's l1 (spacing) + inboard offset made VISIBLE, so the geometry
+        # the bearing loads assume is never invisible again.
+        self._bearing_meshes = [self._new_mesh((0.45, 0.62, 0.95, 0.95))
+                                for _ in range(8)]
+        self._bearing_spacing_m = 0.0508      # l1, matches UprightParams default
+        self._bearing_offset_m = 0.0394       # outer bearing inboard of wheel CL
+        self._car_meshes = self._car_meshes + [
+            (m, (0.45, 0.62, 0.95, 0.95)) for m in self._bearing_meshes]
 
         # ── Decoupled (twin-bellcrank) visuals ───────────────────────────
         # Per axle (front + rear) we render:
@@ -837,6 +850,18 @@ class View3D:
             size=22, edge_width=0,
         )
         self._cg_marker.visible = False
+
+        # ── UNSPRUNG CG spheres (yellow, one per axle) ────────────────────
+        # The dynamics model lumps each axle's unsprung mass at a single
+        # height (VehicleParams.unsprung_cg_height_m) on the axle line — a
+        # DESIGN CONSTRAINT, so it is drawn, not hidden in a parameter.
+        self._uscg_marker = scene.Markers(parent=self._view.scene)
+        self._uscg_marker.set_data(
+            pos=np.zeros((1, 3), np.float32),
+            face_color=(0.95, 0.80, 0.25, 0.75),
+            size=16, edge_width=0,
+        )
+        self._uscg_marker.visible = False
 
         # ── Pitch-axis overlays (front/rear SVIC + pitch axis line) ──────
         self._svic_markers = scene.Markers(parent=self._view.scene)
@@ -1047,6 +1072,21 @@ class View3D:
         self._cg_marker.visible = visible
         self._canvas.update()
 
+    def update_unsprung_cg(self, front_xyz, rear_xyz):
+        """Unsprung-CG spheres, one per axle (the dynamics model lumps each
+        axle's unsprung mass at these points).  (x,y,z) metres, None to hide."""
+        pts = [p for p in (front_xyz, rear_xyz) if p is not None]
+        if pts:
+            self._uscg_marker.set_data(
+                pos=np.array(pts, np.float32),
+                face_color=(0.95, 0.80, 0.25, 0.75),
+                size=16, edge_width=0,
+            )
+            self._uscg_marker.visible = True
+        else:
+            self._uscg_marker.visible = False
+        self._canvas.update()
+
     def set_rc_visible(self, visible: bool):
         self._rc_markers.visible = visible
         self._canvas.update()
@@ -1255,6 +1295,22 @@ class View3D:
                 wc, spin,
                 self._tire_outer_r, self._tire_rim_r, self._tire_half_w)
             _pose_mesh(self._tire_meshes[ci], vertices=tv, faces=tf)
+
+            # wheel bearings: two spheres on the spin axis, INBOARD of the
+            # wheel centre-line — the exact l1/offset the bearing loads use.
+            if ci * 2 + 1 < len(self._bearing_meshes) and not self._motion_lod:
+                _wcv = np.asarray(wc, float)
+                _s = _norm(np.asarray(spin, float))
+                # inboard = the spin-axis direction that reduces |x|
+                if abs((_wcv + _s * 0.01)[0]) > abs(_wcv[0]):
+                    _s = -_s
+                _po = _wcv + _s * self._bearing_offset_m
+                _pi = _wcv + _s * (self._bearing_offset_m
+                                   + self._bearing_spacing_m)
+                for k, p in ((0, _po), (1, _pi)):
+                    bv, bf = build_sphere(p, 0.009, n_lat=8, n_lon=10)
+                    _pose_mesh(self._bearing_meshes[ci * 2 + k],
+                               vertices=bv, faces=bf)
 
             # brake rotor (disc coaxial with the wheel) + caliper block at top
             if ci < len(self._rotor_meshes) and not self._motion_lod:
@@ -1922,7 +1978,8 @@ class View3D:
         except Exception:
             pass
 
-    def set_driveshaft_package(self, pkg, show: bool = True, only=None) -> None:
+    def set_driveshaft_package(self, pkg, show: bool = True, only=None,
+                               show_diff: bool = True) -> None:
         """Draw the rear diff body, tripods and half-shafts as thick cylinders.
 
         pkg: the dict from vahan.driveshaft.package(car, rear_states) (or None).
@@ -1930,7 +1987,9 @@ class View3D:
         pkg, so the shafts move with the uprights every travel step (ONE MODEL).
         show=False (or pkg None) clears them.  only='RL'/'RR' draws just that
         corner's shaft + tripod and hides the (shared) diff body — for the
-        isolated wheel-package view.
+        isolated wheel-package view.  show_diff=False hides the placeholder diff
+        body AND tripods while keeping the driveshafts (use when a real
+        diff/tripod STEP file is imported).
         """
         def _clear(m):
             _pose_mesh(m, vertices=np.zeros((3, 3), np.float32),
@@ -1952,8 +2011,8 @@ class View3D:
         if not self._thick_on:                # thickness toggle OFF → thin wisps
             shaft_r = tri_r = 0.0006
             diff_r = max(0.10 * diff_r, 0.004)
-        if only:                              # isolating one corner → no diff body
-            _clear(self._diff_mesh)
+        if only or not show_diff:             # isolating a corner, or diff body
+            _clear(self._diff_mesh)            # hidden (e.g. real STEP diff in use)
         else:
             dv, df = build_cylinder_between(c + np.array([-body_w / 2, 0, 0]),
                                             c + np.array([body_w / 2, 0, 0]), diff_r, n=20)
@@ -1971,11 +2030,16 @@ class View3D:
             sv, sf = build_cylinder_between(inner, outer, shaft_r, n=16)
             _pose_mesh(self._driveshaft_meshes[i], vertices=sv, faces=sf)
             self._last_ds_segs.append((inner.copy(), outer.copy()))
-            # tripod = stubby cylinder at the inner (diff) end, along the shaft
-            t = float(pkg['tripod_od_mm']) / 1000.0
-            tv, tf = build_cylinder_between(inner - axis * 0.5 * t,
-                                            inner + axis * 0.5 * t, tri_r, n=16)
-            _pose_mesh(self._tripod_meshes[i], vertices=tv, faces=tf)
+            # tripod = stubby cylinder at the inner (diff) end, along the shaft.
+            # Hidden together with the diff body (show_diff=False) so a real
+            # imported diff/tripod STEP shows without the placeholder on top.
+            if show_diff:
+                t = float(pkg['tripod_od_mm']) / 1000.0
+                tv, tf = build_cylinder_between(inner - axis * 0.5 * t,
+                                                inner + axis * 0.5 * t, tri_r, n=16)
+                _pose_mesh(self._tripod_meshes[i], vertices=tv, faces=tf)
+            else:
+                _clear(self._tripod_meshes[i])
 
     # ── internal ─────────────────────────────────────────────────────────────
 
@@ -2016,6 +2080,43 @@ class View3D:
             color=color,
             parent=self._view.scene,
         )
+
+    def set_bearing_dims(self, spacing_mm: float, inboard_offset_mm: float):
+        """Wheel-bearing geometry from the loads model (UprightParams): l1
+        centre-to-centre spacing + outer-bearing inboard offset, both mm.
+        The next scene update re-poses the bearing spheres."""
+        self._bearing_spacing_m = max(float(spacing_mm), 1.0) / 1000.0
+        self._bearing_offset_m = float(inboard_offset_mm) / 1000.0
+
+    # ── imported STEP parts (diff / engine) for clearance ────────────────────
+    def set_imported_parts(self, parts):
+        """Replace all imported STEP geometry shown for clearance.
+
+        parts = list of (vertices_mm Nx3 in the Vahan frame, faces Mx3, rgba).
+        Vertices are in mm (like the hardpoints); the view is in metres, so they
+        are scaled here.  These meshes persist across model solves — they are not
+        touched by the per-frame pose loop."""
+        for m in self._imported_meshes:
+            try:
+                m.parent = None
+            except Exception:
+                pass
+        self._imported_meshes = []
+        for verts_mm, faces, rgba in (parts or []):
+            v = np.asarray(verts_mm, np.float32)
+            f = np.asarray(faces, np.uint32)
+            if len(v) < 3 or len(f) < 1:
+                continue
+            mesh = self._new_mesh(tuple(rgba))
+            _pose_mesh(mesh, vertices=np.ascontiguousarray(v * 0.001), faces=f)
+            self._imported_meshes.append(mesh)
+        try:
+            self._canvas.update()
+        except Exception:
+            pass
+
+    def clear_imported_parts(self):
+        self.set_imported_parts([])
 
     def _make_ground_grid(self):
         """Ground grid spanning ±8 m laterally, -2..12 m longitudinally."""

@@ -2346,6 +2346,13 @@ class MainWindow(QMainWindow):
             'Write the current kinematic sweep (every metric, all 4 corners) '
             'and the last dynamics sweep to CSV files for Excel/Matlab')
         export_csv_act.triggered.connect(self._export_sweep_csv)
+        fm.addSeparator()
+        import_step_act = fm.addAction('Import STEP (diff / engine)…')
+        import_step_act.setToolTip(
+            'Load a .STEP CAD solid (differential, engine, …) into the 3-D view '
+            'for packaging / clearance against the suspension.  Choose whether it '
+            'was exported from SolidWorks (Y-up) or Onshape (Z-up).')
+        import_step_act.triggered.connect(self._import_step_dialog)
 
         # ── Page switcher: Suspension ↔ Laptime ───────────────────────────
         pm = mb.addMenu('Page')
@@ -2367,6 +2374,12 @@ class MainWindow(QMainWindow):
         ack_act.setToolTip('Ackermann analysis — five methods, five graphs, '
                            'one plain-English line each.')
         ack_act.triggered.connect(lambda: self._switch_page(4))
+        eng_act = pm.addAction('Engine')
+        eng_act.setShortcut('Ctrl+6')
+        eng_act.setToolTip('Engine model: SDM26 1-D sim + calibration '
+                           '(VE / friction / published anchor) — the curve '
+                           'the lap sim runs on, every input visible.')
+        eng_act.triggered.connect(lambda: self._switch_page(5))
 
         vm = mb.addMenu('View')
         hp_act = vm.addAction('All Hardpoints…')
@@ -2509,6 +2522,9 @@ class MainWindow(QMainWindow):
                 'aero':     self._aero_panel.get_state(),
                 'brake_calc': self._brake_calc_panel.get_state(),
             },
+            # Imported STEP solids (diff / engine) — base64 mesh blobs so the
+            # clearance geometry travels with the project.
+            'imported_parts': self._imported_parts_to_json(),
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
@@ -3290,6 +3306,7 @@ class MainWindow(QMainWindow):
         car_data.setdefault('driveshaft_dia_mm', 25.4)
         car_data.setdefault('rotor_dia_mm', 240.0)
         car_data.setdefault('show_driveshaft', True)
+        car_data.setdefault('show_diff_body', True)
         car_data.setdefault('show_brakes', True)
         car_data.setdefault('show_shock_thickness', True)
         self._car.update(car_data)
@@ -3380,8 +3397,83 @@ class MainWindow(QMainWindow):
             self._refresh_sag()
         except Exception:
             pass
+        # Imported STEP solids (diff / engine) travel with the project.
+        self._imported_parts = self._imported_parts_from_json(
+            data.get('imported_parts', []))
+        self._push_imported_parts_to_view()
+        if getattr(self, '_step_dialog', None) is not None:
+            try:
+                self._step_dialog.sync_from_state()
+            except Exception:
+                pass
         self.statusBar().showMessage(
             f'Loaded: {path}  |  topology: {self._topology.describe()}', 5000)
+
+    def _import_step_dialog(self):
+        """File → Import STEP: open the STEP-import dialog (differential / engine
+        clearance).  Non-modal so the part updates in the 3-D view live while the
+        placement offsets are nudged."""
+        from gui.step_import_dialog import StepImportDialog
+        dlg = getattr(self, '_step_dialog', None)
+        if dlg is None:
+            dlg = StepImportDialog(self, self)   # (main_window, parent)
+            self._step_dialog = dlg              # keep a ref so it is not GC'd
+        dlg.sync_from_state()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    # ── imported STEP parts: view refresh + .vahan (de)serialisation ─────────
+    _IMPORTED_PART_COLOURS = [
+        (0.55, 0.57, 0.60, 0.55), (0.72, 0.55, 0.20, 0.55),
+        (0.40, 0.42, 0.45, 0.55), (0.85, 0.72, 0.35, 0.55)]
+
+    def _push_imported_parts_to_view(self):
+        """Send the canonical imported-part list to the 3-D view (colours cycle,
+        colourblind-safe grey/amber)."""
+        payload = []
+        for i, p in enumerate(self._imported_parts):
+            payload.append((p['verts'], p['faces'],
+                            self._IMPORTED_PART_COLOURS[i % len(self._IMPORTED_PART_COLOURS)]))
+        try:
+            self.view3d.set_imported_parts(payload)
+        except Exception:
+            pass
+
+    def _imported_parts_to_json(self):
+        """Serialise imported parts (base64 mesh blobs) for the .vahan file."""
+        from vahan.step_import import pack_mesh
+        out = []
+        for p in self._imported_parts:
+            rec = {'name': p.get('name', 'part'),
+                   'source': p.get('source', 'onshape'),
+                   'offset': list(p.get('offset', (0., 0., 0.))),
+                   'flip': bool(p.get('flip', False)),
+                   'src_path': p.get('src_path', '')}
+            rec.update(pack_mesh(p['verts'], p['faces']))
+            out.append(rec)
+        return out
+
+    def _imported_parts_from_json(self, blocks):
+        """Inverse of _imported_parts_to_json; tolerant of missing/old files."""
+        from vahan.step_import import unpack_mesh
+        parts = []
+        for b in (blocks or []):
+            try:
+                v, f = unpack_mesh(b)
+            except Exception:
+                continue
+            size = (v.max(axis=0) - v.min(axis=0)) if len(v) else np.zeros(3)
+            info = {'path': b.get('name', 'part'),
+                    'n_faces': int(len(f)),
+                    'size_mm': [round(float(x), 2) for x in size]}
+            parts.append({'name': b.get('name', 'part'),
+                          'source': b.get('source', 'onshape'),
+                          'offset': list(b.get('offset', (0., 0., 0.))),
+                          'flip': bool(b.get('flip', False)),
+                          'src_path': b.get('src_path', ''),
+                          'verts': v, 'faces': f, 'info': info})
+        return parts
 
     def _export_sweep_csv(self):
         """File → Export Sweep Data (CSV): write the current kinematic sweep
@@ -3469,6 +3561,28 @@ class MainWindow(QMainWindow):
 
         corners = [('FL', fl_full), ('FR', fr_full), ('RL', rl_full), ('RR', rr_full)]
         names = list(fl.keys()) + list(self._front_arb.keys())
+
+        # Wheel BEARINGS as derived hardpoints (design constraint made visible):
+        # both sit on the spin axis, outer at `bearing_inboard_offset_mm` inboard
+        # of the wheel centre-line, inner a further `bearing_spacing_mm` (l1) in.
+        # Derived from the SOLVED static wheel centre + the loads-model params —
+        # not free points (they live on the spin axis by definition).
+        try:
+            _up = self._loads_panel.get_upright_params()
+            _off = float(getattr(_up, 'bearing_inboard_offset_mm', 39.4)) / 1000.0
+            _l1 = float(getattr(_up, 'bearing_spacing_mm', 50.8)) / 1000.0
+            for lbl, hp_dict in corners:
+                st = self._solvers[lbl].solve(0.)
+                wc = np.asarray(st.wheel_center, float)
+                s = np.asarray(st.spin_axis, float)
+                s = s / max(np.linalg.norm(s), 1e-9)
+                if abs((wc + s * 0.01)[0]) > abs(wc[0]):
+                    s = -s                       # point INBOARD
+                hp_dict['bearing_outer'] = wc + s * _off
+                hp_dict['bearing_inner'] = wc + s * (_off + _l1)
+            names = names + ['bearing_outer', 'bearing_inner']
+        except Exception:
+            pass
 
         dlg = QDialog(self)
         dlg.setWindowTitle('All Hardpoints (mm)')
@@ -3569,10 +3683,27 @@ class MainWindow(QMainWindow):
         copy_btn.clicked.connect(_copy)
         btn_row.addWidget(copy_btn)
 
-        # Copy CSV for FeatureScript paste
+        # Driveshaft coordinates: diff centre + tripods from car params, hubs
+        # from the solved rear corners.  All in mm, car frame.
+        def _ds_pts():
+            try:
+                from vahan import driveshaft as _ds
+                dc = _ds.diff_center_m(self._car) * 1000.0
+                tp = _ds.tripod_inners_m(self._car)
+                cd = dict(corners)
+                oL = cd.get('RL', {}).get('wheel_center')
+                oR = cd.get('RR', {}).get('wheel_center')
+                oL = None if oL is None else oL * 1000.0
+                oR = None if oR is None else oR * 1000.0
+                return dc, tp['L'] * 1000.0, tp['R'] * 1000.0, oL, oR
+            except Exception:
+                return None
+
+        # Copy CSV for FeatureScript paste (hardpoints + driveshaft points)
         onshape_btn = QPushButton('Copy for Onshape')
         onshape_btn.setStyleSheet(_btn_purple)
-        onshape_btn.setToolTip('Copy as CSV for pasting into the Vahan Hardpoints FeatureScript')
+        onshape_btn.setToolTip('Copy as CSV for pasting into the Vahan Hardpoints '
+                               'FeatureScript (now includes diff centre + tripods)')
         def _copy_onshape():
             csv_lines = []
             for name in names:
@@ -3585,10 +3716,158 @@ class MainWindow(QMainWindow):
                     else:
                         vals.extend(['0', '0', '0'])
                 csv_lines.append(f'{name},{",".join(vals)}')
+            # driveshaft: front columns zero, rear (RL,RR) carry the points
+            ds = _ds_pts()
+            if ds is not None:
+                dc, tL, tR, oL, oR = ds
+                z3 = ['0', '0', '0']
+
+                def f3(p):
+                    return [f'{p[0]:.2f}', f'{p[1]:.2f}', f'{p[2]:.2f}']
+                csv_lines.append('diff_center,' + ','.join(z3 + z3 + f3(dc) + f3(dc)))
+                csv_lines.append('tripod_inner,' + ','.join(z3 + z3 + f3(tL) + f3(tR)))
+                if oL is not None and oR is not None:
+                    csv_lines.append('driveshaft_outer,' + ','.join(z3 + z3 + f3(oL) + f3(oR)))
             QApplication.clipboard().setText('|'.join(csv_lines))
             onshape_btn.setText('Copied!')
         onshape_btn.clicked.connect(_copy_onshape)
         btn_row.addWidget(onshape_btn)
+
+        # Separate: copy JUST the driveshaft coordinates, labelled
+        ds_btn = QPushButton('Copy driveshaft coords')
+        ds_btn.setStyleSheet(_btn_purple)
+        ds_btn.setToolTip('Copy the differential centre, tripod (CV-at-diff) and '
+                          'hub coordinates in mm')
+        def _copy_ds():
+            ds = _ds_pts()
+            if ds is None:
+                ds_btn.setText('n/a'); return
+            dc, tL, tR, oL, oR = ds
+            lines = ['Driveshaft coordinates (mm) — car frame: X lateral, '
+                     'Y forward, Z up', '=' * 62]
+
+            def _row(nm, p):
+                return f'{nm:22s} {p[0]:9.2f} {p[1]:9.2f} {p[2]:9.2f}'
+            lines.append(_row('diff_center', dc))
+            lines.append(_row('tripod_inner_L (RL)', tL))
+            lines.append(_row('tripod_inner_R (RR)', tR))
+            if oL is not None:
+                lines.append(_row('hub_L (RL)', oL))
+            if oR is not None:
+                lines.append(_row('hub_R (RR)', oR))
+            QApplication.clipboard().setText('\n'.join(lines))
+            ds_btn.setText('Copied!')
+        ds_btn.clicked.connect(_copy_ds)
+        btn_row.addWidget(ds_btn)
+
+        # Copy a ready-to-run SolidWorks VBA macro (all points baked in) — for
+        # shops that paste coords into a macro instead of re-importing a STEP.
+        sw_btn = QPushButton('Copy for SolidWorks')
+        sw_btn.setStyleSheet(_btn_purple)
+        sw_btn.setToolTip('Copy a complete SolidWorks VBA macro that builds a '
+                          '3D sketch of every hardpoint + driveshaft point. '
+                          'Paste into Tools > Macro > New and Run — no STEP re-import.')
+
+        def _copy_solidworks():
+            pts = []   # (name, x, y, z) mm
+            for name in names:
+                for label, hp_dict in corners:
+                    pt = hp_dict.get(name)
+                    if pt is not None:
+                        mm = pt * 1000.0
+                        pts.append((f'{name} {label}', mm[0], mm[1], mm[2]))
+            ds = _ds_pts()
+            if ds is not None:
+                dc, tL, tR, oL, oR = ds
+                pts.append(('diff_center', dc[0], dc[1], dc[2]))
+                pts.append(('tripod_inner_L RL', tL[0], tL[1], tL[2]))
+                pts.append(('tripod_inner_R RR', tR[0], tR[1], tR[2]))
+                if oL is not None:
+                    pts.append(('hub_L RL', oL[0], oL[1], oL[2]))
+                if oR is not None:
+                    pts.append(('hub_R RR', oR[0], oR[1], oR[2]))
+            body = '\n'.join(
+                f'    AddPt {x:.3f}, {y:.3f}, {z:.3f}   \x27 {nm}'
+                for nm, x, y, z in pts)
+            macro = (
+                "' Vahan hardpoints -> SolidWorks 3D sketch points.\n"
+                "' Auto-generated. Tools > Macro > New, paste all of this, Run.\n"
+                "' Car frame: X = lateral, Y = forward, Z = up. Units: mm.\n"
+                "' SWAP_YZ = True imports Y-up (SolidWorks default upright car).\n"
+                "Const SWAP_YZ As Boolean = True\n"
+                "Dim swApp As Object, swModel As Object, swSk As Object\n\n"
+                "Sub main()\n"
+                "    Set swApp = Application.SldWorks\n"
+                "    Set swModel = swApp.ActiveDoc\n"
+                "    If swModel Is Nothing Then MsgBox \"Open a part first.\": Exit Sub\n"
+                "    Set swSk = swModel.SketchManager\n"
+                "    swSk.Insert3DSketch True\n"
+                f"{body}\n"
+                "    swSk.Insert3DSketch True\n"
+                "    swModel.ClearSelection2 True\n"
+                "    swModel.ViewZoomtofit2\n"
+                "End Sub\n\n"
+                "Sub AddPt(x As Double, y As Double, z As Double)\n"
+                "    If SWAP_YZ Then\n"
+                "        swSk.CreatePoint x / 1000#, z / 1000#, y / 1000#\n"
+                "    Else\n"
+                "        swSk.CreatePoint x / 1000#, y / 1000#, z / 1000#\n"
+                "    End If\n"
+                "End Sub\n")
+            QApplication.clipboard().setText(macro)
+            sw_btn.setText('Copied!')
+        sw_btn.clicked.connect(_copy_solidworks)
+        btn_row.addWidget(sw_btn)
+
+        # PARAMETRIC route: SolidWorks equations file (global variables).  Link
+        # the part's Equations to this file ONCE + dimension points to the
+        # variables; then re-exporting + Rebuild moves the whole model (like the
+        # Onshape FeatureScript).  Written to a file the part links to.
+        def _sw_equation_lines():
+            def vname(nm):
+                return nm.replace(' ', '_').replace('/', '_')
+            lines = []   # pure "name"= value lines (SW Import chokes on comments)
+            for name in names:
+                for label, hp_dict in corners:
+                    pt = hp_dict.get(name)
+                    if pt is not None:
+                        mm = pt * 1000.0
+                        v = vname(f'{name}_{label}')
+                        lines.append(f'"{v}_x"= {mm[0]:.3f}mm')
+                        lines.append(f'"{v}_y"= {mm[1]:.3f}mm')
+                        lines.append(f'"{v}_z"= {mm[2]:.3f}mm')
+            ds = _ds_pts()
+            if ds is not None:
+                dc, tL, tR, oL, oR = ds
+                for v, p in (('diff_center', dc), ('tripod_inner_L', tL),
+                             ('tripod_inner_R', tR), ('hub_L', oL), ('hub_R', oR)):
+                    if p is None:
+                        continue
+                    lines.append(f'"{v}_x"= {p[0]:.3f}mm')
+                    lines.append(f'"{v}_y"= {p[1]:.3f}mm')
+                    lines.append(f'"{v}_z"= {p[2]:.3f}mm')
+            return lines
+
+        eq_btn = QPushButton('Export SW equations…')
+        eq_btn.setStyleSheet(_btn_purple)
+        eq_btn.setToolTip('Write a SolidWorks equations file (global variables) '
+                          'for PARAMETRIC linking — re-export + Rebuild updates '
+                          'the model, like the Onshape FeatureScript.')
+
+        def _export_sw_equations():
+            path, _ = QFileDialog.getSaveFileName(
+                self, 'Export SolidWorks equations', 'vahan_hardpoints.txt',
+                'Text (*.txt)')
+            if not path:
+                return
+            try:
+                with open(path, 'w') as f:
+                    f.write('\n'.join(_sw_equation_lines()) + '\n')
+                eq_btn.setText('Saved!')
+            except OSError as e:
+                QMessageBox.critical(self, 'Export failed', str(e))
+        eq_btn.clicked.connect(_export_sw_equations)
+        btn_row.addWidget(eq_btn)
 
         # Export JSON for Onshape upload
         json_btn = QPushButton('Export JSON')
@@ -3663,11 +3942,20 @@ class MainWindow(QMainWindow):
                 import traceback; traceback.print_exc()
                 self.statusBar().showMessage(f'Ackermann page failed: {e}', 8000)
                 return
+        if idx >= 5 and self._pages.count() < 6:
+            try:
+                from gui.engine_page import EnginePage
+                self._engine_page = EnginePage(self)
+                self._pages.addWidget(self._engine_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Engine page failed: {e}', 8000)
+                return
         if idx < self._pages.count():
             self._pages.setCurrentIndex(idx)
             self.statusBar().showMessage(
                 ('Suspension', 'Laptime', 'Design City', 'Loads',
-                 'Ackermann')[idx] + ' page', 2000)
+                 'Ackermann', 'Engine')[idx] + ' page', 2000)
 
     def _build_ui(self):
         self._build_menu()
@@ -3685,6 +3973,10 @@ class MainWindow(QMainWindow):
 
         # 3D + curves
         self.view3d = View3D()
+        # Imported STEP parts (diff / engine) for clearance — canonical state,
+        # saved into the .vahan project.  Each: {name, source, offset, flip,
+        # verts (np mm), faces (np)}.
+        self._imported_parts = []
         self.view3d.set_on_pick(self._on_pick)
         self.view3d.set_on_move(self._on_hp_move)
         self.view3d.set_on_constraint(self._on_constraint_mode)
@@ -5758,6 +6050,9 @@ class MainWindow(QMainWindow):
                                         'caliper_vertical_mounts', True),
                 rotor_thickness_mm=getattr(self._loads_panel.get_brake_params_front(),
                                            'rotor_thickness_mm', 6.35))
+            _up = self._loads_panel.get_upright_params()
+            view3d.set_bearing_dims(getattr(_up, 'bearing_spacing_mm', 50.8),
+                                    getattr(_up, 'bearing_inboard_offset_mm', 39.4))
         except Exception:
             pass
         # Draw the ARB structure too (the user wants it on the Loads page, not
@@ -5783,7 +6078,8 @@ class MainWindow(QMainWindow):
             _only = corner_label if corner_label in ('RL', 'RR') else None
             _show_ds = (cp.get('show_driveshaft', True)
                         and (corner_label is None or corner_label in ('RL', 'RR')))
-            view3d.set_driveshaft_package(_pkg, show=_show_ds, only=_only)
+            view3d.set_driveshaft_package(_pkg, show=_show_ds, only=_only,
+                                          show_diff=cp.get('show_diff_body', True))
         except Exception:
             pass
         # force-vector arrows (feed hover) — from the SAME solved model
@@ -6163,6 +6459,10 @@ class MainWindow(QMainWindow):
                                         'caliper_vertical_mounts', True),
                 rotor_thickness_mm=getattr(self._loads_panel.get_brake_params_front(),
                                            'rotor_thickness_mm', 6.35))
+                _up2 = self._loads_panel.get_upright_params()
+                self.view3d.set_bearing_dims(
+                    getattr(_up2, 'bearing_spacing_mm', 50.8),
+                    getattr(_up2, 'bearing_inboard_offset_mm', 39.4))
             except Exception:
                 pass
             self.view3d.update_scene(corners_draw, arb_segs)
@@ -6186,7 +6486,9 @@ class MainWindow(QMainWindow):
                 _only = _iso if _iso in ('RL', 'RR') else None
                 _show_ds = (self._car.get('show_driveshaft', True)
                             and (_iso is None or _iso in ('RL', 'RR')))
-                self.view3d.set_driveshaft_package(_pkg, show=_show_ds, only=_only)
+                self.view3d.set_driveshaft_package(
+                    _pkg, show=_show_ds, only=_only,
+                    show_diff=self._car.get('show_diff_body', True))
             except Exception:
                 pass
 
@@ -6361,6 +6663,25 @@ class MainWindow(QMainWindow):
             cg_z = self._car.get('cg_z_mm', 280.) / 1000.
             self.view3d.update_cg((cg_x, cg_y, cg_z))
             self.view3d.set_cg_visible(self._show_cg)
+
+            # ── UNSPRUNG CG spheres (design constraint, drawn like the CG) ──
+            # Exactly what the dynamics model uses: each axle's unsprung mass
+            # lumped on the axle line at unsprung_cg_height_m (the load-
+            # transfer lever arm).  Yellow, one sphere per axle.
+            if not light:
+                try:
+                    _veh = self._build_dynamics_solver()._veh
+                    _h_us = float(getattr(_veh, 'unsprung_cg_height_m', 0.203))
+                    def _axle_y(l, r):
+                        lc = next(c for c in corners_draw if c['label'] == l)
+                        rc = next(c for c in corners_draw if c['label'] == r)
+                        return 0.5 * (lc['pts']['wheel_center'][1]
+                                      + rc['pts']['wheel_center'][1])
+                    self.view3d.update_unsprung_cg(
+                        (0.0, float(_axle_y('FL', 'FR')), _h_us),
+                        (0.0, float(_axle_y('RL', 'RR')), _h_us))
+                except Exception:
+                    pass
 
             # ── Pitch axis ────────────────────────────────────────────────
             # The pitch axis is the LATERAL (X-direction) line about which
@@ -6679,6 +7000,10 @@ class MainWindow(QMainWindow):
             if 'wheel_center' in self._rear_hp:
                 self._rear_hp['wheel_center'] = self._rear_hp['wheel_center'] + dx
 
+        # The car PANEL does not manage the tyre file, so carry it forward —
+        # otherwise every car-param edit silently dropped car['tire_file'] and
+        # the next save lost the tyre reference (net then loaded a wrong tyre).
+        params['tire_file'] = old.get('tire_file', params.get('tire_file', ''))
         self._car = params
 
         # Refresh the hardpoint table UIs so the user sees the shifted values
@@ -9047,6 +9372,7 @@ class MainWindow(QMainWindow):
                 return
             tm = self._tire_model
             name = path.split('/')[-1].split('\\')[-1]
+            self._car['tire_file'] = name       # persist so save keeps the tyre
             self._dynamics_panel._tire_path = path
             self._dynamics_panel._tire_label.setText(name)
             self._dynamics_panel._tire_label.setStyleSheet(
