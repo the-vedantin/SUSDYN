@@ -4,3 +4,11 @@ matplotlib>=3.8
 PyQt6>=6.6
 python-docx>=1.0
 Pillow>=10.0
+
+# Optional — STEP import (File → Import STEP, for diff/engine clearance).
+# Without these the feature is disabled and the dialog explains how to install.
+cascadio>=0.1
+trimesh>=4.0
+# Optional — writing a moved STEP back out (Import STEP → Export moved part).
+# OpenCASCADE kernel; without it, STEP import still works but re-export doesn't.
+cadquery-ocp>=7.7
