@@ -1,0 +1,155 @@
+{
+ "n_cycles": 22,
+ "curve": [
+  {
+   "rpm": 6000,
+   "ve_atm": 0.8144,
+   "imep_bar": 11.2575,
+   "fmep_bar": 2.6063,
+   "bmep_bar": 8.6512,
+   "brake_torque_Nm": 41.263,
+   "brake_power_hp": 34.767,
+   "EGT_K": 952.8
+  },
+  {
+   "rpm": 6500,
+   "ve_atm": 0.795,
+   "imep_bar": 11.182,
+   "fmep_bar": 2.7752,
+   "bmep_bar": 8.4068,
+   "brake_torque_Nm": 40.097,
+   "brake_power_hp": 36.6,
+   "EGT_K": 988.3
+  },
+  {
+   "rpm": 7000,
+   "ve_atm": 0.7752,
+   "imep_bar": 11.087,
+   "fmep_bar": 2.9492,
+   "bmep_bar": 8.1378,
+   "brake_torque_Nm": 38.814,
+   "brake_power_hp": 38.155,
+   "EGT_K": 1023.6
+  },
+  {
+   "rpm": 7500,
+   "ve_atm": 0.7557,
+   "imep_bar": 10.9861,
+   "fmep_bar": 3.1282,
+   "bmep_bar": 7.8579,
+   "brake_torque_Nm": 37.479,
+   "brake_power_hp": 39.474,
+   "EGT_K": 1058.7
+  },
+  {
+   "rpm": 8000,
+   "ve_atm": 0.7363,
+   "imep_bar": 10.8694,
+   "fmep_bar": 3.3122,
+   "bmep_bar": 7.5571,
+   "brake_torque_Nm": 36.044,
+   "brake_power_hp": 40.494,
+   "EGT_K": 1096.1
+  },
+  {
+   "rpm": 8500,
+   "ve_atm": 0.7178,
+   "imep_bar": 10.7606,
+   "fmep_bar": 3.5013,
+   "bmep_bar": 7.2594,
+   "brake_torque_Nm": 34.624,
+   "brake_power_hp": 41.33,
+   "EGT_K": 1133.9
+  },
+  {
+   "rpm": 9000,
+   "ve_atm": 0.6979,
+   "imep_bar": 10.6189,
+   "fmep_bar": 3.6953,
+   "bmep_bar": 6.9236,
+   "brake_torque_Nm": 33.023,
+   "brake_power_hp": 41.737,
+   "EGT_K": 1171.0
+  },
+  {
+   "rpm": 9500,
+   "ve_atm": 0.6778,
+   "imep_bar": 10.4603,
+   "fmep_bar": 3.8944,
+   "bmep_bar": 6.5659,
+   "brake_torque_Nm": 31.316,
+   "brake_power_hp": 41.779,
+   "EGT_K": 1207.0
+  },
+  {
+   "rpm": 10000,
+   "ve_atm": 0.66,
+   "imep_bar": 10.3282,
+   "fmep_bar": 4.0985,
+   "bmep_bar": 6.2297,
+   "brake_torque_Nm": 29.713,
+   "brake_power_hp": 41.727,
+   "EGT_K": 1242.4
+  },
+  {
+   "rpm": 10500,
+   "ve_atm": 0.6436,
+   "imep_bar": 10.21,
+   "fmep_bar": 4.3076,
+   "bmep_bar": 5.9024,
+   "brake_torque_Nm": 28.152,
+   "brake_power_hp": 41.511,
+   "EGT_K": 1274.4
+  },
+  {
+   "rpm": 11000,
+   "ve_atm": 0.6261,
+   "imep_bar": 9.9207,
+   "fmep_bar": 4.5217,
+   "bmep_bar": 5.399,
+   "brake_torque_Nm": 25.751,
+   "brake_power_hp": 39.778,
+   "EGT_K": 1291.3
+  },
+  {
+   "rpm": 11500,
+   "ve_atm": 0.6092,
+   "imep_bar": 9.651,
+   "fmep_bar": 4.7408,
+   "bmep_bar": 4.9102,
+   "brake_torque_Nm": 23.42,
+   "brake_power_hp": 37.822,
+   "EGT_K": 1308.6
+  },
+  {
+   "rpm": 12000,
+   "ve_atm": 0.593,
+   "imep_bar": 9.3911,
+   "fmep_bar": 4.965,
+   "bmep_bar": 4.4261,
+   "brake_torque_Nm": 21.11,
+   "brake_power_hp": 35.575,
+   "EGT_K": 1324.4
+  },
+  {
+   "rpm": 12500,
+   "ve_atm": 0.5788,
+   "imep_bar": 9.1481,
+   "fmep_bar": 5.1942,
+   "bmep_bar": 3.9539,
+   "brake_torque_Nm": 18.858,
+   "brake_power_hp": 33.104,
+   "EGT_K": 1347.1
+  },
+  {
+   "rpm": 13000,
+   "ve_atm": 0.5672,
+   "imep_bar": 8.9361,
+   "fmep_bar": 5.4284,
+   "bmep_bar": 3.5078,
+   "brake_torque_Nm": 16.731,
+   "brake_power_hp": 30.543,
+   "EGT_K": 1371.6
+  }
+ ]
+}

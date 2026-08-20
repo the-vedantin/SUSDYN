@@ -31,6 +31,7 @@ from matplotlib.figure import Figure
 _TRACKS = [
     ('2024', 'autocross26.json'),
     ('2025', 'autocross_2025.json'),
+    ('MI 2018 Endurance', 'mi2018_endurance.json'),
 ]
 
 # The tire-dataset dropdown is built DYNAMICALLY from whatever .mat files the
@@ -958,11 +959,21 @@ class LaptimePage(QWidget):
             pairs.sort()
             return ([p[0] for p in pairs], [p[1] for p in pairs],
                     'user-entered dyno points')
-        # Default engine = the SDM26 1-D solver curve (Sun Devil Motorsports),
-        # the ONE engine source.  Only if that curve file is missing do we fall
-        # back to the ASSUMED generic shape scaled to this car's peak power.
-        from vahan.engine import sdm26_engine_curve
-        c = sdm26_engine_curve()
+        # Default engine = the SDM26 curve with the CALIBRATION the user chose
+        # on the Engine page (saved in the project car dict; 'corrected' if
+        # unset).  ONE engine source.  Only if the data files are missing do we
+        # fall back to the ASSUMED generic shape scaled to peak power.
+        import vahan.engine as _VE
+        car = getattr(self._main, '_car', {})
+        _VE.VE_FALL_START_RPM = float(car.get('engine_ve_fall_rpm',
+                                              _VE.VE_FALL_START_RPM))
+        _VE.VE_AT_13K = float(car.get('engine_ve_13k', _VE.VE_AT_13K))
+        c = _VE.engine_curve(
+            car.get('engine_method', _VE.DEFAULT_METHOD),
+            ve_target=float(car.get('engine_ve_target', _VE.VE_TARGET)),
+            fmep_a=float(car.get('engine_fmep_a', _VE.FMEP_A_BAR)),
+            fmep_b=float(car.get('engine_fmep_b', _VE.FMEP_B_BAR)),
+            anchor_hp=float(car.get('engine_anchor_hp', _VE.ANCHOR_HP)))
         if c is not None:
             return list(c[0]), list(c[1]), c[2]
         try:

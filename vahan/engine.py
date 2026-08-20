@@ -20,6 +20,37 @@ from typing import List, Optional, Tuple
 
 _HERE = os.path.dirname(__file__)
 _CURVE_JSON = os.path.join(_HERE, "data", "engine_curve_sdm26.json")
+_SWEEP_JSON = os.path.join(_HERE, "data", "engine_sweep_sdm26.json")
+
+# ── Calibration inputs (ALL explicit — these are the knobs, not magic) ──────
+# The raw solver under-reads ~2x: its breathing (VE) caps at ~0.57-0.71 where a
+# real race 600 runs ~0.85-0.95, and its friction (FMEP) reads 2.6-5.4 bar
+# where realistic sportbike friction is ~1.3-2.7 bar.  Verified 2026-08:
+# even UNRESTRICTED the raw solver makes 48 hp vs ~110 real — a calibration
+# floor, not an input problem.  Two correction methods, both defensible:
+#   'corrected' — per-rpm physics correction: scale indicated work by
+#                 (VE_TARGET / VE_sim), subtract a realistic friction line.
+#   'anchored'  — keep the raw curve SHAPE, scale so peak power equals a
+#                 published restricted-CBR600RR level.
+#   'raw'       — the uncorrected solver output (for reference only).
+VE_TARGET = 0.88            # realistic race-600 breathing (dyno-typical 0.85-0.95)
+# Real VE FALLS at high rpm (the restrictor's pressure drop grows steeply as
+# flow approaches choke, plus port velocity limits) — a flat target would put
+# peak power at the redline, which no restricted 600 does.  Explicit taper:
+VE_FALL_START_RPM = 9500.0  # VE holds VE_TARGET up to here…
+VE_AT_13K = 0.72            # …then falls linearly to this at 13,000 rpm
+FMEP_A_BAR = 0.10           # friction line: FMEP[bar] = A + B*(rpm/1000)
+FMEP_B_BAR = 0.20           #   -> 1.3 bar @6k, 2.2 @10.5k, 2.7 @13k (Heywood-class)
+ANCHOR_HP = 80.0            # published restricted-CBR600RR crank peak (75-85 typical)
+DISPLACEMENT_M3 = 599e-6    # CBR600RR
+DEFAULT_METHOD = "corrected"
+
+METHOD_LABELS = {
+    "raw": "SDM26 1-D sim RAW (known ~2x low — reference only)",
+    "corrected": (f"SDM26 corrected: VE→{VE_TARGET:.2f} + realistic friction "
+                  f"({FMEP_A_BAR:.2f}+{FMEP_B_BAR:.2f}·rpm/1000 bar)"),
+    "anchored": f"SDM26 shape anchored to published {ANCHOR_HP:.0f} hp crank",
+}
 
 # Watermark / attribution strings (used by the GUI, binder and figures).
 CREDIT_SUSPENSION = "Suspension & VD: Yu — Cougar Racing"
@@ -36,10 +67,79 @@ def _load() -> Optional[dict]:
         return None
 
 
+def _load_sweep() -> Optional[dict]:
+    try:
+        with open(_SWEEP_JSON, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def fmep_real_bar(rpm: float, a: float = FMEP_A_BAR, b: float = FMEP_B_BAR) -> float:
+    """Realistic sportbike friction line (bar). Explicit input, not hidden."""
+    return a + b * float(rpm) / 1000.0
+
+
+def ve_target_curve(rpm, ve_peak: float = VE_TARGET,
+                    fall_start: float = VE_FALL_START_RPM,
+                    ve_13k: float = VE_AT_13K):
+    """Target breathing vs rpm: flat ve_peak to fall_start, then linear to
+    ve_13k at 13,000 (restrictor starvation).  All three knobs explicit."""
+    import numpy as np
+    r = np.asarray(rpm, float)
+    frac = np.clip((r - fall_start) / max(13000.0 - fall_start, 1.0), 0.0, 1.0)
+    return ve_peak + (ve_13k - ve_peak) * frac
+
+
+def engine_curve(method: str = DEFAULT_METHOD, ve_target: float = VE_TARGET,
+                 fmep_a: float = FMEP_A_BAR, fmep_b: float = FMEP_B_BAR,
+                 anchor_hp: float = ANCHOR_HP):
+    """(rpm[], crank torque N·m[], label) for the chosen calibration method.
+
+    'corrected': per-rpm — IMEP scaled by (ve_target / VE_sim(rpm)), then a
+                 realistic friction line subtracted.  torque = BMEP·Vd/(4π).
+    'anchored' : raw curve scaled so peak crank power = anchor_hp.
+    'raw'      : untouched solver output.
+    Returns None if the data files are missing."""
+    import numpy as np
+    sw = _load_sweep()
+    method = str(method).lower()
+    if sw and sw.get("curve") and method in ("corrected", "raw"):
+        rpm = np.array([p["rpm"] for p in sw["curve"]], float)
+        if method == "raw":
+            tq = np.array([p["brake_torque_Nm"] for p in sw["curve"]], float)
+            return list(rpm), list(tq), METHOD_LABELS["raw"]
+        imep = np.array([p["imep_bar"] for p in sw["curve"]], float)
+        ve = np.array([p["ve_atm"] for p in sw["curve"]], float)
+        ve_t = ve_target_curve(rpm, ve_peak=float(ve_target))
+        imep_c = imep * (ve_t / np.maximum(ve, 1e-3))
+        bmep_c = imep_c - (float(fmep_a) + float(fmep_b) * rpm / 1000.0)
+        bmep_c = np.maximum(bmep_c, 0.0)
+        tq = bmep_c * 1e5 * DISPLACEMENT_M3 / (4 * np.pi)
+        lbl = (f"SDM26 corrected: VE→{float(ve_target):.2f} + friction "
+               f"{float(fmep_a):.2f}+{float(fmep_b):.2f}·rpm/1000 bar")
+        return list(rpm), list(tq), lbl
+    # anchored (or corrected-fallback when sweep file missing): use raw curve
+    d = _load()
+    if not d or not d.get("curve"):
+        return None
+    rpm = [float(p["rpm"]) for p in d["curve"]]
+    tq = [float(p["brake_torque_Nm"]) for p in d["curve"]]
+    if len(rpm) < 2:
+        return None
+    if method == "anchored":
+        tq = anchor_curve_to_dyno(rpm, tq, float(anchor_hp))
+        return rpm, tq, f"SDM26 shape anchored to {float(anchor_hp):.0f} hp crank"
+    return rpm, tq, ENGINE_LABEL
+
+
 def sdm26_engine_curve() -> Optional[Tuple[List[float], List[float], str]]:
-    """(rpm[], crank torque N·m[], label) from the SDM26 solver sweep, or None
-    if the curve file is missing.  This is the default engine for the whole
-    tool — the backbone every lap-sim/dynamics engine number should read."""
+    """(rpm[], crank torque N·m[], label) — the DEFAULT engine for the whole
+    tool (backbone).  Now returns the CALIBRATED curve (DEFAULT_METHOD);
+    the raw solver curve is available via engine_curve('raw')."""
+    c = engine_curve(DEFAULT_METHOD)
+    if c is not None:
+        return c
     d = _load()
     if not d or not d.get("curve"):
         return None
