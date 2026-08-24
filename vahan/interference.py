@@ -93,6 +93,89 @@ def clashes(members, margin_mm: float = 1.0, share_tol_mm: float = 6.0,
 # a-arm / link OD; the driveshaft uses the real car-dict value.
 _TUBE_R = 0.008           # ~16 mm rod-end tube (assumption)
 
+# ── THE full member set (GUI interference view = packaging validator) ────────
+# One spec list shared by gui/main_window.py's interference view mode and
+# vahan/packaging.py's validity oracle, so "clash-free" always means the SAME
+# members: arms + tie rod + pushrod + ball-joint spheres + coilover + ARB drop
+# link + rocker hardware spheres (+ torsion bar + driveshaft added per corner).
+# Radii are the user's stated hardware (0.625" tubes, 1" ball joints, 1.5"
+# rocker bearing, 0.315"-radius drop-link ball joints); the coilover uses the
+# car's own spring_od_mm — what view3d draws it with.
+_FULL_TUBE_R = 0.5 * 0.625 * 25.4 / 1000.0   # 0.625" pushrod / arm tube radius
+_BJ_R        = 0.0127                        # 1" ball-joint sphere radius
+_LINK_R      = 0.006                         # ~12 mm drop link / ARB blade tube
+_BRG_R       = 0.5 * 38.1 / 1000.0           # 1.5" rocker pivot bearing OD
+_RE_R        = 0.315 * 25.4 / 1000.0         # drop-link ball joint radius
+
+
+def full_member_specs(spring_od_mm: float = 63.0) -> list:
+    """(name, key_a, key_b, radius_m) specs against a corners-draw ``pts`` dict."""
+    sr = 0.5 * float(spring_od_mm) / 1000.0
+    return [
+        ('upper arm front',  'uca_front',        'uca_outer',         _FULL_TUBE_R),
+        ('upper arm rear',   'uca_rear',         'uca_outer',         _FULL_TUBE_R),
+        ('lower arm front',  'lca_front',        'lca_outer',         _FULL_TUBE_R),
+        ('lower arm rear',   'lca_rear',         'lca_outer',         _FULL_TUBE_R),
+        ('tie / toe rod',    'tie_rod_inner',    'tie_rod_outer',     _FULL_TUBE_R),
+        ('pushrod',          'pushrod_outer',    'pushrod_inner',     _FULL_TUBE_R),
+        ('lower ball joint', 'lca_outer',        'lca_outer',         _BJ_R),
+        ('upper ball joint', 'uca_outer',        'uca_outer',         _BJ_R),
+        ('coilover',         'rocker_spring_pt', 'spring_chassis_pt', sr),
+        ('ARB drop link',    'arb_arm_end_world', 'arb_drop_top',     _LINK_R),
+        # Rocker hardware as real volumes (zero-length capsules = spheres).
+        ('rocker bearing',   'rocker_pivot',     'rocker_pivot',      _BRG_R),
+        ('ARB rod end',      'arb_drop_top',     'arb_drop_top',      _RE_R),
+        ('spring rod end',   'rocker_spring_pt', 'rocker_spring_pt',  _RE_R),
+        ('pushrod rod end',  'pushrod_inner',    'pushrod_inner',     _RE_R),
+    ]
+
+
+def full_members(pts: dict, car: dict, arb_pivot=None, arb_od_mm: float = None,
+                 driveshaft_seg=None) -> list:
+    """Build the FULL capsule list for one corner's ``pts`` dict (world metres).
+
+    pts: a corners-draw points dict (solved state points + live arb_drop_top /
+    arb_arm_end_world).  Missing / non-finite points are skipped, never fatal.
+    arb_pivot + arb_od_mm add the chassis-fixed ARB torsion tube (spans +x to
+    -x through arb_pivot); driveshaft_seg=(inner, outer) metres adds the
+    half-shaft with the car-dict OD.
+    """
+    members = []
+    for nm, ka, kb, rr in full_member_specs(car.get('spring_od_mm', 63.0)):
+        a, b = pts.get(ka), pts.get(kb)
+        if a is None or b is None:
+            continue
+        a = np.asarray(a, float); b = np.asarray(b, float)
+        if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+            continue
+        members.append({'name': nm, 'a': a, 'b': b, 'r': rr})
+    if arb_pivot is not None and arb_od_mm is not None:
+        pv = np.asarray(arb_pivot, float)
+        if np.all(np.isfinite(pv)):
+            b2 = pv.copy(); b2[0] = -pv[0]
+            members.append({'name': 'ARB torsion bar', 'a': pv, 'b': b2,
+                            'r': 0.5 * float(arb_od_mm) / 1000.0})
+    if driveshaft_seg is not None:
+        ds_r = 0.5 * float(car.get('driveshaft_dia_mm', 25.4)) / 1000.0
+        members.append({'name': 'driveshaft',
+                        'a': np.asarray(driveshaft_seg[0], float),
+                        'b': np.asarray(driveshaft_seg[1], float), 'r': ds_r})
+    return members
+
+
+def connected_for(label: str):
+    """Designed-joint exemptions for ``clashes()`` on this corner.
+
+    Rear lower A-arm + toe link are ONE fabricated welded part (user DFM,
+    2026-08-05) so their mutual interference is physically impossible; the
+    front tie rod is the steering rack (a separate part) and stays checked.
+    """
+    conn = DEFAULT_CONNECTED
+    if label in ('RL', 'RR'):
+        conn = conn | {frozenset({'lower arm front', 'tie / toe rod'}),
+                       frozenset({'lower arm rear', 'tie / toe rod'})}
+    return conn
+
 
 def corner_members(state, car, driveshaft_seg=None) -> list:
     """Build the capsule list for one solved corner.
