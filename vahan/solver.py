@@ -31,6 +31,12 @@ The Jacobian is derived analytically — no finite differences.
 After the main solve, pushrod_outer (also fixed to the upright) is recovered
 via a rigid-body frame transform.  Then the rocker angle is found with a
 Newton-Raphson 1-D solve (Rodrigues rotation).
+
+GROUND CONVENTION: Z=0 is the ground plane and hardpoints are authored at
+design ride height with the tire bottom ON it (wheel_center_z = tire radius,
+both axles).  All ground-referenced metrics downstream (roll-centre height,
+anti-squat/dive, scrub, trail, contact-patch loads) assume this — see
+vahan/hardpoints.py (tire_ground_gap_mm / GROUND_CONTACT_TOL_MM).
 ──────────────────────────────────────────────────────────────────────────────
 """
 

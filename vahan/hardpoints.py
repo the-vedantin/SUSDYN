@@ -8,10 +8,42 @@ All coordinates are in the chassis frame (meters):
 
 Origin convention: vehicle centerline (X=0), front axle (Y=0), ground (Z=0).
 For the left-front corner outboard is +X.  Mirror X to get the right side.
+
+GROUND CONTACT (authoring convention, written down 2026-08-23):
+    Hardpoints are authored at DESIGN RIDE HEIGHT with every tire sitting ON
+    the ground plane Z=0, i.e. wheel_center_z == tire_outer_radius on BOTH
+    axles.  Everything ground-referenced in the tool — roll-centre height,
+    anti-dive / anti-squat, scrub radius, mechanical trail, the contact patch
+    used by the corner-loads solver, and the 3-D view's ground grid — takes
+    "ground" to be Z=0.  If a tire bottom is NOT at Z=0 all of those numbers
+    are measured from the wrong plane, and a CAD export of the hardpoints puts
+    that tire in the air (the 2026-08 "rear tire floats 14.6 mm in Onshape"
+    bug: configs v41-v69 were baked by Apply-Sag without re-grounding).
+    Use tire_ground_gap_mm() to check; GROUND_CONTACT_TOL_MM is the limit.
 """
 
 from dataclasses import dataclass, field
 import numpy as np
+
+# Max allowed |tire bottom − ground plane| at design position, mm.
+GROUND_CONTACT_TOL_MM = 3.0
+
+
+def tire_ground_gap_mm(wheel_center_m, tire_outer_dia_mm) -> float:
+    """Signed gap (mm) between the tire bottom and the ground plane Z=0 at
+    design position:  wheel_center_z − tire_outer_radius.
+
+    0 = tire exactly on the ground (the authoring convention).
+    Positive = the tire FLOATS above the ground plane (every ground-referenced
+    metric for that axle is then measured from a plane below the real contact
+    patch, and CAD exports show the tire in the air).
+    Negative = the tire penetrates the ground plane.
+
+    wheel_center_m: 3-vector in metres (chassis frame).
+    tire_outer_dia_mm: tire outer DIAMETER in millimetres.
+    """
+    wc = np.asarray(wheel_center_m, dtype=float)
+    return float(wc[2] * 1000.0 - float(tire_outer_dia_mm) / 2.0)
 
 
 @dataclass

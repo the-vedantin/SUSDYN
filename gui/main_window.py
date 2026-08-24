@@ -2380,6 +2380,14 @@ class MainWindow(QMainWindow):
                            '(VE / friction / published anchor) — the curve '
                            'the lap sim runs on, every input visible.')
         eng_act.triggered.connect(lambda: self._switch_page(5))
+        pkg_act = pm.addAction('Packaging')
+        pkg_act.setShortcut('Ctrl+7')
+        pkg_act.setToolTip('Packaging design system: move the inboard '
+                           'actuation with every parameter held in tolerance '
+                           '— manual transforms + a solution generator, all '
+                           'validated (rates, geometric laws, full-travel '
+                           'clash sweep).')
+        pkg_act.triggered.connect(lambda: self._switch_page(6))
 
         vm = mb.addMenu('View')
         hp_act = vm.addAction('All Hardpoints…')
@@ -3406,8 +3414,35 @@ class MainWindow(QMainWindow):
                 self._step_dialog.sync_from_state()
             except Exception:
                 pass
-        self.statusBar().showMessage(
-            f'Loaded: {path}  |  topology: {self._topology.describe()}', 5000)
+        # ── GROUND-CONTACT INVARIANT (2026-08-23) ────────────────────────
+        # At design position each axle's tire bottom (wheel_center_z − tire
+        # radius) must sit ON the ground plane z=0.  A floating axle means
+        # every ground-referenced number (RC height, anti-squat/dive, scrub,
+        # trail, contact-patch loads) is measured from the wrong plane and a
+        # CAD export puts that tire in the air (the "rear tire not touching
+        # the ground in Onshape" bug: v41–v69 rear floated 14.6 mm after an
+        # Apply-Sag bake).  Persistent status warning — timeout 0 stays up.
+        try:
+            from vahan.hardpoints import tire_ground_gap_mm, GROUND_CONTACT_TOL_MM
+            _dia = float(self._car.get('tire_outer_dia_mm', 406.0))
+            _gap_f = tire_ground_gap_mm(self._front_hp['wheel_center'], _dia)
+            _gap_r = tire_ground_gap_mm(self._rear_hp['wheel_center'], _dia)
+        except Exception:
+            _gap_f = _gap_r = 0.0
+        if max(abs(_gap_f), abs(_gap_r)) > GROUND_CONTACT_TOL_MM:
+            _bad = []
+            if abs(_gap_f) > GROUND_CONTACT_TOL_MM:
+                _bad.append(f'FRONT tire bottom {_gap_f:+.1f} mm from ground')
+            if abs(_gap_r) > GROUND_CONTACT_TOL_MM:
+                _bad.append(f'REAR tire bottom {_gap_r:+.1f} mm from ground')
+            self.statusBar().showMessage(
+                f'GROUND WARNING — {" and ".join(_bad)} at design position '
+                f'(tire dia {_dia:.0f} mm). Ground-referenced numbers (RC '
+                f'height, anti-squat) are off by this much and CAD export '
+                f'shows the tire in the air.  |  Loaded: {path}', 0)
+        else:
+            self.statusBar().showMessage(
+                f'Loaded: {path}  |  topology: {self._topology.describe()}', 5000)
 
     def _import_step_dialog(self):
         """File → Import STEP: open the STEP-import dialog (differential / engine
@@ -3951,11 +3986,20 @@ class MainWindow(QMainWindow):
                 import traceback; traceback.print_exc()
                 self.statusBar().showMessage(f'Engine page failed: {e}', 8000)
                 return
+        if idx >= 6 and self._pages.count() < 7:
+            try:
+                from gui.packaging_page import PackagingPage
+                self._packaging_page = PackagingPage(self)
+                self._pages.addWidget(self._packaging_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Packaging page failed: {e}', 8000)
+                return
         if idx < self._pages.count():
             self._pages.setCurrentIndex(idx)
             self.statusBar().showMessage(
                 ('Suspension', 'Laptime', 'Design City', 'Loads',
-                 'Ackermann', 'Engine')[idx] + ' page', 2000)
+                 'Ackermann', 'Engine', 'Packaging')[idx] + ' page', 2000)
 
     def _build_ui(self):
         self._build_menu()
@@ -6498,99 +6542,38 @@ class MainWindow(QMainWindow):
                 _mode = self._car.get('view_mode', 'normal')
                 _clash_segs = []
                 if _mode == 'interference':
-                    _TR = 0.5 * 0.625 * 25.4 / 1000.0   # 0.625" pushrod/arm tube radius (user)
-                    _UR = 0.010        # upright body edge radius
-                    _BJ = 0.0127       # 1" ball-joint sphere radius
-                    _dr = 0.5 * float(self._car.get('driveshaft_dia_mm', 25.4)) / 1000.0
-                    # every corner (front + rear), guarded so a missing key never
-                    # aborts the whole check.  Ball joints are zero-length (sphere)
-                    # capsules.  clashes() skips pairs that share an endpoint, so an
-                    # arm/tie-rod BOLTING to a ball joint is not a false clash — but a
-                    # pushrod or tie-rod passing THROUGH one (v31's bug) is caught.
-                    # NOTE: the upright body is drawn as a solid volume (view3d tetra)
-                    # for the eye, but is NOT added here as edge-capsules — its corners
-                    # ARE the members' own pickups, so edge-capsules falsely flag every
-                    # arm/tie-rod that legitimately attaches to it.  The ball-joint
-                    # spheres carry the meaningful automated check.
-                    _ = _UR  # (upright edge radius reserved; not used as a clash body)
-                    # The ACTUATION members belong here too.  Leaving them out
-                    # meant the whole ARB/damper package was invisible to this
-                    # view: the front drop link overlapped the coilover by 10 mm
-                    # on v34 and nothing flagged it.  The coilover uses the car's
-                    # own spring_od_mm (what view3d already DRAWS it with), so the
-                    # check matches what the user sees rather than a guessed OD.
-                    _SR = 0.5 * float(self._car.get('spring_od_mm', 63.0)) / 1000.0
-                    _LR = 0.006        # ~12 mm drop link / ARB blade tube
-                    _BRG = 0.5 * 38.1 / 1000.0    # 1.5" rocker pivot bearing OD
-                    _RE = 0.315 * 25.4 / 1000.0   # drop-link ball joint RADIUS (user)
-                    _specs = [
-                        ('upper arm front', 'uca_front', 'uca_outer', _TR),
-                        ('upper arm rear',  'uca_rear',  'uca_outer', _TR),
-                        ('lower arm front', 'lca_front', 'lca_outer', _TR),
-                        ('lower arm rear',  'lca_rear',  'lca_outer', _TR),
-                        ('tie / toe rod',   'tie_rod_inner', 'tie_rod_outer', _TR),
-                        ('pushrod',         'pushrod_outer', 'pushrod_inner', _TR),
-                        ('lower ball joint', 'lca_outer', 'lca_outer', _BJ),
-                        ('upper ball joint', 'uca_outer', 'uca_outer', _BJ),
-                        ('coilover',      'rocker_spring_pt', 'spring_chassis_pt', _SR),
-                        ('ARB drop link', 'arb_arm_end_world', 'arb_drop_top', _LR),
-                        # ROCKER HARDWARE as real volumes (zero-length capsules =
-                        # spheres).  Without these the rocker is three dimensionless
-                        # points and any drop-link radius "fits": v36 put the ARB
-                        # rod end at 20 mm radius, overlapping the pivot bearing by
-                        # 14.9 mm, and nothing flagged it.  Sizes are the user's
-                        # (1.5" rocker bearing, 1/2" bore rod ends ~1.25" housing).
-                        ('rocker bearing',  'rocker_pivot', 'rocker_pivot', _BRG),
-                        ('ARB rod end',     'arb_drop_top', 'arb_drop_top', _RE),
-                        ('spring rod end',  'rocker_spring_pt', 'rocker_spring_pt', _RE),
-                        ('pushrod rod end', 'pushrod_inner', 'pushrod_inner', _RE),
-                    ]
+                    # THE full member set lives in vahan.interference.full_members
+                    # (shared with the packaging validator, so "clash-free" means
+                    # the same thing in this view and in vahan/packaging.py).
+                    # Ball joints are zero-length (sphere) capsules; clashes()
+                    # skips pairs that share an endpoint, so an arm/tie-rod
+                    # BOLTING to a ball joint is not a false clash — but a rod
+                    # passing THROUGH one (v31's bug) is caught.  The upright
+                    # body is drawn as a solid volume for the eye but is NOT a
+                    # clash body — its corners ARE the members' own pickups.
+                    from vahan.interference import full_members as _fullmem, \
+                        connected_for as _connfor
                     for c in corners_draw:
-                        pp = c['pts']
-                        def _P(k):
-                            v = pp.get(k)
-                            return None if v is None else np.asarray(v, float)
-                        mem = []
-                        for nm, ka, kb, rr in _specs:
-                            a, b = _P(ka), _P(kb)
-                            if a is not None and b is not None and np.all(np.isfinite(a)) and np.all(np.isfinite(b)):
-                                mem.append({'name': nm, 'a': a, 'b': b, 'r': rr})
-                        if len(mem) < 2:
-                            continue
                         _seg = _pkg.get(c['label']) if (_pkg is not None and c['label'] in ('RL', 'RR')) else None
-                        if _seg is not None:
-                            mem.append({'name': 'driveshaft', 'a': np.asarray(_seg['inner'], float),
-                                        'b': np.asarray(_seg['outer'], float), 'r': _dr})
-                        # ARB TORSION TUBE: chassis-fixed, spans +x to -x through
-                        # arb_pivot.  _assemble_arb_segs already DRAWS it, but it
-                        # was in no clash member list anywhere — so the front bar
-                        # sat 2.9 mm INSIDE both front coilovers at every wheel
-                        # position and neither this view nor the net said a word.
+                        _ds = ((np.asarray(_seg['inner'], float),
+                                np.asarray(_seg['outer'], float))
+                               if _seg is not None else None)
+                        _apv = _aod = None
                         try:
                             _ahp = self._front_arb if c['label'][0] == 'F' else self._rear_arb
                             if _ahp and 'arb_pivot' in _ahp:
-                                _pv = np.asarray(_ahp['arb_pivot'], float)
+                                _apv = np.asarray(_ahp['arb_pivot'], float)
                                 _sp = self._dynamics_panel
-                                _od = float(getattr(_sp, '_arb_OD_f' if c['label'][0] == 'F'
-                                                    else '_arb_OD_r').value())
-                                _a2 = _pv.copy(); _b2 = _pv.copy(); _b2[0] = -_pv[0]
-                                mem.append({'name': 'ARB torsion bar', 'a': _a2, 'b': _b2,
-                                            'r': 0.5 * _od / 1000.0})
+                                _aod = float(getattr(_sp, '_arb_OD_f' if c['label'][0] == 'F'
+                                                     else '_arb_OD_r').value())
                         except Exception:
                             pass
+                        mem = _fullmem(c['pts'], self._car, arb_pivot=_apv,
+                                       arb_od_mm=_aod, driveshaft_seg=_ds)
+                        if len(mem) < 2:
+                            continue
                         _byn = {m['name']: (m['a'], m['b']) for m in mem}
-                        # REAR lower A-arm + toe link are ONE fabricated welded
-                        # part (user DFM, 2026-08-05), so their mutual interference
-                        # is physically impossible — exempt it on the REAR corners
-                        # only.  The FRONT tie rod is the steering rack (a separate
-                        # part), so it stays checked against the front arms.
-                        from vahan.interference import DEFAULT_CONNECTED as _DC
-                        _conn = _DC
-                        if c['label'] in ('RL', 'RR'):
-                            _conn = _DC | {
-                                frozenset({'lower arm front', 'tie / toe rod'}),
-                                frozenset({'lower arm rear', 'tie / toe rod'})}
-                        for cl in _clashfn(mem, connected=_conn):
+                        for cl in _clashfn(mem, connected=_connfor(c['label'])):
                             _clash_segs.append(_byn[cl['a']])
                             _clash_segs.append(_byn[cl['b']])
                 self.view3d.set_clashes(_clash_segs)
@@ -8929,11 +8912,16 @@ class MainWindow(QMainWindow):
           2. Copy the solved moving points (uca_outer, lca_outer,
              tie_rod_outer, wheel_center, pushrod_outer, pushrod_inner,
              rocker_spring_pt) back into `_front_hp` / `_rear_hp`.
-             Chassis-side points are untouched — they're rigidly
-             attached to the frame.
-          3. Rebuild the solvers from the new hardpoints.  Now travel=0
+          3. RE-GROUND: translate the whole axle assembly (chassis side
+             included) down so the tire bottom sits back on the ground
+             plane z=0 — at static ride the tire is ON the ground and
+             the chassis sits lower.  Without this step the tire is
+             left floating by exactly the applied shift (the v41–v72
+             "rear tire in the air" bug).  diff_vert_mm follows the
+             rear drop so the driveshaft geometry is unchanged.
+          4. Rebuild the solvers from the new hardpoints.  Now travel=0
              IS the physics-consistent static position.
-          4. Refresh the hardpoint panels, replot, redraw 3D, and
+          5. Refresh the hardpoint panels, replot, redraw 3D, and
              re-run the sag diagnostic (which should now show ~0
              shift remaining).
         """
@@ -8986,6 +8974,42 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f'Apply sag failed: {e}', 6000)
             return
 
+        # ── RE-GROUND (2026-08-23 root-cause fix) ────────────────────────
+        # _commit raises the wheel-side points relative to the chassis (the
+        # sagged pose), which used to leave the tire bottom floating ABOVE
+        # the ground plane z=0 by exactly the shift — that is how v41…v72
+        # got a rear tire 14.6 mm in the air (seen by the user in Onshape).
+        # At static ride the tire IS on the ground, so after the bake the
+        # WHOLE axle assembly (chassis side included — the chassis really
+        # does sit lower after sag) translates down until the tire bottom is
+        # back on z=0.  Pure per-axle isometry: MR, ARB rate, camber curves
+        # and coplanarity all carry.  The diff is chassis-fixed at the rear,
+        # so diff_vert_mm drops with the rear to keep driveshaft geometry.
+        r_tire_m = float(self._car.get('tire_outer_dia_mm', 406.0)) / 2000.0
+
+        def _reground(axle_dicts):
+            wc = axle_dicts[0].get('wheel_center')
+            if wc is None:
+                return 0.0
+            gap_m = float(np.asarray(wc, float)[2]) - r_tire_m
+            if abs(gap_m) < 1e-9:
+                return 0.0
+            for d in axle_dicts:
+                for k in list(d.keys()):
+                    if d[k] is not None:
+                        p = np.asarray(d[k], float).copy()
+                        p[2] -= gap_m
+                        d[k] = p
+            return gap_m
+
+        gap_f = _reground([self._front_hp, self._front_arb,
+                           self._front_heave, self._front_decoupled]) if nf else 0.0
+        gap_r = _reground([self._rear_hp, self._rear_arb,
+                           self._rear_heave, self._rear_decoupled]) if nr else 0.0
+        if gap_r:
+            self._car['diff_vert_mm'] = (float(self._car.get('diff_vert_mm', 150.0))
+                                         - gap_r * 1000.0)
+
         # Rebuild solvers from the updated hardpoints — travel=0 is now
         # the physics-consistent static ride height, no hidden offsets.
         self._pending_sag_shift_m = {'FL': 0.0, 'FR': 0.0, 'RL': 0.0, 'RR': 0.0}
@@ -9009,7 +9033,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f'Sag applied — shift F {shift_f*1000:+.1f} mm / '
             f'R {shift_r*1000:+.1f} mm committed '
-            f'(F: {nf} pts, R: {nr} pts)', 6000)
+            f'(F: {nf} pts, R: {nr} pts); re-grounded '
+            f'F {-gap_f*1000:+.1f} mm / R {-gap_r*1000:+.1f} mm so the tires '
+            f'sit on z=0', 6000)
 
     def _refresh_sag(self):
         # Sag inputs may have changed -> cached spring limits / MR are stale.

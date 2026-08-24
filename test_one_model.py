@@ -1923,6 +1923,104 @@ except Exception as _em:
     import traceback as _tbm; _tbm.print_exc()
     print(f'corner moments   : UNEXPECTED FAIL ({type(_em).__name__}: {_em})')
 
+# ── PACKAGING SYSTEM (vahan/packaging.py): the ONE validity oracle both the
+#    manual page and the generator run.  Two invariants: (a) the untouched
+#    current design config must validate PASS against its own baseline — the
+#    baseline is by definition a valid packaging solution (wheel points
+#    identical, rates equal, laws met, clash set unchanged); (b) the isometry
+#    primitives must round-trip: mirror∘mirror = identity and rotate(+a)∘
+#    rotate(−a) = identity to 1e-9 m, or the "rates preserved exactly" claim
+#    the transforms are built on is false.
+print('-' * 64)
+try:
+    import glob as _gp, re as _rp
+    from vahan import packaging as _pkgm
+    _pcfgs = _gp.glob('configs/2027_v*.vahan')
+    _pdes = max(_pcfgs, key=lambda p: int((_rp.search(r'2027_v(\d+)', p) or [0, -1]).__getitem__(1))
+                if _rp.search(r'2027_v(\d+)', p) else -1) if _pcfgs else None
+    if _pdes:
+        win._load_project_from_path(_pdes); win._rebuild_solvers(0.)
+        _pbase = _pkgm.capture_baseline(win)
+        _pres = _pkgm.validate(win, _pbase)
+        _pfails = ['%s %s' % (c['axle'], c['name']) for c in _pres.failures()]
+        _b0 = _pkgm.get_bundle(win, 'front')
+        _mmb = _pkgm.mirror_about_pushrod_plane(_pkgm.mirror_about_pushrod_plane(_b0))
+        _rrb = _pkgm.rotate_about_pushrod_line(
+            _pkgm.rotate_about_pushrod_line(_b0, 7.0), -7.0)
+        _dmax = 0.0
+        for _bb in (_mmb, _rrb):
+            for _dn, _kk, _pp in _pkgm._slice_items(_b0):
+                _dmax = max(_dmax, float(np.abs(_bb[_dn][_kk] - _pp).max()))
+        _pok = _pres.ok and _dmax < 1e-9
+        if not _pok:
+            fails += 1
+        print(f'packaging        : {os.path.basename(_pdes)} baseline '
+              f'{"PASS" if _pres.ok else "FAIL: " + "; ".join(_pfails[:4])}, '
+              f'isometry round-trip {_dmax:.1e} m   '
+              f'{"pass" if _pok else "UNEXPECTED FAIL"}')
+    else:
+        print('packaging        : no design config found — skipped')
+except Exception as _ep:
+    fails += 1
+    import traceback as _tbp; _tbp.print_exc()
+    print(f'packaging        : UNEXPECTED FAIL ({type(_ep).__name__}: {_ep})')
+
+# ── GROUND CONTACT (2026-08-23): at design position each axle's tire bottom
+#    (wheel_center_z − tire_outer_dia/2) must sit ON the ground plane z=0
+#    (|gap| ≤ GROUND_CONTACT_TOL_MM).  The Apply-Sag bake used to raise the
+#    wheel side without dropping the car back onto the ground: v41–v69 rear
+#    floated 14.6 mm, so every rear ground-referenced number (RC height,
+#    anti-squat) was measured from the wrong plane and the Onshape export
+#    showed the rear tire in the air.  The CURRENT (highest-version) config
+#    and everything in configs/experiments must pass; archived configs that
+#    still float are KNOWN-FAIL (superseded lineage, kept for history).
+print('-' * 64)
+try:
+    import glob as _gg, re as _rg, json as _jg
+    from vahan.hardpoints import tire_ground_gap_mm, GROUND_CONTACT_TOL_MM
+
+    def _ground_gaps(path):
+        with open(path) as _fh:
+            _d = _jg.load(_fh)
+        _dia = float(_d.get('car', {}).get('tire_outer_dia_mm', 406.0))
+        return {ax: tire_ground_gap_mm(_d[ax]['wheel_center'], _dia)
+                for ax in ('front_hp', 'rear_hp')
+                if ax in _d and 'wheel_center' in _d[ax]}
+
+    _gcfgs = _gg.glob('configs/2027_v*.vahan')
+    _gcur = (max(_gcfgs, key=lambda p: int(_rg.search(r'2027_v(\d+)', p).group(1))
+             if _rg.search(r'2027_v(\d+)', p) else -1) if _gcfgs else None)
+    _gmust = ([_gcur] if _gcur else []) + sorted(_gg.glob('configs/experiments/*.vahan'))
+    _gfail, _garch = [], []
+    for _p in _gmust:
+        _bad = {k: v for k, v in _ground_gaps(_p).items()
+                if abs(v) > GROUND_CONTACT_TOL_MM}
+        if _bad:
+            _gfail.append(os.path.basename(_p) + ' ' + ', '.join(
+                f'{k[:-3]} {v:+.2f}mm' for k, v in _bad.items()))
+    for _p in _gcfgs:
+        if _p == _gcur:
+            continue
+        if any(abs(v) > GROUND_CONTACT_TOL_MM for v in _ground_gaps(_p).values()):
+            _garch.append(os.path.basename(_p))
+    if _gfail:
+        fails += 1
+        print('ground contact   : UNEXPECTED FAIL — ' + '; '.join(_gfail))
+    else:
+        _cg = _ground_gaps(_gcur) if _gcur else {}
+        _cgs = ', '.join(f'{k[:-3]} {v:+.2f}mm' for k, v in _cg.items())
+        print(f'ground contact   : {os.path.basename(_gcur) if _gcur else "?"} '
+              f'{_cgs} + {len(_gmust)-1} experiment cfg(s) all on z=0 '
+              f'(tol {GROUND_CONTACT_TOL_MM:.0f}mm)   pass')
+    if _garch:
+        known += 1
+        print(f'ground contact   : {len(_garch)} ARCHIVED configs still float '
+              f'(v41–v69 sag-bake era, superseded) — KNOWN-FAIL, not edited')
+except Exception as _eg:
+    fails += 1
+    import traceback as _tbg; _tbg.print_exc()
+    print(f'ground contact   : UNEXPECTED FAIL ({type(_eg).__name__}: {_eg})')
+
 print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)
