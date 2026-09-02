@@ -46,6 +46,7 @@ class PackagingPage(QWidget):
         root.addWidget(tabs)
         tabs.addTab(self._build_manual_tab(), 'Manual')
         tabs.addTab(self._build_generator_tab(), 'Generator')
+        tabs.addTab(self._build_relocate_tab(), 'Relocate (IK)')
         self._capture_baseline()
 
     # ══════════════════════════════════════════════════════════════════════
@@ -430,3 +431,425 @@ class PackagingPage(QWidget):
             self._refresh_readout()
         except Exception as e:
             self._gen_status.setText(f'Load failed: {e}')
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Relocate (IK) tab — curve-preserving single-point relocation
+    # ══════════════════════════════════════════════════════════════════════
+    def _build_relocate_tab(self):
+        from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QComboBox, QDoubleSpinBox, QSpinBox,
+                                     QPushButton, QTableWidget, QScrollArea,
+                                     QFrame)
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            'Pick ONE hardpoint - find WHERE ELSE it can live with every '
+            'kinematic curve within tolerance of the original (the tolerances '
+            'on the Manual tab apply). Solutions are shown at least the '
+            'similarity setting apart (packaging distance only); select one '
+            'and "Explore near selected" reveals the finer solutions inside '
+            'its neighbourhood.'))
+        top = QHBoxLayout()
+        top.addWidget(QLabel('Axle:'))
+        self._rl_axle = QComboBox(); self._rl_axle.addItems(['front', 'rear'])
+        self._rl_axle.currentTextChanged.connect(self._rl_fill_points)
+        top.addWidget(self._rl_axle)
+        top.addWidget(QLabel('Point:'))
+        self._rl_point = QComboBox(); top.addWidget(self._rl_point, 1)
+        top.addWidget(QLabel('Radius:'))
+        self._rl_radius = QDoubleSpinBox()
+        self._rl_radius.setRange(5, 500); self._rl_radius.setValue(120)
+        self._rl_radius.setSuffix(' mm'); top.addWidget(self._rl_radius)
+        top.addWidget(QLabel('Similarity:'))
+        self._rl_sim = QDoubleSpinBox()
+        self._rl_sim.setRange(1, 90); self._rl_sim.setValue(20)
+        self._rl_sim.setSuffix(' %')
+        self._rl_sim.setToolTip('No two shown solutions closer than this '
+                                'fraction of the largest feasible extent.')
+        top.addWidget(self._rl_sim)
+        top.addWidget(QLabel('Samples:'))
+        self._rl_n = QSpinBox(); self._rl_n.setRange(20, 2000)
+        self._rl_n.setValue(150); top.addWidget(self._rl_n)
+        lay.addLayout(top)
+
+        trow = QHBoxLayout()
+        trow.addWidget(QLabel('Target:'))
+        self._rl_tgt = []
+        for ax in ('X', 'Y', 'Z'):
+            trow.addWidget(QLabel(ax))
+            sp = QDoubleSpinBox()
+            sp.setRange(-3000.0, 3000.0); sp.setDecimals(2)
+            sp.setSingleStep(1.0); sp.setSuffix(' mm')
+            trow.addWidget(sp)
+            self._rl_tgt.append(sp)
+        trow.addStretch(1)
+        lay.addLayout(trow)
+
+        # Buttons on their own row — keeping them in the target row forced a
+        # ~1900 px minimum width onto the whole MainWindow (scroll/clipping
+        # bug): a QHBoxLayout's minimum is the SUM of its children's minimums.
+        brow = QHBoxLayout()
+        self._rl_test = QPushButton('Test this position')
+        self._rl_test.setToolTip('Put the point EXACTLY at the target, run the '
+                                 'full oracle (curves + laws + rates + clash), '
+                                 'report PASS/FAIL, put it back.')
+        self._rl_test.clicked.connect(self._rl_test_target)
+        brow.addWidget(self._rl_test)
+        self._rl_apply_test = QPushButton('Apply tested position')
+        self._rl_apply_test.setEnabled(False)
+        self._rl_apply_test.setToolTip('Install the last PASS-tested position '
+                                       'WITH its resolved chain (rocker plane, '
+                                       'axis, ARB, rates).')
+        self._rl_apply_test.clicked.connect(self._rl_apply_test_bundle)
+        brow.addWidget(self._rl_apply_test)
+        self._rl_go_tgt = QPushButton('Search near target')
+        self._rl_go_tgt.setToolTip('Find the valid positions CLOSEST to the '
+                                   'target (works even if the exact target is '
+                                   'infeasible - searches from the nearest '
+                                   'valid approach).')
+        self._rl_go_tgt.clicked.connect(self._rl_search_target)
+        brow.addWidget(self._rl_go_tgt)
+        brow.addStretch(1)
+        lay.addLayout(brow)
+
+        row2 = QHBoxLayout()
+        self._rl_run = QPushButton('Search around current')
+        self._rl_run.clicked.connect(lambda: self._rl_search(None))
+        row2.addWidget(self._rl_run)
+        self._rl_drill = QPushButton('Explore near selected')
+        self._rl_drill.setToolTip('Re-search INSIDE the selected neighbourhood '
+                                  '- the finer solutions the similarity filter '
+                                  'hid.')
+        self._rl_drill.clicked.connect(self._rl_drill_down)
+        row2.addWidget(self._rl_drill)
+        self._rl_apply = QPushButton('Apply selected')
+        self._rl_apply.clicked.connect(self._rl_apply_sel)
+        row2.addWidget(self._rl_apply)
+        self._rl_revert = QPushButton('Revert point')
+        self._rl_revert.clicked.connect(self._rl_revert_pt)
+        row2.addWidget(self._rl_revert)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
+        self._rl_status = QLabel('')
+        self._rl_status.setWordWrap(True)
+        lay.addWidget(self._rl_status)
+        self._rl_table = QTableWidget(0, 7)
+        self._rl_table.setHorizontalHeaderLabels(
+            ['x (mm)', 'y (mm)', 'z (mm)', 'dist from OG (mm)',
+             'dist from TARGET (mm)', 'worst tol used', 'clash'])
+        lay.addWidget(self._rl_table, 1)
+        self._rl_result = None
+        self._rl_orig = None            # (axle, dict_name, key, orig pos mm)
+        self._rl_fill_points()
+        # Scroll container: keeps this tab's content from dictating the
+        # MainWindow minimum size — anything that doesn't fit scrolls.
+        sa = QScrollArea()
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.Shape.NoFrame)
+        sa.setWidget(w)
+        return sa
+
+    def _rl_fill_points(self):
+        import vahan.packaging as pkg
+        axle = self._rl_axle.currentText()
+        b = pkg.get_bundle(self._main, axle)
+        self._rl_point.clear()
+        for k in b['hp']:
+            self._rl_point.addItem('hp.' + k)
+        for k in b['arb']:
+            self._rl_point.addItem('arb.' + k)
+        try:
+            self._rl_point.currentTextChanged.disconnect(self._rl_seed_target)
+        except Exception:
+            pass
+        self._rl_point.currentTextChanged.connect(self._rl_seed_target)
+        self._rl_seed_target()
+
+    def _rl_seed_target(self, *_a):
+        """Fill the target boxes with the point CURRENT position, so the
+        user edits from where it is, not from zero."""
+        import vahan.packaging as pkg
+        txt = self._rl_point.currentText()
+        if '.' not in txt:
+            return
+        dict_name, key = txt.split('.', 1)
+        b = pkg.get_bundle(self._main, self._rl_axle.currentText())
+        p = b[dict_name].get(key)
+        if p is None:
+            return
+        for sp, v in zip(self._rl_tgt, p):
+            sp.blockSignals(True)
+            sp.setValue(float(v) * 1000.0)
+            sp.blockSignals(False)
+
+    def _rl_target_mm(self):
+        return [sp.value() for sp in self._rl_tgt]
+
+    def _rl_test_target(self):
+        from vahan.relocate import test_position
+        axle = self._rl_axle.currentText()
+        dict_name, key = self._rl_point.currentText().split('.', 1)
+        self._rl_status.setText('resolving chain + testing position...')
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+        if self._baseline is None:
+            self._capture_baseline()
+        r = test_position(self._main, axle, dict_name, key,
+                          self._rl_target_mm(),
+                          baseline=self._baseline, tol=self._tol)
+        t = tuple(self._rl_target_mm())
+        self._rl_test_bundle = r.get('bundle')
+        self._rl_test_meta = (axle,)
+        if r['ok']:
+            extra = ''
+            info = r.get('info', {})
+            if 'chain_rotation_deg' in info:
+                extra = (' Chain re-solved: rotated %.1f deg%s%s.'
+                         % (info['chain_rotation_deg'],
+                            ', MR re-tuned' if info.get('mr_retuned') else '',
+                            ', ARB re-tuned' if info.get('arb_retuned') else ''))
+            self._rl_status.setText(
+                'PASS - (%.1f, %.1f, %.1f) mm WORKS for %s %s.%s: coplanarity/'
+                'axis/triad/rates all re-solved, curves in tolerance, no clash '
+                'across travel.%s  Click "Apply tested position" to take it.'
+                % (t[0], t[1], t[2], axle, dict_name, key, extra))
+            self._rl_apply_test.setEnabled(True)
+        else:
+            why = '; '.join(str(f) for f in r['fails'][:4])
+            note = (' (chain resolution attempted)' if r.get('resolvable')
+                    else '')
+            self._rl_status.setText(
+                'FAIL - (%.1f, %.1f, %.1f) mm cannot work%s: %s. '
+                'Use Search near target for the closest position that does.'
+                % (t[0], t[1], t[2], note, why))
+            self._rl_apply_test.setEnabled(False)
+
+    def _rl_apply_test_bundle(self):
+        import numpy as np
+        import vahan.packaging as pkg
+        b = getattr(self, '_rl_test_bundle', None)
+        if not b:
+            self._rl_status.setText('no tested PASS position to apply - '
+                                    'run Test this position first')
+            return
+        axle = self._rl_test_meta[0]
+        bundle = {'hp': {k: np.array(v, float) for k, v in b['hp'].items()},
+                  'arb': {k: np.array(v, float) for k, v in b['arb'].items()}}
+        pkg.set_bundle(self._main, axle, bundle)
+        self._main._update_3d()
+        self._rl_status.setText('APPLIED the tested position with its resolved '
+                                'chain (%s axle). Revert axle is on the Manual '
+                                'tab; or re-load the config.' % axle)
+
+    def _rl_search_target(self):
+        from PyQt6.QtWidgets import QApplication, QTableWidgetItem
+        from vahan.relocate import generative_search
+        axle = self._rl_axle.currentText()
+        dict_name, key = self._rl_point.currentText().split('.', 1)
+        self._rl_go_tgt.setEnabled(False)
+        self._rl_status.setText('growing toward target (generative)...')
+
+        def prog(msg):
+            self._rl_status.setText(msg)
+            QApplication.processEvents()
+
+        try:
+            if self._baseline is None:
+                self._capture_baseline()
+            if dict_name == 'hp' and key == 'spring_chassis_pt':
+                # packaging MAP-Elites: fills a DIVERSE archive of rocker/ARB
+                # assemblies with the mount PINNED at target (curves exact,
+                # dynamics <= tol).  Far better than the tree search here.
+                from vahan.packaging_qd import qd_relocate_search
+                r = qd_relocate_search(
+                    self._main, axle, dict_name, key, self._rl_target_mm(),
+                    baseline=self._baseline, tol=self._tol,
+                    n_init=int(self._rl_n.value()),
+                    n_iter=int(self._rl_n.value()) * 2,
+                    min_sep_frac=float(self._rl_sim.value()) / 100.0,
+                    progress=prog)
+            else:
+                r = generative_search(
+                    self._main, axle, dict_name, key, self._rl_target_mm(),
+                    baseline=self._baseline, tol=self._tol,
+                    n_iter=int(self._rl_n.value()) * 2,
+                    step_mm=8.0, n_show=10,
+                    min_sep_frac=float(self._rl_sim.value()) / 100.0,
+                    progress=prog)
+        except Exception as e:
+            self._rl_status.setText('ERROR: %r' % (e,))
+            self._rl_go_tgt.setEnabled(True)
+            return
+        finally:
+            self._main._update_3d()
+        self._rl_go_tgt.setEnabled(True)
+        self._rl_result = r
+        if 'error' in r:
+            self._rl_status.setText(r['error'])
+            self._rl_table.setRowCount(0)
+            return
+        self._rl_orig = (axle, dict_name, key, r['original_mm'])
+        n_sol = len(r['solutions'])
+        # label the searcher that actually ran (QD packaging vs generative tree)
+        tag = ('PACKAGING QD' if 'MAP-Elites' in r.get('method', '')
+               else 'GENERATIVE')
+        reach = ('%d solutions' % n_sol if n_sol else
+                 ('TARGET REACHED but 0 survive the full oracle'
+                  if r.get('target_reached') else
+                  'closest approach %.1f mm from target'
+                  % r['best_approach_mm']))
+        # When solutions are zero, name the DOMINANT binding constraint so the
+        # result teaches instead of a silent 0.  reject_reasons maps a failed
+        # check label -> count across the rejected candidates.
+        binding = ''
+        rr = r.get('reject_reasons') or {}
+        if n_sol == 0 and rr:
+            top = max(rr, key=rr.get)
+            _law = {'front coplanar_mm': ' = the NO-BENDING law (chain leaves '
+                    'its plane across travel; this target forces the pushrod '
+                    'to bend)',
+                    'rear coplanar_mm': ' = the NO-BENDING law',
+                    'both clash sweep (static/bump/droop)': ' = interference '
+                    'across travel'}.get(top, '')
+            binding = ('  |  BINDING: %s%s  — the target itself is infeasible '
+                       'here, not the search. Relax the tolerance, move the '
+                       'target, or use "Search around current" to see where it '
+                       'CAN go.' % (top, _law))
+        self._rl_status.setText(
+            '%s: %s - %d evals over %.0f mm span, %d final rejects%s'
+            % (tag, reach, r['tree_size'], r['span_mm'],
+               r['n_final_rejects'], binding))
+        t = self._rl_table
+        t.setRowCount(len(r['solutions']))
+        for i, s2 in enumerate(r['solutions']):
+            vals = ['%.2f' % s2['pos_mm'][0], '%.2f' % s2['pos_mm'][1],
+                    '%.2f' % s2['pos_mm'][2], '%.1f' % s2['dist_from_og_mm'],
+                    '%.1f' % s2['dist_from_target_mm'],
+                    '%.0f %%' % (s2['worst_tol_frac'] * 100),
+                    'clean' if s2['clash_checked'] else '?']
+            for j, v in enumerate(vals):
+                t.setItem(i, j, QTableWidgetItem(v))
+
+    def _rl_search(self, center_mm, radius_override=None, target_mm=None):
+        from PyQt6.QtWidgets import QApplication, QTableWidgetItem
+        from vahan.relocate import relocate_search
+        axle = self._rl_axle.currentText()
+        dict_name, key = self._rl_point.currentText().split('.', 1)
+        self._rl_run.setEnabled(False)
+        self._rl_status.setText('searching...')
+
+        def prog(msg):
+            self._rl_status.setText(msg)
+            QApplication.processEvents()
+
+        try:
+            r = relocate_search(
+                self._main, axle, dict_name, key,
+                baseline=self._baseline, tol=self._tol,
+                radius_mm=float(radius_override or self._rl_radius.value()),
+                n_samples=int(self._rl_n.value()),
+                min_sep_frac=float(self._rl_sim.value()) / 100.0,
+                center_mm=center_mm, target_mm=target_mm, progress=prog)
+        except Exception as e:
+            self._rl_status.setText('ERROR: %r' % (e,))
+            self._rl_run.setEnabled(True)
+            return
+        finally:
+            self._main._update_3d()
+        self._rl_run.setEnabled(True)
+        self._rl_result = r
+        if 'error' in r:
+            self._rl_status.setText(r['error'])
+            self._rl_table.setRowCount(0)
+            return
+        self._rl_orig = (axle, dict_name, key, r['original_mm'])
+        bind = ''
+        if r.get('clash_binding'):
+            worst = max(r['clash_binding'], key=r['clash_binding'].get)
+            bind = '  |  binding clash: ' + worst
+        if r.get('target_note'):
+            bind += '  |  ' + r['target_note']
+        self._rl_status.setText(
+            '%s: %d solutions (>=%.1f mm apart) from %d feasible of %d tried'
+            ' - max extent %.1f mm, %d clash-rejected%s'
+            % (r['point'], len(r['solutions']), r['min_sep_mm'],
+               r['n_feasible'], r['n_tried'], r['max_extent_mm'],
+               r['n_clash_rejected'], bind))
+        t = self._rl_table
+        t.setRowCount(len(r['solutions']))
+        for i, s in enumerate(r['solutions']):
+            dt = ('%.1f' % s['dist_from_target_mm']
+                  if 'dist_from_target_mm' in s else '-')
+            vals = ['%.2f' % s['pos_mm'][0], '%.2f' % s['pos_mm'][1],
+                    '%.2f' % s['pos_mm'][2], '%.1f' % s['dist_from_og_mm'],
+                    dt, '%.0f %%' % (s['worst_tol_frac'] * 100),
+                    'clean' if s['clash_checked'] else '?']
+            for j, v in enumerate(vals):
+                t.setItem(i, j, QTableWidgetItem(v))
+
+    def _rl_selected_pos(self):
+        r = self._rl_result
+        row = self._rl_table.currentRow()
+        if not r or 'solutions' not in r or row < 0 \
+                or row >= len(r['solutions']):
+            return None
+        return r['solutions'][row]['pos_mm']
+
+    def _rl_point_dict(self, axle, dict_name):
+        if dict_name == 'hp':
+            return (self._main._front_hp if axle == 'front'
+                    else self._main._rear_hp)
+        return (self._main._front_arb if axle == 'front'
+                else self._main._rear_arb)
+
+    def _rl_drill_down(self):
+        pos = self._rl_selected_pos()
+        if pos is None:
+            self._rl_status.setText('select a solution row first')
+            return
+        self._rl_search(pos, radius_override=self._rl_result['min_sep_mm'])
+
+    def _rl_apply_sel(self):
+        import numpy as np
+        import vahan.packaging as pkg
+        r = self._rl_result
+        row = self._rl_table.currentRow()
+        if not r or 'solutions' not in r or row < 0 \
+                or row >= len(r['solutions']):
+            self._rl_status.setText('select a solution row first')
+            return
+        sol = r['solutions'][row]
+        axle, dict_name, key, _ = self._rl_orig
+        if sol.get('bundle'):
+            bundle = {'hp': {k: np.array(v, float)
+                             for k, v in sol['bundle']['hp'].items()},
+                      'arb': {k: np.array(v, float)
+                              for k, v in sol['bundle']['arb'].items()}}
+            pkg.set_bundle(self._main, axle, bundle)
+            self._main._update_3d()
+            self._rl_status.setText(
+                'applied solution %d WITH its resolved chain (%s %s.%s at '
+                '%.1f, %.1f, %.1f mm). Manual tab Revert axle undoes it.'
+                % (row + 1, axle, dict_name, key, *sol['pos_mm']))
+            return
+        pos = sol['pos_mm']
+        d = self._rl_point_dict(axle, dict_name)
+        d[key] = np.array(pos, float) / 1000.0
+        self._main._rebuild_solvers()
+        self._main._update_3d()
+        self._rl_status.setText(
+            'applied %s %s.%s -> (%.1f, %.1f, %.1f) mm - Revert point undoes '
+            'this.' % (axle, dict_name, key, pos[0], pos[1], pos[2]))
+
+    def _rl_revert_pt(self):
+        import numpy as np
+        if self._rl_orig is None:
+            return
+        axle, dict_name, key, orig_mm = self._rl_orig
+        d = self._rl_point_dict(axle, dict_name)
+        d[key] = np.array(orig_mm, float) / 1000.0
+        self._main._rebuild_solvers()
+        self._main._update_3d()
+        self._rl_status.setText('reverted %s %s.%s to original'
+                                % (axle, dict_name, key))

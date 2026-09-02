@@ -186,9 +186,13 @@ def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
     res = solver.solve(float(lat_g), 0.0, aero_Fz=aero_row)
     fz_all = {k: max(float(res.Fz[k]), 0.0) for k in ('FL', 'FR', 'RL', 'RR')}
     # Camber matters: the light front wheel runs ~+1 deg where camber thrust
-    # cancels a real fraction of the slip force on this tyre.
-    cam_all = {k: abs(float((res.camber or {}).get(k, 0.0)))
-               for k in ('FL', 'FR', 'RL', 'RR')}
+    # cancels a real fraction of the slip force on this tyre.  SIGNED tyre
+    # inclination from the solver (ground camber through
+    # vahan.tire_model.wheel_inclination_deg, inner/outer by the solve's own
+    # Fz split) — slip_angle_for_Fy / peak_Fy below search the SA > 0 branch,
+    # where IA < 0 is the wheel leaning into the turn.  Never |camber|.
+    _incl = getattr(res, 'inclination', None) or {}
+    cam_all = {k: float(_incl.get(k, 0.0)) for k in ('FL', 'FR', 'RL', 'RR')}
     LIFTED_N = 5.0          # below this a wheel is off the ground
 
     # Axle lateral demand comes from the CAR'S MASS, never from Fz: the

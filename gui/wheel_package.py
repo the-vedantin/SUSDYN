@@ -268,7 +268,7 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
         _tm = getattr(dyn, '_tire' if lbl[0] == 'F' else '_tire_rear', None)
         mom = _loads.corner_moments(
             Fx=Fx, Fy=Fy, Fz=float(res.Fz.get(lbl, 0.0)),
-            camber_deg=float(res.camber.get(lbl, 0.0)),
+            camber_deg=float((getattr(res, 'inclination', None) or {}).get(lbl, 0.0)),
             wheel_center=wc, spin_axis=spin,
             lca_outer=st.lca_outer, uca_outer=st.uca_outer,
             tire_model=_tm, freebody=fb)

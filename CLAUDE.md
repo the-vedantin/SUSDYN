@@ -13,6 +13,10 @@ Regression net: `python test_one_model.py` (offscreen, ~45 s; exit code = number
 - `gui/main_window.py` (~10k lines) and `gui/panels.py` (~7k lines): NEVER read in full. Grep for
   `class`/`def`, Read with offset/limit, consult memory `project_codemap.md` first; update it after big edits.
 - Broad exploration goes to a subagent; keep only the summary in context.
+- New hardpoints ALWAYS go in `configs/` as the next version (`2027_v<N>_(what_changed).vahan`).
+  During a long job, save the live candidate there as soon as it changes so the current points can
+  always be opened in the app — never leave them only in a scratch/temp file. Follow the existing
+  workflow; do not invent new formats, files or tools for work that already has a workflow.
 - At phase boundaries, write distilled results (decisions, numbers with units, file:line) to the memory dir —
   anything not in a file/memory/git may be lost to compaction.
 - This repo is PUBLIC and tracks the software only. Never commit: `tire_data/`, TTC files, `DESIGN_2027/`,

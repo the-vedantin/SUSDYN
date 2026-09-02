@@ -14,6 +14,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 from .solver import SuspensionConstraints
 from .kinematics import KinematicMetrics
+from .tire_model import wheel_inclination_deg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +147,15 @@ class VehicleParams:
     # not carry; vahan.ackermann applies it where a radius exists.
     toe_front_deg: float = 0.0
     toe_rear_deg: float = 0.0
+
+    # Static alignment camber PER WHEEL, degrees, vehicle-frame sign (negative
+    # = top of the wheel toward the vehicle centreline, both sides).  The
+    # kinematic solver's camber is CHASSIS-relative and exactly 0 at the design
+    # hardpoints, so without this and the body roll the tyre was fed a number
+    # whose sign meant nothing (it flips between bump and droop).  Ground
+    # camber = kinematic + this + roll (see SteadyStateSolver.solve step 4).
+    camber_front_deg: float = 0.0
+    camber_rear_deg: float = 0.0
 
     # Aerodynamic drag — bounds terminal speed during longitudinal
     # acceleration trajectories.  CdA is the lumped drag coefficient ×
@@ -694,8 +704,17 @@ class SteadyStateResult:
     # Per-corner suspension travel (m)
     travel: dict = field(default_factory=dict)
 
-    # Per-corner camber at operating point (deg)
+    # Per-corner KINEMATIC camber at operating point (deg, chassis-relative,
+    # vehicle-frame sign) — what the kinematic graphs show.
     camber: dict = field(default_factory=dict)
+    # Per-corner GROUND camber (deg, vehicle-frame sign): kinematic + static
+    # alignment + body roll.  This is the wheel's real lean on the road.
+    camber_ground: dict = field(default_factory=dict)
+    # Per-corner SIGNED tyre inclination angle (deg) as fed to the tyre model
+    # — camber_ground through vahan.tire_model.wheel_inclination_deg with
+    # inner/outer decided by this solve's own Fz split (heavy = outer).  In the
+    # solver's positive-reference-slip frame IA < 0 = leaning INTO the turn.
+    inclination: dict = field(default_factory=dict)
 
     # Roll centre heights at operating point (m)
     rc_height_front_m: float = 0.0
@@ -1010,6 +1029,28 @@ class SteadyStateSolver:
         result.Fz = Fz
         result.travel = {k: v * 1000 for k, v in travels.items()}  # mm
         result.camber = cambers
+        # GROUND camber and the SIGNED tyre inclination.  `cambers` is chassis-
+        # relative (0 at design), so add the static alignment camber and the
+        # body roll: positive roll here = left side compresses = body leans
+        # LEFT, which tips the top of every wheel to the left — outboard (+) on
+        # the left wheels, inboard (-) on the right wheels.  Then map each
+        # wheel to the tyre's SAE inclination through THE ONE helper, with
+        # inner/outer read off this solve's own Fz split (never by label — the
+        # solver's ay sign happens to load the left side).
+        _roll_deg = float(np.degrees(roll_rad))
+        _cam_ground = {}
+        for label in ('FL', 'FR', 'RL', 'RR'):
+            _static = float(getattr(v, 'camber_front_deg' if label[0] == 'F'
+                                    else 'camber_rear_deg', 0.0))
+            _side = +1.0 if label.endswith('L') else -1.0
+            _cam_ground[label] = (float(cambers.get(label, 0.0)) + _static
+                                  + _side * _roll_deg)
+        _incl = {}
+        for a_, b_ in (('FL', 'FR'), ('RL', 'RR')):
+            _incl[a_] = wheel_inclination_deg(_cam_ground[a_], is_outer=Fz[a_] >= Fz[b_])
+            _incl[b_] = wheel_inclination_deg(_cam_ground[b_], is_outer=Fz[b_] > Fz[a_])
+        result.camber_ground = _cam_ground
+        result.inclination = _incl
         result.rc_height_front_m = rc_f
         result.rc_height_rear_m = rc_r
         result.elastic_lt_front_N = lt['elastic_front']
@@ -1051,8 +1092,10 @@ class SteadyStateSolver:
                 fz_data_min = float(getattr(tire, 'fz_range', (0.0,))[0])
                 fz_raw = max(Fz[label], 0.0)
                 fz_c = max(fz_raw, fz_data_min)
+                # SIGNED inclination (mirror-symmetric in C_alpha, but keep
+                # the one mapped number everywhere — no |camber| anywhere).
                 ca = abs(float(tire.cornering_stiffness(
-                    fz_c, abs(cambers.get(label, 0)))))
+                    fz_c, _incl.get(label, 0.0))))
                 # Linear ramp below data range: C_a(Fz) → 0 as Fz → 0
                 if fz_raw < fz_data_min:
                     ca *= fz_raw / fz_data_min
@@ -1100,8 +1143,12 @@ class SteadyStateSolver:
                         fzl = max(Fz[lb], 0.0)
                         if fzl <= 1e-6:
                             continue          # lifted wheel makes nothing
+                        # a >= 0 here = the SAE left-turn frame, so the
+                        # signed IA from wheel_inclination_deg (inner/outer
+                        # by this solve's Fz) is on the right side of the
+                        # camber table: IA < 0 leans in, IA > 0 leans away.
                         tot += float(self._tire_for(lb).Fy(
-                            a + offs[lb], fzl, abs(cambers.get(lb, 0))))
+                            a + offs[lb], fzl, _incl.get(lb, 0.0)))
                     return abs(tot)
                 if fy_axle <= 1e-9:
                     return {lb: 0.0 for lb in labels}, 0.0, False
@@ -1135,7 +1182,7 @@ class SteadyStateSolver:
                 for lb in labels:
                     fzl = max(Fz[lb], 0.0)
                     out[lb] = (abs(float(self._tire_for(lb).Fy(
-                        a_ref + offs[lb], fzl, abs(cambers.get(lb, 0)))))
+                        a_ref + offs[lb], fzl, _incl.get(lb, 0.0))))
                         if fzl > 1e-6 else 0.0)
                 if hit:
                     _s = sum(out.values())
@@ -1184,8 +1231,10 @@ class SteadyStateSolver:
                 fz_lo = float(getattr(tire, 'fz_range', (0.0,))[0])
                 fz_raw = max(Fz[label], 0.0)
                 fz_for_mu = max(fz_raw, fz_lo)        # stable mu eval
+                # peak on the SA > 0 branch at this wheel's signed IA — the
+                # same branch the pair split evaluated Fy on.
                 mu = float(tire.peak_mu(
-                    fz_for_mu, abs(cambers.get(label, 0.0)))) * self._mu_scale
+                    fz_for_mu, _incl.get(label, 0.0), 1)) * self._mu_scale
                 grip_budget = mu * max(fz_raw, 0.01)  # → 0 smoothly
                 fy_req = fy_per_corner.get(label, 0.0)
                 fx_req = fx_per_corner.get(label, 0.0)
@@ -2055,8 +2104,10 @@ class SteadyStateSolver:
                 if tire is None:
                     continue
                 fz_lo = float(np.asarray(tire.fz_range).ravel()[0])
+                # signed IA (inner/outer by the solve's Fz), SA > 0 branch —
+                # identical lookup to the solve() grip budget
                 mu = float(tire.peak_mu(max(fz, fz_lo),
-                                        abs(result.camber.get(c, 0.0))))
+                                        (result.inclination or {}).get(c, 0.0), 1))
                 cap += mu * self._mu_scale * fz
             out[ax] = dem / max(cap, 1e-6)
         return out
@@ -2399,14 +2450,16 @@ def _ideal_ackermann_pct(result: SteadyStateResult,
     # Ackermann % because we use magnitudes.)
     Fy = getattr(result, 'Fy', {})
     Fz = getattr(result, 'Fz', {})
-    camber = getattr(result, 'camber', {})
+    # SIGNED tyre inclination per wheel, already mapped inner/outer by the
+    # solve's own Fz split (SteadyStateResult.inclination) — no |camber|.
+    incl = getattr(result, 'inclination', None) or {}
 
     Fy_outer = abs(Fy.get('FL', 0))
     Fy_inner = abs(Fy.get('FR', 0))
     Fz_outer = max(Fz.get('FL', 1.0), 1.0)
     Fz_inner = max(Fz.get('FR', 1.0), 1.0)
-    cam_outer = abs(camber.get('FL', 0))
-    cam_inner = abs(camber.get('FR', 0))
+    cam_outer = float(incl.get('FL', 0.0))
+    cam_inner = float(incl.get('FR', 0.0))
 
     try:
         SA_outer = tire.slip_angle_for_Fy(Fy_outer, Fz_outer, cam_outer)

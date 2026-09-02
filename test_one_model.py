@@ -424,7 +424,13 @@ if _design:
                             P('rocker_spring_pt'), P('spring_chassis_pt')])
             _c0 = _pl.mean(0); _, _, _vt = np.linalg.svd(_pl - _c0)
             _doff = float(abs((_ae - _c0) @ _vt[-1]))
-            if _doff > 3.0:
+            # EXEMPT a BOTTOM / control-arm ARB (torsion bar mounted low on the
+            # chassis, >120 mm below the rocker) — the bar is chassis-fixed and
+            # the drop link is a two-force rod-end member, never in bending, so
+            # the bellcrank in-plane rule does not apply (v73 2026-style front).
+            _bar_below = float(P('rocker_pivot')[2]) - float(A('arb_pivot')[2])
+            _is_bottom = _bar_below > 120.0
+            if _doff > 3.0 and not _is_bottom:
                 gfail.append(f'{lbl} ARB drop link off the actuation plane at static ({_doff:.1f} mm)')
         except Exception:
             pass
@@ -595,6 +601,74 @@ if _design:
     except Exception as _e:
         gfail.append(f'pushrod/ARB-balljoint gate did not run: {_e}')
 
+    # ── AUTHORITATIVE FULL-MEMBER SWEEP == the GUI RED interference view ────
+    # Every hand-picked pair above is a friendly diagnostic, but the SOURCE OF
+    # TRUTH for "clash-free" must be the SAME member set + stations the 3D
+    # interference view draws (vahan.packaging._clash_sweep ->
+    # vahan.interference.full_members), or the net green-lights a config the
+    # view shows RED.  v72_1 shipped a coilover<->rocker-bearing overlap (-4.0
+    # mm droop / -0.5 static) that NO subset gate had a member for -- the
+    # bearing sphere vs the fat coilover tube -- and v72_2 a pushrod<->ARB
+    # drop-link overlap (-10 mm all-travel).  Run the real sweep here so the net
+    # and the picture can never disagree again (memory: clash_check_all_members).
+    try:
+        import vahan.packaging as _PKG
+        _seen_cl = set()
+        for _stn, _hits in _PKG._clash_sweep(wD).items():
+            for _h in _hits:
+                if _h['gap_mm'] < 0.0:
+                    _k = (_h['corner'], frozenset({_h['a'], _h['b']}))
+                    if _k in _seen_cl:
+                        continue
+                    _seen_cl.add(_k)
+                    gfail.append(f"{_h['corner']} CLASH {_h['a']}<->{_h['b']} "
+                                 f"{_h['gap_mm']:.1f} mm @{_stn} (interference view)")
+    except Exception as _e:
+        gfail.append(f'full-member interference sweep did not run: {_e}')
+
+    # ── RIM FIT, ALL FOUR CORNERS, BODIES + TUBES (Rule 16) ────────────────
+    # KinematicMetrics.rim_fit() checks joint CENTRES only and only where it is
+    # called (front).  It said "fits" at the real 230 mm rim while the front
+    # upper ball-joint BODY poked 2.4 mm and the tie-rod TUBE 6-8 mm past the
+    # barrel, and the REAR upper ball joint was 33.9 mm out (toe-link outer
+    # 21, upper-arm tubes 29) -- never measured until the user pointed at it.
+    # Gate the physical parts: every outboard joint body (1" BJ r 12.7) and
+    # every member tube (r 7.94) within the rim's axial band must sit inside
+    # r_max - 3 mm at droop/static/bump on FL AND RL.  Band = tire_width/2
+    # (conservative; the real inner lip is set by rim width + offset).
+    try:
+        from vahan.interference import corner_members as _cm_rim
+        _rimR = 0.5 * float(wD._car.get('tire_rim_dia_mm', 230.0))
+        _rimLim = _rimR - 3.0
+        _band = 0.5 * float(wD._car.get('tire_width_mm', 200.0))
+        _loR = wD._motion_panel.min_val / 1000.0; _hiR = wD._motion_panel.max_val / 1000.0
+        for _lbl in ('FL', 'RL'):
+            _worst = {}
+            for _t in (_loR, 0.0, _hiR):
+                _st = wD._solvers[_lbl].solve(float(_t))
+                _wc = np.asarray(_st.wheel_center, float)
+                _ax = np.asarray(_st.spin_axis, float); _ax = _ax / np.linalg.norm(_ax)
+                for _jk, _jr in (('uca_outer', 12.7), ('lca_outer', 12.7), ('tr_outer', 12.7)):
+                    _d = np.asarray(getattr(_st, _jk), float) - _wc; _al = float(np.dot(_d, _ax)) * 1000.0
+                    if abs(_al) > _band:
+                        continue
+                    _e = float(np.linalg.norm(_d - (_al / 1000.0) * _ax)) * 1000.0 + _jr
+                    _worst[_jk] = max(_worst.get(_jk, 0.0), _e)
+                for _m in _cm_rim(_st, wD._car):
+                    _a = np.asarray(_m['a'], float); _b = np.asarray(_m['b'], float)
+                    for _s in np.linspace(0.0, 1.0, 40):
+                        _p = _a + (_b - _a) * _s; _v = _p - _wc; _al = float(np.dot(_v, _ax)) * 1000.0
+                        if abs(_al) > _band:
+                            continue
+                        _e = float(np.linalg.norm(_v - (_al / 1000.0) * _ax)) * 1000.0 + 7.94
+                        _worst[_m['name']] = max(_worst.get(_m['name'], 0.0), _e)
+            for _nm, _e in sorted(_worst.items(), key=lambda kv: -kv[1]):
+                if _e > _rimLim:
+                    gfail.append(f'{_lbl} RIM FIT {_nm} edge {_e:.1f} mm > {_rimLim:.0f} '
+                                 f'(230 rim, 3 mm margin) — POKES {_e - _rimR:+.1f} past the barrel')
+    except Exception as _e:
+        gfail.append(f'rim-fit gate did not run: {_e}')
+
     # bump steer: a tie-rod move must not wreck the toe curve (the v32 rear
     # regression 0.002 -> 0.167 deg/25mm the old gate never checked).
     for _l, _isf in (('FL', True), ('RL', False)):
@@ -660,6 +734,93 @@ if _design:
         fails += 1
         print(f'steering effort  : UNEXPECTED FAIL (exception: {_e})')
 
+    # ── TYRE CAMBER SIGN (solver-bug register class 'sign', 2026-09-02).  The
+    #    tyre was fed |camber| at every dynamics site (ymd loads table, pair
+    #    split, cornering stiffness, peak_mu) while the transient fed the raw
+    #    per-side value, and the fit's lookup CLIPPED negative IA to 0.  With a
+    #    positive reference slip (SAE left-turn frame) IA >= 0 is the wheel
+    #    leaning AWAY from the turn, so the inner wheel — which under roll
+    #    really does lean away — and the outer wheel — which leans in — were
+    #    both scored as leaning away, and a wheel leaning in scored as upright.
+    #    Also the kinematic camber alone is chassis-relative (0 at design):
+    #    static alignment camber + body roll are what give it a meaningful sign.
+    #    ONE helper (vahan.tire_model.wheel_inclination_deg) now maps vehicle
+    #    camber -> signed SAE IA; the tyre evaluates negative IA by the mirror
+    #    identity Fy(a, IA) = -Fy(-a, -IA).  Gates: (1) on the loaded fit at a
+    #    mid-data load the mapped into-turn lean makes MORE force than upright,
+    #    which makes more than the away lean (linear range), and into > away at
+    #    the peak slip; (2) a 1 g steady solve gives the inner and outer front
+    #    wheels OPPOSITE-signed IA, with outer = +ground camber, inner = -ground
+    #    camber, ground camber = kinematic + static + roll.  Failed on the abs()
+    #    code (into == upright, both fronts IA >= 0).
+    try:
+        from vahan.tire_model import wheel_inclination_deg as _wid
+        _tmD = getattr(wD, '_tire_model', None)
+        _cfail = []
+        _cmsg = []
+        if _tmD is None or not hasattr(_tmD, 'camber_levels'):
+            _cmsg.append('no TTC tyre loaded — direction check skipped')
+        else:
+            _lvD = _tmD.camber_levels() if callable(_tmD.camber_levels) else _tmD.camber_levels
+            _lvD = [float(x) for x in np.asarray(_lvD).ravel()]
+            if len(_lvD) < 2 or max(abs(x) for x in _lvD) < 0.5:
+                _cmsg.append(f'fit holds one inclination level {_lvD} — direction check skipped')
+            else:
+                _fzg = 800.0
+                _iaD = float(max(abs(x) for x in _lvD))      # top measured level
+                _grid = np.linspace(0.0, 13.0, 261)
+                _f0 = np.array([abs(float(_tmD.Fy(s, _fzg, 0.0))) for s in _grid])
+                _spk = float(_grid[int(np.argmax(_f0))])
+                _half = 0.5 * _spk
+                # an OUTER wheel with NEGATIVE ground camber leans INTO the turn,
+                # with POSITIVE camber it leans AWAY — through the helper.
+                _ia_in = _wid(-_iaD, is_outer=True)
+                _ia_aw = _wid(+_iaD, is_outer=True)
+                _mag = lambda s, ia: abs(float(_tmD.Fy(s, _fzg, ia)))
+                _o = (_mag(_half, _ia_in), _mag(_half, 0.0), _mag(_half, _ia_aw))
+                if not (_o[0] > _o[1] > _o[2]):
+                    _cfail.append(f'{_half:.1f} deg: |Fy| into/upright/away = '
+                                  f'{_o[0]:.0f}/{_o[1]:.0f}/{_o[2]:.0f} N not ordered')
+                _p = (_mag(_spk, _ia_in), _mag(_spk, _ia_aw))
+                if not (_p[0] > _p[1]):
+                    _cfail.append(f'peak {_spk:.1f} deg: into {_p[0]:.0f} N <= away {_p[1]:.0f} N')
+                _cmsg.append(f'IA {_iaD:.0f} @ {_fzg:.0f} N: into/upright/away '
+                             f'{_o[0]/_o[1]:.3f}/1/{_o[2]/_o[1]:.3f} @ {_half:.1f} deg, '
+                             f'into/away {_p[0]/_p[1]:.3f} @ peak {_spk:.1f} deg')
+        # the helper's sign rule itself (left wheel = inner of the SAE left turn)
+        if not (_wid(-1.0, is_outer=True) == -1.0 and _wid(-1.0, is_outer=False) == 1.0
+                and _wid(-1.0, side='right') == -1.0 and _wid(-1.0, side='left') == 1.0):
+            _cfail.append('wheel_inclination_deg sign rule broken')
+        # 1 g steady solve (solve() takes lateral g, not m/s^2)
+        _ss1 = wD._build_dynamics_solver()
+        _r1 = _ss1.solve(1.0, 0.0)
+        _inc = getattr(_r1, 'inclination', None) or {}
+        _cg1 = getattr(_r1, 'camber_ground', None) or {}
+        _fo, _fi = ('FL', 'FR') if _r1.Fz['FL'] >= _r1.Fz['FR'] else ('FR', 'FL')
+        _io, _ii = float(_inc.get(_fo, 0.0)), float(_inc.get(_fi, 0.0))
+        if not (_io * _ii < 0.0):
+            _cfail.append(f'1 g: outer {_fo} IA {_io:+.2f} / inner {_fi} IA {_ii:+.2f} '
+                          f'not opposite-signed')
+        if abs(_io - float(_cg1.get(_fo, 0.0))) > 1e-9 or abs(_ii + float(_cg1.get(_fi, 0.0))) > 1e-9:
+            _cfail.append('1 g: inclination != (+outer / -inner) ground camber')
+        _stat = float(getattr(_ss1._veh, 'camber_front_deg', 0.0))
+        _roll = abs(float(_r1.roll_angle_deg))
+        _exp_o = float(_r1.camber.get(_fo, 0.0)) + _stat + _roll
+        _exp_i = float(_r1.camber.get(_fi, 0.0)) + _stat - _roll
+        if abs(_exp_o - float(_cg1.get(_fo, 0.0))) > 1e-6 or abs(_exp_i - float(_cg1.get(_fi, 0.0))) > 1e-6:
+            _cfail.append('1 g: ground camber != kinematic + static + roll (outer +, inner -)')
+        _cmsg.append(f'1 g front: outer {_fo} ground {float(_cg1.get(_fo, 0.0)):+.2f} -> IA {_io:+.2f}, '
+                     f'inner {_fi} ground {float(_cg1.get(_fi, 0.0)):+.2f} -> IA {_ii:+.2f} '
+                     f'(kin {float(_r1.camber.get(_fo, 0.0)):+.2f}/{float(_r1.camber.get(_fi, 0.0)):+.2f}, '
+                     f'static {_stat:+.2f}, roll {_roll:.2f})')
+        if _cfail:
+            fails += 1
+        print(f'camber sign      : {"; ".join(_cmsg)}   '
+              f'{"pass" if not _cfail else "UNEXPECTED FAIL: " + "; ".join(_cfail)}')
+    except Exception as _e:
+        fails += 1
+        print(f'camber sign      : UNEXPECTED FAIL (exception: {_e})')
+
 # ── TIRE CAMBER-ROW INTEGRITY: TTC tests sweep discrete inclinations (0/2/4);
 #    stray transition samples used to create phantom integer camber rows filled
 #    with zeros, so peak_mu at interpolated cambers (e.g. 0.45 deg — exactly
@@ -703,15 +864,27 @@ if _tm is not None:
         fails += 1
 if _tm is not None:
     _fzs = [300, 400, 600, 800, 1000]
-    _mus = [float(_tm.peak_mu(float(f), 0.45)) for f in _fzs]
+    # slip_sign=0 = the peak over BOTH slip branches, the definition this gate
+    # was calibrated on.  The per-branch peaks (slip_sign=+1/-1, what the
+    # solver's grip budget now uses at a SIGNED IA — see 'camber sign') carry
+    # the rig's own branch asymmetry: on this fit the SA>0 branch is ~4% weaker
+    # than the SA<0 branch at 300 N and equal by 800 N, which shows up as a
+    # +2% wobble in mu vs load, NOT a phantom row.  Phantom rows are caught by
+    # the both-branch trend AND by each branch staying within 8% of it.
+    _mus = [float(_tm.peak_mu(float(f), 0.45, 0)) for f in _fzs]
     _degr = all(_mus[i+1] <= _mus[i] * 1.02 for i in range(len(_mus) - 1))
+    _br = [(float(_tm.peak_mu(float(f), 0.45, 1)), float(_tm.peak_mu(float(f), 0.45, -1)))
+           for f in _fzs]
+    _br_ok = all(0.92 * m <= p <= m * 1.0001 and 0.92 * m <= n <= m * 1.0001
+                 for m, (p, n) in zip(_mus, _br))
     _lv = _tm.camber_levels() if callable(_tm.camber_levels) else _tm.camber_levels
     _lv = list(np.asarray(_lv).ravel())
-    if not _degr:
+    if not (_degr and _br_ok):
         fails += 1
     print(f'tire camber rows : levels={_lv}  mu(300..1000N)@0.45deg='
-          f'{" ".join(f"{m:.2f}" for m in _mus)}  '
-          f'{"pass" if _degr else "UNEXPECTED FAIL (non-degressive: phantom camber rows back)"}')
+          f'{" ".join(f"{m:.2f}" for m in _mus)}  SA>0 branch '
+          f'{" ".join(f"{p/m:.3f}" for m, (p, _) in zip(_mus, _br))} of both  '
+          f'{"pass" if (_degr and _br_ok) else "UNEXPECTED FAIL (non-degressive / branch off: phantom camber rows back)"}')
 else:
     print('tire camber rows : no TTC file on this machine — skipped (data-dependent check)')
 
@@ -846,8 +1019,16 @@ else:
 #    the table erratic across g: -1.27 deg at 1.5 g, -4.39 at 1.7, then +0.145
 #    at 1.9 AND 2.0 — the last two were pure geometry dressed as a result.
 #    Guards: (a) any saturated row reports valid=False and NaN toe difference;
-#    (b) the VALID rows are smooth — monotone decreasing in g with exactly one
-#    sign change (pro at low g -> reverse near the limit), no jumps.
+#    (b) the VALID rows are smooth — monotone decreasing in g with AT MOST one
+#    sign change, no jumps.  (Was "exactly one": pro at low g -> reverse near
+#    the limit.  That crossing was an artifact of feeding the tyre |camber| on
+#    its favourable branch: the light inner wheel scored as leaning INTO the
+#    turn and needed LESS slip.  With the signed inclination (2026-09-02, see
+#    'camber sign') the inner wheel leans AWAY under roll on this car and
+#    needs MORE slip, so the spread stays pro-Ackermann and decays toward
+#    zero: +1.72 -> +0.05 deg over 0.3..1.7 g.  Whether it crosses is a
+#    physics result of tyre + static camber, not a gate invariant; the
+#    erratic table this gate was built against had TWO crossings.)
 print('-' * 64)
 if _tm is not None:
     from vahan.ackermann import ackermann_bucket as _ab
@@ -862,7 +1043,7 @@ if _tm is not None:
     _mono = all(_sp[i + 1] <= _sp[i] + 1e-6 for i in range(len(_sp) - 1))
     _sgn = sum(1 for i in range(len(_sp) - 1) if (_sp[i] > 0) != (_sp[i + 1] > 0))
     _sat = [r for r in _rb if not r.get('valid', True)]
-    _ok = (not _fab) and _mono and _sgn == 1 and len(_sat) >= 1 and len(_val) >= 4
+    _ok = (not _fab) and _mono and _sgn <= 1 and len(_sat) >= 1 and len(_val) >= 4
     if not _ok:
         fails += 1
     print(f'ackermann trust  : {len(_val)} valid rows {_sp[0]:+.2f}->{_sp[-1]:+.2f} deg, '
@@ -1964,6 +2145,71 @@ except Exception as _ep:
     fails += 1
     import traceback as _tbp; _tbp.print_exc()
     print(f'packaging        : UNEXPECTED FAIL ({type(_ep).__name__}: {_ep})')
+
+# ── RELOCATE IK (vahan/relocate.py): curve-preserving single-point relocation.
+#    Oracle honesty check, both directions: (a) with allow_wheel_motion=True an
+#    UNMOVED model must still validate PASS (the switch may not weaken an
+#    untouched car); (b) shoving a wheel-locating point (front uca_outer) 5 mm
+#    up must FAIL the re-measured wheel metrics — if it passes, the oracle is
+#    blind to curve changes and every "solution" the search returns is a lie.
+#    The point is restored and re-verified byte-identical afterwards.
+print('-' * 64)
+try:
+    from vahan.relocate import _PointHandle as _RPH, _feasible as _RF
+    # (uses win/_pbase from the packaging block above — same loaded config)
+    _ok_same, _ = _RF(win, _pbase, _pkgm.Tolerances(), 'front')
+    _h = _RPH(win, 'front', 'hp', 'uca_outer')
+    _pmoved = _h.original + np.array([0.0, 0.0, 0.005])
+    _h.set(_pmoved)
+    _ok_moved, _res_m = _RF(win, _pbase, _pkgm.Tolerances(), 'front')
+    _h.restore()
+    _back = np.abs(np.array((win._front_hp)['uca_outer'], float)
+                   - _h.original).max()
+    _rok = _ok_same and (not _ok_moved) and _back < 1e-12
+    if not _rok:
+        fails += 1
+    print(f'relocate IK      : unmoved PASS={_ok_same}, uca_outer +5mm z '
+          f'FAILs oracle={not _ok_moved}, restore {_back:.1e} m   '
+          f'{"pass" if _rok else "UNEXPECTED FAIL"}')
+except Exception as _er:
+    fails += 1
+    import traceback as _tbr; _tbr.print_exc()
+    print(f'relocate IK      : UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── DAMPER MOTION SIGN (2026-08-26): a matched |motion ratio| can still be a
+#    sign-inverted rocker — the pushrod acting as a PULLROD (damper EXTENDS in
+#    bump).  solver_mr()/the rate checks take an absolute value and are blind
+#    to it; v73 shipped inverted and was caught by eye, not by the tool.  Gate:
+#    the loaded design's front + rear dampers must read as PUSHRODS (compress
+#    in bump, sign −1), AND flipping the rocker chain to invert the motion must
+#    make validate() FAIL 'damper acts as pushrod'.
+print('-' * 64)
+try:
+    _dsf = _pkgm.damper_motion_sign(win, 'front')
+    _dsr = _pkgm.damper_motion_sign(win, 'rear')
+    # a KNOWN-inverted geometry (archived v73, pushrod-acting-as-pullrod front)
+    # must trip 'damper acts as pushrod' when judged against a pushrod baseline
+    import glob as _g73
+    _inv_caught = None
+    _v73 = _g73.glob('configs/**/2027_v73_INVERTED*.vahan', recursive=True)
+    if _v73:
+        win._load_project_from_path(_v73[0]); win._rebuild_solvers(0.)
+        _res_inv = _pkgm.validate(win, _pbase, _pkgm.Tolerances(),
+                                  allow_wheel_motion=True)
+        _inv_caught = any(c['axle'] == 'front'
+                          and c['name'] == 'damper acts as pushrod'
+                          and not c['ok'] for c in _res_inv.checks)
+        win._load_project_from_path(_design_cfg[0]); win._rebuild_solvers(0.)
+    _dsok = (_dsf < 0 and _dsr < 0 and (_inv_caught is not False))
+    if not _dsok:
+        fails += 1
+    print(f'damper sign      : design front={_dsf:+.0f} rear={_dsr:+.0f} '
+          f'(pushrod=-1), archived-inverted caught={_inv_caught}   '
+          f'{"pass" if _dsok else "UNEXPECTED FAIL"}')
+except Exception as _eds:
+    fails += 1
+    import traceback as _tbds; _tbds.print_exc()
+    print(f'damper sign      : UNEXPECTED FAIL ({type(_eds).__name__}: {_eds})')
 
 # ── GROUND CONTACT (2026-08-23): at design position each axle's tire bottom
 #    (wheel_center_z − tire_outer_dia/2) must sit ON the ground plane z=0

@@ -75,6 +75,9 @@ class Tolerances:
     arb_inplane_mm:    float = 3.0    # ARB drop link in rocker plane at static
     triad_deg:         float = 1.0    # bar/blade/drop mutual angles vs baseline
     clash_worsen_mm:   float = 0.25   # standing near-miss may not get worse
+    arb_mount_shift_mm: float = 100.0 # bar re-mount may move at most this far
+                                      # from the baseline chassis mount (a bar
+                                      # only mounts where structure exists)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -268,6 +271,100 @@ def refit_arb(bundle: dict, ref_bundle: dict) -> dict:
     return out
 
 
+def refit_arb_variants(bundle: dict, ref_bundle: dict) -> list:
+    """EVERY discrete re-hang branch of refit_arb (2 chiralities x 2 plane-
+    offset signs x up-to-2 rotation roots -> up to 8 bundles), sorted by
+    closeness to the rigidly-transformed pose.  refit_arb() returns just the
+    first of these; a packaging search may need the others — a different
+    branch places the BAR on the other side of the rocker without touching
+    the drop-top or the drive geometry."""
+    D0 = np.asarray(ref_bundle['arb']['arb_drop_top'], float)
+    E0 = np.asarray(ref_bundle['arb']['arb_arm_end'], float)
+    P0 = np.asarray(ref_bundle['arb']['arb_pivot'], float)
+    D1 = np.asarray(bundle['arb']['arb_drop_top'], float)
+    E_rig = np.asarray(bundle['arb']['arb_arm_end'], float)
+    P_rig = np.asarray(bundle['arb']['arb_pivot'], float)
+    c1, n1 = _chain_plane(bundle)
+    c0, n0 = _chain_plane(ref_bundle)
+    off0 = float(np.dot(E0 - c0, n0))
+    vE0, vP0 = E0 - D0, P0 - D0
+    M = np.array([1.0, -1.0, 1.0])
+    cands = []
+    for vE, vP in ((vE0, vP0), (vE0 * M, vP0 * M)):
+        for target in (off0, -off0):
+            nx, ny, nz = n1
+            K = float(np.dot(D1 - c1, n1)) + nx * vE[0] - target
+            A = ny * vE[1] + nz * vE[2]
+            B = nz * vE[1] - ny * vE[2]
+            R = float(np.hypot(A, B))
+            phi = float(np.arctan2(B, A))
+            if R < 1e-12:
+                psis = [0.0]
+            elif abs(K) <= R:
+                d = float(np.arccos(np.clip(-K / R, -1.0, 1.0)))
+                psis = [phi + d, phi - d]
+            else:
+                psis = [phi + (np.pi if K > 0 else 0.0)]
+            for psi in psis:
+                c, sn = np.cos(psi), np.sin(psi)
+                Rx = np.array([[1, 0, 0], [0, c, -sn], [0, sn, c]])
+                E1 = D1 + Rx @ vE
+                P1 = D1 + Rx @ vP
+                cost = float(np.linalg.norm(E1 - E_rig)
+                             + np.linalg.norm(P1 - P_rig))
+                out = {'hp': {k: np.array(v, float)
+                              for k, v in bundle['hp'].items()},
+                       'arb': {k: np.array(v, float)
+                               for k, v in bundle['arb'].items()}}
+                out['arb']['arb_arm_end'] = E1
+                out['arb']['arb_pivot'] = P1
+                cands.append((cost, out))
+    cands.sort(key=lambda t: t[0])
+    return [b for _c, b in cands]
+
+
+def retune_arb_blade(win, bundle: dict, axle: str, target_rate: float,
+                     ref_bundle: dict, s_lo: float = 0.5, s_hi: float = 2.5,
+                     iters: int = 18) -> tuple:
+    """Bisect the BLADE length (arm_end scaled about arb_pivot in the
+    reference triangle) until the panel ARB wheel rate matches target_rate.
+    The alternative knob to retune_arb(): a LONGER blade softens the rate
+    without shrinking the drop radius into the rocker bearing.  Blade
+    direction is preserved, so the triad angles survive; the drop link is an
+    adjustable rod, so its length change is real hardware.
+    Returns (bundle, s, rate).  Caller owns restoring window state."""
+    E0 = np.asarray(ref_bundle['arb']['arb_arm_end'], float)
+    P0 = np.asarray(ref_bundle['arb']['arb_pivot'], float)
+
+    def rate_of(sc):
+        ref2 = {'hp': {k: np.array(v, float)
+                       for k, v in ref_bundle['hp'].items()},
+                'arb': {k: np.array(v, float)
+                        for k, v in ref_bundle['arb'].items()}}
+        ref2['arb']['arb_arm_end'] = P0 + sc * (E0 - P0)
+        b = refit_arb(bundle, ref2)
+        set_bundle(win, axle, b)
+        return panel_arb_rate(win, axle), b
+    r_lo, _ = rate_of(s_lo)
+    r_hi, _ = rate_of(s_hi)
+    f_lo = r_lo - target_rate
+    if f_lo * (r_hi - target_rate) > 0:
+        raise ValueError(f'ARB rate target {target_rate:.0f} not bracketed by '
+                         f'blade length: {r_lo:.0f}..{r_hi:.0f} N/m')
+    lo, hi = s_lo, s_hi
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        fm, _b = rate_of(mid)
+        fm -= target_rate
+        if f_lo * fm <= 0:
+            hi = mid
+        else:
+            lo, f_lo = mid, fm
+    sc = 0.5 * (lo + hi)
+    rate, b = rate_of(sc)
+    return b, sc, rate
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Fast solver-level measurements (pure; no GUI state mutated)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -334,8 +431,8 @@ def panel_arb_rate(win, axle: str) -> float:
 
 
 def retune_arb(win, bundle: dict, axle: str, target_rate: float,
-               ref_bundle: dict, m_lo: float = 0.5, m_hi: float = 2.0,
-               iters: int = 16) -> tuple:
+               ref_bundle: dict, m_lo: float = 0.15, m_hi: float = 3.5,
+               iters: int = 18) -> tuple:
     """Bisect the drop-link radius scale m until the panel ARB wheel rate
     matches target_rate.  Each trial re-hangs the bar (refit_arb) and applies
     the bundle to the window (the rate formula needs the live solvers).
@@ -438,17 +535,33 @@ def _axle_geometry_laws(win, axle: str) -> dict:
         c = pts.mean(0); _, _, vt = np.linalg.svd(pts - c)
         cop = max(cop, float(np.abs((pts - c) @ vt[-1]).max()))
     out['coplanar_mm'] = cop
-    # (2) drop link in-plane at static, both ends, against the chain plane
+    # (2) drop link in-plane at static, both ends, against the chain plane.
+    #     This is a BELLCRANK-ARB law (bar rides the rocker, so its blade + drop
+    #     link must lie in the rocker plane).  A BOTTOM / control-arm ARB mounts
+    #     the torsion bar low on the chassis (well below the rocker) with a long
+    #     drop link down to it — the bar is chassis-fixed and the drop link is a
+    #     two-force member (rod ends), so it is never in bending regardless of
+    #     plane.  Detect that layout (bar pivot mounted far below the rocker)
+    #     and EXEMPT the in-plane check for it; the triad + rate + clash laws
+    #     still apply.
     st = solver.solve(0.0)
     P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
     pl = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
                    P('rocker_spring_pt'), P('spring_chassis_pt')])
     c0 = pl.mean(0); _, _, vt = np.linalg.svd(pl - c0)
     n = vt[-1]
-    dt_off = float(abs((np.asarray(arb['arb_drop_top'], float) * 1000 - c0) @ n))
-    ae_off = float(abs((np.asarray(arb['arb_arm_end'], float) * 1000 - c0) @ n))
-    out['arb_drop_top_inplane_mm'] = dt_off
-    out['arb_arm_end_inplane_mm'] = ae_off
+    _rk_z = float(P('rocker_pivot')[2])
+    _bar_z = float(np.asarray(arb['arb_pivot'], float)[2] * 1000.0)
+    is_bottom_arb = (_rk_z - _bar_z) > 120.0     # bar >120 mm below the rocker
+    out['arb_is_bottom'] = bool(is_bottom_arb)
+    if is_bottom_arb:
+        out['arb_drop_top_inplane_mm'] = 0.0
+        out['arb_arm_end_inplane_mm'] = 0.0
+    else:
+        dt_off = float(abs((np.asarray(arb['arb_drop_top'], float) * 1000 - c0) @ n))
+        ae_off = float(abs((np.asarray(arb['arb_arm_end'], float) * 1000 - c0) @ n))
+        out['arb_drop_top_inplane_mm'] = dt_off
+        out['arb_arm_end_inplane_mm'] = ae_off
     # (3) triad: torsion bar (X axis) / blade (pivot->arm end) / drop link
     pv = np.asarray(arb['arb_pivot'], float)
     ae = np.asarray(arb['arb_arm_end'], float)
@@ -522,11 +635,28 @@ def _clash_sweep(win) -> dict:
     return out
 
 
+def damper_motion_sign(win, axle: str) -> float:
+    """Sign of d(spring_length)/d(travel): a proper PUSHROD COMPRESSES the
+    damper in bump, so spring_length falls as travel rises -> negative.  A
+    sign-inverted rocker turns the pushrod into a PULLROD (damper EXTENDS in
+    bump, +).  solver_mr() takes an absolute value and is blind to this, so
+    the sign must be judged separately or a pullrod passes as 'rate matched'
+    (v73 shipped inverted before this guard existed)."""
+    label = _LABEL[axle]
+    solver = win._solvers[label]
+    lo, hi = travel_range_m(win)
+    L_hi = float(solver.solve(hi).spring_length)
+    L_lo = float(solver.solve(lo).spring_length)
+    d = L_hi - L_lo
+    return float(np.sign(d)) if abs(d) > 1e-9 else 0.0
+
+
 def capture_baseline(win) -> dict:
     """Snapshot of EVERY held parameter from the currently loaded model.
     This is the reference validate() judges candidates against; the untouched
     model must always validate PASS against its own baseline."""
-    base = {'wheel_points': {}, 'wheel_metrics': {}, 'geometry': {}}
+    base = {'wheel_points': {}, 'wheel_metrics': {}, 'geometry': {},
+            'damper_sign': {}}
     for axle in ('front', 'rear'):
         hp = win._front_hp if axle == 'front' else win._rear_hp
         base['wheel_points'][axle] = {
@@ -534,6 +664,7 @@ def capture_baseline(win) -> dict:
             for k in WHEEL_HP_KEYS if k in hp and hp[k] is not None}
         base['wheel_metrics'][axle] = _axle_wheel_metrics(win, axle)
         base['geometry'][axle] = _axle_geometry_laws(win, axle)
+        base['damper_sign'][axle] = damper_motion_sign(win, axle)
     base['rates'] = _rates(win)
     base['clashes'] = _clash_sweep(win)
     lo, hi = travel_range_m(win)
@@ -569,7 +700,9 @@ class ValidationResult:
 
 
 def validate(win, baseline: dict, tol: Tolerances = None,
-             axles=('front', 'rear'), stop_early: bool = False) -> ValidationResult:
+             axles=('front', 'rear'), stop_early: bool = False,
+             allow_wheel_motion: bool = False,
+             skip_clash: bool = False) -> ValidationResult:
     """THE single validity oracle.  Judges the model CURRENTLY loaded in `win`
     against `baseline` within `tol`.  Cheap checks run first; the full-travel
     clash sweep runs last; with stop_early=True the first failing group aborts
@@ -596,8 +729,11 @@ def validate(win, baseline: dict, tol: Tolerances = None,
         for k, ref in baseline['wheel_points'][axle].items():
             cur = np.asarray(hp.get(k), float)
             moved = max(moved, float(np.abs(cur - np.asarray(ref)).max()))
-        res.add('wheel points moved', axle, moved * 1000, 0.0, 1e-9, moved < 1e-12,
-                ' mm')
+        # In relocation mode (allow_wheel_motion) a moved wheel point is the
+        # POINT of the exercise — the re-measured metric/curve comparisons
+        # below then carry the whole judgement; the distance is informational.
+        res.add('wheel points moved', axle, moved * 1000, 0.0, 1e-9,
+                allow_wheel_motion or moved < 1e-12, ' mm')
         bm = baseline['wheel_metrics'][axle]
         if moved < 1e-12:
             # held EXACTLY by construction — record zero deltas
@@ -660,11 +796,24 @@ def validate(win, baseline: dict, tol: Tolerances = None,
         ref = br[key]
         pct = abs(r[key] - ref) / abs(ref) * 100 if abs(ref) > 1e-12 else 0.0
         res.add(key, ax, r[key], ref, t, pct <= t, ' %')
+    # damper motion SIGN — a matched |motion ratio| can still be a sign-
+    # inverted rocker (pushrod acting as pullrod: damper EXTENDS in bump).
+    # The percent checks above are blind to it (abs), so guard it explicitly.
+    for ax in axles:
+        bs = baseline.get('damper_sign', {}).get(ax)
+        if bs is None or bs == 0.0:
+            continue
+        cs = damper_motion_sign(win, ax)
+        ok = (cs == bs)
+        res.add('damper acts as pushrod', ax, cs, bs, 0.5, ok,
+                ' (sign of d spring_length / d travel; must match baseline)')
     if stop_early and not res.ok:
         res.aborted_after = 'rates'
         return res
 
     # ── 4. clash sweep (most expensive — last) ───────────────────────────────
+    if skip_clash:
+        return res
     cur = _clash_sweep(win)
     res.clashes = cur
     # pool baseline pairs (corner+pair -> worst standing gap)

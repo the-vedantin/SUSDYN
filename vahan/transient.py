@@ -48,6 +48,7 @@ import numpy as np
 from .dynamics import VehicleParams
 from .kinematics import KinematicMetrics
 from .steering import SteeringGeometry
+from .tire_model import wheel_inclination_deg
 
 G = 9.81
 
@@ -985,17 +986,34 @@ class TransientSolver:
             Fz = loads['Fz']
             travel = loads['travel']
             fz_arr  = np.array([max(Fz[c], 0.0) for c in _CORNERS])
-            cam_arr = np.array([self._camber(c, travel[c]) for c in _CORNERS])
+            # GROUND camber per wheel = kinematic (chassis-relative LUT)
+            # + static alignment + body roll.  ISO +phi = body tilts RIGHT,
+            # which tips the top of every wheel to the right: inboard (-) on
+            # the left wheels, outboard (+) on the right ones.  Then the
+            # SIGNED SAE inclination per side through THE ONE helper — the
+            # raw LUT value used to go straight in, which is only right for
+            # the right-hand wheels, and negative values were clipped to 0.
+            _phi_deg = float(np.degrees(phi))
+            cam_arr = np.array([
+                wheel_inclination_deg(
+                    self._camber(c, travel[c])
+                    + float(getattr(v, 'camber_front_deg' if c[0] == 'F'
+                                    else 'camber_rear_deg', 0.0))
+                    + (_phi_deg if c.endswith('R') else -_phi_deg),
+                    side='right' if c.endswith('R') else 'left')
+                for c in _CORNERS])
 
             # One batched tire call for all 4 wheels
             fy_tire = np.asarray(self._tire.Fy(alpha_deg, fz_arr, cam_arr),
                                  dtype=float)
             if fy_tire.ndim == 0:
                 fy_tire = np.array([float(fy_tire)] * 4)
-            # TTC convention flip: positive alpha → negative Fy in raw data.
-            # ISO expects positive alpha → positive Fy.  Flip where signs agree.
-            sign_flip = (np.sign(fy_tire) == -np.sign(alpha_arr)) & (np.abs(alpha_arr) > 1e-6)
-            fy_tire = np.where(sign_flip, -fy_tire, fy_tire)
+            # SAE -> ISO: the table's Y points RIGHT, this model's Y points
+            # LEFT, so Fy flips sign UNCONDITIONALLY.  (alpha here is
+            # numerically the SAE slip angle: left turn = positive both ways.)
+            # The old "flip only where sign(Fy) == -sign(alpha)" left camber
+            # thrust near zero slip pointing the wrong way.
+            fy_tire = -fy_tire
             Fy = {c: float(fy_tire[i]) for i, c in enumerate(_CORNERS)}
 
             # Per-wheel Fx distribution

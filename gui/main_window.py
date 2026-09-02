@@ -2964,6 +2964,11 @@ class MainWindow(QMainWindow):
         dyn_params = dict(dyn_params)
         dyn_params['toe_front_deg'] = 2.0 * float(_al.get('front_toe_deg', 0.0))
         dyn_params['toe_rear_deg'] = 2.0 * float(_al.get('rear_toe_deg', 0.0))
+        # STATIC CAMBER -> dynamics (per wheel, vehicle-frame sign).  The
+        # kinematic camber is chassis-relative and 0 at design, so the tyre
+        # needs this + body roll to know which way each wheel really leans.
+        dyn_params['camber_front_deg'] = float(_al.get('front_camber_deg', 0.0))
+        dyn_params['camber_rear_deg'] = float(_al.get('rear_camber_deg', 0.0))
 
         topo = getattr(self, '_topology', None)
         if topo is None:
@@ -4025,6 +4030,13 @@ class MainWindow(QMainWindow):
         self.view3d.set_on_move(self._on_hp_move)
         self.view3d.set_on_constraint(self._on_constraint_mode)
         self.view3d.set_on_increment(self._on_edit_increment_changed)
+        # MCP connector: operate the RUNNING app from Claude directly
+        # (127.0.0.1:8765; VAHAN_MCP=0 disables).  Must never kill the app.
+        try:
+            from gui.mcp_server import start_mcp
+            start_mcp(self)
+        except Exception:
+            pass
 
         self.curves = CurvesCanvas()
         # Hover-to-read on the main kinematic/dynamics graph surface (Fz, roll,
@@ -7637,28 +7649,55 @@ class MainWindow(QMainWindow):
         # rocker / damper / drop-link swing around as one rigid plane.
         axis = axis.upper()
         axis_vec = None
-        if axis == 'PUSHROD':
-            # Need both pushrod endpoints on this axle
-            corner_d = self._front_hp if is_front else self._rear_hp
-            if ('pushrod_inner' in corner_d and 'pushrod_outer' in corner_d):
-                v = (np.asarray(corner_d['pushrod_inner'], float)
-                     - np.asarray(corner_d['pushrod_outer'], float))
+        corner_d = self._front_hp if is_front else self._rear_hp
+        arb_d = self._front_arb if is_front else self._rear_arb
+
+        def _seg(dsrc, a, b):
+            """Unit vector a-b if both endpoints exist, else None."""
+            if a in dsrc and b in dsrc:
+                v = np.asarray(dsrc[a], float) - np.asarray(dsrc[b], float)
                 n = float(np.linalg.norm(v))
                 if n > 1e-9:
-                    axis_vec = v / n
-            if axis_vec is None:
-                self.statusBar().showMessage(
-                    'PLANE TILT — no pushrod on this axle (DIRECT damper '
-                    'topology); pick a world axis instead', 4000)
-                return
+                    return v / n
+            return None
+
+        # Derived revolve axes — every meaningful line the assembly can be
+        # revolved about, not just the world triad.  A None result means the
+        # topology lacks that member; report it rather than silently doing X.
+        _need = None
+        if axis == 'PUSHROD':
+            axis_vec = _seg(corner_d, 'pushrod_inner', 'pushrod_outer')
+            _need = 'pushrod (pushrod_inner/outer)'
+        elif axis in ('SPRING AXIS', 'SPRING'):
+            axis_vec = _seg(corner_d, 'rocker_spring_pt', 'spring_chassis_pt')
+            _need = 'coilover (rocker_spring_pt/spring_chassis_pt)'
+        elif axis in ('ROCKER AXIS', 'ROCKER'):
+            axis_vec = _seg(corner_d, 'rocker_axis_pt', 'rocker_pivot')
+            _need = 'rocker axis (rocker_axis_pt/rocker_pivot)'
+        elif axis in ('DROP LINK', 'DROPLINK'):
+            axis_vec = _seg(arb_d, 'arb_drop_top', 'arb_arm_end')
+            _need = 'ARB drop link (arb_drop_top/arb_arm_end)'
+        elif axis in ('PLANE NORMAL', 'NORMAL'):
+            # normal of the actuation plane (revolve IN the plane, i.e. spin
+            # the whole assembly flat about the pivot axis direction)
+            try:
+                import vahan.packaging as _pk
+                _b = _pk.get_bundle(self, 'front' if is_front else 'rear')
+                _c, _n = _pk._chain_plane(_b)
+                if np.all(np.isfinite(_n)) and np.linalg.norm(_n) > 1e-9:
+                    axis_vec = _n / np.linalg.norm(_n)
+            except Exception:
+                axis_vec = None
+            _need = 'actuation plane (needs the full chain)'
         else:
             axis_vec = {'X': np.array([1., 0., 0.]),
                         'Y': np.array([0., 1., 0.]),
                         'Z': np.array([0., 0., 1.])}.get(axis)
         if axis_vec is None:
-            self.statusBar().showMessage(
-                f'PLANE TILT — bad axis "{axis}" (expected PUSHROD or X/Y/Z)',
-                3000)
+            msg = (f'PLANE TILT — this axle has no {_need}; pick another axis'
+                   if _need else
+                   f'PLANE TILT — bad axis "{axis}"')
+            self.statusBar().showMessage(msg, 4000)
             return
 
         # Rotation matrix — Rodrigues formula works for any unit axis.
@@ -8162,6 +8201,11 @@ class MainWindow(QMainWindow):
                     if k in self._GROUP_SPRING_CORNER]
             out += [('heave', heave, k) for k in heave]        # 3rd-element spring setup
             out += [('decoupled', deco, k) for k in deco]      # twin-rocker cradle
+            # the ARB drop-link top is bolted to the ROCKER, so it rides with
+            # the spring/rocker sub-assembly — NOT with the ARB body.  It lives
+            # in the arb dict, so pull it in here or it moves with neither group.
+            out += [('arb', arb, k) for k in ('arb_drop_top', 'tbar_drop_top')
+                    if k in arb]
         elif group == 'arb':
             out += [('arb', arb, k) for k in arb
                     if k not in self._GROUP_ARB_EXCLUDE]
@@ -9848,7 +9892,7 @@ class MainWindow(QMainWindow):
                 brake_params_r=bp_r,
                 system=system,
                 tire_model=tire,
-                cambers=result.camber,
+                cambers=getattr(result, 'inclination', None) or {},
             )
 
             # Rotor thermal — single braking event

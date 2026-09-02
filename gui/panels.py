@@ -7174,7 +7174,8 @@ class DirectEditPanel(CollapsibleSection):
         #   Y       = +Y world (longitudinal, fwd)
         #   Z       = +Z world (vertical, up)
         self._cmb_plane_axis.addItems(
-            ['Pushrod', 'X (lat)', 'Y (long)', 'Z (vert)'])
+            ['Pushrod', 'Spring axis', 'Rocker axis', 'Plane normal',
+             'Drop link', 'X (lat)', 'Y (long)', 'Z (vert)'])
         prow1.addWidget(self._cmb_plane_axis)
         prow1.addStretch(1)
         self.add_layout(prow1)
@@ -7294,8 +7295,8 @@ class DirectEditPanel(CollapsibleSection):
         grow = QHBoxLayout(); grow.setSpacing(4)
         grow.addWidget(QLabel('Step:'))
         self._grp_step = QDoubleSpinBox()
-        self._grp_step.setRange(0.1, 100.0)
-        self._grp_step.setDecimals(1)
+        self._grp_step.setRange(0.001, 1.0e6)   # no practical translation cap
+        self._grp_step.setDecimals(3)
         self._grp_step.setSingleStep(1.0)
         self._grp_step.setValue(5.0)
         self._grp_step.setSuffix(' mm')
@@ -7561,19 +7562,29 @@ class DirectEditPanel(CollapsibleSection):
         """
         axle = self._cmb_plane_axle.currentText().lower()        # 'front'/'rear'
         axis_label = self._cmb_plane_axis.currentText().strip()
-        if axis_label.upper().startswith('PUSHROD'):
-            axis_key = 'PUSHROD'
-        else:
-            # First letter of "X / Y / Z (...)" maps to canonical world axis
-            axis_key = axis_label[0].upper()
+        # Stable token per menu item (not localised text).  Derived-axis items
+        # (spring/rocker/normal/drop link) map to their own tokens; the world
+        # triad "X / Y / Z (...)" maps to its first letter.
+        _amap = {'PUSHROD': 'PUSHROD', 'SPRING AXIS': 'SPRING',
+                 'ROCKER AXIS': 'ROCKER', 'PLANE NORMAL': 'NORMAL',
+                 'DROP LINK': 'DROPLINK'}
+        axis_key = _amap.get(axis_label.upper(), axis_label[0].upper())
         deg = float(self._spn_plane_deg.value()) * sign
         pivot = self._cmb_plane_pivot.currentText()
         # For rotation about the pushrod, the pivot MUST lie on the
         # pushrod line or you get a screw motion (rotation + translation).
         # Auto-snap to pushrod_inner — that's the canonical chassis end
         # and what we use during design.
-        if axis_key == 'PUSHROD':
-            pivot = 'pushrod_inner'
+        # Auto-snap the pivot onto the chosen axis so the revolve keeps that
+        # member fixed (a pure spin about its line), matching the pushrod case.
+        # 'NORMAL' spins the assembly flat and works about any in-plane pivot,
+        # so it keeps the user's pivot choice.
+        _snap = {'PUSHROD': 'pushrod_inner',
+                 'SPRING': 'rocker_spring_pt',
+                 'ROCKER': 'rocker_pivot',
+                 'DROPLINK': 'arb_drop_top'}
+        if axis_key in _snap:
+            pivot = _snap[axis_key]
         # Only emit if user has selected a non-zero rotation
         if abs(deg) < 1e-9:
             return

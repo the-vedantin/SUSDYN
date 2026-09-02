@@ -100,6 +100,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from .tire_model import wheel_inclination_deg
+
 G = 9.81            # matches vahan/dynamics.py
 _CORNERS = ('FL', 'FR', 'RL', 'RR')
 
@@ -140,8 +142,14 @@ def build_loads_table(solver, aero_Fz_per_g=None, ay_max=3.0, n=13):
         except Exception:
             break                       # wheel-lift refusal etc.: stop the table
         fz = {k: max(float(res.Fz[k]), 0.0) for k in _CORNERS}
-        cam = {k: abs(float((getattr(res, 'camber', None) or {}).get(k, 0.0)))
-               for k in _CORNERS}
+        # GROUND camber, SIGNED, vehicle frame (negative = top toward the
+        # centreline): kinematic + static alignment + body roll, from the
+        # solver (SteadyStateResult.camber_ground).  Stored signed by inner/
+        # outer; the per-side SAE inclination is made at the lookup, once the
+        # turn hand says which physical wheel is inner.  Never |camber|: that
+        # scored every wheel as leaning AWAY from the turn.
+        _cg = getattr(res, 'camber_ground', None) or {}
+        cam = {k: float(_cg.get(k, 0.0)) for k in _CORNERS}
         row = {}
         for axle, (a, b) in (('F', ('FL', 'FR')), ('R', ('RL', 'RR'))):
             # match by LOAD, never by label (ackermann.py lesson): the solver
@@ -249,10 +257,19 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
                        np.interp(a_abs, table['ay'], table['fz_' + right + '_F']),
                        np.interp(a_abs, table['ay'], table['fz_' + left + '_R']),
                        np.interp(a_abs, table['ay'], table['fz_' + right + '_R'])])
-        cam = np.array([np.interp(a_abs, table['ay'], table['cam_' + left + '_F']),
-                        np.interp(a_abs, table['ay'], table['cam_' + right + '_F']),
-                        np.interp(a_abs, table['ay'], table['cam_' + left + '_R']),
-                        np.interp(a_abs, table['ay'], table['cam_' + right + '_R'])])
+        # Ground camber per PHYSICAL wheel (FL, FR, RL, RR), then the SAE
+        # inclination per side through THE ONE helper: the slip `s` below is
+        # SAE-signed for both hands (s > 0 = left turn), so the tyre must see
+        # the true per-side IA (-camber on the left wheels, +camber on the
+        # right), not a magnitude.
+        cam_v = np.array([np.interp(a_abs, table['ay'], table['cam_' + left + '_F']),
+                          np.interp(a_abs, table['ay'], table['cam_' + right + '_F']),
+                          np.interp(a_abs, table['ay'], table['cam_' + left + '_R']),
+                          np.interp(a_abs, table['ay'], table['cam_' + right + '_R'])])
+        cam = np.array([wheel_inclination_deg(cam_v[0], side='left'),
+                        wheel_inclination_deg(cam_v[1], side='right'),
+                        wheel_inclination_deg(cam_v[2], side='left'),
+                        wheel_inclination_deg(cam_v[3], side='right')])
         # into-turn slip per wheel: FL, FR, RL, RR (see module docstring)
         s = np.array([ang[0] + beta - yaw_f,
                       ang[1] + beta - yaw_f,

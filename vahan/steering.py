@@ -348,7 +348,10 @@ def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
         parts = {}
         for lbl, g in (('FL', gL), ('FR', gR)):
             Fy = float(r.Fy.get(lbl, 0.0)); Fz = float(r.Fz.get(lbl, 1.0))
-            cam = float(r.camber.get(lbl, 0.0)) if hasattr(r, 'camber') else 0.0
+            # signed tyre inclination (ground camber mapped inner/outer by the
+            # solve's Fz split — see vahan.tire_model.wheel_inclination_deg);
+            # the raw vehicle-frame camber is only right for one side.
+            cam = float((getattr(r, 'inclination', None) or {}).get(lbl, 0.0))
             al = alpha_for(Fy, Fz, cam)
             mz = mz_tire(al, Fz, cam)
             if not np.isfinite(mz):

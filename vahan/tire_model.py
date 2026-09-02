@@ -31,6 +31,59 @@ from scipy.ndimage import uniform_filter1d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Camber sign convention — THE ONE mapping from vehicle camber to tyre IA
+# ─────────────────────────────────────────────────────────────────────────────
+
+def wheel_inclination_deg(camber_vehicle_deg, is_outer=None, *, side=None):
+    """Vehicle-frame camber -> SIGNED tyre inclination angle (IA) for the lookup.
+
+    THE CONVENTIONS (do not re-derive, they are cited):
+      * Vehicle camber (KinematicMetrics.camber, the alignment spinboxes, every
+        `camber` dict in this tool): NEGATIVE = top of the wheel leans toward
+        the vehicle centreline, on BOTH sides (kinematics.py:13, mirrored by
+        `_sign` per side).  Ground-relative camber = kinematic camber +
+        static alignment camber + body roll (roll adds + on the outer wheel,
+        - on the inner wheel, because the body rolls toward the outside).
+      * TTC data is in the SAE tyre axis system (Contents_Round8/9.pdf sec.5
+        "All data is reported in SAE sign convention, see SAE J670e / RCVD
+        p.39"): X = travel, Y = to the RIGHT, Z = down.  IA is POSITIVE when
+        the top of the tyre tilts to the RIGHT seen from behind (RCVD fig 2.33
+        and text, printed p.39-49), and positive IA makes positive (rightward,
+        toward-the-lean) camber thrust at zero slip.  Slip angle is positive
+        when the tyre slips to the RIGHT and gives NEGATIVE Fy, so an SAE
+        LEFT turn is SA > 0 / Fy < 0.  RCVD warns that "to use camber angle
+        on a vehicle, the signs must be converted" per side — this function.
+      * Per-side conversion:  IA_SAE = -camber for a LEFT wheel (its inboard
+        is +Y_SAE), IA_SAE = +camber for a RIGHT wheel.  `side='left'|'right'`.
+      * Every magnitude solve in this tool (SteadyStateSolver pair split,
+        vahan.ackermann, steering) evaluates the tyre at a POSITIVE reference
+        slip, i.e. in the SAE LEFT-turn frame, and matches wheels by LOAD
+        (heavy = outer).  In that frame the OUTER wheel is the right wheel
+        and the INNER wheel the left one, so `is_outer=True` is `side='right'`
+        and `is_outer=False` is `side='left'`.  Pass exactly one of the two.
+
+    RESULT: IA < 0 = wheel top leaning INTO the turn (toward the turn centre),
+    the favourable side, evaluated by the tyre model through the mirror
+    identity Fy(a, IA) = -Fy(-a, -IA) of a non-directional tyre (the loaded
+    fits only hold IA >= 0); IA > 0 = leaning AWAY, camber thrust opposing the
+    slip force.  An outer wheel with negative camber and an inner wheel with
+    positive camber are both favourable.  NEVER feed |camber| to the tyre:
+    with a positive reference slip that scores EVERY wheel as leaning away.
+    """
+    if (is_outer is None) == (side is None):
+        raise ValueError('wheel_inclination_deg: give exactly one of is_outer / side')
+    if side is not None:
+        if side not in ('left', 'right'):
+            raise ValueError("side must be 'left' or 'right'")
+        sgn = 1.0 if side == 'right' else -1.0
+    else:
+        sgn = 1.0 if is_outer else -1.0
+    cam = np.asarray(camber_vehicle_deg, float)
+    out = sgn * cam
+    return float(out) if out.ndim == 0 else out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Raw data container
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -681,6 +734,23 @@ class TireModel:
             (self._fz_axis, self._camber_levels),
             self._peak_fy_grid, method='linear',
             bounds_error=False, fill_value=None)
+        # PER-BRANCH peaks.  The max over BOTH slip signs above always returns
+        # the FAVOURABLE side of the camber table (at IA=+4 the SA<0 branch
+        # makes more force than the SA>0 branch), so a wheel evaluated on the
+        # SA>0 branch was handed a grip budget it cannot reach — utilization
+        # sat below 1 while the tyre was already saturated.  Keep one peak per
+        # branch so peak_Fy(fz, IA, slip_sign) can answer for the branch the
+        # wheel is actually on (see wheel_inclination_deg for the sign rule).
+        _pos_rows = self._sa_axis >= 0.0
+        _neg_rows = self._sa_axis <= 0.0
+        self._peak_fy_grid_pos = np.max(np.abs(fy_grid[_pos_rows]), axis=0)
+        self._peak_fy_grid_neg = np.max(np.abs(fy_grid[_neg_rows]), axis=0)
+        self._peak_fy_interp_pos = RegularGridInterpolator(
+            (self._fz_axis, self._camber_levels), self._peak_fy_grid_pos,
+            method='linear', bounds_error=False, fill_value=None)
+        self._peak_fy_interp_neg = RegularGridInterpolator(
+            (self._fz_axis, self._camber_levels), self._peak_fy_grid_neg,
+            method='linear', bounds_error=False, fill_value=None)
 
         # ── Out-of-data behaviour ────────────────────────────────────────
         # RegularGridInterpolator was left to extrapolate, which on this grid
@@ -834,19 +904,38 @@ class TireModel:
 
     # ── Public lookup API ────────────────────────────────────────────────
 
+    @staticmethod
+    def _mirror_args(sa, fz, ia):
+        """Fold a SIGNED inclination onto the measured IA >= 0 rows.
+
+        The fits hold IA in {0, 2, 4} only, and the old lookup CLIPPED any
+        negative IA to 0 — silently scoring a wheel leaning into the turn as
+        upright.  A non-directional tyre is mirror-symmetric about its own
+        plane, so  Fy(a, IA) = -Fy(-a, -IA)  and  Mz(a, IA) = -Mz(-a, -IA):
+        a negative IA is looked up at (-a, |IA|) and the force negated.
+        Returns (sa_eff, fz, ia_eff, flip) with flip = -1 where mirrored.
+        """
+        sa = np.atleast_1d(np.asarray(sa, float))
+        fz = np.atleast_1d(np.asarray(fz, float))
+        ia = np.atleast_1d(np.asarray(ia, float))
+        sa, fz, ia = np.broadcast_arrays(sa, fz, ia)
+        neg = ia < 0.0
+        flip = np.where(neg, -1.0, 1.0)
+        return sa * flip, fz, np.abs(ia), flip
+
     def Fy(self, slip_angle_deg, Fz_N, camber_deg=0.0):
         """
-        Lateral force (N).
+        Lateral force (N), SAE signs: +slip -> -Fy; +IA -> +camber thrust.
 
+        `camber_deg` is the SIGNED SAE inclination angle of the wheel — get it
+        from `wheel_inclination_deg`, never as |camber|.  Negative IA is
+        evaluated through the mirror identity (see _mirror_args), not clipped.
         Accepts scalar or array inputs (broadcast together).
-        Clamps to grid bounds for out-of-range queries.
         """
-        sa = np.atleast_1d(np.asarray(slip_angle_deg, float))
-        fz = np.atleast_1d(np.asarray(Fz_N, float))
-        sa_b, fz_b = np.broadcast_arrays(sa, fz)
+        sa_b, fz_b, ia_b, flip = self._mirror_args(slip_angle_deg, Fz_N, camber_deg)
         self._note_excursion(sa=sa_b, fz=fz_b)
-        pts = self._make_pts(slip_angle_deg, Fz_N, camber_deg)
-        out = np.atleast_1d(self._fy_interp(pts))
+        pts = self._make_pts(sa_b, fz_b, ia_b)
+        out = np.atleast_1d(self._fy_interp(pts)) * flip.ravel()
 
         # Past the measured slip sweep the grid holds flat; continue the curve's
         # OWN trailing slope instead so over-slipping costs force, as it must.
@@ -880,32 +969,54 @@ class TireModel:
         return out.squeeze()
 
     def Mz(self, slip_angle_deg, Fz_N, camber_deg=0.0):
-        """Aligning moment (Nm)."""
-        pts = self._make_pts(slip_angle_deg, Fz_N, camber_deg)
-        return self._mz_interp(pts).squeeze()
+        """Aligning moment (Nm), SAE signs; signed IA mirrored like Fy."""
+        sa_b, fz_b, ia_b, flip = self._mirror_args(slip_angle_deg, Fz_N, camber_deg)
+        pts = self._make_pts(sa_b, fz_b, ia_b)
+        return (np.atleast_1d(self._mz_interp(pts)) * flip.ravel()).squeeze()
 
-    def peak_Fy(self, Fz_N, camber_deg=0.0):
-        """Maximum |Fy| across all slip angles at given (Fz, camber)."""
+    def peak_Fy(self, Fz_N, camber_deg=0.0, slip_sign=1):
+        """Peak |Fy| at (Fz, signed IA) on ONE slip branch.
+
+        slip_sign=+1 (default): the SA > 0 branch — the SAE left-turn frame
+        every magnitude solve in this tool works in, where a NEGATIVE IA is the
+        wheel leaning into the turn.  slip_sign=-1: the SA < 0 branch (right
+        turn).  slip_sign=0: the max over both branches (the old behaviour,
+        which always picked the favourable side of the camber table).
+        A negative IA on one branch is the mirror of +|IA| on the other.
+        """
         fz = np.atleast_1d(np.asarray(Fz_N, float))
         ia = np.atleast_1d(np.asarray(camber_deg, float))
         fz, ia = np.broadcast_arrays(fz, ia)
         pts = np.column_stack([
             np.clip(fz, self._fz_axis[0], self._fz_axis[-1]),
-            np.clip(ia, self._camber_levels[0], self._camber_levels[-1]),
+            np.clip(np.abs(ia), self._camber_levels[0], self._camber_levels[-1]),
         ])
-        out = np.atleast_1d(self._peak_fy_interp(pts))
+        if slip_sign == 0:
+            out = np.atleast_1d(self._peak_fy_interp(pts))
+        else:
+            # branch actually seen by a wheel with this signed IA
+            branch = np.where(ia < 0.0, -float(slip_sign), float(slip_sign))
+            pos = np.atleast_1d(self._peak_fy_interp_pos(pts))
+            neg = np.atleast_1d(self._peak_fy_interp_neg(pts))
+            out = np.where(branch.ravel() > 0, pos, neg)
         self._note_excursion(fz=fz)
+        # Beyond the measured loads continue the IA=0 mu-vs-Fz trend, SCALED
+        # from this (IA, branch)'s own edge value so the camber effect stays
+        # continuous across the edge instead of snapping to the IA=0 curve.
         over = np.asarray(fz, float).ravel() - self._fz_hi
         m = over > 0
         if np.any(m):
             mu_ext = np.maximum(self._mu_edge + self._mu_slope * over[m], 0.05)
-            out.ravel()[m] = mu_ext * np.asarray(fz, float).ravel()[m]
+            out.ravel()[m] = out.ravel()[m] * np.clip(
+                mu_ext * np.asarray(fz, float).ravel()[m]
+                / np.maximum(self._mu_edge * self._fz_hi, 1e-9), 0.0, 10.0)
         under = self._fz_lo - np.asarray(fz, float).ravel()
         m2 = under > 0
         if np.any(m2):
             fzu = np.maximum(np.asarray(fz, float).ravel()[m2], 0.0)
-            out.ravel()[m2] = np.sign(out.ravel()[m2] + 1e-30) \
-                * self._mu_below_floor(fzu) * fzu
+            out.ravel()[m2] = out.ravel()[m2] * np.clip(
+                self._mu_below_floor(fzu) * fzu
+                / np.maximum(self._mu_lo_edge * self._fz_lo, 1e-9), 0.0, 1.0)
         return out.squeeze()
 
     def slip_angle_at_peak_Fy(self, Fz_N, camber_deg=0.0):
@@ -927,7 +1038,7 @@ class TireModel:
         fz, ia = np.broadcast_arrays(fz, ia)
         pts = np.column_stack([
             np.clip(fz, self._fz_axis[0], self._fz_axis[-1]),
-            np.clip(ia, self._camber_levels[0], self._camber_levels[-1]),
+            np.clip(np.abs(ia), self._camber_levels[0], self._camber_levels[-1]),
         ])
         return self._peak_sa_interp(pts).squeeze()
 
@@ -1093,8 +1204,11 @@ class TireModel:
         fy_neg = self.Fy(-da, Fz_N, camber_deg)
         return (fy_pos - fy_neg) / (2 * da)
 
-    def peak_mu(self, Fz_N, camber_deg=0.0):
+    def peak_mu(self, Fz_N, camber_deg=0.0, slip_sign=1):
         """Peak friction coefficient: mu = peak_Fy / Fz.
+
+        `camber_deg` is the SIGNED IA (wheel_inclination_deg) and `slip_sign`
+        the slip branch, both passed straight to peak_Fy.
 
         LOAD SENSITIVITY: mu falls as Fz rises (real, measured tire physics).
         Above the tested Fz range we EXTEND that decline using the last
@@ -1110,7 +1224,7 @@ class TireModel:
         """
         fz = np.atleast_1d(np.asarray(Fz_N, float))
         fz_max = float(self._fz_axis[-1])
-        peak = self.peak_Fy(fz, camber_deg)
+        peak = self.peak_Fy(fz, camber_deg, slip_sign)
         mu = np.where(fz > 1.0, peak / np.maximum(fz, 1.0), 0.0)
         over = fz > fz_max
         if np.any(over):
@@ -1128,10 +1242,10 @@ class TireModel:
             # on the smoothed peak grid), held constant.  mu then decays
             # hyperbolically toward that slope — load sensitivity preserved,
             # no zero-cliff, no runaway.  Floor mu at 0.3 (sliding rubber).
-            fy_at_max = float(self.peak_Fy(fz_max, camber_deg))
+            fy_at_max = float(self.peak_Fy(fz_max, camber_deg, slip_sign))
             i_lo = max(0, int(0.6 * (len(self._fz_axis) - 1)))
             f_lo = float(self._fz_axis[i_lo])
-            fy_lo = float(self.peak_Fy(f_lo, camber_deg))
+            fy_lo = float(self.peak_Fy(f_lo, camber_deg, slip_sign))
             m_top = (fy_at_max - fy_lo) / max(fz_max - f_lo, 1e-6)
             m_top = float(np.clip(m_top, 0.0, fy_at_max / fz_max))
             fy_ext = fy_at_max + m_top * (fz - fz_max)
@@ -1139,14 +1253,18 @@ class TireModel:
             mu = np.where(over, mu_ext, mu)
         return mu.squeeze()
 
-    def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0):
+    def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0, slip_sign=1):
         """
         Inverse lookup: find the slip angle that produces a given |Fy|.
 
-        Searches SA range using abs(Fy) to handle TTC sign convention
-        (positive SA → negative Fy). Returns the slip angle (deg) on
-        the rising portion of the |Fy| vs |SA| curve.
-        If Fy_target exceeds peak Fy, returns the SA at peak.
+        Searches |SA| on ONE branch — slip_sign=+1 (default) the SA > 0
+        branch, the SAE left-turn frame the magnitude solves use, so the
+        SIGNED IA from wheel_inclination_deg lands on the correct side of the
+        camber table.  (It used to pick whichever slip sign made MORE force,
+        which with |camber| always chose the favourable side.)  slip_sign=0
+        keeps that auto-pick.  Returns |slip| (deg) on the rising portion of
+        the |Fy| vs |SA| curve; if Fy_target exceeds the branch peak, returns
+        the SA at that peak and sets last_lookup_saturated.
         """
         target = abs(float(Fy_target_N))
         fz = float(Fz_N)
@@ -1155,9 +1273,12 @@ class TireModel:
         if target < 1.0 or fz < 1.0:
             return 0.0
         sa_hi = float(self._sa_axis[-1])
-        # Which sign of slip raises |Fy| (TTC sign convention varies by file)
-        sa_sign = 1.0 if abs(float(self.Fy(2.0, fz, ia))) >= \
-            abs(float(self.Fy(-2.0, fz, ia))) else -1.0
+        if slip_sign == 0:
+            # legacy auto-pick: whichever sign of slip raises |Fy|
+            sa_sign = 1.0 if abs(float(self.Fy(2.0, fz, ia))) >= \
+                abs(float(self.Fy(-2.0, fz, ia))) else -1.0
+        else:
+            sa_sign = 1.0 if slip_sign > 0 else -1.0
 
         # REACHABILITY MUST BE TESTED AGAINST THE PEAK, NOT THE END OF THE
         # SWEEP.  This used to compare against |Fy| at +/-13 deg, the last
@@ -1309,7 +1430,9 @@ class LinearTireModel:
     def Mz(self, slip_angle_deg, Fz_N, camber_deg=0.0):
         return np.zeros_like(np.atleast_1d(np.asarray(slip_angle_deg, float))).squeeze()
 
-    def peak_Fy(self, Fz_N, camber_deg=0.0):
+    def peak_Fy(self, Fz_N, camber_deg=0.0, slip_sign=1):
+        # camber-blind saturation (mu*Fz); slip_sign kept for API parity with
+        # TireModel so callers can pass it without checking the class.
         fz = np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0))
         return (self._mu_of_Fz(fz) * fz).squeeze()
 
@@ -1317,12 +1440,12 @@ class LinearTireModel:
         fz = np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0))
         return (self._Ca * (fz / self._Fz_ref) ** self._ls_Ca).squeeze()
 
-    def peak_mu(self, Fz_N, camber_deg=0.0):
+    def peak_mu(self, Fz_N, camber_deg=0.0, slip_sign=1):
         """Now load-sensitive per RCVD section 2.4 (previously constant)."""
         fz = np.atleast_1d(np.maximum(np.asarray(Fz_N, float), 0.0))
         return self._mu_of_Fz(fz).squeeze()
 
-    def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0):
+    def slip_angle_for_Fy(self, Fy_target_N, Fz_N, camber_deg=0.0, slip_sign=1):
         fz = max(float(Fz_N), 0.0)
         if fz < 1.0:
             return 0.0

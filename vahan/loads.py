@@ -684,7 +684,8 @@ def compute_brake_system(
         Tire model with ``peak_mu(Fz_N, camber_deg)`` — pulls μ per corner
         from TTC data (load-sensitive).  Falls back to 1.5 if None.
     cambers : dict, optional
-        Per-corner camber {'FL': deg, ...} for peak_mu lookup.
+        Per-corner SIGNED tyre inclination {'FL': deg, ...} for the peak_mu
+        lookup — pass SteadyStateResult.inclination, not .camber.
 
     Returns
     -------
@@ -707,10 +708,13 @@ def compute_brake_system(
         mu_pad = bp.pad_mu
         n_pistons = bp.num_pistons
 
-        # Peak tire μ from tire model (load-sensitive) or fallback
+        # Peak tire μ from tire model (load-sensitive) or fallback.  `cambers`
+        # is the SIGNED tyre inclination (SteadyStateResult.inclination);
+        # straight-line braking has no turn hand, so take the peak over BOTH
+        # slip branches (slip_sign=0) at that inclination — no |camber|.
         if tire_model is not None and hasattr(tire_model, 'peak_mu'):
-            cam = abs(cambers.get(label, 0.0))
-            mu_tire = float(tire_model.peak_mu(max(fz, 1.0), cam))
+            cam = float(cambers.get(label, 0.0))
+            mu_tire = float(tire_model.peak_mu(max(fz, 1.0), cam, 0))
         else:
             mu_tire = 1.5
 
