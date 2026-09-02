@@ -6444,12 +6444,18 @@ class VehicleConstantsPanel(CollapsibleSection):
         note('picture — this number is just the elastic baseline.')
 
         # ═══ Roll gradient ─────────────────────────────────────────
-        hdr('ROLL GRADIENT', 'φ / A_y  =  m·g·h / K_φ,total')
+        # SPRUNG mass and the SPRUNG CG height (not total mass / full CG —
+        # unsprung mass rolls about the contact patch, not the roll axis).
+        # This is still an ELASTIC estimate (CG measured above ground, not
+        # above the roll axis); the RC-corrected roll gradient is the
+        # "Roll grad" line in the Kinematics readout.
+        hdr('ROLL GRADIENT', 'φ / A_y  ≈  m_s·g·h_s / K_φ,total  (elastic est.)')
         if rs_t > 0:
-            mgh = veh.total_mass_kg * g * veh.cg_height_m
+            mgh = veh.sprung_mass_kg * g * veh.sprung_cg_height_m
             roll_per_g_deg = math.degrees(mgh / rs_t)
-            note(f'Roll moment per g  =  {mgh:.0f}  Nm')
-            note(f'→ Roll gradient     =  {roll_per_g_deg:.3f}  °/g')
+            note(f'Roll moment per g  =  {mgh:.0f}  Nm  (sprung)')
+            note(f'→ Roll gradient     =  {roll_per_g_deg:.3f}  °/g  (CG above ground;')
+            note('   RC-corrected value is in the Kinematics readout)')
             target = ('soft (>1.5°/g)' if roll_per_g_deg > 1.5 else
                       'race-typical (0.5–1.5°/g)' if roll_per_g_deg > 0.5 else
                       'stiff (<0.5°/g)')

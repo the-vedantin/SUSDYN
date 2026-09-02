@@ -3143,7 +3143,7 @@ class MainWindow(QMainWindow):
                     corner_load_N = m_total * 9.81 * wf_frac / 2.0
                 else:
                     corner_load_N = m_total * 9.81 * (1 - wf_frac) / 2.0
-                mr_static = float(mr_arr[mid]) if abs(mr_arr[mid]) > 1e-4 else 1.0
+                mr_static = float(mr_arr[pos]) if abs(mr_arr[pos]) > 1e-4 else 1.0
                 Fs = corner_load_N / mr_static
                 out[f'mr_slope_{suffix}_per_m'] = float(mr_slope)
                 out[f'static_spring_force_{suffix}_N'] = float(Fs)
