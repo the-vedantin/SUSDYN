@@ -1954,22 +1954,34 @@ try:
             _ss7a = _w7._build_dynamics_solver()
             _a7 = _tbl7(_ss7a)
             _ack_before = float(_w7._probe_static_ackermann())
-            # move the rack 25 mm fore-aft — a REAL Ackermann change
-            _w7._front_hp['tie_rod_inner'] = (
-                np.asarray(_w7._front_hp['tie_rod_inner'], float)
-                + np.array([0.0, 0.025, 0.0]))
-            _w7._rebuild_solvers(0.)
-            _ack_after = float(_w7._probe_static_ackermann())
+            # Move the rack fore-aft — a REAL Ackermann change.  25 mm is the
+            # nominal perturbation, but a tight-steering-margin geometry (e.g.
+            # the tie rod pulled inboard for 1.5" rim clearance) may not solve
+            # to FULL LOCK with the rack relocated that far, which makes the
+            # as-built probe NaN.  That is a reduced rack-ADJUSTMENT margin, not
+            # a broken sweep — so back the perturbation off until the as-built
+            # stays solvable and the change is still live (>1%).  The invariant
+            # this gate actually protects (swept capability immune to rack) is
+            # re-checked below regardless.
+            _tri0 = np.asarray(_w7._front_hp['tie_rod_inner'], float)
+            _ack_after = float('nan'); _rack_mm = 0.0
+            for _rack_mm in (25.0, 20.0, 15.0, 10.0):
+                _w7._front_hp['tie_rod_inner'] = _tri0 + np.array([0.0, _rack_mm / 1000.0, 0.0])
+                _w7._rebuild_solvers(0.)
+                _ack_after = float(_w7._probe_static_ackermann())
+                if np.isfinite(_ack_after) and abs(_ack_after - _ack_before) > 1.0:
+                    break
             _ss7b = _w7._build_dynamics_solver()
             _b7 = _tbl7(_ss7b)
 
             _f7 = []
             if not (np.isfinite(_ack_before) and np.isfinite(_ack_after)
                     and abs(_ack_after - _ack_before) > 1.0):
-                _f7.append(f'the 25 mm rack move did not change the car\'s '
-                           f'as-built Ackermann ({_ack_before:.2f}% -> '
-                           f'{_ack_after:.2f}%) — the perturbation is not '
-                           f'live, so this gate proves nothing')
+                _f7.append(f'no rack move in 10..25 mm kept the as-built '
+                           f'Ackermann solvable AND live ({_ack_before:.2f}% '
+                           f'-> {_ack_after:.2f}% at +{_rack_mm:.0f} mm) — the '
+                           f'perturbation is not live, so this gate proves '
+                           f'nothing')
             _dmax = float(np.nanmax(np.abs(_a7._ay_cap - _b7._ay_cap)))
             # Tolerance is PHYSICAL, not bitwise.  This was 1e-12 g, which is
             # unsatisfiable by construction: SteadyStateSolver keeps a
@@ -1999,7 +2011,7 @@ try:
                            'angles become equal, so the win is tautological')
             if _f7:
                 fails += 1
-            print(f'ackermann sweep  : rack +25 mm moved as-built '
+            print(f'ackermann sweep  : rack +{_rack_mm:.0f} mm moved as-built '
                   f'{_ack_before:+.1f}% -> {_ack_after:+.1f}%, swept '
                   f'capability moved {_dmax:.1e} g; best of -100..+200% is '
                   f'{_p7[int(np.argmax(_u7))]:+.0f}% (not 100%)   '
