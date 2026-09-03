@@ -2333,6 +2333,50 @@ except Exception as _eg:
     print(f'ground contact   : UNEXPECTED FAIL ({type(_eg).__name__}: {_eg})')
 
 print('-' * 64)
+# ── ARB IS A ROLL-ONLY ELEMENT (solver-bug register): the anti-roll bar links
+#    left and right, so in SYMMETRIC motion (pure braking dive / pure accel
+#    squat, no roll) it barely twists and the drop-link force must be ~0.  The
+#    old per-corner freebody wrongly reacted each rocker's full moment, showing
+#    ~3.7 kN through the bar in pure braking (and a bogus SF 0.2).  Gate: pure
+#    braking ARB drop-link ~0, pure cornering ARB drop-link clearly non-zero.
+try:
+    import glob as _gb, re as _rb
+    _bcfgs = _gb.glob('configs/2027_v*.vahan')
+    _bcur = (max(_bcfgs, key=lambda p: int(_rb.search(r'2027_v(\d+)', p).group(1))
+                 if _rb.search(r'2027_v(\d+)', p) else -1) if _bcfgs else None)
+    if _bcur is None:
+        print('arb roll-only    : no config — skipped')
+    else:
+        import gui.wheel_package as _WPb
+        _wb = MainWindow(); _wb._load_project_from_path(_bcur); _wb._rebuild_solvers(0.)
+
+        def _arb_peak(lat, lon):
+            pk = 0.0
+            for _p, _v, _c, _lab in _WPb._load_items(_wb, lat, lon):
+                if 'ARB' in _lab and 'drop-link' in _lab:
+                    pk = max(pk, float(np.linalg.norm(_v)))
+            return pk
+        _arb_brake = _arb_peak(0.0, -1.5)     # pure braking (symmetric)
+        _arb_corner = _arb_peak(1.5, 0.0)     # pure cornering (roll)
+        _abfail = []
+        if _arb_brake > 200.0:
+            _abfail.append(f'pure-braking ARB drop-link {_arb_brake:.0f} N (>200) — bar '
+                           f'is reacting symmetric load; roll-only decomposition broken')
+        if _arb_corner < 300.0:
+            _abfail.append(f'pure-cornering ARB drop-link {_arb_corner:.0f} N (<300) — bar '
+                           f'is not reacting roll')
+        if _abfail:
+            fails += 1
+            print('arb roll-only    : UNEXPECTED FAIL — ' + '; '.join(_abfail))
+        else:
+            print(f'arb roll-only    : braking {_arb_brake:.0f} N (~0), cornering '
+                  f'{_arb_corner:.0f} N (roll-only decomposition holds)   pass')
+except Exception as _eab:
+    fails += 1
+    import traceback as _tab; _tab.print_exc()
+    print(f'arb roll-only    : UNEXPECTED FAIL ({type(_eab).__name__}: {_eab})')
+
+print('-' * 64)
 # ── ACCELERATION MODEL (vahan/acceleration.py) — the gear-resolved launch event.
 #    Smoke + physics sanity: a SHORTER final drive must give a LOWER gearing-
 #    limited top speed (F = torque·ratio/r → higher ratio tops out sooner), the

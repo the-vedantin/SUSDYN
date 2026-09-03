@@ -491,6 +491,7 @@ def rocker_arb_freebody(
     rocker_spring_pt, spring_chassis_pt, spring_force_N: float,
     arb_drop_top, arb_arm_end, arb_pivot=None,
     bar_axis=(1.0, 0.0, 0.0),
+    m0_opposite: float | None = None,
 ) -> dict:
     """Rocker / ARB bellcrank free body, in WORLD coordinates.
 
@@ -527,11 +528,25 @@ def rocker_arb_freebody(
     u_arb = (ae - dt) / max(np.linalg.norm(ae - dt), 1e-9)
     m0 = (np.cross(pi - P, F_push) + np.cross(sp - P, F_spr)) @ axis
     lever = np.cross(dt - P, u_arb) @ axis
-    F_arb = (-m0 / lever if abs(lever) > 1e-9 else 0.0) * u_arb
+    # The anti-roll bar is ONE torsion element linking left and right, so it can
+    # carry only the ROLL (differential) part of the two rockers' moment about
+    # the rocker axis.  The SYMMETRIC part — both wheels compressing together
+    # (braking dive, acceleration squat, a two-wheel bump) — is taken by the
+    # SPRINGS, not the bar; a free bar just rotates rigidly there and barely
+    # twists.  The paired corner (FR/RR) is X-mirrored, so its rocker axis is
+    # sign-flipped and its m0 carries the OPPOSITE sign for the SAME physical
+    # rotation; hence the physical roll differential is m0 + m0_opposite (they
+    # cancel to ~0 in symmetric braking, and add to the full bar load in pure
+    # roll — verified: braking FL +53.3 / FR -53.3 -> 0).  Without a pair
+    # (m0_opposite None) fall back to the per-corner moment (a conservative
+    # over-estimate, not the physical bar load).
+    m_react = (m0 + float(m0_opposite)) / 2.0 if m0_opposite is not None else m0
+    F_arb = (-m_react / lever if abs(lever) > 1e-9 else 0.0) * u_arb
     F_pivot = -(F_push + F_spr + F_arb)
 
     out = {'F_push': F_push, 'F_spr': F_spr, 'F_arb': F_arb,
-           'F_pivot': F_pivot, 'u_arb': u_arb, 'arb_torsion_Nm': None}
+           'F_pivot': F_pivot, 'u_arb': u_arb, 'arb_torsion_Nm': None,
+           'm0': float(m0), 'lever': float(lever)}
 
     # ── ARB BAR TORSION: the only moment on the car that does NOT act at the
     #    wheel.  Every link ends in a spherical joint (carries no moment); the

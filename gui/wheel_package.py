@@ -72,6 +72,41 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
     loads, veh, up, res, bp_f, bp_r, dyn = compute_case(win, lat_g, lon_g)
     corners = [only_corner] if only_corner else ['FL', 'FR', 'RL', 'RR']
     items = []
+    # The ARB drop-link force is the ANTISYMMETRIC (left-right) part of the two
+    # rockers' moment about the rocker axis — the bar is one torsion element, so
+    # it reacts only ROLL (the difference), never a symmetric brake/squat/bump.
+    # Precompute each corner's rocker moment m0 and pair the sides so the free
+    # body below reacts m0 - m0_opposite (zero when both sides match).
+    _OPP = {'FL': 'FR', 'FR': 'FL', 'RL': 'RR', 'RR': 'RL'}
+
+    def _rocker_m0(lbl):
+        c = loads.get(lbl)
+        if c is None:
+            return None
+        try:
+            st = win._solvers[lbl].solve(0.)
+            arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
+            hp = win._front_hp if lbl[0] == 'F' else win._rear_hp
+            mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else 1.0
+            axis = (np.asarray(hp['rocker_axis_pt'], float)
+                    - np.asarray(hp['rocker_pivot'], float)) * mir
+            ae = np.asarray(arb['arb_arm_end'], float)
+            if lbl in ('FR', 'RR'):
+                ae = ae * np.array([-1.0, 1.0, 1.0])
+            fb = _loads.rocker_arb_freebody(
+                pushrod_inner=np.asarray(st.pushrod_inner, float),
+                pushrod_outer=np.asarray(st.pushrod_outer, float),
+                pushrod_N=float(c.pushrod_N),
+                rocker_pivot=np.asarray(st.rocker_pivot, float), rocker_axis=axis,
+                rocker_spring_pt=np.asarray(st.rocker_spring_pt, float),
+                spring_chassis_pt=np.asarray(st.spring_chassis_pt, float),
+                spring_force_N=float(c.spring_force_N),
+                arb_drop_top=win._arb_drop_top_world(lbl, st), arb_arm_end=ae,
+                arb_pivot=arb.get('arb_pivot'))
+            return fb.get('m0')
+        except Exception:
+            return None
+    _m0_corner = {L: _rocker_m0(L) for L in ('FL', 'FR', 'RL', 'RR')}
     for lbl in corners:
         c = loads.get(lbl)
         if c is None:
@@ -231,7 +266,8 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
                 rocker_pivot=P, rocker_axis=axis,
                 rocker_spring_pt=sp, spring_chassis_pt=sc,
                 spring_force_N=float(c.spring_force_N),
-                arb_drop_top=dt, arb_arm_end=ae, arb_pivot=arb_piv)
+                arb_drop_top=dt, arb_arm_end=ae, arb_pivot=arb_piv,
+                m0_opposite=_m0_corner.get(_OPP.get(lbl)))
             F_push = fb['F_push']; F_spr = fb['F_spr']
             F_arb = fb['F_arb']; F_pivot = fb['F_pivot']
             rows = [(pi, F_push, 'ROCKER · pushrod force', _C_RK),
