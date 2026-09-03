@@ -669,18 +669,34 @@ if _design:
     except Exception as _e:
         gfail.append(f'rim-fit gate did not run: {_e}')
 
-    # bump steer: a tie-rod move must not wreck the toe curve (the v32 rear
-    # regression 0.002 -> 0.167 deg/25mm the old gate never checked).
-    for _l, _isf in (('FL', True), ('RL', False)):
-        _aln = wD._alignment
-        _rr = wD._do_sweep(wD._solvers[_l], np.linspace(-0.025, 0.025, 5), 'left',
-                           arb_hp=wD._front_arb if _isf else wD._rear_arb,
-                           camber_off=_aln['front_camber_deg'] if _isf else _aln['rear_camber_deg'],
-                           toe_off=_aln['front_toe_deg'] if _isf else _aln['rear_toe_deg'], is_front=_isf)
-        _toe = np.asarray(_rr['toe'], float)
-        _bs = float(np.nanmax(_toe) - np.nanmin(_toe))   # full-range over +/-25 mm
-        if _bs > 0.15:
-            gfail.append(f'{"front" if _isf else "rear"} bump steer {_bs:.3f} deg full-travel')
+    # Toe curve vs travel.  FRONT must stay NULL (<0.15 deg over +-25 mm) — no
+    # deliberate front toe gain.  REAR carries a DELIBERATE toe-OUT gain for
+    # corner rotation (2027 design: toe-link inner co-located at lca_rear, whole
+    # link aft), so the rear gate enforces a CONTROLLED toe-OUT (bump toes out),
+    # bounded to a sane magnitude — an accidental null, toe-IN, or excessive
+    # value all fail.  If the rear reverts to null, restore a <0.15 rear gate.
+    _REAR_TOEGAIN_BAND = (-1.5, -0.2)   # deg (bump-minus-droop), toe-OUT
+    # FRONT: null bump steer via the sweep tool.
+    _aln = wD._alignment
+    _rrf = wD._do_sweep(wD._solvers['FL'], np.linspace(-0.025, 0.025, 5), 'left',
+                        arb_hp=wD._front_arb, camber_off=_aln['front_camber_deg'],
+                        toe_off=_aln['front_toe_deg'], is_front=True)
+    _bs = float(np.nanmax(np.asarray(_rrf['toe'], float)) - np.nanmin(np.asarray(_rrf['toe'], float)))
+    if _bs > 0.15:
+        gfail.append(f'front bump steer {_bs:.3f} deg full-travel')
+    # REAR: deliberate toe-OUT gain — measured from the RAW solver (the incremental
+    # _do_sweep can NaN at the -25 mm droop step on the long aft toe link, while
+    # solver.solve is clean there; the raw toe at +-25 is the robust ground truth).
+    from vahan.kinematics import KinematicMetrics as _KMr
+    _tb = _KMr(wD._solvers['RL'].solve(+0.025), 'left').toe
+    _td = _KMr(wD._solvers['RL'].solve(-0.025), 'left').toe
+    if not (np.isfinite(_tb) and np.isfinite(_td)):
+        gfail.append('rear toe curve non-finite at +-25 mm (raw solver)')
+    else:
+        _gain = float(_tb - _td)                             # bump(+25) minus droop(-25)
+        if not (_REAR_TOEGAIN_BAND[0] <= _gain <= _REAR_TOEGAIN_BAND[1]):
+            gfail.append(f'rear toe gain {_gain:+.3f} deg outside the deliberate '
+                         f'toe-out band {_REAR_TOEGAIN_BAND} (accidental null/toe-in/excess)')
     # UNEXPECTED failures fail the net; the documented KNOWN open v32 conflict
     # (pushrod/driveshaft + rear bump steer) prints but does not (awaiting user).
     _unexp = [g for g in gfail if not any(k in g for k in _KNOWN)]
