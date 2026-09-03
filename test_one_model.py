@@ -2317,5 +2317,47 @@ except Exception as _eg:
     print(f'ground contact   : UNEXPECTED FAIL ({type(_eg).__name__}: {_eg})')
 
 print('-' * 64)
+# ── ACCELERATION MODEL (vahan/acceleration.py) — the gear-resolved launch event.
+#    Smoke + physics sanity: a SHORTER final drive must give a LOWER gearing-
+#    limited top speed (F = torque·ratio/r → higher ratio tops out sooner), the
+#    launch must be grip-limited (tractive force >= grip off the line), and the
+#    75 m sprint must be covered with a physical time.  Guards the one-model
+#    coupling (engine curve + tyre grip + aero) from silently breaking.
+try:
+    import glob as _ga, re as _ra
+    _acfgs = _ga.glob('configs/2027_v*.vahan')
+    _acur = (max(_acfgs, key=lambda p: int(_ra.search(r'2027_v(\d+)', p).group(1))
+                 if _ra.search(r'2027_v(\d+)', p) else -1) if _acfgs else None)
+    if _acur is None:
+        print('acceleration     : no config — skipped')
+    else:
+        from vahan.acceleration import from_window as _accel_fw
+        _wa = MainWindow(); _wa._load_project_from_path(_acur); _wa._rebuild_solvers(0.)
+        _m26 = _accel_fw(_wa, final_drive=2.6, grip_scale=0.60)
+        _m41 = _accel_fw(_wa, final_drive=4.1, grip_scale=0.60)
+        _r26 = _m26.run(); _r41 = _m41.run()
+        _afail = []
+        if not (_r41['top_speed_gearing_kph'] < _r26['top_speed_gearing_kph']):
+            _afail.append(f'shorter FD 4.1 top {_r41["top_speed_gearing_kph"]:.0f} '
+                          f'not below FD 2.6 top {_r26["top_speed_gearing_kph"]:.0f}')
+        if not (_m26.tractive_force_N(2.0) >= _m26.traction_force_N(2.0)):
+            _afail.append('launch is not grip-limited (tractive < grip off the line)')
+        if not (np.isfinite(_r26['t_75m_s']) and 3.0 < _r26['t_75m_s'] < 6.0):
+            _afail.append(f'75 m time {_r26["t_75m_s"]} outside 3-6 s')
+        if not (70.0 < _r26['top_speed_kph'] < 160.0):
+            _afail.append(f'top speed {_r26["top_speed_kph"]:.0f} km/h non-physical')
+        if _afail:
+            fails += 1
+            print('acceleration     : UNEXPECTED FAIL — ' + '; '.join(_afail))
+        else:
+            print(f'acceleration     : FD2.6 top {_r26["top_speed_kph"]:.0f} km/h / 75 m '
+                  f'{_r26["t_75m_s"]:.2f} s, FD4.1 top {_r41["top_speed_gearing_kph"]:.0f} '
+                  f'(shorter=lower), launch grip-limited   pass')
+except Exception as _ea:
+    fails += 1
+    import traceback as _tba; _tba.print_exc()
+    print(f'acceleration     : UNEXPECTED FAIL ({type(_ea).__name__}: {_ea})')
+
+print('-' * 64)
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)
