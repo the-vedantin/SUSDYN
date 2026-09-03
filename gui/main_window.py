@@ -3097,41 +3097,54 @@ class MainWindow(QMainWindow):
         # ── RCVD item 3: geometric IR-rate correction ──────────────────
         # K_wheel = Fs * (dIR/d_delta) + K_s * IR^2.  Compute Fs (static
         # spring force = corner load / MR_static) and dIR/d_delta (MR
-        # slope vs wheel travel) from the kinematic sweep results.  These
-        # populate mr_slope_*_per_m and static_spring_force_*_N which the
-        # VehicleParams._wheel_rate_for_axle method consumes.
+        # slope vs wheel travel).
+        #
+        # dIR/d_delta is the TANGENT motion-ratio slope: the derivative of the
+        # instantaneous MR = |d(spring_length)/d(travel)| with respect to wheel
+        # travel.  It is computed DIRECTLY from the corner solvers here — the
+        # SAME central-difference MR that _build_dynamics_solver uses for
+        # motion_ratio — NOT by differentiating the sweep's `motion_ratio`
+        # array.  That array is a SECANT ratio |L(t)-L0|/t (see _do_sweep,
+        # "cumulative MR"); its slope is neither the tangent dMR/d_delta the
+        # RCVD term needs nor numerically stable — near-identical linear
+        # geometries could read wildly different secant slopes, swinging the
+        # front wheel-rate/ride-rate by a factor of two.  Using the tangent
+        # slope makes the correction correct AND deterministic.
         try:
-            sweep = getattr(self, '_sweep_results', {}) or {}
-            for label, suffix, fl_key, n_unsprung_key in (
-                ('FL', 'front', 'unsprung_mass_front_kg', 'unsprung_mass_front_kg'),
-                ('RL', 'rear',  'unsprung_mass_rear_kg',  'unsprung_mass_rear_kg'),
-            ):
-                fl = sweep.get(label, {})
-                mr_arr = np.asarray(fl.get('motion_ratio', []), dtype=float)
-                wc_z = np.asarray(fl.get('wc_z', []), dtype=float)
-                finite = np.isfinite(mr_arr) & np.isfinite(wc_z)
-                if finite.sum() < 5:
+            dt_mr = 0.001   # inner: tangent MR central difference (1 mm)
+            h_sl  = 0.010   # outer: slope of MR vs travel (+-10 mm)
+
+            def _tangent_mr(label, is_front, t):
+                """|d(spring_length)/d(travel)| at wheel travel t (metres)."""
+                solver = self._solvers.get(label)
+                if solver is None:
+                    return None
+                hts = self._heave_tbar_solver(is_front)
+                try:
+                    if hts is not None and hts.coil_length(
+                            np.asarray(solver.solve(0.0).pushrod_outer, float)) > 0:
+                        pp = np.asarray(solver.solve(t + dt_mr).pushrod_outer, float)
+                        pm = np.asarray(solver.solve(t - dt_mr).pushrod_outer, float)
+                        mr = abs(hts.coil_length(pp) - hts.coil_length(pm)) / (2 * dt_mr)
+                    else:
+                        sp = solver.solve(t + dt_mr)
+                        sm = solver.solve(t - dt_mr)
+                        mr = abs(sp.spring_length - sm.spring_length) / (2 * dt_mr)
+                    return float(mr) if np.isfinite(mr) else None
+                except Exception:
+                    return None
+
+            for label, suffix, is_front in (('FL', 'front', True),
+                                            ('RL', 'rear', False)):
+                mr_0 = _tangent_mr(label, is_front, 0.0)
+                mr_p = _tangent_mr(label, is_front, +h_sl)
+                mr_m = _tangent_mr(label, is_front, -h_sl)
+                if mr_0 is None or mr_p is None or mr_m is None:
                     continue
-                # mr_slope = derivative at the middle of the sweep
-                idx = np.where(finite)[0]
-                # Take a few points around the centre for a robust slope.
-                # Index INTO the finite list (idx) so lo/hi are guaranteed
-                # finite even when the sweep has NaN points (e.g. travel
-                # extremes that fail to solve) — otherwise mid±5 can land on
-                # a NaN sample and poison mr_slope → roll_angle → the whole
-                # dynamics solve returns NaN.
-                pos = len(idx) // 2
-                lo = int(idx[max(0, pos - 5)])
-                hi = int(idx[min(len(idx) - 1, pos + 5)])
-                if hi - lo < 2:
+                if not (0.1 < mr_0 < 3.0):
                     continue
-                # mr_slope in 1/m: dMR per metre of wheel travel.
-                # wc_z is in mm in the sweep -- convert to m.
-                dz_m = (wc_z[hi] - wc_z[lo]) / 1000.0
-                if abs(dz_m) < 1e-9:
-                    continue
-                mr_slope = (mr_arr[hi] - mr_arr[lo]) / dz_m
-                # Static spring force per corner: F_corner / MR_at_design
+                # dMR per metre of wheel travel (tangent slope, central diff)
+                mr_slope = (mr_p - mr_m) / (2.0 * h_sl)
                 m_total = (out.get('sprung_mass_kg', 0.0)
                            + out.get('unsprung_mass_front_kg', 0.0)
                            + out.get('unsprung_mass_rear_kg', 0.0))
@@ -3143,8 +3156,7 @@ class MainWindow(QMainWindow):
                     corner_load_N = m_total * 9.81 * wf_frac / 2.0
                 else:
                     corner_load_N = m_total * 9.81 * (1 - wf_frac) / 2.0
-                mr_static = float(mr_arr[pos]) if abs(mr_arr[pos]) > 1e-4 else 1.0
-                Fs = corner_load_N / mr_static
+                Fs = corner_load_N / mr_0
                 out[f'mr_slope_{suffix}_per_m'] = float(mr_slope)
                 out[f'static_spring_force_{suffix}_N'] = float(Fs)
         except Exception:

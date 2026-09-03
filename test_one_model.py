@@ -734,6 +734,43 @@ if _design:
         fails += 1
         print(f'steering effort  : UNEXPECTED FAIL (exception: {_e})')
 
+    # ── WHEEL-RATE GEOMETRIC TERM = TANGENT dMR/ddelta (solver-bug register,
+    #    2026-09-02).  RCVD 16.3: K_wheel = Ks*MR^2 + Fs*(dIR/ddelta), where
+    #    dIR/ddelta is the slope of the INSTANTANEOUS (tangent) motion ratio.
+    #    It was being computed as the slope of the sweep's `motion_ratio`
+    #    array, which is a SECANT |L(t)-L0|/t (see _do_sweep, "cumulative MR")
+    #    -- a different quantity that is wrong-signed AND numerically unstable:
+    #    two near-identical linear geometries read wildly different secant
+    #    slopes, swinging the front wheel-rate / ride-rate by ~2x (caught while
+    #    linearising the v79 rocker -- ride_f jumped 16.9k -> 33.8k for a 0.002
+    #    MR change).  Now taken directly from the corner solvers as the tangent
+    #    central difference (the SAME MR the build uses for motion_ratio).
+    #    Gates: (1) veh.mr_slope_front matches the independent tangent slope;
+    #    (2) the build is deterministic (identical ride rate on a re-build).
+    try:
+        _ss1 = wD._build_dynamics_solver(); _v1 = _ss1._veh
+        _sFL = wD._solvers['FL']; _dtm = 0.001; _hsl = 0.010
+        def _tan_mr(t):
+            return abs(_sFL.solve(t + _dtm).spring_length
+                       - _sFL.solve(t - _dtm).spring_length) / (2 * _dtm)
+        _tan_slope = (_tan_mr(+_hsl) - _tan_mr(-_hsl)) / (2 * _hsl)
+        _mrfail = []
+        if abs(_v1.mr_slope_front_per_m - _tan_slope) > 0.15:
+            _mrfail.append(f'mr_slope_front {_v1.mr_slope_front_per_m:+.3f} '
+                           f'!= tangent {_tan_slope:+.3f} /m (secant-array bug back)')
+        _r1 = float(_v1.ride_rate_front_Npm)
+        _r2 = float(wD._build_dynamics_solver()._veh.ride_rate_front_Npm)
+        if abs(_r1 - _r2) > 1.0:
+            _mrfail.append(f'front ride rate non-deterministic {_r1:.0f} vs {_r2:.0f}')
+        if _mrfail:
+            fails += 1
+        print(f'wheel-rate dMR   : tangent {_tan_slope:+.3f}/m, mr_slope '
+              f'{_v1.mr_slope_front_per_m:+.3f}/m, ride_f {_r1:.0f} N/m   '
+              f'{"pass" if not _mrfail else "UNEXPECTED FAIL: " + "; ".join(_mrfail)}')
+    except Exception as _e:
+        fails += 1
+        print(f'wheel-rate dMR   : UNEXPECTED FAIL (exception: {_e})')
+
     # ── TYRE CAMBER SIGN (solver-bug register class 'sign', 2026-09-02).  The
     #    tyre was fed |camber| at every dynamics site (ymd loads table, pair
     #    split, cornering stiffness, peak_mu) while the transient fed the raw
