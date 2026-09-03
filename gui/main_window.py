@@ -3812,63 +3812,44 @@ class MainWindow(QMainWindow):
         ds_btn.clicked.connect(_copy_ds)
         btn_row.addWidget(ds_btn)
 
-        # Copy a ready-to-run SolidWorks VBA macro (all points baked in) — for
-        # shops that paste coords into a macro instead of re-importing a STEP.
-        sw_btn = QPushButton('Copy for SolidWorks')
+        # Copy for SW: IDENTICAL format to 'Copy for Onshape' (CSV, mm, pipe-
+        # joined, one X/Y/Z triplet per corner + the driveshaft rows), but in
+        # the SolidWorks axis system (Y UP).  Vahan is Z-up (X lateral, Y
+        # forward, Z up); SolidWorks default is Y-up, so each point's Y and Z
+        # are swapped -> SW gets (X, Z, Y) = (lateral, up, forward).
+        sw_btn = QPushButton('Copy for SW')
         sw_btn.setStyleSheet(_btn_purple)
-        sw_btn.setToolTip('Copy a complete SolidWorks VBA macro that builds a '
-                          '3D sketch of every hardpoint + driveshaft point. '
-                          'Paste into Tools > Macro > New and Run — no STEP re-import.')
+        sw_btn.setToolTip('Copy as CSV in the SolidWorks axis system (Y up): '
+                          'same format as Copy for Onshape, with each point\x27s '
+                          'Y and Z swapped (Vahan Z-up -> SW Y-up).')
 
-        def _copy_solidworks():
-            pts = []   # (name, x, y, z) mm
+        def _copy_sw():
+            csv_lines = []
             for name in names:
+                vals = []
                 for label, hp_dict in corners:
                     pt = hp_dict.get(name)
                     if pt is not None:
                         mm = pt * 1000.0
-                        pts.append((f'{name} {label}', mm[0], mm[1], mm[2]))
+                        # Y up: (x, z, y) — swap Vahan Y(forward) and Z(up)
+                        vals.extend([f'{mm[0]:.2f}', f'{mm[2]:.2f}', f'{mm[1]:.2f}'])
+                    else:
+                        vals.extend(['0', '0', '0'])
+                csv_lines.append(f'{name},{",".join(vals)}')
             ds = _ds_pts()
             if ds is not None:
                 dc, tL, tR, oL, oR = ds
-                pts.append(('diff_center', dc[0], dc[1], dc[2]))
-                pts.append(('tripod_inner_L RL', tL[0], tL[1], tL[2]))
-                pts.append(('tripod_inner_R RR', tR[0], tR[1], tR[2]))
-                if oL is not None:
-                    pts.append(('hub_L RL', oL[0], oL[1], oL[2]))
-                if oR is not None:
-                    pts.append(('hub_R RR', oR[0], oR[1], oR[2]))
-            body = '\n'.join(
-                f'    AddPt {x:.3f}, {y:.3f}, {z:.3f}   \x27 {nm}'
-                for nm, x, y, z in pts)
-            macro = (
-                "' Vahan hardpoints -> SolidWorks 3D sketch points.\n"
-                "' Auto-generated. Tools > Macro > New, paste all of this, Run.\n"
-                "' Car frame: X = lateral, Y = forward, Z = up. Units: mm.\n"
-                "' SWAP_YZ = True imports Y-up (SolidWorks default upright car).\n"
-                "Const SWAP_YZ As Boolean = True\n"
-                "Dim swApp As Object, swModel As Object, swSk As Object\n\n"
-                "Sub main()\n"
-                "    Set swApp = Application.SldWorks\n"
-                "    Set swModel = swApp.ActiveDoc\n"
-                "    If swModel Is Nothing Then MsgBox \"Open a part first.\": Exit Sub\n"
-                "    Set swSk = swModel.SketchManager\n"
-                "    swSk.Insert3DSketch True\n"
-                f"{body}\n"
-                "    swSk.Insert3DSketch True\n"
-                "    swModel.ClearSelection2 True\n"
-                "    swModel.ViewZoomtofit2\n"
-                "End Sub\n\n"
-                "Sub AddPt(x As Double, y As Double, z As Double)\n"
-                "    If SWAP_YZ Then\n"
-                "        swSk.CreatePoint x / 1000#, z / 1000#, y / 1000#\n"
-                "    Else\n"
-                "        swSk.CreatePoint x / 1000#, y / 1000#, z / 1000#\n"
-                "    End If\n"
-                "End Sub\n")
-            QApplication.clipboard().setText(macro)
+                z3 = ['0', '0', '0']
+
+                def f3(p):
+                    return [f'{p[0]:.2f}', f'{p[2]:.2f}', f'{p[1]:.2f}']   # x, z, y (Y up)
+                csv_lines.append('diff_center,' + ','.join(z3 + z3 + f3(dc) + f3(dc)))
+                csv_lines.append('tripod_inner,' + ','.join(z3 + z3 + f3(tL) + f3(tR)))
+                if oL is not None and oR is not None:
+                    csv_lines.append('driveshaft_outer,' + ','.join(z3 + z3 + f3(oL) + f3(oR)))
+            QApplication.clipboard().setText('|'.join(csv_lines))
             sw_btn.setText('Copied!')
-        sw_btn.clicked.connect(_copy_solidworks)
+        sw_btn.clicked.connect(_copy_sw)
         btn_row.addWidget(sw_btn)
 
         # PARAMETRIC route: SolidWorks equations file (global variables).  Link
