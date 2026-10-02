@@ -7,11 +7,7 @@ actuation plane. The pivot-axis point is not a free hardpoint — it is derived:
     rocker_axis_pt = rocker_pivot + (unit plane normal) x (axis length)
 
 ## Why
-If the rocker's rotation axis is not the plane normal, the rocker sweeps its
-attached points (pushrod inner, spring eye, drop top) out of the actuation plane
-as it turns, which breaks coplanarity (Rule 01) and loads members in bending.
-Making the axis exactly the plane normal is what keeps the inboard points in the
-plane across travel.
+The axis is normal to this corner's static actuation plane so that the rocker attachments rotate in their intended plane. This does not require the wheel-side pushrod pickup to remain in the same plane throughout suspension travel. Each corner has its own plane; see the user's 2026-09-15 clarification in Rule 01.
 
 ## How Vahan holds it
 Whenever a chain point is relocated, the resolver regenerates `rocker_axis_pt`

@@ -610,9 +610,10 @@ class PackagingPage(QWidget):
                             ', MR re-tuned' if info.get('mr_retuned') else '',
                             ', ARB re-tuned' if info.get('arb_retuned') else ''))
             self._rl_status.setText(
-                'PASS - (%.1f, %.1f, %.1f) mm WORKS for %s %s.%s: coplanarity/'
-                'axis/triad/rates all re-solved, curves in tolerance, no clash '
-                'across travel.%s  Click "Apply tested position" to take it.'
+                'PASS - (%.1f, %.1f, %.1f) mm WORKS for %s %s.%s: left/right '
+                'static planes, axes, triads and rates pass; curves remain in '
+                'tolerance and the travel sweep has no clash.%s  Click '
+                '"Apply tested position" to take it.'
                 % (t[0], t[1], t[2], axle, dict_name, key, extra))
             self._rl_apply_test.setEnabled(True)
         else:
@@ -706,10 +707,8 @@ class PackagingPage(QWidget):
         rr = r.get('reject_reasons') or {}
         if n_sol == 0 and rr:
             top = max(rr, key=rr.get)
-            _law = {'front coplanar_mm': ' = the NO-BENDING law (chain leaves '
-                    'its plane across travel; this target forces the pushrod '
-                    'to bend)',
-                    'rear coplanar_mm': ' = the NO-BENDING law',
+            _law = {'front coplanar_mm': ' = the static assembly plane law',
+                    'rear coplanar_mm': ' = the static assembly plane law',
                     'both clash sweep (static/bump/droop)': ' = interference '
                     'across travel'}.get(top, '')
             binding = ('  |  BINDING: %s%s  — the target itself is infeasible '

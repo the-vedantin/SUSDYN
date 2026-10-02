@@ -2,8 +2,11 @@
 
 ## The rule
 When the pushrod picks up on a control arm, it mounts NEAR the outer ball joint,
-not in the middle of the arm. The standard placement is one inch inboard and one
-inch up from the ball joint, measured in the control-arm plane.
+not in the middle of the arm. The user's current placement is one inch
+(25.4 mm) inboard in the control-arm plane and 1.25 inches (31.75 mm) above
+that plane along its upward normal, near the arm bisector. BOTH axles mount to
+the UPPER arm (user, 2026-09-22 — the earlier "rear mounts to the lower arm" text was stale;
+the car has carried the rear pushrod on the upper arm for many versions).
 
 ## Why
 A pushrod load applied in the middle of a control arm bends the arm — the arm has
@@ -24,10 +27,11 @@ body. Set it to match where the pushrod actually mounts.
 ## How Vahan holds it
 - The damper-mount topology (`AxleTopology.damper_mount`, values upper/lower/
   upright) drives the solver's pushrod body.
-- The mount point is placed one inch inboard along the arm and one inch up along
+- The mount point is placed one inch inboard along the arm and 1.25 inches up along
   the control-arm-plane normal from the ball joint.
-- The regression net's "design actuation" gate reports the pushrod is over the arm
-  and clear.
+- The regression net's "design actuation" gate measures each pushrod mount against the
+  UPPER arm plane (0..35 mm above). v148: front 31.9 mm, rear 19.5 mm above; 41 / 52 mm
+  from the ball joint.
 
 ## Caution when changing topology in code
 Setting the topology reloads the whole hardpoint set to defaults (both axles).

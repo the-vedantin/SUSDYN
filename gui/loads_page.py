@@ -14,11 +14,12 @@ import numpy as np
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QComboBox,
                              QRadioButton, QButtonGroup, QPushButton, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView, QSplitter,
-                             QDoubleSpinBox, QGridLayout)
+                             QDoubleSpinBox, QGridLayout, QCheckBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
-from gui.wheel_package import CASES, _load_items
+from gui.wheel_package import (CASES, _load_items, load_arrows, case_speed_kph, case_aero,
+                               case_aero_text)
 
 # Colourblind-safe category text (docs/DESIGN.md): NO yellow/amber, NO blue.
 # Distinguished by luminance + the Impeccable red on the tyre row; the category
@@ -59,7 +60,24 @@ class LoadsPage(QWidget):
         _gg = QGridLayout(); _gg.setContentsMargins(0, 0, 0, 0); _gg.setSpacing(4)
         _gg.addWidget(QLabel('Lateral'), 0, 0); _gg.addWidget(self._lat_g, 0, 1)
         _gg.addWidget(QLabel('Longitudinal'), 1, 0); _gg.addWidget(self._lon_g, 1, 1)
+        # SPEED of the case (user 2026-09-29): the aero downforce on the corners
+        # is Cl·A·½ρv², so every case is solved at a speed.  Auto = the case
+        # rule (cornering: the speed for this lateral g on the Dynamics-panel
+        # turn radius; straight line: the aero package's reference speed);
+        # untick to type any speed.
+        self._speed = QDoubleSpinBox(); self._speed.setRange(0.0, 400.0); self._speed.setDecimals(1)
+        self._speed.setSingleStep(5.0); self._speed.setSuffix(' km/h')
+        self._speed.setStyleSheet('QDoubleSpinBox{background:#1e1e24;border:1px solid #444;'
+                                  'border-radius:3px;padding:2px 4px;}')
+        _gg.addWidget(QLabel('Speed'), 2, 0); _gg.addWidget(self._speed, 2, 1)
+        self._speed_auto = QCheckBox('Speed from the case rule'); self._speed_auto.setChecked(True)
+        self._speed_auto.setToolTip('Cornering: the speed that gives this lateral g on the Dynamics-panel '
+                                    'turn radius.  Straight line: the aero package reference speed.')
+        _gg.addWidget(self._speed_auto, 3, 0, 1, 2)
         left.addLayout(_gg)
+        self._aero_lab = QLabel('')
+        self._aero_lab.setWordWrap(True); self._aero_lab.setStyleSheet('color:#9A9AA2;font-size:11px')
+        left.addWidget(self._aero_lab)
         # quick-fill presets (they just POPULATE the editable g fields above)
         _pg = QGridLayout(); _pg.setContentsMargins(0, 2, 0, 0); _pg.setSpacing(3)
         for _i, (_nm, _la, _lo) in enumerate(
@@ -160,6 +178,8 @@ class LoadsPage(QWidget):
         self._corner.currentTextChanged.connect(self._on_input)
         for _s in (self._lat_g, self._lon_g):
             _s.valueChanged.connect(self._on_input)
+        self._speed.valueChanged.connect(self._on_speed_edit)
+        self._speed_auto.toggled.connect(self._on_input)
         self._res.toggled.connect(self._on_input)
         self.refresh()
 
@@ -170,6 +190,44 @@ class LoadsPage(QWidget):
 
     def _case_g(self):
         return float(self._lat_g.value()), float(self._lon_g.value())
+
+    def _sync_speed(self):
+        """Auto mode: fill the speed box from the case rule (no signal storm)."""
+        if not self._speed_auto.isChecked():
+            return
+        try:
+            lat, lon = self._case_g()
+            v = case_speed_kph(self._main, lat, lon)
+        except Exception:
+            return
+        self._speed.blockSignals(True); self._speed.setValue(float(v)); self._speed.blockSignals(False)
+
+    def _case_speed(self):
+        """The speed (km/h) this page's loads are solved at: the rule speed in
+        auto mode, else the typed one.  None is never passed on, so the table,
+        the 3-D arrows and the readout all use the SAME speed."""
+        self._sync_speed()
+        return float(self._speed.value())
+
+    def _speed_override(self):
+        """The typed speed when it differs from the case rule, else None."""
+        if self._speed_auto.isChecked():
+            return None
+        return float(self._speed.value())
+
+    def _on_speed_edit(self, *_):
+        if self._speed_auto.isChecked():
+            self._speed_auto.blockSignals(True); self._speed_auto.setChecked(False)
+            self._speed_auto.blockSignals(False)
+        self.refresh()
+
+    def _refresh_aero_label(self):
+        try:
+            lat, lon = self._case_g()
+            ca = case_aero(self._main, lat, lon, self._case_speed())
+            self._aero_lab.setText('Solved at ' + case_aero_text(ca))
+        except Exception as e:
+            self._aero_lab.setText(f'Speed / aero: {e}')
 
     def _ensure_view(self):
         """Build the embedded View3D on first use (its GL canvas needs a running
@@ -271,13 +329,15 @@ class LoadsPage(QWidget):
         self.refresh()
 
     def refresh(self, *_):
+        self._refresh_aero_label()
         self._refresh_table()
         self._refresh_3d()
 
     def _refresh_table(self):
         try:
             lat, lon = self._case_g()
-            items = _load_items(self._main, lat, lon, only_corner=self._corner_arg())
+            items = _load_items(self._main, lat, lon, only_corner=self._corner_arg(),
+                                speed_kph=self._case_speed())
         except Exception as e:
             self._tbl.setRowCount(1)
             self._tbl.setItem(0, 0, QTableWidgetItem(f'Error: {e}'))
@@ -324,5 +384,11 @@ class LoadsPage(QWidget):
             lat, lon = self._case_g()
             vec = 'components' if self._comp.isChecked() else 'resultant'
             self._main.build_load_view(self._v3d, self._corner_arg(), lat, lon, vec)
+            # build_load_view draws the arrows at the case-rule speed; a typed
+            # speed re-draws them at that speed so picture == table.
+            v = self._speed_override()
+            if v is not None:
+                self._v3d.set_load_vectors(load_arrows(self._main, lat, lon, mode=vec,
+                                                       only_corner=self._corner_arg(), speed_kph=v))
         except Exception:
             pass

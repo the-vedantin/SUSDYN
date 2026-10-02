@@ -125,8 +125,12 @@ class Differential:
         r = max(float(tire_radius_m), 1e-3)
         T_lock = self.locking_torque_Nm(axle_torque_Nm, on_power)
         d_fx = 2.0 * T_lock / r
-        if max_bias_N is not None and max_bias_N > 0.0:
-            d_fx = min(d_fx, float(max_bias_N))
+        # A cap of ZERO is a real cap (inner driven wheel off the ground or
+        # no grip left): no force difference can be transmitted.  It used to
+        # be read as "no cap" and returned the full clutch bias.  Only None
+        # means uncapped.
+        if max_bias_N is not None:
+            d_fx = min(d_fx, max(float(max_bias_N), 0.0))
         return d_fx * float(track_m) / 2.0
 
     # ── description ──────────────────────────────────────────────────────

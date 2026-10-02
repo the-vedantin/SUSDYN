@@ -10,6 +10,9 @@ The existing forward solver (SuspensionConstraints → KinematicMetrics) is
 used as a black box inside the optimization loop.
 """
 
+import hashlib
+import logging
+
 import numpy as np
 from dataclasses import dataclass, field
 from scipy.optimize import least_squares, differential_evolution
@@ -25,6 +28,157 @@ from vahan.metrics_catalog import CATALOG_MAP, compute_ackermann_post
 # (e.g. DIRECT has no pushrod) — none of those may be forwarded to the
 # dataclass, which rejects unknown kwargs.
 _DWH_FIELD_NAMES = set(DoubleWishboneHardpoints.__dataclass_fields__)
+
+log = logging.getLogger(__name__)
+
+
+class IKEvaluationError(RuntimeError):
+    """A defect in the IK forward evaluation itself (not a geometry that
+    fails to close).  Raised instead of being converted to NaN so a coding
+    error can never masquerade as "no solution at this station"."""
+
+
+# Exceptions that indicate a bug in the evaluation code, never a geometry
+# that legitimately fails to assemble at one travel station.
+_CODE_DEFECTS = (NameError, AttributeError, TypeError, KeyError, ImportError)
+
+# Rule 01 / Rule 04 static gates (mm) and Rule 02 axis gate (deg) -- the same
+# numbers vahan.packaging.Tolerances uses for coplanar_mm / arb_inplane_mm /
+# rocker_axis_deg.  Kept literal so the optimizer does not import the
+# packaging module at load time; test_one_model.py asserts they stay equal.
+CHAIN_COPLANAR_GATE_MM = 3.0
+ARB_INPLANE_GATE_MM = 3.0
+ROCKER_AXIS_GATE_DEG = 1e-4
+# Residual normalisation: 1.0 == one design-target unit (Rule 01 design target
+# is < 0.1 mm static out-of-plane), so the solver drives toward zero offset.
+CHAIN_RESIDUAL_UNIT_MM = 0.1
+
+# Points that define the rocker plate (Rule 01 plane) -- moving any of them
+# re-derives rocker_axis_pt (Rule 02: axis = pivot + plane normal x length).
+_PLATE_KEYS = ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')
+_CHAIN_KEYS = ('pushrod_outer', 'pushrod_inner', 'rocker_pivot',
+               'rocker_spring_pt', 'spring_chassis_pt')
+_DROP_LINK_KEYS = ('arb_drop_top', 'arb_arm_end')
+
+
+def geometry_fingerprint(hp_dict: dict) -> str:
+    """Stable stamp of a hardpoint dict (1 micrometre resolution).
+
+    Bound to every IK result at SOLVE time; Apply refuses when the live
+    geometry's stamp differs (the solution was computed for another car)."""
+    h = hashlib.sha1()
+    for k in sorted(hp_dict):
+        v = hp_dict[k]
+        h.update(str(k).encode())
+        if v is None:
+            h.update(b'<None>')
+            continue
+        a = np.asarray(v, float).ravel()
+        # +0.0 folds -0.0 into 0.0 so the sign of a zero never changes the stamp
+        h.update((np.round(a * 1e6) + 0.0).tobytes())
+    return h.hexdigest()[:16]
+
+
+def derive_rocker_axis(hp: dict, ref_hp: dict | None = None) -> dict:
+    """Rule 02: regenerate ``rocker_axis_pt`` = pivot + (unit normal of the
+    static rocker plate) x (reference axis length), keeping the reference
+    axis sense.  Same construction as ``vahan.relocate.resolve_bundle``.
+    Modifies and returns ``hp``; no-op when the plate is degenerate or any
+    plate point is missing."""
+    ref = hp if ref_hp is None else ref_hp
+    if not all(hp.get(k) is not None for k in _PLATE_KEYS):
+        return hp
+    pv = np.asarray(hp['rocker_pivot'], float)
+    n = np.cross(np.asarray(hp['pushrod_inner'], float) - pv,
+                 np.asarray(hp['rocker_spring_pt'], float) - pv)
+    nn = float(np.linalg.norm(n))
+    if nn < 1e-12 or not np.isfinite(nn):
+        return hp
+    n = n / nn
+    L = 0.0254
+    if ref.get('rocker_axis_pt') is not None and ref.get('rocker_pivot') is not None:
+        old = (np.asarray(ref['rocker_axis_pt'], float)
+               - np.asarray(ref['rocker_pivot'], float))
+        lo = float(np.linalg.norm(old))
+        if lo > 1e-9:
+            L = lo
+            if float(old @ n) < 0.0:
+                n = -n
+    hp['rocker_axis_pt'] = pv + n * L
+    return hp
+
+
+def static_chain_rule_metrics(hp: dict, side: str = 'left',
+                              include_drop_link: bool = True) -> dict | None:
+    """Rules 01/02/04 at STATIC for one corner's hardpoint dict.
+
+    Thin wrapper over the shared checker
+    ``vahan.packaging.actuation_chain_plate_metrics`` (the same function the
+    packaging validator and the regression net use): the plane is the CURRENT
+    static plate through rocker pivot / pushrod inner / rocker spring eye; the
+    pushrod outer+inner, pivot, spring eye, spring chassis eye and (bellcrank
+    ARB) both drop-link ends are measured against it; the rocker axis error is
+    its angle from that plane's normal.  Returns None when the corner has no
+    per-corner rocker chain (DIRECT, cradle topologies)."""
+    if not all(hp.get(k) is not None
+               and np.all(np.isfinite(np.asarray(hp[k], float)))
+               for k in _CHAIN_KEYS):
+        return None
+    from vahan.packaging import actuation_chain_plate_metrics
+    state = {k: np.asarray(hp[k], float) for k in _CHAIN_KEYS}
+    axis = None
+    if hp.get('rocker_axis_pt') is not None:
+        axis = (np.asarray(hp['rocker_axis_pt'], float)
+                - np.asarray(hp['rocker_pivot'], float))
+    else:
+        state['rocker_axis_pt'] = state['rocker_pivot'] + np.array([0., 0.0254, 0.])
+    arb = None
+    if include_drop_link and all(hp.get(k) is not None for k in _DROP_LINK_KEYS):
+        arb = {k: np.asarray(hp[k], float) for k in _DROP_LINK_KEYS}
+    out = actuation_chain_plate_metrics(
+        [(0.0, state)], outboard_sign=(1.0 if side == 'left' else -1.0),
+        rocker_axis=axis, arb=arb)
+    signed = out.get('static_signed_mm', {})
+    chain_mm = max((abs(signed[k]) for k in _CHAIN_KEYS if k in signed),
+                   default=float('nan'))
+    drop_mm = (max(abs(signed[k]) for k in _DROP_LINK_KEYS)
+               if arb is not None else 0.0)
+    out['chain_static_mm'] = float(chain_mm)
+    out['drop_link_static_mm'] = float(drop_mm)
+    out['drop_link_checked'] = arb is not None
+    return out
+
+
+def chain_rule_violations(m: dict | None) -> list[str]:
+    """Plain-language reasons a static chain fails Rules 01/02/04."""
+    if m is None:
+        return []
+    if not np.isfinite(m.get('coplanar_static_mm', np.nan)):
+        return ['rocker plate is degenerate (pivot, pushrod and spring eye '
+                'in a line) - no actuation plane']
+    bad = []
+    if m['chain_static_mm'] > CHAIN_COPLANAR_GATE_MM:
+        bad.append(f"actuation chain {m['chain_static_mm']:.2f} mm out of its "
+                   f"static plane (limit {CHAIN_COPLANAR_GATE_MM:.1f} mm), "
+                   f"worst at {m.get('worst_point')}")
+    if m.get('drop_link_checked') and m['drop_link_static_mm'] > ARB_INPLANE_GATE_MM:
+        bad.append(f"ARB drop link {m['drop_link_static_mm']:.2f} mm out of the "
+                   f"rocker plane (limit {ARB_INPLANE_GATE_MM:.1f} mm)")
+    ax = m.get('rocker_axis_normal_error_deg', np.nan)
+    if not (np.isfinite(ax) and ax <= ROCKER_AXIS_GATE_DEG):
+        bad.append(f'rocker pivot axis {ax:.4f} deg off the plate normal')
+    return bad
+
+
+def _undefined_by_definition(metric_key: str, travel: np.ndarray,
+                             motion: str) -> np.ndarray:
+    """Stations where a metric is undefined by its own definition (not a
+    solve failure): the ARB motion ratio is the secant (bar angle / wheel
+    travel) and has no value at exactly zero travel."""
+    t = np.asarray(travel, float)
+    if metric_key == 'arb_mr' and motion != 'steer':
+        return np.abs(t) < 1e-9
+    return np.zeros(t.shape, bool)
 
 
 # ─── Design variable specification ───────────────────────────────────────────
@@ -307,6 +461,15 @@ class DesignSpace:
         self.base_hp = {k: v.copy() for k, v in base_hp.items()}
         self.variables = list(variables)
         self.n = len(self.variables)
+        for v in self.variables:
+            if v.point == 'rocker_axis_pt':
+                raise ValueError('rocker_axis_pt is DERIVED (pivot + plate '
+                                 'normal, Rule 02) - move rocker_pivot, '
+                                 'pushrod_inner or rocker_spring_pt instead')
+        # Rule 02: when a plate point moves, the pivot axis is re-derived as
+        # the new plate normal (the corner solver already rotates the rocker
+        # about that normal; the stored point must agree with it).
+        self._derive_axis = any(v.point in _PLATE_KEYS for v in self.variables)
 
     def pack(self, hp: dict) -> np.ndarray:
         """Extract variable coordinates from hp dict → flat array."""
@@ -317,6 +480,8 @@ class DesignSpace:
         hp = {k: v.copy() for k, v in self.base_hp.items()}
         for i, v in enumerate(self.variables):
             hp[v.point][v.coord] = x[i]
+        if self._derive_axis:
+            derive_rocker_axis(hp, self.base_hp)
         return hp
 
     def x0(self) -> np.ndarray:
@@ -434,9 +599,16 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
                     pushrod_body: str = 'uca',
                     metric_keys: list[str] | None = None,
                     anti_kwargs: dict | None = None,
-                    motion: str = 'heave') -> dict[str, np.ndarray]:
+                    motion: str = 'heave',
+                    diagnostics: dict | None = None,
+                    steer_params: dict | None = None) -> dict[str, np.ndarray]:
     """
     Run the forward solver over a travel array and return metric curves.
+
+    A station that fails to assemble leaves NaN in the curves; when
+    ``diagnostics`` (a dict) is given, each such failure is recorded in
+    ``diagnostics['station_errors']`` as (index, stage, message).  A defect in
+    the evaluation code itself raises :class:`IKEvaluationError`.
 
     motion controls what the travel_arr values mean:
         'heave'  — vertical wheel travel in metres
@@ -520,8 +692,15 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
         t_raw = float(travel_arr[idx])
         try:
             if motion == 'steer':
-                rack_mm_per_rev = 60.0
-                rack_m = t_raw * rack_mm_per_rev / 360.0 / 1000.0
+                # Handwheel deg -> rack travel through the ONE conversion,
+                # fed from the PROJECT steer block (mm/rev, stroke clamp,
+                # rack direction).  This used to be a private 60 mm/rev.
+                from vahan.steering import rack_travel_from_handwheel_deg
+                if steer_params is None:
+                    raise IKEvaluationError(
+                        "steer-mode IK needs the project steer block "
+                        "(steer_params) - no built-in rack")
+                rack_m = rack_travel_from_handwheel_deg(t_raw, steer_params)
                 hp_steer = {k: v.copy() for k, v in hp_solver.items()}
                 hp_steer['tie_rod_inner'] = (hp_solver['tie_rod_inner']
                                              + np.array([rack_m, 0., 0.]))
@@ -555,8 +734,12 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
                     pv = st.rocker_pivot
                     # REAL rocker axis, not a hardcoded +Y (84.4 deg off at the
                     # front).  This feeds IK target evaluation, so a wrong axis
-                    # here optimises against a fictitious ARB.
-                    _axp = getattr(hp, 'rocker_axis_pt', None)
+                    # here optimises against a fictitious ARB.  Read from THIS
+                    # sweep's hardpoints (hp_work) -- the same source the GUI's
+                    # graph path uses.  (Was getattr(hp, ...) on an undefined
+                    # name: a NameError swallowed below -> every ARB IK metric
+                    # silently NaN, 2026-09-22 audit P0.)
+                    _axp = hp_work.get('rocker_axis_pt')
                     ax_pt = (np.asarray(_axp, float) if _axp is not None
                              else pv + np.array([0., 0.0254, 0.]))
                     r_axis = ax_pt - pv
@@ -574,12 +757,22 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
                         out['arb_drop_travel'][idx] = dl_t * 1000
                     if 'arb_mr' in out:
                         out['arb_mr'][idx] = min(abs(np.degrees(ang) / (t_raw * 1000)), 5.0) if abs(t_raw) > 1e-9 else float('nan')
-                except Exception:
-                    pass
+                except _CODE_DEFECTS as e:
+                    raise IKEvaluationError(
+                        f'ARB metric evaluation defect: {type(e).__name__}: {e}') from e
+                except Exception as e:      # geometry: bellcrank cannot close here
+                    if diagnostics is not None:
+                        diagnostics.setdefault('station_errors', []).append(
+                            (int(idx), 'arb', f'{type(e).__name__}: {e}'))
 
             spring_prev = m.spring_length
             travel_prev = t_raw
-        except Exception:
+        except IKEvaluationError:
+            raise
+        except Exception as e:              # corner does not assemble here
+            if diagnostics is not None:
+                diagnostics.setdefault('station_errors', []).append(
+                    (int(idx), 'corner', f'{type(e).__name__}: {e}'))
             spring_prev = None
             travel_prev = None
 
@@ -606,6 +799,18 @@ def _evaluate_sweep(hp_dict: dict, travel_arr: np.ndarray, side: str = 'left',
     return out
 
 
+def _ls_diag(res, label: str) -> dict:
+    """Retained scipy.optimize.least_squares termination diagnostics.
+    ``success`` is False for status <= 0 (evaluation budget exhausted or an
+    improper input) -- such a result is not applicable."""
+    status = int(getattr(res, 'status', -1))
+    ok = bool(getattr(res, 'success', False)) and status > 0
+    ok = ok and bool(np.all(np.isfinite(getattr(res, 'x', [np.nan]))))
+    return {'success': ok, 'status': status,
+            'message': f'{label}: status {status}: {getattr(res, "message", "")}',
+            'nfev': int(getattr(res, 'nfev', 0) or 0)}
+
+
 # ─── Inverse solver ──────────────────────────────────────────────────────────
 
 class InverseSolver:
@@ -624,8 +829,24 @@ class InverseSolver:
                  travel_mm: tuple[float, float] = (-40, 40),
                  n_points: int = 21,
                  anti_kwargs: dict | None = None,
-                 motion: str = 'heave'):
+                 motion: str = 'heave',
+                 axle: str | None = None,
+                 drop_link_in_plane: bool = True,
+                 steer_params: dict | None = None):
         self.hp_dict = {k: v.copy() for k, v in hp_dict.items()}
+        # Project steer block (rack mm/rev, stroke, direction) — required for
+        # motion='steer'; the sweep converts handwheel deg with it.
+        self.steer_params = dict(steer_params) if steer_params else None
+        if motion == 'steer' and self.steer_params is None:
+            raise ValueError("InverseSolver(motion='steer') needs steer_params "
+                             "= the project steer block")
+        # Solve context bound to every result: which axle this geometry is
+        # and a stamp of it, so Apply can never write the solution onto the
+        # other axle or onto geometry that changed after the solve.
+        self.axle = axle
+        self.geometry_stamp = geometry_fingerprint(self.hp_dict)
+        # Rule 04 applies to bellcrank ARBs only (control-arm bars exempt).
+        self.drop_link_in_plane = bool(drop_link_in_plane)
         self.side = side
         self.pushrod_body = pushrod_body
         self.motion = motion
@@ -693,7 +914,8 @@ class InverseSolver:
         hp = self.ds.unpack(x)
         return _evaluate_sweep(hp, self.travel, self.side, self.pushrod_body,
                                 self._metric_keys(), self.anti_kwargs,
-                                motion=self.motion)
+                                motion=self.motion,
+                                steer_params=self.steer_params)
 
     def _residuals(self, x: np.ndarray) -> np.ndarray:
         """Residual vector for least-squares (not squared)."""
@@ -733,29 +955,36 @@ class InverseSolver:
                     coll[k] = 2000.0 * (margin - gap)
             parts.append(coll)
 
-        # Rocker coplanarity constraint: rocker_pivot, pushrod_inner, and
-        # rocker_spring_pt must lie on the same plane (defined by the
-        # design-position normal).  The rocker is a planar mechanism.
+        # Static actuation-chain rule (Rules 01/02/04, 2026-09-15): EVERY
+        # chain point -- pushrod outer+inner, rocker pivot, rocker spring eye,
+        # spring chassis eye and (bellcrank ARB) both drop-link ends -- in the
+        # CURRENT static plate plane of this candidate, via the shared checker.
+        # The plane is re-evaluated for every candidate (never the original
+        # plane); the pivot axis is re-derived as that plane's normal in
+        # DesignSpace.unpack, so axis normality holds by construction.
+        # Residuals are signed mm / CHAIN_RESIDUAL_UNIT_MM (1.0 == 0.1 mm).
+        # (Replaces a 3-point residual against the ORIGINAL plane that could
+        # not see pushrod_outer / spring_chassis_pt / drop links -- audit P0.)
         hp_curr = self.ds.unpack(x) if not self._collision_pairs else hp
-        if all(k in hp_curr for k in ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')):
-            pv = hp_curr['rocker_pivot']
-            pi = hp_curr['pushrod_inner']
-            rs = hp_curr['rocker_spring_pt']
-            # Design-position plane normal
-            if not hasattr(self, '_rocker_plane_normal'):
-                pv0 = self.hp_dict['rocker_pivot']
-                a = self.hp_dict['pushrod_inner'] - pv0
-                b = self.hp_dict['rocker_spring_pt'] - pv0
-                n = np.cross(a, b)
-                norm = np.linalg.norm(n)
-                self._rocker_plane_normal = n / norm if norm > 1e-9 else np.array([0., 1., 0.])
-            n_hat = self._rocker_plane_normal
-            # Penalise out-of-plane deviation for both arm tips
-            dev_pi = float(np.dot(pi - pv, n_hat))
-            dev_rs = float(np.dot(rs - pv, n_hat))
-            parts.append(np.array([5000.0 * dev_pi, 5000.0 * dev_rs]))
+        m = static_chain_rule_metrics(hp_curr, self.side,
+                                      include_drop_link=self.drop_link_in_plane)
+        if m is not None:
+            names = self._chain_residual_names(m)
+            sm = m.get('static_signed_mm', {})
+            vals = [sm.get(k, np.nan) for k in names]
+            parts.append(np.array([v / CHAIN_RESIDUAL_UNIT_MM if np.isfinite(v)
+                                   else 10.0 / CHAIN_RESIDUAL_UNIT_MM
+                                   for v in vals]))
 
         return np.concatenate(parts)
+
+    def _chain_residual_names(self, m: dict) -> list[str]:
+        """Fixed-length list of chain points in the residual (least_squares
+        needs a constant residual length across candidates)."""
+        if not hasattr(self, '_chain_names'):
+            self._chain_names = list(_CHAIN_KEYS) + (
+                list(_DROP_LINK_KEYS) if m.get('drop_link_checked') else [])
+        return self._chain_names
 
     def _cost(self, x: np.ndarray) -> float:
         r = self._residuals(x)
@@ -806,6 +1035,7 @@ class InverseSolver:
             )
             x_final = res_lm.x
             cost = float(res_lm.cost)
+            diag = _ls_diag(res_lm, 'warm-start LM')
 
         elif method == 'staged':
             # ── Priority-ordered staged solving ─────────────────────
@@ -855,6 +1085,7 @@ class InverseSolver:
                     stages.append((t.metric_key, t))
 
             n_stages = len(stages)
+            stage_diags = []
             for i, (metric_key, target) in enumerate(stages):
                 group = ORTHO_GROUPS[metric_key]
 
@@ -885,6 +1116,7 @@ class InverseSolver:
                     n_points=self.n_points,
                     anti_kwargs=self.anti_kwargs,
                     motion=self.motion,
+                    steer_params=self.steer_params,
                 )
                 stage_ik.add_target(
                     metric_key, target.values, weight=1.0)
@@ -893,6 +1125,8 @@ class InverseSolver:
                 stage_ik.tube_od = self.tube_od
 
                 stage_res = stage_ik.solve(method='local')
+                stage_diags.append((metric_key, stage_res.get('solver_success'),
+                                    stage_res.get('solver_message', '')))
                 hp_work = {k: v.copy()
                            for k, v in stage_res['hp'].items()}
 
@@ -908,6 +1142,7 @@ class InverseSolver:
                 n_points=self.n_points,
                 anti_kwargs=self.anti_kwargs,
                 motion=self.motion,
+                steer_params=self.steer_params,
             )
             for t in self.targets:
                 polish_ik.add_target(
@@ -928,6 +1163,8 @@ class InverseSolver:
             )
             x_final = res_polish.x
             cost = float(res_polish.cost)
+            diag = _ls_diag(res_polish, 'staged final polish')
+            diag['stages'] = stage_diags
 
         elif method == 'global':
             if progress_cb:
@@ -947,6 +1184,9 @@ class InverseSolver:
             )
             x_final = res_de.x
             cost = self._cost(x_final)
+            diag = {'success': bool(res_de.success), 'status': None,
+                    'message': f'differential evolution: {res_de.message}',
+                    'nfev': int(getattr(res_de, 'nfev', 0) or 0)}
 
         elif method == 'hybrid':
             # Multi-start LM: try N random starting points + the base x0,
@@ -959,6 +1199,8 @@ class InverseSolver:
 
             best_x = x0
             best_cost = float('inf')
+            best_res = None
+            start_errors = []
             for i, xs in enumerate(starts):
                 if progress_cb:
                     progress_cb(f'Multi-start LM: {i+1}/{n_starts}...')
@@ -967,13 +1209,30 @@ class InverseSolver:
                         self._residuals, xs, bounds=(lo, hi),
                         method='trf', ftol=1e-10, xtol=1e-10, max_nfev=500,
                     )
-                    if res.cost < best_cost:
-                        best_cost = float(res.cost)
-                        best_x = res.x
-                except Exception:
-                    pass
+                except IKEvaluationError:
+                    raise                     # code defect: never hide it
+                except Exception as e:        # this start failed numerically
+                    start_errors.append(f'start {i+1}: {type(e).__name__}: {e}')
+                    log.warning('IK hybrid start %d failed: %s', i + 1, e)
+                    continue
+                # Prefer converged starts; among equals, the lower cost.
+                if best_res is None or (
+                        (bool(res.success), -float(res.cost))
+                        > (bool(best_res.success), -best_cost)):
+                    best_cost = float(res.cost)
+                    best_x = res.x
+                    best_res = res
             x_final = best_x
             cost = best_cost
+            if best_res is None:
+                diag = {'success': False, 'status': None, 'nfev': 0,
+                        'message': 'every multi-start LM start failed: '
+                                   + '; '.join(start_errors)}
+            else:
+                diag = _ls_diag(best_res, f'multi-start LM (best of {n_starts})')
+                if start_errors:
+                    diag['message'] += (f' [{len(start_errors)} start(s) '
+                                        f'failed: ' + '; '.join(start_errors) + ']')
 
         else:   # 'local'
             if progress_cb:
@@ -984,11 +1243,14 @@ class InverseSolver:
             )
             x_final = res_lm.x
             cost = float(res_lm.cost)
+            diag = _ls_diag(res_lm, 'local LM')
 
         hp_final = self.ds.unpack(x_final)
+        eval_diag = {}
         curves = _evaluate_sweep(hp_final, self.travel, self.side, self.pushrod_body,
                                   self._metric_keys(), self.anti_kwargs,
-                                  motion=self.motion)
+                                  motion=self.motion, diagnostics=eval_diag,
+                                  steer_params=self.steer_params)
         deltas = (x_final - x0) * 1000  # metres → mm
 
         # travel_mm depends on motion type
@@ -1013,18 +1275,84 @@ class InverseSolver:
                     'pct_used': pct,
                 })
 
-        # Primary target error (first target = the one the user asked for)
+        # Primary target error (first target = the one the user asked for).
+        # Evaluated only over stations where the metric is defined; a NaN at
+        # any other station makes the whole error NaN (never nanmax-hidden).
         primary = self.targets[0]
         primary_curve = curves.get(primary.metric_key,
                                    np.full(self.n_points, np.nan))
         primary_errors = np.abs(primary_curve - primary.values)
-        primary_max_error = float(np.nanmax(primary_errors))
+        undefined = _undefined_by_definition(primary.metric_key, self.travel,
+                                             self.motion)
+        defined_err = primary_errors[~undefined]
+        primary_max_error = (float(np.max(defined_err))
+                             if defined_err.size and np.all(np.isfinite(defined_err))
+                             else float('nan'))
 
         # ── Collision check ──────────────────────────────────────────────
         collisions = (check_collisions(hp_final, self.tube_od)
                       if self.tube_od else [])
 
+        # ── Result contract: may this result be applied to the model? ────
+        reasons = []
+        if not diag.get('success', False):
+            reasons.append(f"solver did not converge ({diag.get('message', '')})")
+        if not np.isfinite(cost):
+            reasons.append('final objective is not finite')
+        for t in self.targets:
+            c = np.asarray(curves.get(t.metric_key,
+                                      np.full(self.n_points, np.nan)), float)
+            bad = ~np.isfinite(c) & ~_undefined_by_definition(
+                t.metric_key, self.travel, self.motion)
+            if bad.any():
+                tr = (self.travel if self.motion == 'steer'
+                      else self.travel * 1000.0)
+                unit = 'deg' if self.motion == 'steer' else 'mm'
+                reasons.append(
+                    f'{t.metric_key} not solved at {int(bad.sum())} of '
+                    f'{len(c)} travel stations (e.g. {tr[bad][0]:+.1f} {unit})')
+        if not np.isfinite(primary_max_error):
+            reasons.append(f'{primary.metric_key} target error is not finite')
+        # Rules 01/02/04 at static: refuse if the solve introduced or worsened
+        # a violation; a pre-existing violation is reported, not blamed on IK.
+        chain_base = static_chain_rule_metrics(
+            self.hp_dict, self.side, include_drop_link=self.drop_link_in_plane)
+        chain_final = static_chain_rule_metrics(
+            hp_final, self.side, include_drop_link=self.drop_link_in_plane)
+        base_bad = chain_rule_violations(chain_base)
+        chain_warnings = []
+        for msg in chain_rule_violations(chain_final):
+            worse = True
+            if chain_base is not None and base_bad:
+                worse = (not np.isfinite(chain_final['coplanar_static_mm'])
+                         or chain_final['chain_static_mm']
+                         > chain_base['chain_static_mm'] + 0.01
+                         or chain_final['drop_link_static_mm']
+                         > chain_base['drop_link_static_mm'] + 0.01
+                         or chain_final['rocker_axis_normal_error_deg']
+                         > chain_base['rocker_axis_normal_error_deg'] + 1e-6)
+            if worse:
+                reasons.append(msg)
+            else:
+                chain_warnings.append(f'pre-existing: {msg}')
+        applicable = not reasons
+
         return {
+            'axle': self.axle,
+            'geometry_stamp': self.geometry_stamp,
+            'side': self.side,
+            'motion': self.motion,
+            'solver_success': bool(diag.get('success', False)),
+            'solver_status': diag.get('status'),
+            'solver_message': diag.get('message', ''),
+            'solver_nfev': diag.get('nfev'),
+            'solver_stages': diag.get('stages', []),
+            'station_errors': eval_diag.get('station_errors', []),
+            'chain_rules': chain_final,
+            'chain_rules_base': chain_base,
+            'chain_warnings': chain_warnings,
+            'applicable': applicable,
+            'reject_reasons': reasons,
             'hp': hp_final,
             'x': x_final,
             'cost': cost,
@@ -1067,6 +1395,9 @@ def _solve_at_bound(args: tuple) -> dict:
         hp_dict, side=side, pushrod_body=pushrod_body,
         travel_mm=travel_mm, n_points=n_points,
         anti_kwargs=anti_kwargs, motion=motion,
+        axle=solver_kwargs.get('axle'),
+        drop_link_in_plane=solver_kwargs.get('drop_link_in_plane', True),
+        steer_params=solver_kwargs.get('steer_params'),
     )
 
     for entry in targets_spec:

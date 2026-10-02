@@ -59,6 +59,65 @@ import numpy as np
 G = 9.80665
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  THE CANONICAL ACKERMANN PERCENT  (one definition for every consumer)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Draw the line through each front contact point at right angles to that
+# wheel's heading (top view).  The two lines meet a distance X behind the
+# front axle.  Geometry of that intersection (inner wheel at t/2 nearer the
+# turn centre):  tan(d_in) = X/(R - t/2),  tan(d_out) = X/(R + t/2)
+#     =>  cot(d_out) - cot(d_in) = t / X
+# Ackermann % = 100 * L / X  = 100 * (L/t) * (cot d_out - cot d_in)
+#   100 %  -> the lines meet ON THE REAR-AXLE LINE (classic low-speed Ackermann)
+#     0 %  -> parallel steer (lines never meet)
+#   < 0 %  -> reverse (lines meet AHEAD of the front axle, outer steers more)
+# It needs NO reference radius or path, and it is exact at every steer angle —
+# unlike the old "mean-angle radius, then linear angle ratio" readout, which
+# read an exact 100 % pair as 99.2 % at 10 deg and 94.8 % at 30 deg of steer
+# (Astra F-08, 2026-09-22).  YMD's _ackermann_split already built pairs in
+# this cotangent domain; the GUI pair readout, the kinematic Ackermann curve
+# and the dynamics sensitivity now READ in the same domain, so a percentage
+# means the same wheel pair everywhere.
+#
+# (solve_ackermann_force's sweep axis below is a DIFFERENT, documented
+#  quantity: a linear split referenced to the solved TRAVEL headings — its
+#  100 % is "each wheel pointed along its own travel direction", not the
+#  geometric Ackermann above.)
+
+def ackermann_pct_from_pair(d_inner_deg: float, d_outer_deg: float,
+                            track_m: float, wheelbase_m: float) -> float:
+    """Canonical Ackermann % from the inner/outer front-wheel steer angles
+    (degrees, magnitudes steered INTO the turn; inner = nearer the turn
+    centre).  NaN when either angle is not in (0, 90) deg or the car
+    dimensions are not positive."""
+    di, do = float(d_inner_deg), float(d_outer_deg)
+    t, L = float(track_m), float(wheelbase_m)
+    if not (np.isfinite(di) and np.isfinite(do) and t > 0.0 and L > 0.0):
+        return float('nan')
+    if not (0.0 < di < 90.0 and 0.0 < do < 90.0):
+        return float('nan')
+    cot_i = 1.0 / math.tan(math.radians(di))
+    cot_o = 1.0 / math.tan(math.radians(do))
+    return 100.0 * (L / t) * (cot_o - cot_i)
+
+
+def ackermann_pair_from_pct(mean_deg: float, ackermann_pct: float,
+                            track_m: float, wheelbase_m: float) -> tuple:
+    """Inverse of ackermann_pct_from_pair about a mean steer (the split is
+    symmetric in the cotangent domain: cot d_in = cot d - off, cot d_out =
+    cot d + off, off = (t/2L)(pct/100)).  Returns (d_inner, d_outer) in deg
+    for mean_deg > 0; (mean, mean) at zero steer."""
+    ad = abs(float(mean_deg))
+    if ad < 1e-9:
+        return (float(mean_deg), float(mean_deg))
+    cot_m = 1.0 / math.tan(math.radians(ad))
+    off = (float(track_m) / (2.0 * float(wheelbase_m))) * (float(ackermann_pct) / 100.0)
+    d_in = math.degrees(math.atan2(1.0, cot_m - off))
+    d_out = math.degrees(math.atan2(1.0, cot_m + off))
+    return (d_in, d_out)
+
+
 def _turn_geometry(veh, radius_m, beta_deg, front=True):
     """Which way each wheel is travelling, and how far it is from the middle
     of the turn.  Angles in degrees, measured from straight ahead, positive
@@ -84,7 +143,7 @@ def _turn_geometry(veh, radius_m, beta_deg, front=True):
 
 
 def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
-                             grip_multiplier: float = 1.0, aero=False):
+                             grip_multiplier: float | None = None, aero=False):
     """PART 1 — point each front wheel where it needs to point, and read off
     the Ackermann that requires.
 
@@ -172,7 +231,8 @@ def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
     # Clamp rather than raise: a fat-fingered 0 would divide fy_needed by
     # zero, and anything past 1.5 claims asphalt beats the belt by more than
     # any surface pairing in the literature.
-    gm = min(max(float(grip_multiplier), 0.05), 1.5)
+    from vahan.dynamics import resolve_grip_scale   # None = project scale
+    gm = min(max(resolve_grip_scale(grip_multiplier, solver), 0.05), 1.5)
     if aero and not isinstance(aero, dict):
         # A bare `aero=True` carries no package data and would silently mean
         # "no aero" if allowed through — fail loudly instead.
@@ -306,7 +366,13 @@ def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
     _beta0 = 0.5 * (_b_lo + _b_hi)
     g0 = _turn_geometry(veh, radius_m, _beta0)
     spread_static = (g0[inner]['heading_deg'] - g0[outer]['heading_deg'])
-    pct = (100.0 * spread_point / spread_static
+    # CANONICAL percent (ackermann_pct_from_pair, top of this file): the pair
+    # the tyres want, read in the cotangent domain — the SAME scale as the GUI
+    # linkage readout and the YMD input.  (Was the linear ratio
+    # spread_point/spread_static: equal at exactly 100 %, a different scale
+    # elsewhere.)  static_spread_deg / point_spread_deg are still reported.
+    _t_f = float(veh.front_track_m); _L = float(veh.wheelbase_m)
+    pct = (ackermann_pct_from_pair(point_in, point_out, _t_f, _L)
            if abs(spread_static) > 0.05 else float('nan'))
     pct_dyn = (100.0 * spread_point / spread_travel
                if spread_travel > 0.05 else float('nan'))
@@ -365,7 +431,7 @@ def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
                              if not (saturated[lighter] or saturated[heavier])
                              else float('nan')),
         'point_spread_raw_deg': spread_point,   # the fallback-built value
-        # STANDARD definition: spread_point / static geometric spread.
+        # STANDARD definition: canonical % of the pointed pair (cot domain).
         'ackermann_pct': (pct if not (saturated[lighter]
                                       or saturated[heavier])
                           else float('nan')),
@@ -386,8 +452,12 @@ def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
                                     if not (saturated[lighter]
                                             or saturated[heavier])
                                     else float('nan')),
-        'ackermann_pct_capped': (100.0 * max(spread_point, _peak_bound)
-                                 / spread_static
+        # canonical % of the pair with the same mean pointing and the capped
+        # spread (same scale as ackermann_pct above)
+        'ackermann_pct_capped': (ackermann_pct_from_pair(
+                                     0.5 * (point_in + point_out) + 0.5 * max(spread_point, _peak_bound),
+                                     0.5 * (point_in + point_out) - 0.5 * max(spread_point, _peak_bound),
+                                     _t_f, _L)
                                  if abs(spread_static) > 0.05
                                  and not (saturated[lighter]
                                           or saturated[heavier])
@@ -405,7 +475,7 @@ def solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
 
 def solve_ackermann_force(tire_model, solver, radius_m, lat_g,
                           ack_range=(-1000.0, 1000.0), n=401,
-                          grip_multiplier: float = 1.0, aero=False):
+                          grip_multiplier: float | None = None, aero=False):
     """PART 2 — of all the Ackermann settings, which one puts the most force
     in the direction that holds the car on the circle?
 
@@ -427,7 +497,8 @@ def solve_ackermann_force(tire_model, solver, radius_m, lat_g,
     wing presses down, it does not add mass to corner.
     """
     # Same clamp as PART 1 so both parts of one call agree on the derate.
-    gm = min(max(float(grip_multiplier), 0.05), 1.5)
+    from vahan.dynamics import resolve_grip_scale   # None = project scale
+    gm = min(max(resolve_grip_scale(grip_multiplier, solver), 0.05), 1.5)
     geo = solve_ackermann_geometry(solver, tire_model, radius_m, lat_g,
                                    grip_multiplier=gm, aero=aero)
     veh = solver._veh
@@ -582,7 +653,7 @@ def solve_ackermann_force(tire_model, solver, radius_m, lat_g,
 
 def ackermann_bucket(tire_model, solver, radius_m=10.0,
                      lat_g_list=(1.5, 1.6, 1.7, 1.75, 1.8, 1.9, 2.0),
-                     include_force=False, grip_multiplier: float = 1.0,
+                     include_force=False, grip_multiplier: float | None = None,
                      aero=False):
     # include_force gates PART 2: its sweep is ~56k tyre lookups PER g
     # and per rule, which turned the GUI button into a multi-minute

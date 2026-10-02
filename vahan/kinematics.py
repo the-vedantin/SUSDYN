@@ -23,6 +23,37 @@ import numpy as np
 from .solver import SolvedState, _norm
 
 
+def road_plane_camber_deg(spin_axis, road_normal=(0., 0., 1.), *, side='left'):
+    """Signed wheel inclination relative to a road plane, in degrees.
+
+    Negative means wheel top leans inboard. Unlike the historical front-view
+    ``KinematicMetrics.camber``, this includes the complete horizontal spin
+    projection and remains valid at steering angle. Inputs must share a frame;
+    apply alignment and body orientation before calling. The road normal points
+    up and the spin uses the solver's +X-at-design orientation on BOTH sides.
+    This function applies no alignment, body rotation, or tire-sign conversion.
+    """
+    if side not in ('left', 'right'):
+        raise ValueError("side must be 'left' or 'right'")
+
+    def unit(value, name):
+        vector = np.asarray(value, dtype=float)
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            raise ValueError(f'{name} must be a finite three-vector')
+        scale = float(np.max(np.abs(vector)))
+        if scale == 0.:
+            raise ValueError(f'{name} must be nonzero')
+        vector = vector / scale
+        return vector / np.linalg.norm(vector)
+
+    spin = unit(spin_axis, 'spin_axis')
+    normal = unit(road_normal, 'road_normal')
+    vertical = float(np.dot(spin, normal))
+    in_plane = float(np.linalg.norm(spin - vertical * normal))
+    sign = 1. if side == 'left' else -1.
+    return float(-sign * np.degrees(np.arctan2(vertical, in_plane)))
+
+
 def _intersect_2d(p1, p2, p3, p4):
     """2-D line intersection. Returns None if parallel."""
     d1 = p2 - p1
@@ -141,20 +172,44 @@ class KinematicMetrics:
 
     # ── roll centre ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _arm_trace_xz(pin_a, pin_b, bj, y_ref):
+        """Front-view (XZ) trace of one A-arm plane on the transverse plane
+        Y = y_ref: the two points where the arm's pivot axis and the parallel
+        through the ball joint pierce that plane.  Depends only on the pivot
+        AXIS (line through the two inboard pickups), so sliding a pickup along
+        its own axis — a physical no-op — leaves the result unchanged.  A
+        purely lateral axis (u_y ~ 0) cannot be projected this way; fall back
+        to the pickup midpoint (identical result when the axis is along Y)."""
+        pin_a = np.asarray(pin_a, float); pin_b = np.asarray(pin_b, float)
+        bj = np.asarray(bj, float)
+        u = pin_b - pin_a
+        if abs(u[1]) < 1e-9:
+            mid = 0.5 * (pin_a + pin_b)
+            return np.array([mid[0], mid[2]]), np.array([bj[0], bj[2]])
+        p_axis = pin_a + u * ((y_ref - pin_a[1]) / u[1])
+        p_bj = bj + u * ((y_ref - bj[1]) / u[1])
+        return np.array([p_axis[0], p_axis[2]]), np.array([p_bj[0], p_bj[2]])
+
     @property
     def ic_front_view(self):
         """
         Instant-centre in the front view (XZ plane) for this corner.
         Returns a 2-element array [x_m, z_m], or None if arms are parallel.
         Used by the axle-level roll-centre computation (requires both corners).
+
+        Instant-axis method (RCVD ch. 17): the upright's instant axis is the
+        intersection of the two arm planes; its trace on the transverse plane
+        through the wheel centre is the front-view IC.  Each arm plane is drawn
+        in that transverse plane from its pivot AXIS, not the pickup midpoint,
+        so the IC is invariant to where along the axis the pickups sit
+        (2026-09-09: the midpoint construction moved the front RC 1.1 mm for a
+        pickup slid 38.7 mm along its own axis — a metric artifact).
         """
         s = self._s
-        uca_in  = np.array([(s.uca_front[0]+s.uca_rear[0])/2,
-                             (s.uca_front[2]+s.uca_rear[2])/2])
-        lca_in  = np.array([(s.lca_front[0]+s.lca_rear[0])/2,
-                             (s.lca_front[2]+s.lca_rear[2])/2])
-        uca_out = np.array([s.uca_outer[0], s.uca_outer[2]])
-        lca_out = np.array([s.lca_outer[0], s.lca_outer[2]])
+        y_ref = float(s.wheel_center[1])
+        uca_in, uca_out = self._arm_trace_xz(s.uca_front, s.uca_rear, s.uca_outer, y_ref)
+        lca_in, lca_out = self._arm_trace_xz(s.lca_front, s.lca_rear, s.lca_outer, y_ref)
         return _intersect_2d(uca_in, uca_out, lca_in, lca_out)
 
     @property
@@ -162,22 +217,14 @@ class KinematicMetrics:
         """
         Roll-centre height (m) — instant-centre method, front view (XZ plane).
 
-        1. Project arm inboard midpoints + outboard BJs into XZ plane.
+        1. Trace each arm plane on the transverse plane through the wheel
+           centre from its pivot AXIS + ball joint (see ic_front_view).
         2. Find IC = intersection of arm lines.
         3. Line from IC → contact patch; intersect with X=0 (centreline).
         """
         s = self._s
 
-        # Inboard midpoints in XZ plane (X=lateral, Z=height)
-        uca_in = np.array([(s.uca_front[0]+s.uca_rear[0])/2,
-                            (s.uca_front[2]+s.uca_rear[2])/2])
-        lca_in = np.array([(s.lca_front[0]+s.lca_rear[0])/2,
-                            (s.lca_front[2]+s.lca_rear[2])/2])
-
-        uca_out = np.array([s.uca_outer[0], s.uca_outer[2]])
-        lca_out = np.array([s.lca_outer[0], s.lca_outer[2]])
-
-        ic = _intersect_2d(uca_in, uca_out, lca_in, lca_out)
+        ic = self.ic_front_view
 
         # Contact patch in XZ (Z=0, X=wheel centre lateral pos)
         cp = np.array([s.wheel_center[0], 0.0])

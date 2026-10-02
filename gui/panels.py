@@ -75,6 +75,21 @@ BTN_INFO_ROUND = (
 #  COLLAPSIBLE SECTION WIDGET
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _project_grip_scale(widget, fallback_spin=None) -> float:
+    """THE project grip scale (MainWindow.grip_scale()) as seen from any
+    panel; the panel's own grip box is only a mirror of it.  Falls back to
+    that box when the panel is used outside a MainWindow (tests)."""
+    try:
+        mw = widget.window()
+        if hasattr(mw, 'grip_scale'):
+            return float(mw.grip_scale())
+    except Exception:
+        pass
+    if fallback_spin is not None:
+        return float(fallback_spin.value())
+    raise RuntimeError('no project grip scale available')
+
+
 class CollapsibleSection(QWidget):
     """A titled section that can be toggled open/closed.
 
@@ -223,6 +238,7 @@ class MotionPanel(CollapsibleSection):
     position_changed      = pyqtSignal(float)
     damper_params_changed = pyqtSignal(dict)
     apply_sag_requested   = pyqtSignal()
+    reset_sag_requested   = pyqtSignal()
     dance_toggled         = pyqtSignal(bool)
 
     def __init__(self):
@@ -232,6 +248,7 @@ class MotionPanel(CollapsibleSection):
         self._max_val =  50.0
         self._pos     =   0.0
         self._travel_limits = None      # (droop, bump) mm, set from stroke+sag
+        self._has_saved_motion_range = False
         self._building = False
         self._build()
         self.set_info(section_info.MOTION)
@@ -258,11 +275,10 @@ class MotionPanel(CollapsibleSection):
             row.addWidget(rb)
         self.add_layout(row)
 
-        # Travel range is NOT an input.  For the mm motions it is exactly what
-        # the damper allows: droop = the sag already in the shock, bump = the
-        # stroke left above sag, both divided by the motion ratio to get wheel
-        # travel.  Typing a separate Min/Max was redundant with stroke+sag and
-        # let the slider run past where the damper physically stops.
+        # Travel range is not a control here. Saved explicit bounds take
+        # precedence; otherwise estimate droop from shock compression and
+        # bump from the remaining stroke, using the static motion ratio.
+        # Physical damper-stop checks are separate from this slider estimate.
         # Degree motions (roll / steer) are not stroke-limited and keep defaults.
         self._range_lbl = QLabel('Travel: droop — / bump —')
         self._range_lbl.setStyleSheet(
@@ -319,6 +335,13 @@ class MotionPanel(CollapsibleSection):
             'where the car actually sits at rest.')
         self._apply_sag_btn.clicked.connect(self.apply_sag_requested.emit)
         btn_row.addWidget(self._apply_sag_btn)
+        self._reset_sag_btn = QPushButton('Undo applied sag')
+        self._reset_sag_btn.setToolTip(
+            'Undo "Apply Sag to Hardpoints": put every hardpoint back where it was '
+            'drawn (the CAD / file positions saved before the last apply). The backup '
+            'is stored in the project file, so this works after a save and reload.')
+        self._reset_sag_btn.clicked.connect(self.reset_sag_requested.emit)
+        btn_row.addWidget(self._reset_sag_btn)
         btn_row.addStretch(1)
         self.add_layout(btn_row)
 
@@ -340,6 +363,15 @@ class MotionPanel(CollapsibleSection):
         self._pos_label = QLabel(' 0.0 mm')
         self._pos_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.add_widget(self._pos_label)
+        static_row = QHBoxLayout()
+        self._static_btn = QPushButton('Go to static sag (0)')
+        self._static_btn.setToolTip(
+            'Put the position slider back at static ride height (0 mm travel = the '
+            'car sitting on its springs), for heave / pitch / roll / steer alike.')
+        self._static_btn.clicked.connect(self.go_to_static)
+        static_row.addWidget(self._static_btn)
+        static_row.addStretch(1)
+        self.add_layout(static_row)
 
         # Easter egg: wave the four corners (FL leads, FR / RL / RR follow
         # a quarter period apart each).  Checkable -- click again to stop.
@@ -363,7 +395,7 @@ class MotionPanel(CollapsibleSection):
                 'pitch': (-30, 30, ' mm'), 'steer': (-360, 360, ' °')}
         lo, hi, suf = defs[key]
         if key in ('heave', 'pitch') and self._travel_limits is not None:
-            lo, hi = self._travel_limits          # damper-derived, not typed
+            lo, hi = self._travel_limits          # saved or damper-derived
         self._min_val, self._max_val = lo, hi
         self._building = False
         self._sync()
@@ -409,7 +441,29 @@ class MotionPanel(CollapsibleSection):
         self._sync()
         self.position_changed.emit(self._pos)
 
+    def _slider_value_for(self, pos: float) -> int:
+        span = self._max_val - self._min_val
+        if abs(span) < 1e-12:
+            return self._slider.value()
+        pct = (float(pos) - self._min_val) / span
+        return int(round(min(max(pct, 0.0), 1.0) * 400))
+
+    def go_to_static(self):
+        """Slider to 0 (static sag). The slider is 0..400 across [min, max]; with an
+        asymmetric droop/bump range its midpoint is NOT static, so compute the tick."""
+        v = self._slider_value_for(0.0)
+        blocked = self._slider.blockSignals(True)
+        self._slider.setValue(v)        # nearest tick (0.2 mm steps) for the handle ...
+        self._slider.blockSignals(blocked)
+        self._pos = 0.0                 # ... but the pose is EXACTLY static
+        unit = '°' if self._motion == 'roll' else ' mm'
+        self._pos_label.setText(f'{self._pos:+.1f}{unit}')
+        self.position_changed.emit(self._pos)
+
     def _on_damper(self):
+        # An actual hardware/preload edit opts back into the automatic range.
+        # Loading saved controls blocks their signals and preserves the range.
+        self._has_saved_motion_range = False
         self.damper_params_changed.emit({
             'stroke_mm':         self._stroke.value(),
             'preload_front_mm':  self._preload_f.value(),
@@ -439,6 +493,56 @@ class MotionPanel(CollapsibleSection):
         blocked = self._fully_extended.blockSignals(True)
         self._fully_extended.setValue(float(val))
         self._fully_extended.blockSignals(blocked)
+
+    def restore_project_state(self, state: dict):
+        """Restore saved motion without treating a load as a damper edit.
+
+        Explicit wheel-travel bounds remain authoritative during read-only
+        sag/dynamics refreshes. Legacy projects without valid bounds keep the
+        automatic range; physical damper-stop checks remain independent.
+        """
+        state = state if isinstance(state, dict) else {}
+        self._has_saved_motion_range = False
+        self._travel_limits = None
+        blocked = self.blockSignals(True)
+        try:
+            for key, control in (
+                    ('stroke_mm', self._stroke),
+                    ('preload_front_mm', self._preload_f),
+                    ('preload_rear_mm', self._preload_r),
+                    ('fully_extended_mm', self._fully_extended)):
+                if key not in state:
+                    continue
+                try:
+                    value = float(state[key])
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(value):
+                    continue
+                was_blocked = control.blockSignals(True)
+                control.setValue(value)
+                control.blockSignals(was_blocked)
+            motion = state.get('type', 'heave')
+            if motion not in ('heave', 'roll', 'pitch', 'steer'):
+                motion = 'heave'
+            for button in self._btn_grp.buttons():
+                button.setChecked(button.text().lower() == motion)
+            self._on_motion(True, motion)
+            try:
+                lo, hi = float(state['min']), float(state['max'])
+            except (KeyError, TypeError, ValueError):
+                return
+            if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+                return
+            self._min_val, self._max_val = lo, hi
+            if motion in ('heave', 'pitch'):
+                self._travel_limits = (lo, hi)
+                self._has_saved_motion_range = True
+                self._range_lbl.setText(
+                    f'Saved travel: {lo:+.1f} / {hi:+.1f} mm')
+            self._sync()
+        finally:
+            self.blockSignals(blocked)
 
     def update_sag_display(self, sag_info: dict):
         """Refresh the read-only sag readout from a VehicleParams.static_sag() dict.
@@ -483,7 +587,7 @@ class MotionPanel(CollapsibleSection):
                 if _mr > 1e-6:
                     _dr.append(max(_s, 0.0) / _mr)
                     _bp.append(max(_stroke - _s, 0.0) / _mr)
-            if _dr and _bp:
+            if _dr and _bp and not self._has_saved_motion_range:
                 self.set_travel_limits(min(_dr), min(_bp))
         except Exception:
             pass
@@ -561,6 +665,7 @@ class SteeringPanel(CollapsibleSection):
         return {
             'rack_travel_per_rev_mm': self._rack_ratio.value(),
             'total_rack_travel_mm':   self._rack_total.value(),
+            'rack_direction': self._rack_direction.currentData(),
         }
 
     def set_params(self, d: dict):
@@ -586,6 +691,11 @@ class SteeringPanel(CollapsibleSection):
                     spin.setValue(float(d[key]))
                 finally:
                     spin.blockSignals(False)
+        self._rack_direction.blockSignals(True)
+        try:
+            self._rack_direction.setCurrentIndex(1 if d.get('rack_direction', 1) == -1 else 0)
+        finally:
+            self._rack_direction.blockSignals(False)
         self._refresh_max_hw()
 
     def _build(self):
@@ -593,13 +703,22 @@ class SteeringPanel(CollapsibleSection):
 
         grid.addWidget(QLabel('Rack travel/rev:'), 0, 0)
         self._rack_ratio = _spin(0.1, 100000, 120.0, ' mm/rev')
+        self._rack_ratio.setDecimals(3)
         self._rack_ratio.valueChanged.connect(self._on_rack_changed)
         grid.addWidget(self._rack_ratio, 0, 1)
 
         grid.addWidget(QLabel('Total rack travel:'), 1, 0)
         self._rack_total = _spin(0.1, 100000, 64.0, ' mm')
+        self._rack_total.setDecimals(3)
         self._rack_total.valueChanged.connect(self._on_rack_changed)
         grid.addWidget(self._rack_total, 1, 1)
+        grid.addWidget(QLabel('Rack direction:'), 2, 0)
+        self._rack_direction = QComboBox()
+        self._rack_direction.addItem('+X for positive handwheel', 1)
+        self._rack_direction.addItem('−X for positive handwheel', -1)
+        self._rack_direction.setToolTip('Physical rack travel direction for positive steering-wheel input. Must match the pinion installation.')
+        self._rack_direction.currentIndexChanged.connect(self._on_rack_changed)
+        grid.addWidget(self._rack_direction, 2, 1)
         self.add_layout(grid)
 
         # ── Readout: max steering-wheel angle achievable ────────────────────
@@ -808,7 +927,7 @@ class CarParamsPanel(CollapsibleSection):
         self.add_widget(self._show_driveshaft)
 
         self._show_diff_body = QCheckBox('Show diff + tripods (placeholder)')
-        self._show_diff_body.setChecked(True)
+        self._show_diff_body.setChecked(False)
         self._show_diff_body.setToolTip(
             'Uncheck to hide the placeholder diff body AND tripods while KEEPING '
             'the driveshafts — for checking a real imported diff/tripod STEP file '
@@ -2083,10 +2202,15 @@ class InverseKinematicsPanel(CollapsibleSection):
         """Called by main_window after solve completes."""
         self._solve_btn.setEnabled(True)
         self._find_btn.setVisible(False)
+        # A new solve (or a failure) always invalidates the previous result:
+        # Apply is only ever offered for the result currently on screen.
+        self._apply_btn.setVisible(False)
         if error:
+            self._last_result = None
             self._status.setText(f'Error: {error}')
             return
         if result is None:
+            self._last_result = None
             self._status.setText('No result.')
             return
 
@@ -2098,7 +2222,9 @@ class InverseKinematicsPanel(CollapsibleSection):
         for k, curve in result['curves'].items():
             achieved[k] = curve[mid]
 
-        lines = [f'Cost: {cost:.4f}']
+        solved_axle = result.get('axle')
+        lines = [f'Solved for: {str(solved_axle).upper() if solved_axle else "UNKNOWN"} axle',
+                 f'Cost: {cost:.4f}']
         for k, tgt in targets.items():
             tgt_val = tgt[mid]
             ach_val = achieved.get(k, float('nan'))
@@ -2146,7 +2272,36 @@ class InverseKinematicsPanel(CollapsibleSection):
             new_val = result['x'][i] * 1000
             self._results_table.setItem(i, 2, QTableWidgetItem(f'{new_val:.2f} mm'))
         self._results_table.setVisible(True)
-        self._apply_btn.setVisible(True)
+
+        # ── Applicability: only a converged, fully-solved, rule-compliant
+        #    result bound to a known axle may be applied (2026-09-22 audit).
+        reasons = self.apply_refusal_reasons(result)
+        for w in result.get('chain_warnings', []):
+            lines.append(f'Note: {w}')
+        if reasons:
+            lines.append('')
+            lines.append('NOT APPLICABLE - Apply disabled:')
+            lines.extend(f'  {r}' for r in reasons)
+        self._status.setText('\n'.join(lines))
+        self._apply_btn.setText(
+            f'Apply to {solved_axle.title()} Model' if solved_axle else 'Apply to Model')
+        self._apply_btn.setVisible(not reasons)
+
+    @staticmethod
+    def apply_refusal_reasons(result: dict | None) -> list[str]:
+        """Why this IK result may NOT be applied (empty list = applicable)."""
+        if result is None:
+            return ['no result']
+        reasons = list(result.get('reject_reasons', []))
+        if 'applicable' not in result:
+            reasons.append('result has no applicability record (re-solve)')
+        elif not result['applicable'] and not reasons:
+            reasons.append('solver marked the result not applicable')
+        if result.get('axle') not in ('front', 'rear'):
+            reasons.append('result is not bound to an axle (re-solve)')
+        if not result.get('geometry_stamp'):
+            reasons.append('result has no geometry stamp (re-solve)')
+        return reasons
 
     def _on_find_solutions(self):
         """Run multiple solves at wider bounds and let user pick."""
@@ -2186,11 +2341,26 @@ class InverseKinematicsPanel(CollapsibleSection):
     def _on_apply(self):
         if self._last_result is None:
             return
-        axle = 'front' if self._axle.currentIndex() == 0 else 'rear'
+        reasons = self.apply_refusal_reasons(self._last_result)
+        if reasons:
+            self._apply_btn.setVisible(False)
+            self._status.setText('Apply refused:\n' + '\n'.join(f'  {r}' for r in reasons))
+            return
+        # The axle comes from the RESULT (bound at solve time), never from the
+        # selector's current position -- flipping the selector after a front
+        # solve must not write the front solution onto the rear axle.
         self.apply_requested.emit({
             'hp': self._last_result['hp'],
-            'axle': axle,
+            'axle': self._last_result['axle'],
+            'geometry_stamp': self._last_result['geometry_stamp'],
         })
+
+    def show_apply_refused(self, message: str):
+        """main_window refused the Apply (e.g. geometry changed since the
+        solve): drop the stale result and say why."""
+        self._last_result = None
+        self._apply_btn.setVisible(False)
+        self._status.setText(f'Apply refused: {message}')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2255,7 +2425,12 @@ Longitudinal sweep = pitch, front/rear load shift under braking/accel.</td></tr>
 <tr><td style="color:#E23B48;">Roll centre height</td>
 <td>Queried from the kinematic solver at each iteration's travel. Migrates with roll.</td></tr>
 <tr><td style="color:#E23B48;">Camber at load</td>
-<td>Queried from the kinematic solver at the operating travel.</td></tr>
+<td>The kinematic solver supplies chassis-relative camber change at the operating
+travel. The dynamics camber display adds static alignment and body roll to show
+wheel camber relative to the road. The steady solve uses the currently
+configured corner geometry; it does not solve a steering angle from turn
+radius or tyre trim. Its reported pitch angle does not change the sampled
+suspension travel.</td></tr>
 </table>
 
 <h4 style="color:#e07b30;">Results Table</h4>
@@ -2264,8 +2439,9 @@ Longitudinal sweep = pitch, front/rear load shift under braking/accel.</td></tr>
 <td>Vertical load on each tire. Positive = compression. Sum of all 4 = total weight.</td></tr>
 <tr><td style="color:#E23B48;">Travel (mm)</td>
 <td>Suspension travel at each corner from body roll. Positive = bump (compression).</td></tr>
-<tr><td style="color:#E23B48;">Camber (deg)</td>
-<td>Wheel camber at the operating travel. Negative = top of wheel leans inboard.</td></tr>
+<tr><td style="color:#E23B48;">Camber to road (deg)</td>
+<td>Wheel camber relative to the road: kinematic camber change plus static
+alignment and body roll. Negative = top of wheel leans inboard.</td></tr>
 <tr><td style="color:#E23B48;">Utilization</td>
 <td>Fraction of available tire grip used. &gt;1.0 means that corner has exceeded its peak lateral force &mdash; the car is sliding.</td></tr>
 <tr><td style="color:#E23B48;">LT Geo (N)</td>
@@ -2467,16 +2643,26 @@ class DynamicsPanel(CollapsibleSection):
         # optimistic); ~0.65-0.75 = real asphalt (belt grip runs 30-50% high).
         # Lower it to read HONEST utilization — at 0.70 the car reaches util 1.0
         # near its true grip-limited lateral g, not the inflated belt number.
-        self._grip_mult       = row('Grip multiplier:',    0.10, 1.50, 1.00, '×', r, dec=2, step=0.05); r += 1
+        self._grip_mult       = row('Grip multiplier:',    0.10, 1.50, 0.70, '×', r, dec=2, step=0.05); r += 1
         self._grip_mult.setToolTip(
-            'Friction-circle grip scale applied to the tyre mu when computing '
-            'tire utilization.\n'
+            'THE project grip scale: belt-to-road multiplier on the tyre\'s '
+            'peak mu.  EVERY grip limit in the app uses it — utilization, '
+            'per-corner and axle limits, traction, braking, the lap sim, '
+            'Corner Speed, Ackermann / MMD.  The grip boxes on the other '
+            'pages are the same number.\n'
             '  1.00 = raw belt / TTC mu (what the tyre data says — optimistic).\n'
-            '  0.65-0.75 = typical real asphalt (belt grip is ~30-50% high).\n'
-            'Lower this for honest utilization: at 0.70 the car hits util 1.0 '
-            'around its TRUE grip-limited lateral g, not the belt-grip value.\n'
-            '(The lap-time sim already derates internally; this sets the '
-            'dynamics page.)')
+            '  0.65-0.75 = typical real asphalt (belt grip is ~30-50% high).')
+        # The user's list of grip scales to SHOW LIMITS AT (traction, braking
+        # here; per-corner / axle lateral limits on Corner Speed).  The
+        # project scale above is always included.
+        g.addWidget(QLabel('Limits at grip ×:'), r, 0)
+        self._grip_list_edit = QLineEdit('0.70, 1.00')
+        self._grip_list_edit.setToolTip(
+            'Comma-separated grip scales to show the limits at, e.g. '
+            '"0.7, 1.0".  The project grip scale is always included.')
+        self._grip_list_edit.editingFinished.connect(
+            lambda: self.params_changed.emit(self.get_params()))
+        g.addWidget(self._grip_list_edit, r, 1); r += 1
         # ── DECOUPLED-only damper rates ─────────────────────────────────
         # Only consumed when the topology is DECOUPLED.  Otherwise these
         # values are ignored.  Labels say "DECOUPLED" so the user knows
@@ -3049,9 +3235,10 @@ class DynamicsPanel(CollapsibleSection):
             ('roll',           'Roll Angle'),
             ('pitch',          'Pitch Angle'),
             ('travel',         'Suspension Travel'),
-            ('camber',         'Camber'),
+            ('camber',         'Camber to road'),
             ('lt',             'Load Transfer'),
             ('rc',             'Roll Centre Height'),
+            ('jacking',        'Jacking (body lift)'),
             ('utilization',    'Tire Utilization'),
             ('understeer',     'Understeer Gradient'),
             ('steer_correction', 'Steer Correction'),
@@ -3091,11 +3278,14 @@ class DynamicsPanel(CollapsibleSection):
         self.add_layout(corner_row)
 
         # ── Results table ────────────────────────────────────────────────
-        self._result_table = QTableWidget(7, 4)
+        self._result_table = QTableWidget(8, 4)
         self._result_table.setHorizontalHeaderLabels(['FL', 'FR', 'RL', 'RR'])
+        # 'Jacking (N)' = vertical force the links put on the body from that
+        # tyre's side force (+ = lifts the body), RCVD §17.3 Fig. 17.8(b).
         self._result_table.setVerticalHeaderLabels([
-            'Fz (N)', 'Travel (mm)', 'Camber (deg)',
+            'Fz (N)', 'Travel (mm)', 'Camber to road (deg)',
             'Utilization', 'LT Geo (N)', 'LT Elastic (N)', 'LT Unsprung (N)',
+            'Jacking (N)',
         ])
         self._result_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch)
@@ -3103,7 +3293,7 @@ class DynamicsPanel(CollapsibleSection):
             QHeaderView.ResizeMode.Fixed)
         self._result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._result_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
-        self._result_table.setMaximumHeight(210)
+        self._result_table.setMaximumHeight(236)
         self.add_widget(self._result_table)
 
         # ── Summary line ─────────────────────────────────────────────────
@@ -3143,7 +3333,8 @@ class DynamicsPanel(CollapsibleSection):
                                     MR: float, G_Npmm2: float,
                                     E_Npmm2: float,
                                     blade_w_mm: float = 0.0,
-                                    blade_t_mm: float = 0.0) -> float:
+                                    blade_t_mm: float = 0.0,
+                                    arm_compliance_mm_per_N: float = 0.0) -> float:
         """Wheel-rate contribution of one anti-roll bar (N/m).
 
         Hollow-shaft form — the area moments scale with (OD⁴−ID⁴) so a
@@ -3185,12 +3376,20 @@ class DynamicsPanel(CollapsibleSection):
         # quietly softened every bar — 16% at a 130 mm lever, 38% at 197 mm —
         # i.e. it treated an arm we do not analyse as a designed spring.
         bw = max(0.0, float(blade_w_mm)); bt = max(0.0, float(blade_t_mm))
+        arm_c = max(0.0, float(arm_compliance_mm_per_N))
         K_t = G * J / (A * A * L)          # N/mm at arm tip (torsion bar)
         if bw > 0.0 and bt > 0.0:
             I_arm = bw * bt ** 3 / 12.0    # mm⁴ (weak axis)
             K_a = 3.0 * E * I_arm / (A * A * A)  # N/mm at arm tip (blade bending)
             K_arb = (K_t * K_a) / (K_t + K_a) if K_t > 0.0 and K_a > 0.0 \
                 else max(K_t, K_a)
+        elif arm_c > 0.0:
+            # A routed rigid-section arm is not an infinitely stiff lever.
+            # Its unit-load compliance is derived from the actual shared
+            # polyline and section in MainWindow, then combined in series
+            # with bar torsion.  Straight legacy arms pass zero here.
+            K_a = 1.0 / arm_c
+            K_arb = (K_t * K_a) / (K_t + K_a)
         else:
             K_arb = K_t                    # rigid lever: tube carries it all
         K_w_Npmm = K_arb / (MR * MR)       # N/mm at wheel
@@ -3295,6 +3494,10 @@ class DynamicsPanel(CollapsibleSection):
                                        ('arm_length_mm', 'half_length_mm', 'mr')}
         self._derived_arb_geom['R'] = {k: float(rear[k]) for k in
                                        ('arm_length_mm', 'half_length_mm', 'mr')}
+        self._derived_arb_geom['F']['arm_compliance_mm_per_N'] = float(
+            front.get('arm_compliance_mm_per_N', 0.0))
+        self._derived_arb_geom['R']['arm_compliance_mm_per_N'] = float(
+            rear.get('arm_compliance_mm_per_N', 0.0))
         self._refresh_arb_geom_label()
 
     def _refresh_arb_geom_label(self) -> None:
@@ -3338,7 +3541,8 @@ class DynamicsPanel(CollapsibleSection):
             MR=f_geom['mr'],
             G_Npmm2=G, E_Npmm2=E,
             blade_w_mm=self._arb_blade_w_f.value(),
-            blade_t_mm=self._arb_blade_t_f.value())
+            blade_t_mm=self._arb_blade_t_f.value(),
+            arm_compliance_mm_per_N=f_geom.get('arm_compliance_mm_per_N', 0.0))
         arb_r_Npm = self._compute_arb_wheel_rate_Npm(
             OD_mm=self._arb_OD_r.value(),
             ID_mm=self._arb_ID_r.value(),
@@ -3347,7 +3551,8 @@ class DynamicsPanel(CollapsibleSection):
             MR=r_geom['mr'],
             G_Npmm2=G, E_Npmm2=E,
             blade_w_mm=self._arb_blade_w_r.value(),
-            blade_t_mm=self._arb_blade_t_r.value())
+            blade_t_mm=self._arb_blade_t_r.value(),
+            arm_compliance_mm_per_N=r_geom.get('arm_compliance_mm_per_N', 0.0))
         params = {
             # total_mass_kg is now DERIVED from the three below — no longer
             # an independent input.  VehicleParams computes it as a @property.
@@ -3484,7 +3689,30 @@ class DynamicsPanel(CollapsibleSection):
             'tire_path':           str(self._tire_path),
             'tire_pressure_psi':   float(self._tire_psi.value()),
             'grip_multiplier':     float(self._grip_mult.value()),
+            'grip_scale_list':     self.grip_scale_list(),
         }
+
+    def grip_scale_list(self) -> list:
+        """Grip scales to show limits at: the user's list + the project
+        scale, sorted, de-duplicated, each clipped to the 0.10-1.50 range the
+        grip box allows.  Unparseable entries are ignored."""
+        vals = [float(self._grip_mult.value())]
+        txt = self._grip_list_edit.text() if hasattr(self, '_grip_list_edit') else ''
+        for tok in txt.replace(';', ',').split(','):
+            tok = tok.strip().rstrip('x×')
+            if not tok:
+                continue
+            try:
+                v = float(tok)
+            except ValueError:
+                continue
+            if v == v:
+                vals.append(min(max(v, 0.10), 1.50))
+        out = []
+        for v in sorted(vals):
+            if not out or abs(v - out[-1]) > 1e-6:
+                out.append(round(v, 4))
+        return out
 
     def set_state(self, d: dict) -> None:
         """Restore every input from a dict produced by :meth:`get_state`.
@@ -3537,6 +3765,9 @@ class DynamicsPanel(CollapsibleSection):
             _set_spin(self._spring_r,        'spring_rear_lbfin')
             _set_spin(self._tire_rate,       'tire_rate_lbfin')
             _set_spin(self._grip_mult,       'grip_multiplier')
+            if isinstance(d.get('grip_scale_list'), (list, tuple)):
+                self._grip_list_edit.setText(', '.join(
+                    f'{float(x):.2f}' for x in d['grip_scale_list']))
             _set_spin(self._decoupled_heave_f, 'decoupled_heave_f_lbfin')
             _set_spin(self._decoupled_roll_f,  'decoupled_roll_f_lbfin')
             _set_spin(self._decoupled_heave_r, 'decoupled_heave_r_lbfin')
@@ -3799,10 +4030,14 @@ class DynamicsPanel(CollapsibleSection):
     def show_result(self, result):
         """Populate the table from a SteadyStateResult."""
         cols = ['FL', 'FR', 'RL', 'RR']
+        camber_ground = getattr(result, 'camber_ground', None) or {}
+        def road_camber_cell(c):
+            value = float(camber_ground.get(c, float('nan')))
+            return f'{value:.3f}' if np.isfinite(value) else '—'
         rows_data = [
             [f'{result.Fz.get(c, 0):.1f}' for c in cols],
             [f'{result.travel.get(c, 0):.2f}' for c in cols],
-            [f'{result.camber.get(c, 0):.3f}' for c in cols],
+            [road_camber_cell(c) for c in cols],
             [f'{result.utilization.get(c, 0):.2f}' for c in cols],
         ]
         rows_data.append([
@@ -3817,6 +4052,11 @@ class DynamicsPanel(CollapsibleSection):
             f'{result.unsprung_lt_front_N:.1f}', f'{result.unsprung_lt_front_N:.1f}',
             f'{result.unsprung_lt_rear_N:.1f}', f'{result.unsprung_lt_rear_N:.1f}',
         ])
+
+        _jc = getattr(result, 'jacking_corner_N', None) or {}
+        rows_data.append([
+            (f'{_jc[c]:+.1f}' if c in _jc and _jc[c] == _jc[c] else '—')
+            for c in cols])
 
         for r, row in enumerate(rows_data):
             for c, val in enumerate(row):
@@ -3860,11 +4100,23 @@ class DynamicsPanel(CollapsibleSection):
                     ack = math.degrees(L / R)
                     hw_needed = (ack + us_val) * sr
                     us_str += f'  |  HW: {hw_needed:.0f}° (Ack {ack*sr:.0f}°)'
+        # Jacking: the side forces' vertical push on the body through the
+        # links (+ = lifts), and the body rise it causes at each axle.
+        jack_str = ''
+        _jf = getattr(result, 'jacking_force_front_N', 0.0)
+        _jr = getattr(result, 'jacking_force_rear_N', 0.0)
+        if (_jf == _jf and _jr == _jr) and (abs(_jf) > 0.05 or abs(_jr) > 0.05):
+            jack_str = (f'\nJacking (body lift from side force): front {_jf:+.0f} N / '
+                        f'rear {_jr:+.0f} N  ->  body rises '
+                        f'{result.jacking_heave_front_mm:+.1f} mm front / '
+                        f'{result.jacking_heave_rear_mm:+.1f} mm rear')
+            if getattr(result, 'jacking_feedback_passes', 0) > 1:
+                jack_str += '  (fed back into the kinematics)'
         self._summary.setText(
             f'Roll: {result.roll_angle_deg:.3f} deg{pitch_str}  |  '
             f'LLTD: {lltd:.1f}% front{us_str}  |  '
             f'RC: {result.rc_height_front_m*1000:.5f}/{result.rc_height_rear_m*1000:.5f} mm  |  '
-            f'{result.iterations} iter')
+            f'{result.iterations} iter{jack_str}')
 
     def show_max_g(self, info: dict):
         """Display max acceleration info below the summary."""
@@ -3881,8 +4133,16 @@ class DynamicsPanel(CollapsibleSection):
             parts.append(f'mu: {info["mu_front"]:.2f}F / {info["mu_rear"]:.2f}R')
         if info.get('min_turn_radius_m', 0) > 0:
             parts.append(f'R_min: {info["min_turn_radius_m"]:.2f} m')
-        if parts:
-            self._summary.setText(self._summary.text() + '\n' + '  |  '.join(parts))
+        if info.get('mu_scale') is not None and parts:
+            parts.insert(0, f'at grip ×{float(info["mu_scale"]):.2f}')
+        text = '  |  '.join(parts)
+        rows = info.get('by_grip_scale') or []
+        if rows:
+            text += '\nLimits by grip scale:  ' + '   '.join(
+                f'×{r_["mu_scale"]:.2f}: traction {r_["traction_g"]:.2f} g, '
+                f'brake {r_["braking_g"]:.2f} g' for r_ in rows)
+        if text:
+            self._summary.setText(self._summary.text() + '\n' + text)
 
     def set_status(self, msg: str):
         self._status.setText(msg)
@@ -4304,6 +4564,8 @@ class DynamicsPanel(CollapsibleSection):
                 p['cg_to_front_axle_m'] = car.get('cg_y_mm', 1100) / 1000
                 if 'front_brake_bias_pct' in car:
                     p['front_brake_bias'] = car['front_brake_bias_pct'] / 100
+            if hasattr(mw, '_steer_into_dyn_params'):
+                p = mw._steer_into_dyn_params(p)     # THE project steer block
             veh = VehicleParams(**{k: v for k, v in p.items()
                                    if k in VehicleParams.__dataclass_fields__})
             self.update_constants(veh)
@@ -4608,8 +4870,9 @@ class LoadsPanel(CollapsibleSection):
         upr.addWidget(QLabel('Caliper angle:'), r, 2)
         self._cal_angle = _spin(0, 360, 45, '\u00b0', dec=0, step=15)
         self._cal_angle.setToolTip(
-            'Manual caliper clock (degrees from top of disc, CW from outboard '
-            'view) \u2014 used only when vertical mounts is unchecked')
+            'Manual caliper clock: degrees from the TOP of the disc toward the '
+            'REAR (0 = top, 90 = trailing edge, 270 = leading edge), mirrored '
+            'left/right \u2014 used only when vertical mounts is unchecked')
         upr.addWidget(self._cal_angle, r, 3)
 
         self.add_layout(upr)
@@ -4759,8 +5022,8 @@ class LoadsPanel(CollapsibleSection):
         rows = [
             ('header', 'TIRE CONTACT PATCH LOADS', None, None),
             ('Fz  ground reaction (up+)',          'Fz_N',       'N',  0),
-            ('Fy  lateral cornering force',        'Fy_N',       'N',  0),
-            ('Fx  longitudinal (fwd+)',            'Fx_N',       'N',  0),
+            ('Fy  lateral (+ = toward car left)',  'Fy_N',       'N',  0),
+            ('Fx  longitudinal (+ drive / - brake)', 'Fx_N',     'N',  0),
             ('', None, None, None),
 
             ('header', 'MEMBER AXIAL FORCES  (+ tension / - compression)', None, None),
@@ -4771,6 +5034,14 @@ class LoadsPanel(CollapsibleSection):
             ('Tie rod',        'tierod_N',    'N', 0),
             ('Pushrod',        'pushrod_N',   'N', 0),
             ('Spring (comp+)', 'spring_force_N', 'N', 0),
+            ('ARB drop link (tension+)', 'arb_link_N', 'N', 0),
+            ('', None, None, None),
+
+            ('header', 'PUSHROD-CARRYING ARM: LEG SHEAR at pickup (bending)', None, None),
+            ('UCA front leg shear', 'uca_front_shear_N', 'N', 0),
+            ('UCA rear leg shear',  'uca_rear_shear_N',  'N', 0),
+            ('LCA front leg shear', 'lca_front_shear_N', 'N', 0),
+            ('LCA rear leg shear',  'lca_rear_shear_N',  'N', 0),
             ('', None, None, None),
 
             ('header', 'BALL JOINT REACTIONS  (V=up+, H=fwd+)', None, None),
@@ -4802,6 +5073,15 @@ class LoadsPanel(CollapsibleSection):
             ('Brake torque',                        'brake_torque_Nm',    'Nm',  1),
             ('Caliper clamp (both pads)',            'caliper_clamp_N',    'N',   0),
             ('Line pressure',                       'line_pressure_MPa',  'MPa', 2),
+            ('', None, None, None),
+
+            ('header', 'SOLVE VALIDITY  (nan = not a valid solution)', None, None),
+            ('Valid (1 = yes)',                     'valid',              '-',   0),
+            ('Condition number (limit 1000)',       'cond_number',        '-',   1),
+            # sub-body statuses: an unusable bearing / caliper geometry reads
+            # nan in its rows above AND 0 here (never a plausible zero load)
+            ('Bearing model valid (1 = yes)',       'bearing_valid',      '-',   0),
+            ('Caliper model valid (1 = yes)',       'caliper_valid',      '-',   0),
         ]
 
         # ── popup ────────────────────────────────────────────────────
@@ -4889,6 +5169,23 @@ class LoadsPanel(CollapsibleSection):
         tbl.setVerticalHeaderLabels(vlabels)
         tbl.resizeRowsToContents()
         lay.addWidget(tbl)
+
+        # Say WHY any corner's sub-body is not a usable number (nan rows above).
+        _why = []
+        for corner in ('FL', 'FR', 'RL', 'RR'):
+            cl = loads.get(corner)
+            if cl is None:
+                _why.append(f'{corner}: no result'); continue
+            for flag, reason, nm in (('valid', 'invalid_reason', 'members'),
+                                     ('bearing_valid', 'bearing_invalid_reason', 'bearings'),
+                                     ('caliper_valid', 'caliper_invalid_reason', 'caliper')):
+                if not getattr(cl, flag, True):
+                    _why.append(f'{corner} {nm}: {getattr(cl, reason, "") or "invalid"}')
+        if _why:
+            _wl = QLabel('NOT VALID — ' + '  |  '.join(_why))
+            _wl.setWordWrap(True)
+            _wl.setStyleSheet('color: #E23B48; font-size: 12px; padding: 4px;')
+            lay.addWidget(_wl)
 
         # ── build plain-text for copy / export ───────────────────────
         def _build_text():
@@ -5594,7 +5891,6 @@ class DynamicsOptPanel(CollapsibleSection):
                 break
 
         baseline_val = baseline.get(target_key, 0)
-        predicted_val = baseline_val + target_delta
 
         self._sens_table.setRowCount(len(recs))
         for i, rec in enumerate(recs):
@@ -5614,8 +5910,18 @@ class DynamicsOptPanel(CollapsibleSection):
             else:
                 change_str = f'{change:+.4f}'
                 change_str += f'\n  {rec["current"]:.3f} -> {new_val:.3f}'
-            # Show predicted target metric value
-            change_str += f'\n{target_label}: {baseline_val:.2f} -> {predicted_val:.2f}{target_unit}'
+            # Predicted target value from THIS row's actual (possibly clamped)
+            # change -- a linear estimate, never the requested target when
+            # the knob hit its physical bound (2026-09-22 audit).
+            predicted_val = baseline_val + rec.get(
+                'predicted_delta', target_delta)
+            change_str += (f'\n{target_label}: {baseline_val:.2f} -> '
+                           f'{predicted_val:.2f}{target_unit} (linear est.)')
+            if rec.get('clamped'):
+                lo_b, hi_b = rec.get('bounds') or (float('nan'), float('nan'))
+                change_str += (f'\n[LIMITED to {lo_b:g}-{hi_b:g} {unit}: '
+                               f'reaches {rec["predicted_delta"]:+.2f} of '
+                               f'{target_delta:+.2f}{target_unit}]')
 
             # Flag infeasible values
             feasible = True
@@ -6817,7 +7123,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         include aero downforce (main_window resolves the actual package
         from its one aero path, _get_aero_Fz_per_g)."""
         return dict(radius_m=float(self._ack_radius.value()),
-                    grip_multiplier=float(self._ack_grip.value()),
+                    grip_multiplier=_project_grip_scale(self, self._ack_grip),
                     aero=bool(self._ack_aero.isChecked()))
 
     def ackermann_pair_inputs(self):
@@ -7083,7 +7389,9 @@ class DirectEditPanel(CollapsibleSection):
             ('Link (L)', 'link', 'Movement projected onto the LINK this point '
                                  'belongs to (slides along the member — length '
                                  'changes, direction preserved)'),
-            ('Plane (P)', 'plane', 'Movement projected onto the rocker / '
+            ('Plane (P)', 'plane', 'Movement projected onto the point\'s OWN plane: '
+                                   'control-arm plane for arm / tie-rod points, '
+                                   'otherwise the rocker / '
                                    'bellcrank plane (keeps the mechanism planar)'),
         ):
             b = QPushButton(label)

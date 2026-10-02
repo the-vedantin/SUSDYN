@@ -64,6 +64,61 @@ def coplanar_oop_mm(hp):
 win = MainWindow()
 win._check_damper_bounds_after_edit = lambda *a, **k: ''   # bypass poka-yoke so it can't mask dead curves
 fails, known = 0, 0
+# Regression: packaging must catch the plate penetration the renderer highlights.
+try:
+    from test_rule04_strict import Rule04PhysicalPlateTest
+    Rule04PhysicalPlateTest().test_packaging_sweep_reports_real_plate_penetration()
+    Rule04PhysicalPlateTest().test_packaging_sweep_requires_plate_clearance_margin()
+    print('packaging plate sweep: pass')
+except Exception as exc:
+    print(f'packaging plate sweep: UNEXPECTED FAIL {exc}')
+    fails += 1
+# Physical double-shear plates must preserve their geometry and catch body hits.
+try:
+    import test_double_shear_rocker as _double_shear_tests
+    _double_shear_tests.test_double_shear_plates_share_declared_gap_and_arm_widths()
+    _double_shear_tests.test_center_plane_link_has_real_clearance_and_offset_tube_hits_plate()
+    _double_shear_tests.test_joint_spheres_and_torsion_are_checked_without_attachment_skip()
+    _double_shear_tests.test_full_coilover_capsule_clears_70mm_gap_and_is_not_skipped()
+    _double_shear_tests.test_local_clevis_is_connected_and_clears_centered_pushrod_joint()
+    _double_shear_tests.test_local_clevis_does_not_hide_non_pushrod_clashes()
+    _double_shear_tests.test_local_clevis_invalid_geometry_fails_closed()
+    _double_shear_tests.test_rocker_style_resolves_per_axle_with_global_fallback()
+    _double_shear_tests.test_fixed_push_arm_scallop_clears_nearby_arb_eye_without_thinning_whole_arm()
+    _double_shear_tests.test_declared_rectangular_arb_blade_uses_circumscribed_shared_envelope()
+    print('double-shear physical plate geometry: pass')
+except Exception as exc:
+    print(f'double-shear physical plate geometry: UNEXPECTED FAIL {exc}')
+    fails += 1
+# A failed ARB closure must never become a drawable stretched drop link.
+_arb_test_hp = {'arb_pivot': np.zeros(3),
+                'arb_arm_end': np.array([0., .04, 0.]),
+                'arb_drop_top': np.array([0., .04, .05])}
+_arb_rejected = False
+try:
+    MainWindow._solve_arb_bellcrank(np.array([0., .20, 0.]), _arb_test_hp)
+except ValueError:
+    _arb_rejected = True
+_a, _end, _res = MainWindow._solve_arb_bellcrank(_arb_test_hp['arb_drop_top'], _arb_test_hp)
+_arb_valid = abs(_res) < 1e-7 and np.allclose(_end, _arb_test_hp['arb_arm_end'])
+print(f'ARB closure      : impossible rejected={_arb_rejected}, design held={_arb_valid}')
+if not (_arb_rejected and _arb_valid):
+    fails += 1
+from vahan.interference import rim_barrel_gap as _TestBarrelGap
+_barrel_cases = [
+    ([0., .05, 0.], [0., .05, 0.], .01, .06),
+    ([0., .12, 0.], [0., .12, 0.], .01, -.01),
+    ([.084, .123, 0.], [.084, .123, 0.], .006, -.001),
+    ([0., .05, 0.], [0., .15, 0.], .005, -.005),
+    ([0., .15, 0.], [0., .15, 0.], .005, .025),
+]
+_barrel_ok = all(abs(_TestBarrelGap({'a': a, 'b': b, 'r': r},
+    np.zeros(3), np.array([1., 0., 0.]), .12, .08) - expected) < 1e-8
+    for a, b, r, expected in _barrel_cases)
+print(f'rim barrel math  : inside, wall, lip, crossing, outside '
+      f'{"pass" if _barrel_ok else "UNEXPECTED FAIL"}')
+if not _barrel_ok:
+    fails += 1
 print(f'{"topology":14s} {"coplanar":>10s}  {"MR-connected":>13s}   result')
 print('-' * 64)
 for name, (a, spring_key, want_coplanar, known_fail) in CASES.items():
@@ -354,8 +409,172 @@ def _seg_gap(a1, a2, b1, b2, ra, rb):
     return float(np.linalg.norm((a1 + s * d1) - (b1 + t * d2)) - (ra + rb))
 
 _cfgs = _glob.glob('configs/2027_v*.vahan')
-_design = max(_cfgs, key=lambda p: int((_re.search(r'2027_v(\d+)', p) or [0, -1]).__getitem__(1))
-              if _re.search(r'2027_v(\d+)', p) else -1) if _cfgs else None
+def _highest_config(paths):
+    return max(paths, key=lambda p: int(_re.search(r'2027_v(\d+)', p).group(1)) if _re.search(r'2027_v(\d+)', p) else -1) if paths else None
+# VAHAN_DESIGN=<path> pins the design config the net judges (default: the highest configs/2027_v<N>)
+_design = os.environ.get('VAHAN_DESIGN') or _highest_config(_cfgs)
+# ── RULE 20: rear toe-link inner == aft LCA inboard pickup (user hard rule 2026-09-21) ──
+try:
+    import json as _j20
+    _r20 = _j20.load(open(_design, encoding='utf-8'))['rear_hp']
+    _d20 = float(np.linalg.norm(np.array(_r20['tie_rod_inner']) - np.array(_r20['lca_rear']))) * 1000.
+    print(f'rule 20 rear toe inner on LCA rear pickup: {_d20:.3f} mm apart   {"pass" if _d20 < 1e-3 else "UNEXPECTED FAIL (must be the SAME point)"}')
+    if _d20 >= 1e-3:
+        fails += 1
+except Exception as _e:
+    print(f'rule 20 rear toe inner on LCA rear pickup: UNEXPECTED FAIL {_e}'); fails += 1
+# ── RULE 21: the pushrod's arm mount leaves the actuation plane through travel (user check 2026-09-22) ──
+# REPORTED, not gated: the DIRECT effect is the pushrod leaning out of the rocker plane (rod-end
+# misalignment, side load on the rocker = sin(lean) x pushrod force).  No user threshold yet.
+try:
+    from vahan import packaging as _pk21
+    _w21 = MainWindow(); _w21._load_project_from_path(_design); _w21._rebuild_solvers(0.)
+    _lo21, _hi21 = _w21._spring_travel_range(_w21._solvers['FL'], 'FL')
+    _txt21 = []
+    for _ax21, _lb21 in (('front', 'FL'), ('rear', 'RL')):
+        _hp21 = _pk21.get_bundle(_w21, _ax21)['hp']
+        _ra21 = np.asarray(_hp21['rocker_axis_pt']) - np.asarray(_hp21['rocker_pivot']); _ra21 /= np.linalg.norm(_ra21)
+        _s21 = _w21._solvers[_lb21]; _lean21 = []
+        for _t in np.linspace(_lo21, _hi21, 9):
+            _st21 = _s21.solve(float(_t))
+            _u21 = np.asarray(_st21.pushrod_inner) - np.asarray(_st21.pushrod_outer); _u21 /= np.linalg.norm(_u21)
+            _lean21.append(float(np.degrees(np.arcsin(abs(_u21 @ _ra21)))))
+        _txt21.append(f'{_lb21} pushrod lean out of the rocker plane max {max(_lean21):.1f} deg '
+                      f'(side load {np.sin(np.radians(max(_lean21))) * 1000:.0f} N per kN of pushrod force)')
+    print(f'rule 21 pushrod lean  : {"; ".join(_txt21)} over {_lo21*1000:+.0f}..{_hi21*1000:+.0f} mm   reported')
+except Exception as _e:
+    print(f'rule 21 pushrod lean  : UNEXPECTED FAIL {_e}'); fails += 1
+# ── REAL WHEEL PROFILE (2026-09-21): members vs the manufacturer's STEP-derived barrel + centre disc ──
+# car['wheel_profile'] -> JSON from vahan.wheel_profile.barrel_profile_from_step (Keizer, 6 in backspacing).
+# Every member tube and joint body at FL/RL, droop/static/bump (+ front steer lock) must clear the
+# real inner surface by 3 mm.  Alternatives listed in car['wheel_profile_alternatives'] are REPORTED only.
+try:
+    import json as _jwp
+    _wpw = MainWindow(); _wpw._load_project_from_path(_design); _wpw._rebuild_solvers(0.)
+    _wp_main = _wpw._car.get('wheel_profile')
+    if not _wp_main:
+        print('real wheel profile : no car["wheel_profile"] set — assumed-cylinder rim gates only   pass (not gated)')
+    else:
+        from vahan import wheel_profile as _WP
+        from vahan.interference import corner_members as _cm_wp
+        _lock = _wpw._steer['total_rack_travel_mm'] / _wpw._steer['rack_travel_per_rev_mm'] * 180.0
+        def _wp_worst(prof):
+            worst = (1e9, '', '', 0.0, 0.0)
+            for _hw in (-_lock, 0.0, _lock):
+                _wpw._rebuild_solvers(float(_hw))
+                for _lbl in ('FL', 'RL'):
+                    if _lbl == 'RL' and _hw != 0.0:
+                        continue
+                    for _t in (_wpw._motion_panel.min_val / 1000., 0.0, _wpw._motion_panel.max_val / 1000.):
+                        _st = _wpw._solvers[_lbl].solve(float(_t))
+                        _ax = np.asarray(_st.spin_axis, float); _ax = _ax / np.linalg.norm(_ax)
+                        if _ax[0] > 0: _ax = -_ax
+                        _mem = _cm_wp(_st, _wpw._car)
+                        for _jk in ('uca_outer', 'lca_outer', 'tr_outer'):
+                            _p = np.asarray(getattr(_st, _jk), float); _mem.append({'name': _jk + ' joint body', 'a': _p, 'b': _p, 'r': 0.0127})
+                        for _m in _mem:
+                            _g = _WP.member_clearance(_m, np.asarray(_st.wheel_center, float), _ax, prof)
+                            if _g['gap_mm'] < worst[0]:
+                                worst = (_g['gap_mm'], _lbl, _m['name'], _t * 1000., _hw)
+            _wpw._rebuild_solvers(0.)
+            return worst
+        _prof = _WP.load_profile(_wp_main); _wst = _wp_worst(_prof)
+        _wp_ok = _wst[0] >= 3.0
+        print(f'real wheel profile : {os.path.basename(_wp_main)} ({_prof["width_in"]:.1f} in, backspacing {_prof["backspacing_mm"]/25.4:.2f} in read from the STEP) — '
+              f'tightest {_wst[1]} {_wst[2]} {_wst[0]:.1f} mm at {_wst[3]:+.0f} mm travel, {_wst[4]:.0f} deg handwheel (need 3)   {"pass" if _wp_ok else "UNEXPECTED FAIL"}')
+        if not _wp_ok:
+            fails += 1
+        for _alt in _wpw._car.get('wheel_profile_alternatives', []) or []:
+            try:
+                _pa = _WP.load_profile(_alt); _wa = _wp_worst(_pa)
+                print(f'   alternative wheel {os.path.basename(_alt)} ({_pa["width_in"]:.1f} in): tightest {_wa[1]} {_wa[2]} {_wa[0]:.1f} mm at {_wa[3]:+.0f} mm travel   (reported, not gated)')
+            except Exception as _e:
+                print(f'   alternative wheel {_alt}: could not evaluate ({_e})')
+except Exception as _e:
+    print(f'real wheel profile : UNEXPECTED FAIL {_e}'); fails += 1
+# ── 3-D VIEW = THE MODEL (2026-09-23): real rim + ground that follows the tyres ──
+# (1) The rim drawn at every corner is the manufacturer profile (car['wheel_profile']) revolved about
+#     the SOLVED spin axis: every drawn barrel vertex must sit on the surface the "real wheel profile"
+#     gate measures against (vahan.wheel_profile.barrel_radius_at), at the corner's solved wheel centre.
+# (2) The ground plane is drawn at the mean contact patch of the four solved corners at the CURRENT
+#     travel (chassis-fixed view: in bump the ground rises toward the chassis, e.g. the sprocket).
+try:
+    from vahan import wheel_profile as _WPv
+    from gui.view3d import RIM_N as _RIM_N
+    _v3 = MainWindow(); _v3._load_project_from_path(_design); _v3._rebuild_solvers(0.)
+    _v3mp = _v3._motion_panel
+    _v3mp._btn_grp.buttons()[0].setChecked(True)          # heave
+    _v3mp.go_to_static(); _v3._update_3d()
+    _v3_prof = _v3.view3d._wheel_profile
+    _r_t = float(_v3._car['tire_outer_dia_mm']) / 2000.0
+    if _v3_prof is None:
+        print('3D view real rim   : no car["wheel_profile"] set — plain tyre cylinder drawn   pass (not gated)')
+    else:
+        _n_st = len(_v3_prof['d_mm']); _rb = np.asarray(_v3_prof['r_barrel_mm'], float)
+        _worst = 0.0; _n_chk = 0; _cam_max = 0.0
+        # pose = the GUI's own per-corner draw (solved state + the alignment panel's static camber /
+        # toe rotation of the spin axis); the rim must sit on THAT axis at THAT wheel centre.
+        _cd3, _ = _v3._assemble_corners_draw({_l: 0.0 for _l in ('FL', 'FR', 'RL', 'RR')}, 0.0)
+        for _ci, _c3 in enumerate(_cd3):
+            _lbl = _c3['label']
+            _wc = np.asarray(_c3['pts']['wheel_center'], float)
+            _ax = np.asarray(_c3['spin_axis'], float); _ax = _ax / np.linalg.norm(_ax)
+            _st = _v3._solvers[_lbl].solve(0.0)
+            if not np.allclose(_wc, np.asarray(_st.wheel_center, float), atol=1e-9):
+                raise RuntimeError(f'{_lbl}: drawn wheel centre != solver wheel centre')
+            _cam_max = max(_cam_max, float(np.degrees(np.arccos(min(1.0, abs(_ax @ np.asarray(_st.spin_axis, float)
+                                                                                / np.linalg.norm(_st.spin_axis)))))))
+            if abs((_wc + _ax * 0.01)[0]) > abs(_wc[0]):
+                _ax = -_ax                                      # inboard, as the gate uses
+            _mv = np.asarray(_v3.view3d._rim_meshes[_ci]._meshdata.get_vertices(), float)
+            _p = _mv[:_n_st * _RIM_N] - _wc
+            _d = _p @ _ax; _rad = np.linalg.norm(_p - np.outer(_d, _ax), axis=1)
+            _ok = np.isfinite(_rb[np.arange(_n_st * _RIM_N) // _RIM_N])   # open-barrel stations only
+            _exp = _WPv.barrel_radius_at(_v3_prof, _d[_ok] * 1000.0)
+            _err = np.abs(_rad[_ok] * 1000.0 - _exp)
+            _worst = max(_worst, float(np.nanmax(_err))); _n_chk += int(_ok.sum())
+        _rim_ok = (_n_chk > 0) and (_worst < 0.05)
+        print(f'3D view real rim   : {os.path.basename(str(_v3._car.get("wheel_profile")))} — {_n_chk} drawn barrel vertices '
+              f'over 4 corners vs the wheel-profile gate surface at the drawn wheel centres/spin axes (= solver '
+              f'+ {_cam_max:.2f} deg static alignment), max deviation {_worst:.3f} mm (need <0.05)   '
+              f'{"pass" if _rim_ok else "UNEXPECTED FAIL"}')
+        if not _rim_ok:
+            fails += 1
+    _z0 = _v3.view3d.ground_height_m()
+    _v3mp._slider.setValue(_v3mp._slider_value_for(0.5 * _v3mp.max_val)); app.processEvents()
+    _v3._update_3d()
+    _tg = float(_v3mp.position) / 1000.0
+    _exp_z = float(np.mean([_v3._solvers[_l].solve(_tg).wheel_center[2] - _r_t for _l in ('FL', 'FR', 'RL', 'RR')]))
+    _got_z = _v3.view3d.ground_height_m()
+    _grd_ok = abs(_got_z - _exp_z) < 1e-6 and abs(_tg) > 1e-3 and abs((_got_z - _z0) - _tg) < 1e-3
+    print(f'3D view ground     : heave {_tg*1000:+.1f} mm -> ground drawn at {_got_z*1000:+.2f} mm = mean contact patch '
+          f'{_exp_z*1000:+.2f} mm (static {_z0*1000:+.2f} mm; rose by {(_got_z-_z0)*1000:.1f} mm)   '
+          f'{"pass" if _grd_ok else "UNEXPECTED FAIL"}')
+    if not _grd_ok:
+        fails += 1
+    _v3mp.go_to_static()
+except Exception as _e:
+    print(f'3D view rim/ground : UNEXPECTED FAIL {_e}'); fails += 1
+# ── STALE BACKGROUND SWEEP (2026-09-21) ────────────────────────────────────
+# A hardpoint-edit sweep worker started DURING project load landed after the
+# synchronous load sweep and drew a 1.48 deg front toe swing on v141 that the
+# geometry does not have.  Gate: after the load and the queued events settle,
+# the GUI sweep results must equal a fresh synchronous sweep.
+try:
+    import time as _time
+    _sw_win = MainWindow(); _sw_win._load_project_from_path(_design)
+    for _ in range(40):
+        app.processEvents(); _time.sleep(0.05)
+    _t_evt = np.asarray(_sw_win._sweep_results['FL']['toe'], float)
+    _sw_win._run_sweep()
+    _t_sync = np.asarray(_sw_win._sweep_results['FL']['toe'], float)
+    _sw_ok = _t_evt.shape == _t_sync.shape and np.allclose(np.nan_to_num(_t_evt), np.nan_to_num(_t_sync), atol=1e-9)
+    print(f'stale sweep guard: front toe swing after load events {np.nanmax(_t_evt)-np.nanmin(_t_evt):.3f} deg, '
+          f'sync sweep {np.nanmax(_t_sync)-np.nanmin(_t_sync):.3f} deg   {"pass" if _sw_ok else "UNEXPECTED FAIL (a stale background sweep overwrote the load sweep)"}')
+    if not _sw_ok:
+        fails += 1
+except Exception as _e:
+    print(f'stale sweep guard: UNEXPECTED FAIL {_e}'); fails += 1
 if _design:
     wD = MainWindow(); wD._load_project_from_path(_design); wD._rebuild_solvers(0.)
     # Rear half-shaft segments (mm) so the gate catches the pushrod crossing the
@@ -378,6 +597,23 @@ if _design:
     # clash or bump-steer failure is UNEXPECTED again and fails the net.
     _KNOWN = ()
     gfail = []
+    from vahan.packaging import (_axle_geometry_laws as _triad_geometry,
+                                 arb_drop_link_plate_metrics as _rule04_metrics)
+    for _axle in ('front', 'rear'):
+        _tg = _triad_geometry(wD, _axle)
+        for _name in ('triad_bar_blade_deg', 'triad_blade_drop_deg', 'triad_bar_drop_deg'):
+            if not np.isfinite(_tg[_name]) or abs(_tg[_name] - 90.0) > 1.0:
+                gfail.append(f'{_axle} {_name} {_tg[_name]:.3f} deg (require 90 +/-1)')
+    _rack_width = 2000. * abs(float(wD._front_hp['tie_rod_inner'][0]))
+    if abs(_rack_width - float(wD._car['rack_length_mm'])) > 0.1:
+        gfail.append(f'rack width mismatch: hardpoints {_rack_width:.2f} mm '
+                     f"versus car setting {wD._car['rack_length_mm']:.2f} mm")
+    _allowance_keys = ('rim_joint_clearance_mm', 'rim_housing_allowance_mm',
+                      'rim_barrel_width_mm', 'front_bump_steer_limit_deg')
+    _allowances = {k: wD._car[k] for k in _allowance_keys if k in wD._car}
+    wD._on_car(wD._car_panel.get_params())
+    if any(wD._car.get(k) != v for k, v in _allowances.items()):
+        gfail.append('car panel discarded saved packaging allowances')
     # ALL FOUR corners.  This loop was ('RL','RR') only, so the FRONT corner was
     # structurally invisible to every check inside it — coplanarity, the ARB
     # drop-link-in-plane HARD requirement, pushrod-over-LCA, damper cant and the
@@ -390,22 +626,9 @@ if _design:
         _arb0 = wD._front_arb if lbl[0] == 'F' else wD._rear_arb
         _sgn = -1.0 if lbl[1] == 'R' else 1.0
         arb = {k: np.array([_sgn * v[0], v[1], v[2]], float) for k, v in _arb0.items()}
-        # coplanarity of the WHOLE actuation chain across travel — INCLUDING
-        # pushrod_outer.  The bellcrank is a planar mechanism: the rod must lie IN
-        # the plate plane or it side-thrusts the pivot bearing (USER HARD
-        # REQUIREMENT).  Being ~1" above the LOWER-ARM plane (checked below) is a
-        # Z offset and says NOTHING about the rocker plane (a fore-aft slice) —
-        # v33 shipped a foot 22 mm out of the rocker plane while this check only
-        # looked at the plate points.  Never exclude the pushrod again.
-        cop = 0.0
-        for _t in (-0.025, 0.0, 0.025):
-            st = wD._solvers[lbl].solve(_t)
-            P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
-            pts = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
-                            P('rocker_spring_pt'), P('spring_chassis_pt'),
-                            np.asarray(arb['arb_drop_top'], float) * 1000.0])
-            c = pts.mean(0); _, _, vt = np.linalg.svd(pts - c)
-            cop = max(cop, float(np.abs((pts - c) @ vt[-1]).max()))
+        _axle_name = 'front' if lbl[0] == 'F' else 'rear'
+        _shared_laws = _triad_geometry(wD, _axle_name)
+        cop = _shared_laws['coplanar_mm']
         st = wD._solvers[lbl].solve(0.)
         P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
         po, lo = P('pushrod_outer'), P('lca_outer')
@@ -419,36 +642,70 @@ if _design:
         try:
             _cd, _ = wD._assemble_corners_draw({_l: 0.0 for _l in ('FL', 'FR', 'RL', 'RR')}, 0.0)
             _pts = [c for c in _cd if c['label'] == lbl][0]['pts']
-            _ae = np.asarray(_pts['arb_arm_end_world'], float) * 1000.0
-            _pl = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
-                            P('rocker_spring_pt'), P('spring_chassis_pt')])
-            _c0 = _pl.mean(0); _, _, _vt = np.linalg.svd(_pl - _c0)
-            _doff = float(abs((_ae - _c0) @ _vt[-1]))
-            # EXEMPT a BOTTOM / control-arm ARB (torsion bar mounted low on the
-            # chassis, >120 mm below the rocker) — the bar is chassis-fixed and
-            # the drop link is a two-force rod-end member, never in bending, so
-            # the bellcrank in-plane rule does not apply (v73 2026-style front).
-            _bar_below = float(P('rocker_pivot')[2]) - float(A('arb_pivot')[2])
-            _is_bottom = _bar_below > 120.0
-            if _doff > 3.0 and not _is_bottom:
-                gfail.append(f'{lbl} ARB drop link off the actuation plane at static ({_doff:.1f} mm)')
+            _ae = np.asarray(_pts['arb_arm_end_world'], float)
+            _metric_arb = dict(arb, arb_arm_end=_ae)
+            _metric_hp = {k: np.asarray(getattr(st, k), float) for k in
+                          ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')}
+            _r04 = _rule04_metrics(_metric_hp, _metric_arb, _sgn)
+            _doff = max(abs(_r04['drop_top_signed_mm']),
+                        abs(_r04['arm_end_signed_mm']))
+            # Only the saved topology can claim the control-arm exemption.
+            _is_bottom = bool(_shared_laws.get('arb_is_bottom', False))
+            _waived = bool(wD._car.get(('front' if lbl[0] == 'F' else 'rear') + '_arb_rule04_waiver'))
+            # ROCKER PLATE is a solid (the 6 mm prism the 3D view draws): the drop link
+            # must clear it by 3 mm at droop / static / bump beyond its own rod end
+            # (2026-09-14: the user saw v106's drop link through the bellcrank).
+            try:
+                from vahan.interference import (full_members as _fm_pl,
+                                                 rocker_plate_gaps as _rpg,
+                                                 arb_member_kwargs as _amk_pl,
+                                                 rocker_plate_physical_options_for as _rpo_pl)
+                _tlo, _thi = wD._spring_travel_range(wD._solvers[lbl], lbl); _tlo = min(_tlo, -0.025); _thi = max(_thi, 0.025)
+                _pl_worst = (float('inf'), '')
+                for _tp, _tn in ((_tlo, 'droop'), (0.0, 'static'), (_thi, 'bump')):
+                    _cdp, _ = wD._assemble_corners_draw({_l: float(_tp) for _l in ('FL', 'FR', 'RL', 'RR')}, 0.0, light=True)
+                    _pp = [c for c in _cdp if c['label'] == lbl][0]['pts']
+                    _ax = 'front' if lbl.startswith('F') else 'rear'
+                    _panel = wD._dynamics_panel
+                    _blade_w = float(getattr(_panel, '_arb_blade_w_f' if _ax == 'front' else '_arb_blade_w_r').value())
+                    _blade_t = float(getattr(_panel, '_arb_blade_t_f' if _ax == 'front' else '_arb_blade_t_r').value())
+                    _od = float(getattr(_panel, '_arb_OD_f' if _ax == 'front' else '_arb_OD_r').value())
+                    _arb_live = wD._front_arb if _ax == 'front' else wD._rear_arb
+                    _members = _fm_pl(_pp, wD._car,
+                                      arb_pivot=np.asarray(_arb_live['arb_pivot'], float),
+                                      arb_od_mm=_od,
+                                      **_amk_pl(wD._car, lbl, _blade_w, _blade_t))
+                    for _pn, _pg in _rpg(_pp, _members,
+                            half_t=float(wD._car.get('rocker_plate_thickness_mm', 6.0))/2000.,
+                            **_rpo_pl(wD._car, lbl)):
+                        if 'ARB drop link' in _pn and _pg * 1000.0 < _pl_worst[0]:
+                            _pl_worst = (_pg * 1000.0, _tn)
+                if np.isfinite(_pl_worst[0]) and _pl_worst[0] < 3.0 and not _is_bottom:
+                    gfail.append(f'{lbl} ARB drop link {_pl_worst[0]:.1f} mm from the rocker PLATE at {_pl_worst[1]} (need 3)')
+            except Exception as _epl:
+                gfail.append(f'{lbl} rocker-plate check did not run: {_epl}')
+            if (not np.isfinite(_doff) or _doff > 3.0) and not _is_bottom:
+                gfail.append(
+                    f'{lbl} ARB drop link off the physical rocker plate at static '
+                    f'(top {_r04["drop_top_signed_mm"]:+.1f} mm, arm '
+                    f'{_r04["arm_end_signed_mm"]:+.1f} mm, direction '
+                    f'{_r04["direction_deg"]:+.1f} deg)')
+                if _waived:
+                    print(f'{lbl} RULE 04 waiver metadata present; geometry remains NONCOMPLIANT')
         except Exception:
             pass
-        # "over the LCA" = the pushrod loads onto a PLATE welded on TOP of the lower
-        # arm: the 1" spherical rod-end (pushrod_outer is its centre) sits ~1" ABOVE
-        # the arm plane, clear of the arm's own thickness, never buried below it and
-        # never flung far off it (v28 slid it toward the tie-rod).  Signed perpendicular
-        # distance to the plane through the arm's three pickups, +normal oriented up.
-        _n = np.cross(lr - lf, lo - lf); _n = _n / (np.linalg.norm(_n) or 1.0)
+        # Rule 11 (user, 2026-09-22): BOTH pushrods pick up on the UPPER arm, on a plate
+        # over the arm near the ball joint: the rod-end centre sits ~1-1.25 in ABOVE the
+        # arm plane, never buried below it or flung far off it.  Signed perpendicular
+        # distance to the plane through the UPPER arm's three pickups, +normal up.
+        # (Until 2026-09-22 the rear was measured against the LOWER arm -> a false 156 mm.)
+        _uf, _ur, _uo = P('uca_front'), P('uca_rear'), P('uca_outer')
+        _n = np.cross(_ur - _uf, _uo - _uf); _n = _n / (np.linalg.norm(_n) or 1.0)
         if _n[2] < 0:
             _n = -_n
-        d_arm = float((po - lo) @ _n)          # signed mm; + = above the arm plane
-        # REAR ONLY: the rear pushrod picks up on the LOWER arm, the front one on
-        # the UPPER arm (front pushrod_outer z=322 vs uca_outer 308, lca_outer 141).
-        # Measuring the front rod against the LCA plane returns ~183 mm and means
-        # nothing — it is a different pickup, not a fault.
-        if lbl[0] == 'R' and (d_arm < -3.0 or d_arm > 35.0):
-            gfail.append(f'{lbl} pushrod perp-to-arm {d_arm:.0f} mm (want 0..35 above)')
+        d_arm = float((po - _uo) @ _n)          # signed mm; + = above the upper-arm plane
+        if d_arm < -3.0 or d_arm > 35.0:
+            gfail.append(f'{lbl} pushrod perp-to-upper-arm {d_arm:.0f} mm (want 0..35 above)')
         # REAR ONLY: the rear damper is meant to lie across the car, so fore-aft
         # cant is a defect there (v28 canted it 63 mm).  The FRONT damper runs
         # fore-aft by design, ~185 mm, which is not a fault.
@@ -456,6 +713,11 @@ if _design:
             gfail.append(f'{lbl} damper canted fore-aft {abs(rsp[1]-scp[1]):.0f} mm')
         if cop > 3.0:
             gfail.append(f'{lbl} rocker non-coplanar {cop:.1f} mm')
+        if (not np.isfinite(_shared_laws['rocker_axis_normal_error_deg'])
+                or _shared_laws['rocker_axis_normal_error_deg'] > 1e-4):
+            gfail.append(
+                f'{lbl} rocker axis {_shared_laws["rocker_axis_normal_error_deg"]:.6f} '
+                f'deg from physical plate normal')
         # realistic-radius clash sweep (mm radii: pushrod 5, arm 9, tierod 6, damper 11)
         # restricted to the pairs a bad ACTUATION edit newly breaks (v28 drove the
         # pushrod at the tie-rod and canted the damper into the arms).  Same-arm
@@ -626,6 +888,62 @@ if _design:
     except Exception as _e:
         gfail.append(f'full-member interference sweep did not run: {_e}')
 
+    # Steering endpoints alone missed the v84 ARB closure failure between
+    # straight-ahead and lock. Check intermediate steer/travel too, with the
+    # actual rack position and each rendered wheel's alignment-adjusted axis.
+    try:
+        from types import SimpleNamespace as _RimState
+        from vahan.kinematics import KinematicMetrics as _RimMetrics
+        _lock = wD._steer['total_rack_travel_mm'] / wD._steer['rack_travel_per_rev_mm'] * 180.0
+        _travel = np.unique(np.r_[np.linspace(wD._motion_panel.min_val / 1000.,
+                                              wD._motion_panel.max_val / 1000., 9), 0.])
+        _body_margin = float(wD._car.get('rim_joint_clearance_mm', 3.0))
+        _housing_allowance = float(wD._car.get('rim_housing_allowance_mm', 0.0))
+        if not np.isfinite(_housing_allowance) or not 0 <= _housing_allowance <= _body_margin:
+            raise ValueError('upright housing allowance exceeds reserved rim clearance')
+        _barrel_hits = {}
+        _joint_diameter = (float(wD._car['tire_rim_dia_mm']) - 2 * (12.7 + _body_margin)) / 1000.
+        for _hw in np.linspace(-_lock, _lock, 7):
+            wD._rebuild_solvers(float(_hw))
+            for _station, _hits in _PKG._clash_sweep(wD, _travel).items():
+                for _hit in _hits:
+                    if _hit['b'] == 'rim barrel + 3 mm clearance':
+                        _key = (_hit['corner'], _hit['a'])
+                        _gap = _hit['surface_gap_mm']
+                        if _key not in _barrel_hits or _gap < _barrel_hits[_key][0]:
+                            _barrel_hits[_key] = (_gap, _hw, float(_station.split()[0]))
+                        continue
+                    if _hit['gap_mm'] < 0:
+                        gfail.append(f"{_hit['corner']} steered CLASH {_hit['a']}/{_hit['b']} "
+                                     f"{_hit['gap_mm']} mm at {_hw:.1f} deg, {_station}")
+            for _t in _travel:
+                _draw, _ = wD._assemble_corners_draw(
+                    {l: float(_t) for l in ('FL', 'FR', 'RL', 'RR')},
+                    wD._solver_rack_travel_m, light=True)
+                if len(_draw) != 4:
+                    raise ValueError('rim check requires all four corners')
+                for _corner in _draw:
+                    _p = _corner['pts']
+                    _raw = wD._solvers[_corner['label']].solve(float(_t))
+                    if not np.allclose(_p['tie_rod_inner'], _raw.tr_inner, atol=1e-10, rtol=0):
+                        raise ValueError(f"{_corner['label']} rendered rack point differs from solved rack")
+                    _rim_state = _RimState(wheel_center=_p['wheel_center'],
+                        spin_axis=_corner['spin_axis'], uca_outer=_p['uca_outer'],
+                        lca_outer=_p['lca_outer'], tr_outer=_p['tie_rod_outer'])
+                    _fit = _RimMetrics(_rim_state).rim_fit(_joint_diameter)
+                    if len(_fit['radii_m']) != 3 or not all(np.isfinite(v) for v in _fit['radii_m'].values()):
+                        raise ValueError('missing or non-finite upright joint radius')
+                    if not _fit['fits']:
+                        gfail.append(f"{_corner['label']} rim joint body misses {_body_margin:.1f} mm "
+                                     f"clearance at {_hw:.1f} deg, {_t*1000:.1f} mm")
+        for (_label, _name), (_gap, _hw, _tmm) in sorted(_barrel_hits.items()):
+            gfail.append(f'{_label} RIM BARREL {_name}: {_gap:.2f} mm gap < 3 mm '
+                         f'at {_hw:.1f} deg handwheel, {_tmm:.1f} mm travel')
+    except Exception as _e:
+        gfail.append(f'steered packaging/ARB closure gate: {_e}')
+    finally:
+        wD._rebuild_solvers(0.)
+
     # ── RIM FIT, ALL FOUR CORNERS, BODIES + TUBES (Rule 16) ────────────────
     # KinematicMetrics.rim_fit() checks joint CENTRES only and only where it is
     # called (front).  It said "fits" at the real 230 mm rim while the front
@@ -670,33 +988,123 @@ if _design:
         gfail.append(f'rim-fit gate did not run: {_e}')
 
     # Toe curve vs travel.  FRONT must stay NULL (<0.15 deg over +-25 mm) — no
-    # deliberate front toe gain.  REAR carries a DELIBERATE toe-OUT gain for
-    # corner rotation (2027 design: toe-link inner co-located at lca_rear, whole
-    # link aft), so the rear gate enforces a CONTROLLED toe-OUT (bump toes out),
-    # bounded to a sane magnitude — an accidental null, toe-IN, or excessive
-    # value all fail.  If the rear reverts to null, restore a <0.15 rear gate.
-    _REAR_TOEGAIN_BAND = (-1.5, -0.2)   # deg (bump-minus-droop), toe-OUT
-    # FRONT: null bump steer via the sweep tool.
-    _aln = wD._alignment
-    _rrf = wD._do_sweep(wD._solvers['FL'], np.linspace(-0.025, 0.025, 5), 'left',
-                        arb_hp=wD._front_arb, camber_off=_aln['front_camber_deg'],
-                        toe_off=_aln['front_toe_deg'], is_front=True)
-    _bs = float(np.nanmax(np.asarray(_rrf['toe'], float)) - np.nanmin(np.asarray(_rrf['toe'], float)))
-    if _bs > 0.15:
+    # deliberate front toe gain.  REAR: the 2027 deliberate toe-OUT band
+    # (-1.5..-0.2 deg bump-minus-droop) was RETIRED on 2026-09-09 — the user
+    # asked for the rear toe-link outer point placed for maximum lever from the
+    # kingpin axis with bump steer reduced as far as possible ("possible to get
+    # it within 0.1 degrees"); v101 solves it at 0.0999 deg.  The rear gate is
+    # now a bump-steer bound over +-25 mm (raw solver), like the front.
+    _REAR_BUMP_STEER_LIM = 0.25   # deg over +-25 mm (user 2026-09-21: "0.25 degrees over 25 mm is negligible"; was 0.10 from 2026-09-09)
+    # FRONT: dense raw states avoid missing a peak between sparse stations.
+    from vahan.kinematics import KinematicMetrics as _FrontToeMetrics
+    _toe_dense = np.array([_FrontToeMetrics(wD._solvers['FL'].solve(float(t)), 'left').toe
+                          for t in np.linspace(-0.025, 0.025, 51)])
+    _bs = float(np.ptp(_toe_dense))
+    if not np.all(np.isfinite(_toe_dense)) or _bs > float(wD._car.get('front_bump_steer_limit_deg', 0.15)):
         gfail.append(f'front bump steer {_bs:.3f} deg full-travel')
     # REAR: deliberate toe-OUT gain — measured from the RAW solver (the incremental
     # _do_sweep can NaN at the -25 mm droop step on the long aft toe link, while
     # solver.solve is clean there; the raw toe at +-25 is the robust ground truth).
     from vahan.kinematics import KinematicMetrics as _KMr
-    _tb = _KMr(wD._solvers['RL'].solve(+0.025), 'left').toe
-    _td = _KMr(wD._solvers['RL'].solve(-0.025), 'left').toe
-    if not (np.isfinite(_tb) and np.isfinite(_td)):
-        gfail.append('rear toe curve non-finite at +-25 mm (raw solver)')
+    _toe_r = np.array([_KMr(wD._solvers['RL'].solve(float(t)), 'left').toe
+                       for t in np.linspace(-0.025, 0.025, 7)])
+    if not np.all(np.isfinite(_toe_r)):
+        gfail.append('rear toe curve non-finite over +-25 mm (raw solver)')
     else:
-        _gain = float(_tb - _td)                             # bump(+25) minus droop(-25)
-        if not (_REAR_TOEGAIN_BAND[0] <= _gain <= _REAR_TOEGAIN_BAND[1]):
-            gfail.append(f'rear toe gain {_gain:+.3f} deg outside the deliberate '
-                         f'toe-out band {_REAR_TOEGAIN_BAND} (accidental null/toe-in/excess)')
+        _bsr = float(np.ptp(_toe_r))
+        if _bsr > _REAR_BUMP_STEER_LIM:
+            gfail.append(f'rear bump steer {_bsr:.4f} deg over +-25 mm > {_REAR_BUMP_STEER_LIM} '
+                         f'(user 2026-09-09: rear toe link nulled, lever maximised)')
+    # ── ROLL CENTRE IS AN AXIS PROPERTY (Rule 17, 2026-09-09) ───────────────
+    # Sliding an inboard pickup ALONG its own pivot axis is a physical no-op
+    # (same arm plane, same swing axis, every wheel curve identical).  The old
+    # pickup-MIDPOINT construction moved the front RC 1.1 mm for a 38.7 mm
+    # slide (v101 hoop-line move) and under-read the swept rear axle by 6.8 mm;
+    # the instant-axis construction must not move at all.
+    try:
+        import vahan.packaging as _PKrc
+        from vahan.kinematics import KinematicMetrics as _KMrc
+        _b = _PKrc.get_bundle(wD, 'front')
+        _lf = np.asarray(_b['hp']['lca_front'], float); _lr = np.asarray(_b['hp']['lca_rear'], float)
+        _u = (_lr - _lf) / np.linalg.norm(_lr - _lf)
+        _s0 = _PKrc._corner_solver(wD, 'front', _b)
+        _b2 = {'hp': dict(_b['hp']), 'arb': dict(_b['arb'])}; _b2['hp']['lca_rear'] = _lr + 0.030 * _u
+        _s1 = _PKrc._corner_solver(wD, 'front', _b2)
+        _drc = max(abs(_KMrc(_s0.solve(float(t)), 'left').roll_center_height
+                       - _KMrc(_s1.solve(float(t)), 'left').roll_center_height)
+                   for t in (-0.025, 0.0, 0.025)) * 1000.0
+        if not np.isfinite(_drc) or _drc > 1e-6:
+            gfail.append(f'roll centre moved {_drc:.4f} mm for a pickup slid 30 mm along its own '
+                         f'pivot axis (construction not axis-invariant)')
+    except Exception as _e:
+        gfail.append(f'roll-centre axis-invariance check did not run: {_e}')
+    # ── ARB BAR MOTION RATIO FLAT THROUGH TRAVEL (tangent law, 2026-09-09) ──
+    # A re-hang can keep the exact 90/90/90 triad and the static rate and still
+    # lose the rate in travel when the drop link is not tangent to the drop-top
+    # arc (Cluster C / v74 cliff).  v99's front bar ran 1.29 / 2.64 / 15.27 at
+    # -25 / 0 / +25 mm through every static gate; caught only by the Design
+    # City parameter vector.  Gate: bar MR at +-25 mm within 25 % of static on
+    # both axles (v98 front 0.8 %, rear 19 % pre-existing since v97).
+    try:
+        for _axc, _axn in (('F', 'front'), ('R', 'rear')):
+            _mrs = []
+            for _t in (-0.025, 0.0, 0.025):
+                _g = wD._compute_arb_geometry_from_kinematics(_axc, travel_m=_t)
+                _mrs.append(float(_g['mr']) if _g else float('nan'))
+            if not np.all(np.isfinite(_mrs)) or _mrs[1] == 0:
+                gfail.append(f'{_axn} ARB bar motion ratio not finite through travel: {_mrs}')
+            else:
+                _flat = max(abs(_mrs[0] / _mrs[1] - 1.0), abs(_mrs[2] / _mrs[1] - 1.0))
+                if _flat > 0.25:
+                    gfail.append(f'{_axn} ARB bar motion ratio {_mrs[0]:.2f} / {_mrs[1]:.2f} / {_mrs[2]:.2f} at '
+                                 f'-25/0/+25 mm ({_flat*100:.0f} % swing > 25 %): drop link off the '
+                                 f'drop-top arc tangent — rate cliff')
+    except Exception as _e:
+        gfail.append(f'ARB motion-ratio flatness check did not run: {_e}')
+    # ── CHASSIS KEEP-OUT (Rule 18, 2026-09-10) ───────────────────────────────
+    # If the project names a keep-out solid (car['keepout_step'], e.g. the
+    # bulkhead red zone exported from Onshape), no member may be inside it at
+    # droop/static/bump x -lock/0/+lock.  v101 had the rack housing 42 mm and
+    # the front torsion bar 176 mm inside the footwell — "the rack is too high
+    # and the ARB is in the middle".
+    try:
+        from vahan.keepout import keepout_for_window as _kofw, audit_window as _koaw
+        _ko = _kofw(wD)
+        if _ko is not None:
+            _kr = _koaw(wD, _ko, n_rack=3)
+            for _nm, (_g, _t, _r) in _kr['inside'][:8]:
+                gfail.append(f'keep-out {_ko.name}: {_nm} inside by {-_g:.1f} mm at {_t:+.0f} mm travel, rack {_r:+.0f} mm')
+            print(f"keep-out         : {_ko.name} — {len(_kr['worst'])} members, {len(_kr['inside'])} inside; closest "
+                  f"{min(_kr['worst'].items(), key=lambda kv: kv[1][0])[0]} {min(v[0] for v in _kr['worst'].values()):.1f} mm")
+    except Exception as _e:
+        gfail.append(f'keep-out check did not run: {_e}')
+    # ── RULE 04 WAIVER / DECLARED STANDOFF (2026-09-14) — printed LOUDLY, never silent ──
+    try:
+        _so = float(wD._car.get('front_arb_drop_standoff_mm', 0.0) or 0.0)
+        if abs(_so) > 1e-9:
+            print(f'front ARB standoff: HARDWARE FLAG — drop-top rod end on a {_so:+.1f} mm spacer off the rocker plate '
+                  f'(diagnostic metadata; does not satisfy Rule 04)')
+        _wv = wD._car.get('front_arb_rule04_waiver')
+        if _wv:
+            _tgw = _pkgm._axle_geometry_laws(wD, 'front') if '_pkgm' in dir() else None
+            print(f'RULE 04 metadata : NONCOMPLIANT waiver note — {_wv} '
+                  f'(arm end {_tgw["arb_arm_end_inplane_mm"]:.1f} mm off the plate)'
+                  if _tgw else f'RULE 04 metadata : NONCOMPLIANT waiver note — {_wv}')
+    except Exception as _e:
+        print(f'rule-04 waiver / standoff print did not run: {_e}')
+    # ── FRONT HOOP LINE (Rule 19, 2026-09-14) ─────────────────────────────────
+    # The front ARB (bar, blades, links, rod ends) must stay AHEAD of the line
+    # through the LCA-aft / UCA-aft pickups extended upward (the front hoop),
+    # by >= 3 mm at droop / static / bump.  "make sure it doesn't pass the
+    # imaginary line extended upwards from LCA aft and UCA aft" (user).
+    try:
+        from vahan.packaging import front_arb_hoop_line_gap_mm as _hoopf
+        _hg = _hoopf(wD)
+        if not np.isfinite(_hg['gap_mm']) or _hg['gap_mm'] < 3.0:
+            gfail.append(f"front ARB crosses / is within 3 mm of the front-hoop line: {_hg['gap_mm']:.1f} mm ({_hg['worst']})")
+        print(f"front hoop line  : Y {_hg['line'][0]:.1f} mm through LCA-aft/UCA-aft — front ARB ahead by {_hg['gap_mm']:.1f} mm ({_hg['worst']})")
+    except Exception as _e:
+        gfail.append(f'front hoop-line check did not run: {_e}')
     # UNEXPECTED failures fail the net; the documented KNOWN open v32 conflict
     # (pushrod/driveshaft + rear bump steer) prints but does not (awaiting user).
     _unexp = [g for g in gfail if not any(k in g for k in _KNOWN)]
@@ -799,10 +1207,8 @@ if _design:
     #    static alignment camber + body roll are what give it a meaningful sign.
     #    ONE helper (vahan.tire_model.wheel_inclination_deg) now maps vehicle
     #    camber -> signed SAE IA; the tyre evaluates negative IA by the mirror
-    #    identity Fy(a, IA) = -Fy(-a, -IA).  Gates: (1) on the loaded fit at a
-    #    mid-data load the mapped into-turn lean makes MORE force than upright,
-    #    which makes more than the away lean (linear range), and into > away at
-    #    the peak slip; (2) a 1 g steady solve gives the inner and outer front
+    #    identity Fy(a, IA) = -Fy(-a, -IA).  Gates: (1) the loaded fit is finite
+    #    at signed inclinations and honours that mirror identity; (2) a 1 g steady solve gives the inner and outer front
     #    wheels OPPOSITE-signed IA, with outer = +ground camber, inner = -ground
     #    camber, ground camber = kinematic + static + roll.  Failed on the abs()
     #    code (into == upright, both fronts IA >= 0).
@@ -831,15 +1237,18 @@ if _design:
                 _ia_aw = _wid(+_iaD, is_outer=True)
                 _mag = lambda s, ia: abs(float(_tmD.Fy(s, _fzg, ia)))
                 _o = (_mag(_half, _ia_in), _mag(_half, 0.0), _mag(_half, _ia_aw))
-                if not (_o[0] > _o[1] > _o[2]):
-                    _cfail.append(f'{_half:.1f} deg: |Fy| into/upright/away = '
-                                  f'{_o[0]:.0f}/{_o[1]:.0f}/{_o[2]:.0f} N not ordered')
                 _p = (_mag(_spk, _ia_in), _mag(_spk, _ia_aw))
-                if not (_p[0] > _p[1]):
-                    _cfail.append(f'peak {_spk:.1f} deg: into {_p[0]:.0f} N <= away {_p[1]:.0f} N')
+                if not np.all(np.isfinite(np.asarray(_o + _p, float))):
+                    _cfail.append('signed-IA Fy returned a non-finite value')
+                _mir_err = max(abs(float(_tmD.Fy(_sa, _fzg, -_iaD))
+                                   + float(_tmD.Fy(-_sa, _fzg, _iaD)))
+                               for _sa in (1.0, _half, _spk))
+                if _mir_err > 1e-6:
+                    _cfail.append(f'signed-IA mirror identity error {_mir_err:.3e} N')
                 _cmsg.append(f'IA {_iaD:.0f} @ {_fzg:.0f} N: into/upright/away '
                              f'{_o[0]/_o[1]:.3f}/1/{_o[2]/_o[1]:.3f} @ {_half:.1f} deg, '
-                             f'into/away {_p[0]/_p[1]:.3f} @ peak {_spk:.1f} deg')
+                             f'into/away {_p[0]/_p[1]:.3f} @ peak {_spk:.1f} deg; '
+                             f'mirror error {_mir_err:.1e} N')
         # the helper's sign rule itself (left wheel = inner of the SAE left turn)
         if not (_wid(-1.0, is_outer=True) == -1.0 and _wid(-1.0, is_outer=False) == 1.0
                 and _wid(-1.0, side='right') == -1.0 and _wid(-1.0, side='left') == 1.0):
@@ -858,10 +1267,16 @@ if _design:
             _cfail.append('1 g: inclination != (+outer / -inner) ground camber')
         _stat = float(getattr(_ss1._veh, 'camber_front_deg', 0.0))
         _roll = abs(float(_r1.roll_angle_deg))
-        _exp_o = float(_r1.camber.get(_fo, 0.0)) + _stat + _roll
-        _exp_i = float(_r1.camber.get(_fi, 0.0)) + _stat - _roll
-        if abs(_exp_o - float(_cg1.get(_fo, 0.0))) > 1e-6 or abs(_exp_i - float(_cg1.get(_fi, 0.0))) > 1e-6:
-            _cfail.append('1 g: ground camber != kinematic + static + roll (outer +, inner -)')
+        # Independent dot/arcsin oracle. XZ-projected camber + angles only
+        # agrees at zero toe/steer; do not enshrine that approximation here.
+        for _corner in (_fo, _fi):
+            _spin = _ss1._solvers[_corner].solve(_r1.travel[_corner] / 1000.).spin_axis
+            _side = 1. if _corner.endswith('L') else -1.
+            _angle = np.radians(_side * _stat + _r1.roll_angle_deg)
+            _z = -np.sin(_angle)*_spin[0] + np.cos(_angle)*_spin[2]
+            _expected = -_side*np.degrees(np.arcsin(np.clip(_z/np.linalg.norm(_spin), -1., 1.)))
+            if abs(_expected - float(_cg1.get(_corner, 0.0))) > 1e-6:
+                _cfail.append(f'{_corner}: ground camber differs from aligned/rolled wheel plane')
         _cmsg.append(f'1 g front: outer {_fo} ground {float(_cg1.get(_fo, 0.0)):+.2f} -> IA {_io:+.2f}, '
                      f'inner {_fi} ground {float(_cg1.get(_fi, 0.0)):+.2f} -> IA {_ii:+.2f} '
                      f'(kin {float(_r1.camber.get(_fo, 0.0)):+.2f}/{float(_r1.camber.get(_fi, 0.0)):+.2f}, '
@@ -1029,15 +1444,17 @@ print('-' * 64)
 if _tm is not None:
     from vahan.ackermann import solve_ackermann_geometry
     _ss = win._build_dynamics_solver()
-    _lo = solve_ackermann_geometry(_ss, _tm, 8.0, 0.2)
-    _hi = solve_ackermann_geometry(_ss, _tm, 8.0, 1.5)
+    # raw belt curves (x1.00) stated explicitly — since 2026-09-22 an omitted
+    # grip means THE project scale, not raw belt
+    _lo = solve_ackermann_geometry(_ss, _tm, 8.0, 0.2, grip_multiplier=1.0)
+    _hi = solve_ackermann_geometry(_ss, _tm, 8.0, 1.5, grip_multiplier=1.0)
     _geo_ok = abs(_lo['ackermann_pct'] - 100.0) < 8.0
     _split_ok = _hi['outer_slip_deg'] > _hi['inner_slip_deg'] > 0.0
     _mono_ok = (_hi['outer_slip_deg'] > _lo['outer_slip_deg']
                 and _hi['inner_slip_deg'] > _lo['inner_slip_deg'])
     _sat_ok = not (_hi['inner_saturated'] or _hi['outer_saturated'])
     # (5) grip derate at 0.70: same ROAD g, derated curve.
-    _raw12 = solve_ackermann_geometry(_ss, _tm, 8.0, 1.2)
+    _raw12 = solve_ackermann_geometry(_ss, _tm, 8.0, 1.2, grip_multiplier=1.0)
     _der12 = solve_ackermann_geometry(_ss, _tm, 8.0, 1.2,
                                       grip_multiplier=0.70)
     _der17 = solve_ackermann_geometry(_ss, _tm, 8.0, 1.7,
@@ -1286,6 +1703,89 @@ except Exception as _e:
     fails += 1
     print(f'force transfer   : UNEXPECTED FAIL ({_e})')
 
+# ── DESIGN CITY (design_city.py + vahan/packaging.py parameter gate): the
+#    0.1 %-of-EVERY-parameter packaging engine, in-process on the current
+#    design config, three trials.  (1) the untouched model must pass its own
+#    gate; (2) two EXACT-family moves (spring pair swung 5 deg about the rocker
+#    axis; UCA pickups slid 10 mm toward each other along their pivot axis) —
+#    every KEPT solution must re-load in a FRESH window and pass the 0.1 % gate
+#    again, keep the wheel side + the other axle byte-identical, show 0 clash
+#    negatives at centre/locks and actually move a point; (3) an INEXACT move
+#    (slice rotated 5 deg about the pushrod line: static MR re-tuned but the
+#    MR CURVE moves) must be REJECTED at the parameter stage — proves the gate
+#    is not blind.  Groups = baseline + kept.
+print('-' * 64)
+if _design:
+    try:
+        import json as _cj, tempfile as _ctf, shutil as _csh
+        import design_city as _dc
+        from vahan.packaging import (parameter_vector as _c_pvec, compare_parameters as _c_pcmp,
+                                     clash_negatives_at_locks as _c_pcl)
+        # a PRIVATE folder per run: a fixed shared folder let two concurrent nets (e.g. a
+        # worktree session) wipe each other's groups.json mid-read (2026-09-26 JSONDecodeError)
+        _dc_out = _ctf.mkdtemp(prefix='vahan_city_net_')
+
+        def _c_recipe(**kw):
+            _r = _dc.identity_recipe(); _r.update(kw); return _r
+        _dc_run = _dc.run_city(config=_design, out_dir=_dc_out, axles=('front',), workers=1, render=False,
+                               recipes={'front': [_c_recipe(spring_swing_deg=5.0),
+                                                  _c_recipe(pickup_spacing={'uca': 10.0}),
+                                                  _c_recipe(rotate_pushrod_deg=5.0)]}, progress=None)
+        _c_ax = _dc_run['axles']['front']
+        _c_fail = []
+        if not _c_ax['baseline_ok']:
+            _c_fail.append(f"baseline fails its own gate: {_c_ax['baseline_reason']}")
+        with open(os.path.join(_dc_out, 'front', 'trials.jsonl'), 'r', encoding='utf-8') as _cf:
+            _c_recs = [_cj.loads(_l) for _l in _cf if _l.strip()]
+        _c_by = {_r['id']: _r for _r in _c_recs}
+        # the inexact family must be REJECTED; which gate catches it first (laws
+        # on v101, parameters on v99) depends on the config and is reported, not asserted
+        if _c_by['f0002']['kept']:
+            _c_fail.append('pushrod-line rotation (inexact family) was KEPT — the gate is blind')
+        _c_kept = [_r for _r in _c_recs if _r['kept'] and not _r.get('is_baseline')]
+        if not _c_kept:
+            _c_fail.append('no exact-family solution kept (spring swing +5 deg / UCA spacing +10 mm)')
+        with open(_design, 'r', encoding='utf-8') as _cf:
+            _c_src = _cj.load(_cf)
+        _wC = MainWindow(); _wC._load_project_from_path(_design); _wC._rebuild_solvers(0.)
+        _c_base = _c_pvec(_wC)
+        for _r in _c_kept:
+            _c_cfg = os.path.join(_dc_out, 'front', _r['id'], 'config.vahan')
+            _wC._load_project_from_path(_c_cfg); _wC._rebuild_solvers(0.)
+            _c_bad = [_x['name'] for _x in _c_pcmp(_c_base, _c_pvec(_wC)) if not _x['ok']]
+            if _c_bad:
+                _c_fail.append(f"{_r['id']} beyond 0.1 % after reload: {_c_bad[:4]}")
+            with open(_c_cfg, 'r', encoding='utf-8') as _cf:
+                _c_saved = _cj.load(_cf)
+            if any(_c_src['front_hp'][_k] != _c_saved['front_hp'][_k] for _k in _dc.WHEEL_SIDE_KEYS):
+                _c_fail.append(f"{_r['id']} wheel side not byte-identical")
+            if _c_src['rear_hp'] != _c_saved['rear_hp'] or _c_src['rear_arb'] != _c_saved['rear_arb']:
+                _c_fail.append(f"{_r['id']} rear axle not byte-identical")
+            _c_cl = _c_pcl(_wC)
+            if _c_cl['negatives']:
+                _c_fail.append(f"{_r['id']} {_c_cl['negatives']} clash negatives after reload")
+            if _r['max_point_move_mm'] < _dc.DUPLICATE_MM:
+                _c_fail.append(f"{_r['id']} moved nothing ({_r['max_point_move_mm']:.2f} mm)")
+        _wC.close()
+        with open(os.path.join(_dc_out, 'front', 'groups.json'), 'r', encoding='utf-8') as _cf:
+            _c_groups = _cj.load(_cf)
+        if _c_groups['n_solutions'] != len(_c_kept) + 1:
+            _c_fail.append(f"groups.json holds {_c_groups['n_solutions']} solutions, expected baseline + {len(_c_kept)}")
+        _c_ok = not _c_fail
+        if not _c_ok:
+            fails += 1
+        print(f"design city      : {len(_c_recs) - 1} tried, {len(_c_kept)} kept, {len(_c_groups['groups'])} groups, "
+              f"baseline self-gate {_c_ax['baseline_ok']}, pushrod-line rotation rejected at "
+              f"'{_c_by['f0002']['stage']}' ({_c_by['f0002'].get('worst_parameter')} "
+              f"{(_c_by['f0002'].get('max_deviation_pct') or 0):.2f} %)   "
+              f"{'pass' if _c_ok else 'UNEXPECTED FAIL (' + '; '.join(_c_fail) + ')'}")
+        _csh.rmtree(_dc_out, ignore_errors=True)
+    except Exception as _e:
+        fails += 1
+        print(f'design city      : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+else:
+    print('design city      : no design config — skipped')
+
 # ── BRAKE TORQUE IS BRAKE-ONLY (vahan/dynamics.py): under power the driven
 #    axle's hub torque is reacted by the DRIVESHAFT, not the caliper.  Booking
 #    drive torque as brake torque put phantom kN-level loads into the caliper
@@ -1320,7 +1820,12 @@ try:
     _ld, _veh2, _up2, _res2, _bpf2, _bpr2, _slv2 = _WP2.compute_case(win, 0.0, -1.5)
     _cl = _ld['FL']
     _Fpad = _cl.brake_torque_Nm / (_bpf2.pad_radius_mm / 1000.0)
-    _tbl = abs(_cl.caliper_upper_H - _cl.caliper_lower_H) / 2.0
+    # The Seward couple acts along the caliper RADIAL (pad centre -> bolt line),
+    # so at a manual clock (the saved car: 315 deg, vertical mounts off) it has
+    # BOTH an H and a V part.  Compare its MAGNITUDE; the old H-only check was
+    # only right for vertical mounts (2026-09-22 caliper clocking repair).
+    _tbl = float(np.hypot(_cl.caliper_upper_H - _cl.caliper_lower_H,
+                          _cl.caliper_upper_V - _cl.caliper_lower_V)) / 2.0
     _pic = _Fpad * (_bpf2.caliper_l4_mm / 1000.0) / (_bpf2.caliper_bolt_spacing_mm / 1000.0)
     cal_ok = _tbl > 1.0 and abs(_tbl - _pic) < max(1.0, 0.01 * _pic)
     if not cal_ok:
@@ -1345,7 +1850,9 @@ try:
     _bias = 65.0
     _sys = _BSP(pedal_ratio=5.0, mc_bore_front_mm=15.87, mc_bore_rear_mm=15.87,
                 bias_pct_front=_bias)
-    _rb = _cbs(_Fz, _pf, _pr, _sys)
+    from vahan.tire_model import LinearTireModel as _LTMb
+    _tmb = _LTMb()
+    _rb = _cbs(_Fz, _pf, _pr, _sys, tire_model=_tmb, grip_scale=1.0)
     _fl, _rl = _rb['FL'], _rb['RL']
     _exp_f = _fl.lockup_line_pressure_MPa * _sys.mc_area_front_mm2 / (5.0 * _bias / 100.0)
     _exp_r = _rl.lockup_line_pressure_MPa * _sys.mc_area_rear_mm2 / (5.0 * (1 - _bias / 100.0))
@@ -1355,7 +1862,7 @@ try:
     # and the bias must actually MOVE the answer (the old code was bias-blind)
     _sys2 = _BSP(pedal_ratio=5.0, mc_bore_front_mm=15.87, mc_bore_rear_mm=15.87,
                  bias_pct_front=50.0)
-    _rb2 = _cbs(_Fz, _pf, _pr, _sys2)
+    _rb2 = _cbs(_Fz, _pf, _pr, _sys2, tire_model=_tmb, grip_scale=1.0)
     _moves = abs(_rb2['FL'].lockup_pedal_force_N - _fl.lockup_pedal_force_N) > 1.0
     _bb_ok = _bb_ok and _moves
     if not _bb_ok:
@@ -1398,6 +1905,83 @@ try:
 except Exception as _e:
     fails += 1
     print(f'static sag sprung: UNEXPECTED FAIL ({_e})')
+
+# Configured damper hardware stops do not depend on spring preload, mass,
+# static CAD length, or a dynamics panel being available during startup.
+print('-' * 64)
+try:
+    from types import SimpleNamespace as _DamperNS
+    _limit_owner = _DamperNS(_motion_panel=_DamperNS(
+        stroke_mm=55.0, fully_extended_mm=210.0))
+    _limit_results = []
+    for _cad_length in (0.175, 0.189, 0.205):
+        _limit_solver = _DamperNS(solve=lambda t, length=_cad_length:
+                                _DamperNS(spring_length=length))
+        _limit_results.append(MainWindow._spring_limits_uncached(
+            _limit_owner, _limit_solver, False))
+    _limits_ok = all(np.allclose(pair, (0.155, 0.210), atol=1e-12, rtol=0.)
+                     for pair in _limit_results)
+    if not _limits_ok:
+        fails += 1
+    print(f'physical dampers : {_limit_results} '
+          f'{"pass" if _limits_ok else "UNEXPECTED FAIL"}')
+except Exception as _e:
+    fails += 1
+    print(f'physical dampers : UNEXPECTED FAIL ({_e})')
+
+# Loading and read-only dynamics refreshes must not widen a saved motion
+# domain. A real damper edit still restores automatic range calculation.
+print('-' * 64)
+try:
+    import json as _motion_json
+    import tempfile as _motion_tempfile
+    from pathlib import Path as _MotionPath
+    with _motion_tempfile.TemporaryDirectory() as _motion_dir:
+        _motion_path = _MotionPath(_motion_dir) / 'motion_roundtrip.vahan'
+        _motion_win = MainWindow()
+        _motion_win._save_project_to_path(str(_motion_path))
+        _motion_data = _motion_json.loads(_motion_path.read_text())
+        _motion_expected = (-12.375, 18.625)
+        _motion_data['motion'].update(
+            type='heave', min=_motion_expected[0], max=_motion_expected[1],
+            stroke_mm=59.0, fully_extended_mm=221.0,
+            preload_front_mm=1.25, preload_rear_mm=2.5)
+        _motion_path.write_text(_motion_json.dumps(_motion_data))
+        _motion_win._load_project_from_path(str(_motion_path))
+        _motion_win._build_dynamics_solver()
+        _motion_win._refresh_sag()
+        _mp = _motion_win._motion_panel
+        assert np.allclose((_mp.min_val, _mp.max_val), _motion_expected,
+                           atol=1e-12, rtol=0.), 'saved range overwritten'
+        assert (_mp.stroke_mm, _mp.fully_extended_mm,
+                _mp.preload_front_mm, _mp.preload_rear_mm) == (59., 221., 1.25, 2.5)
+        for _axle in ('front', 'rear'):
+            for _key, _point in _motion_data[f'{_axle}_hp'].items():
+                assert np.array_equal(getattr(_motion_win, f'_{_axle}_hp')[_key],
+                                      _point), f'load moved {_axle}/{_key}'
+        _motion_win._save_project_to_path(str(_motion_path))
+        _motion_resaved = _motion_json.loads(_motion_path.read_text())['motion']
+        assert (_motion_resaved['min'], _motion_resaved['max']) == _motion_expected
+        _mp._stroke.setValue(60.0)  # a real control edit, not a load callback
+        assert not np.allclose((_mp.min_val, _mp.max_val), _motion_expected), \
+            'damper edit failed to restore automatic travel range'
+        assert np.allclose(_motion_win._spring_limits_uncached(
+            _motion_win._solvers['FL'], True), (.161, .221), atol=1e-12, rtol=0.)
+        # A following legacy load must not inherit the previous project's
+        # explicit bounds, and switching mm motions must retain saved bounds.
+        _motion_win._load_project_from_path(str(_motion_path))
+        _mp._on_motion(True, 'pitch')
+        assert (_mp.min_val, _mp.max_val) == _motion_expected
+        _motion_data.pop('motion')
+        _motion_path.write_text(_motion_json.dumps(_motion_data))
+        _motion_win._load_project_from_path(str(_motion_path))
+        assert not np.allclose((_mp.min_val, _mp.max_val), _motion_expected), \
+            'legacy load inherited explicit travel bounds'
+        _motion_win.close()
+    print('motion roundtrip: saved bounds/hardware/points held; edits remain automatic pass')
+except Exception as _e:
+    fails += 1
+    print(f'motion roundtrip: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
 # ── YAW INERTIA must be PHYSICALLY POSSIBLE.  m·a·b is the exact maximum
 #    longitudinal yaw inertia for mass living between the axles (all mass split
@@ -1483,6 +2067,7 @@ try:
     from vahan.dynamics import AeroDownforceSolver as _ADS
     _cf4 = _g4.glob('configs/2027_v*.vahan')
     _cf4 = max(_cf4, key=lambda p: int(_re4.search(r'2027_v(\d+)', p).group(1))) if _cf4 else None
+    _cf4 = _design or _cf4
     if _cf4 is None:
         print('aero per-corner  : no config — skipped')
     else:
@@ -1493,13 +2078,38 @@ try:
         _dA = _wA._get_aero_Fz_per_g() or {}
         _applied = sum(v * _rA.lateral_g for v in _dA.values())
         _own = sum(_rA.downforce.values())
-        _ok_a = (_rA.total_downforce_N > 1.0
-                 and abs(_applied - _rA.total_downforce_N) / _rA.total_downforce_N < 0.02
-                 and abs(_own - _rA.total_downforce_N) / _rA.total_downforce_N < 0.02)
+        # SOURCE-AWARE (2026-09-29): the Dynamics panel's aero source decides
+        # what "asked for" means.  'solved' = the aero-target solver's need;
+        # 'custom' (v150: 1000 N at 88.5 km/h, 54 % rear) = the package formula
+        # F_ref·g·R/V_ref² at the panel radius, which the solver's need is NOT.
+        _srcA = _wA._dynamics_panel.get_aero_source()
+        if _srcA == 'custom':
+            _cpA = _wA._dynamics_panel.get_custom_aero_params()
+            _RA = float(_wA._dynamics_panel._turn_radius.value())
+            _vrefA = float(_cpA['V_ref_kph']) / 3.6
+            _askedA = float(_cpA['F_ref_N']) * 9.80665 * _RA / (_vrefA * _vrefA) * _rA.lateral_g
+            # the Loads-page path must agree at the speed of that g on that radius
+            from gui import wheel_package as _WPA
+            _spA = np.sqrt(_rA.lateral_g * 9.80665 * _RA) * 3.6
+            _caA = _WPA.case_aero(_wA, _rA.lateral_g, 0.0)
+            _rearA = (_dA.get('RL', 0.0) + _dA.get('RR', 0.0)) / max(sum(_dA.values()), 1e-9)
+            _ok_a = (_askedA > 1.0 and abs(_applied - _askedA) / _askedA < 0.02
+                     and abs(_caA['speed_kph'] - _spA) < 0.05
+                     and abs(_caA['total_N'] - _askedA) / _askedA < 0.02
+                     and abs(_rearA - float(_cpA['cop_rear_pct']) / 100.0) < 1e-6)
+            _whatA = (f"custom package {_cpA['F_ref_N']:.0f} N at {_cpA['V_ref_kph']:.1f} km/h on "
+                      f"{_RA:.1f} m asks {_askedA:.0f} N at {_rA.lateral_g:.2f} g ({_spA:.1f} km/h); "
+                      f"loads path {_caA['total_N']:.0f} N at {_caA['speed_kph']:.1f} km/h")
+        else:
+            _askedA = _rA.total_downforce_N
+            _ok_a = (_rA.total_downforce_N > 1.0
+                     and abs(_applied - _rA.total_downforce_N) / _rA.total_downforce_N < 0.02
+                     and abs(_own - _rA.total_downforce_N) / _rA.total_downforce_N < 0.02)
+            _whatA = f'solved aero need {_rA.total_downforce_N:.0f} N'
         if not _ok_a:
             fails += 1
-        print(f'aero per-corner  : solver total {_rA.total_downforce_N:.0f} N, applied '
-              f'{_applied:.0f} N, ratio {_applied/max(_rA.total_downforce_N,1e-9):.3f}   '
+        print(f'aero per-corner  : source {_srcA}: {_whatA}, applied '
+              f'{_applied:.0f} N, ratio {_applied/max(_askedA,1e-9):.3f}   '
               f'{"pass" if _ok_a else "UNEXPECTED FAIL"}')
 except Exception as _e:
     fails += 1
@@ -1537,6 +2147,128 @@ try:
 except Exception as _e:
     fails += 1
     print(f'save round-trip  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── ATOMIC SAVE / TRANSACTIONAL LOAD — FAULT INJECTION (Astra F-01, 2026-09-22)
+#    FAILING-THEN-PASSING: _save_project_to_path opened the user's file with 'w'
+#    BEFORE json.dump, so an unserialisable field raised TypeError AFTER the
+#    accepted project had been truncated (Astra: 667 bytes of invalid JSON left
+#    on disk); _load_project_from_path replaced the motion bounds and front
+#    hardpoints before discovering a missing rear_hp (KeyError), leaving the
+#    live window half old / half new.  Gate: (a) unserialisable save and (b) an
+#    I/O failure at the replace step leave the file byte-identical and no temp
+#    litter; (c) a schema-broken file and (d) a failure injected MID-apply
+#    (after hardpoints/car were already replaced) leave the whole live project
+#    — the same dict Save writes — unchanged; (e) a normal load still works.
+print('-' * 64)
+try:
+    import tempfile as _tfA, shutil as _shA, json as _jA
+    _fA = []
+    if _cf3 is None:
+        print('atomic save/load : no config — skipped')
+    else:
+        _wA = _wS
+        _dA = _tfA.mkdtemp(prefix='_net_atomic_')
+        _pA = os.path.join(_dA, 'proj.vahan')
+        _wA._save_project_to_path(_pA)
+        _b0 = open(_pA, 'rb').read()
+
+        def _live(_w):
+            return _jA.dumps(_w._project_to_dict(), sort_keys=True, default=str)
+        # (a) unserialisable field
+        _wA._car['__net_probe_unserialisable__'] = object()
+        try:
+            _wA._save_project_to_path(_pA)
+            _fA.append('unserialisable save did not raise')
+        except TypeError:
+            pass
+        finally:
+            _wA._car.pop('__net_probe_unserialisable__', None)
+        _okA = open(_pA, 'rb').read() == _b0
+        if not _okA:
+            _fA.append('failed (unserialisable) save changed the saved file')
+        # (b) I/O failure at the atomic replace
+        _orep = os.replace
+        def _boomA(*_a, **_k):
+            raise OSError('injected replace failure')
+        os.replace = _boomA
+        try:
+            _wA._save_project_to_path(_pA)
+            _fA.append('save with a failing replace did not raise')
+        except OSError:
+            pass
+        finally:
+            os.replace = _orep
+        _okB = open(_pA, 'rb').read() == _b0
+        _litter = [f for f in os.listdir(_dA) if f != 'proj.vahan']
+        if not _okB:
+            _fA.append('failed (I/O) save changed the saved file')
+        if _litter:
+            _fA.append(f'temp files left behind: {_litter}')
+        # (c) schema-broken file: nothing live may change
+        _s0 = _live(_wA)
+        _dbad = _jA.loads(_b0.decode('ascii'))
+        del _dbad['rear_hp']
+        _pbad = os.path.join(_dA, 'missing_rear.vahan')
+        with open(_pbad, 'w') as _fh:
+            _jA.dump(_dbad, _fh)
+        try:
+            _wA._load_project_from_path(_pbad)
+            _fA.append('load of a file with no rear_hp did not raise')
+        except ValueError:
+            pass
+        _okC = _live(_wA) == _s0
+        if not _okC:
+            _fA.append('schema-broken load changed the live project')
+        # (d) failure injected MID-apply, after hardpoints / car / motion replaced
+        _dmid = _jA.loads(_b0.decode('ascii'))
+        _dmid['front_hp'] = {k: [v[0], v[1] + 0.001, v[2]] for k, v in _dmid['front_hp'].items()}
+        _dmid['car']['__net_probe_key__'] = 1.0
+        _pmid = os.path.join(_dA, 'shifted.vahan')
+        with open(_pmid, 'w') as _fh:
+            _jA.dump(_dmid, _fh)
+        _oset = _wA._dynamics_panel.set_state
+        _hit = []
+        def _boom_set(*_a, **_k):
+            if not _hit:                       # fail the LOAD only; the rollback's re-apply runs clean
+                _hit.append(float(np.asarray(_wA._front_hp['wheel_center'])[1]))
+                raise RuntimeError('injected mid-load failure')
+            return _oset(*_a, **_k)
+        _solv0 = np.asarray(_wA._solvers['FL'].solve(0.).uca_outer, float).copy()
+        _wA._dynamics_panel.set_state = _boom_set
+        try:
+            _wA._load_project_from_path(_pmid)
+            _fA.append('mid-apply failure did not raise')
+        except RuntimeError:
+            pass
+        finally:
+            _wA._dynamics_panel.set_state = _oset
+        _okD = (_live(_wA) == _s0 and '__net_probe_key__' not in _wA._car
+                and np.allclose(np.asarray(_wA._solvers['FL'].solve(0.).uca_outer, float), _solv0, atol=1e-12))
+        _wc0 = _jA.loads(_s0)['front_hp']['wheel_center'][1]
+        _mutated = bool(_hit) and abs(_hit[0] - (_wc0 + 0.001)) < 1e-12
+        if not _mutated:
+            _fA.append('injected failure did not fire after the hardpoints were replaced '
+                       '(the rollback was not exercised)')
+        if not _okD:
+            _d0 = _jA.loads(_s0); _d1 = _jA.loads(_live(_wA))
+            _diffk = [k for k in _d0 if _d0.get(k) != _d1.get(k)]
+            _fA.append(f'mid-apply failure left the live project changed in {_diffk}')
+        # (e) a normal load of the accepted file still works and round-trips
+        _wA._load_project_from_path(_pA)
+        _okE = _jA.loads(_live(_wA))['front_hp'] == _jA.loads(_b0.decode('ascii'))['front_hp']
+        if not _okE:
+            _fA.append('normal load after the injected failures did not restore the saved hardpoints')
+        _shA.rmtree(_dA, ignore_errors=True)
+        if _fA:
+            fails += 1
+        print(f'atomic save/load : bad save file intact={_okA and _okB} (no temp litter={not _litter}); '
+              f'schema-broken load live unchanged={_okC}; mid-apply failure (hardpoints already '
+              f'replaced={_mutated}) rolled back={_okD}; normal reload ok={_okE}   '
+              + ('pass' if not _fA else 'UNEXPECTED FAIL: ' + '; '.join(_fA)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbA2; _tbA2.print_exc()
+    print(f'atomic save/load : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
 # ── LATERAL LOAD TRANSFER INVARIANT ─────────────────────────────────────────
 # sum over axles of (one-side load delta x track) MUST equal m*a*h_cg.  This is
@@ -1645,7 +2377,10 @@ except Exception as _e:
 # ── REAR ROCKER COPLANAR across travel (config 2027_v28): the pushrod, rocker
 #    and shock must stay in the rocker plate plane through the whole wheel travel
 #    (was 48 mm off / 68 mm across travel before v28). Guards the coplanar re-tune
-#    AND that the rear rates were held (MR_r ~0.808, arb_r ~353k).
+#    AND the rear motion ratio.  ARB wheel rate is a separately derived value:
+#    it depends on the project panel's declared bar section/material as well as
+#    the kinematic arm geometry, so it is checked from those explicit inputs,
+#    not against a rate from another fixture.
 print('-' * 64)
 try:
     import glob as _glob
@@ -1667,15 +2402,24 @@ try:
                 _worst = max(_worst, abs(float(np.dot(np.asarray(getattr(_st, _a), float) - _p0, _n))) * 1000)
         _veh = win._build_dynamics_solver()._veh
         _mr = _veh.motion_ratio_rear; _arb = _veh.arb_rate_rear_Npm
-        # arb_r expectation is 380500, not the old 353000: the rigid-blade model
-        # (2026-07-25) drops the phantom K_a arm-bending term, so this fixture's
-        # bar is +7.8% stiffer.  Geometry (MR, coplanarity) is unchanged, which
-        # is what this v28 fixture is actually guarding.
-        cop_ok = (_worst < 3.0 and abs(_mr - 0.808) < 0.01 and abs(_arb - 380500) < 9000)
-        if not cop_ok:
+        _dp = win._dynamics_panel
+        _rg = _dp._derived_arb_geom['R']
+        _arb_expected = _dp._compute_arb_wheel_rate_Npm(
+            OD_mm=_dp._arb_OD_r.value(), ID_mm=_dp._arb_ID_r.value(),
+            L_half_mm=_rg['half_length_mm'], A_mm=_rg['arm_length_mm'],
+            MR=_rg['mr'], G_Npmm2=_dp._arb_G.value(), E_Npmm2=_dp._arb_E.value(),
+            blade_w_mm=_dp._arb_blade_w_r.value(), blade_t_mm=_dp._arb_blade_t_r.value())
+        _arb_ok = (np.isfinite(_arb) and np.isfinite(_arb_expected)
+                   and abs(_arb - _arb_expected) <= max(1.0, abs(_arb_expected) * 1e-9))
+        _cop_ok = (_worst < 3.0 and abs(_mr - 0.808) < 0.01)
+        if not (_cop_ok and _arb_ok):
             fails += 1
         print(f'rear coplanar    : {_worst:.2f} mm across travel, MR_r {_mr:.4f}, '
-              f'arb_r {_arb:.0f}   {"pass" if cop_ok else "UNEXPECTED FAIL"}')
+              f'arb_r {_arb:.0f} from OD {_dp._arb_OD_r.value():.2f} / ID '
+              f'{_dp._arb_ID_r.value():.2f} mm, half {_rg["half_length_mm"]:.2f} mm, '
+              f'arm {_rg["arm_length_mm"]:.2f} mm, MR {_rg["mr"]:.4f} '
+              f'(derived {_arb_expected:.0f})   '
+              f'{"pass" if _cop_ok and _arb_ok else "UNEXPECTED FAIL"}')
     else:
         print('rear coplanar    : no v28 config found — skipped')
 except Exception as _e:
@@ -1874,6 +2618,15 @@ except Exception as _e:
 #            +2.00 s (+4.8%), 134 kg of equivalent mass in 1st gear.  Gate
 #            that switching it on still SLOWS the car by a real margin and
 #            that the equivalent mass is in the physically sane band.
+#            2026-09-22 (audit items 22/23): that +2.00 s over-charged inertia
+#            — it divided TYRE-limited braking and traction by (1 + m_eq/m).
+#            Inertia now slows only torque-limited drive (plus the free
+#            wheels in traction); a tyre-limited stop is inertia-invariant.
+#            v147 on the Laptime page's own settings, full resolution:
+#            inertia costs +1.22 s (was +1.92 s on the same car/code).  The
+#            net's subsampled inertia+shift delta reads ~+1.1 s, so the gate
+#            is 0.5 s: still proves inertia is LIVE, no longer demands the
+#            overcount.
 #      (ii)  SHIFT CHATTER.  The gear picker had no memory, so it used 2nd
 #            gear for ONE STATION (0.08 s) at the top of a straight, five
 #            times a lap.  Gate that the minimum-shift-interval actually
@@ -1926,10 +2679,11 @@ try:
         # (i) rotating inertia is LIVE and physically sized
         _d_lap = _rOn.lap_time_s - _rOff.lap_time_s
         _meq = _sOn.equivalent_mass_kg(1)
-        if _d_lap < 1.0:
+        if _d_lap < 0.5:
             _lf.append(f'rotating inertia + shift model only cost '
-                       f'{_d_lap:+.3f} s — it should slow the car by >1 s '
-                       f'(it was measured at +2.09 s here)')
+                       f'{_d_lap:+.3f} s — it should slow the car by >0.5 s '
+                       f'(measured +1.11 s here after the 2026-09-22 '
+                       f'tyre-vs-torque fix; +2.09 s before it)')
         if not (100.0 <= _meq <= 200.0):
             _lf.append(f'equivalent mass in 1st is {_meq:.0f} kg, outside the '
                        f'100-200 kg band a 0.05 kg.m^2 crank on a 9.75:1 '
@@ -1959,6 +2713,144 @@ except Exception as _e:
     import traceback as _tbL; _tbL.print_exc()
     print(f'lap sim honesty  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
+# ── AUDIT 2026-09-22 items 21-24, 27 (SOFTWARE_MATH_AND_USABILITY_AUDIT,
+#    Appendix 4; verified in DESIGN_2027/binder_run/ASTRA_AUDIT_VERIFY_*).
+#    FAILING-THEN-PASSING, each on the audit's own repro numbers:
+#      21 Engine VE-taper controls were dead (module globals never reached
+#         ve_target_curve): 9500/0.72 -> 7000/0.40 moved torque by 0.0 N m.
+#      22 Lap torque cut returned max(0, …) = 0.0; force balance at 25 m/s,
+#         CdA 1, rho 1.2, no inertia = -1.29155 m/s^2.
+#      23 A TYRE-limited stop was divided by (1 + m_eq/m): 9.81 -> 6.622 m/s^2
+#         with no brake-torque limit modelled.  Friction-limited decel must be
+#         inertia-INVARIANT; a TORQUE-limited drive must still be slowed by it.
+#      24 Aero-heave wheel force dropped F_s*dMR/dq: 485.69 N vs exact 608.2 N
+#         (c = q + 2.5q^2, MR = 1 + 5q, K_s 22 kN/m, F_s0 1 kN, q 20 mm).
+#      27 Ride selector called min tyre load -100 N / 10 % contact loss
+#         'feasible'.
+print('-' * 64)
+try:
+    import vahan.engine as _E21
+    from types import SimpleNamespace as _SN21
+    from vahan.dynamics import VehicleParams as _VP21
+    from vahan.laptime import LapSimulator as _LS21
+    from vahan.ride_solve import RideSweep as _RSw27
+    _af = []
+    _d21 = _dp21 = _a22 = _b0 = _b1 = _dt0 = _dt1 = _dq0 = _dq1 = _lap24 = _ex24 = float('nan')
+    _sel27 = {'status': '(not run)'}
+    try:
+        # ── 21: explicit calibration reaches the curve; GUI boxes are live ──
+        _g0 = (_E21.VE_FALL_START_RPM, _E21.VE_AT_13K)
+        _t0 = np.asarray(_E21.engine_curve('corrected')[1])
+        _t1 = np.asarray(_E21.engine_curve('corrected', ve_fall_rpm=7000., ve_13k=.40)[1])
+        _d21 = float(np.max(np.abs(_t1 - _t0)))
+        if not _d21 > 1.0:
+            _af.append(f'21: VE taper 9500/0.72 -> 7000/0.40 moved torque {_d21:.3f} N m (dead input)')
+    except Exception as _ex:
+        _af.append(f'21: crashed {type(_ex).__name__}: {_ex}')
+    try:
+        # ── 21b: the Engine page's taper boxes (the GUI path) move its curve ──
+        _g0 = (_E21.VE_FALL_START_RPM, _E21.VE_AT_13K)
+        from gui.engine_page import EnginePage as _EP21
+        _ep = _EP21(win)
+        _c0 = np.asarray(_ep.current_curve()[1])
+        _ep._vefall.setValue(7000.); _ep._ve13.setValue(0.40)
+        _c1 = np.asarray(_ep.current_curve()[1])
+        _dp21 = float(np.max(np.abs(_c1 - _c0)))
+        if not _dp21 > 1.0:
+            _af.append(f'21: Engine page taper boxes moved its curve {_dp21:.3f} N m (dead controls)')
+        if np.isfinite(_d21) and not np.allclose(_c1, _t1):
+            _af.append('21: Engine page curve != engine_curve(same knobs)')
+        if (_E21.VE_FALL_START_RPM, _E21.VE_AT_13K) != _g0:
+            _af.append('21: a GUI path still mutates vahan.engine module globals')
+        _ep.deleteLater()
+    except Exception as _ex:
+        _af.append(f'21b: crashed {type(_ex).__name__}: {_ex}')
+    try:
+        # ── 22: torque cut slows the car by exactly -D/m (no inertia) ──
+        _v21 = _VP21(power_hp=80)
+        _ss21 = _SN21(_veh=_v21, _tire=None, _solvers={}, _traction_g_dynamic=lambda _: 1.)
+        _s21 = _LS21(_ss21, cda_m2=1., air_density=1.2)
+        _s21._ay_max = lambda speed: 9.81
+        _s21.set_rotating_inertia(0, 0, 0)
+        _a22 = _s21._ax_drive(25., 0., torque_cut=True)
+        _e22 = -_s21.drag_N(25.) / _v21.total_mass_kg
+        if not (abs(_e22 + 1.2915446874) < 1e-6 and abs(_a22 - _e22) < 1e-9):
+            _af.append(f'22: torque cut gave {_a22:.6f} m/s^2, force balance {_e22:.6f}')
+    except Exception as _ex:
+        _af.append(f'22: crashed {type(_ex).__name__}: {_ex}')
+    try:
+        # ── 23: friction-limited stop invariant to inertia; torque branch not ──
+        _s21.cda = 0.
+        _b0 = _s21._ax_brake(20, 0)
+        _s21.set_rotating_inertia(.19, .19, .05)
+        _b1 = _s21._ax_brake(20, 0)
+        if not (abs(_b0 - 9.81) < 1e-12 and abs(_b1 - 9.81) < 1e-12):
+            _af.append(f'23: tyre-limited brake {_b0:.5f} -> {_b1:.5f} m/s^2 with inertia (must stay 9.81)')
+        # traction-limited drive (grip 0.5 g, huge engine torque via 1st gear):
+        # engine + driven-wheel inertia must NOT reduce it; only the free fronts
+        _s21.set_gearbox([2.75], 1.0, 3.545, 11000.)
+        _s21.ss._traction_g_dynamic = lambda _: 0.05     # 0.05 g: surely tyre-limited
+        _s21.set_rotating_inertia(0, 0, 0)
+        _dt0 = _s21._ax_drive(10., 0., gear=1)
+        _s21.set_rotating_inertia(.19, .19, .05)
+        _dt1 = _s21._ax_drive(10., 0., gear=1)
+        _m21 = _v21.total_mass_kg; _rr = _v21.tire_radius_m
+        _dt1_exp = _dt0 * _m21 / (_m21 + 2 * .19 / _rr ** 2)
+        if not abs(_dt1 - _dt1_exp) < 1e-9:
+            _af.append(f'23: traction-limited drive {_dt0:.4f} -> {_dt1:.4f} m/s^2 with inertia, '
+                       f'expected {_dt1_exp:.4f} (free-wheel inertia only)')
+        # torque-limited drive (grip huge): whole-driveline inertia DOES apply
+        _s21.ss._traction_g_dynamic = lambda _: 50.
+        _s21.set_rotating_inertia(0, 0, 0)
+        _dq0 = _s21._ax_drive(20., 0., gear=1)
+        _s21.set_rotating_inertia(.19, .19, .05)
+        _dq1 = _s21._ax_drive(20., 0., gear=1)
+        if not abs(_dq1 - _dq0 / _s21._inertia_div(1)) < 1e-9 or not _dq1 < _dq0:
+            _af.append(f'23: torque-limited drive {_dq0:.4f} -> {_dq1:.4f} m/s^2, expected /'
+                       f'{_s21._inertia_div(1):.4f}')
+    except Exception as _ex:
+        _af.append(f'23: crashed {type(_ex).__name__}: {_ex}')
+    try:
+        # ── 24: progressive spring wheel force == virtual work, exact ──
+        _v24 = _VP21(power_hp=80, static_spring_force_front_N=1000.)
+        _ss24 = _SN21(_veh=_v24, _tire=None, _traction_g_dynamic=lambda _: 1.,
+                      _solvers={'FL': _SN21(solve=lambda t: _SN21(spring_length=.210 - t - 2.5 * t * t))})
+        _cv24 = _LS21(_ss24, cda_m2=1., air_density=1.2)._build_rate_curves()['F']
+        _q24, _k24 = .020, _v24.spring_rate_front_Npm
+        _lap24 = float(np.interp(_q24, _cv24['ts'], _cv24['fcum']))
+        _ex24 = (1000. + _k24 * (_q24 + 2.5 * _q24 ** 2)) * (1 + 5 * _q24) - 1000.
+        if not (abs(_ex24 - 608.2) < 1e-6 and abs(_lap24 - _ex24) < 1e-6):
+            _af.append(f'24: lap wheel force {_lap24:.4f} N vs exact {_ex24:.4f} N at 20 mm')
+    except Exception as _ex:
+        _af.append(f'24: crashed {type(_ex).__name__}: {_ex}')
+    try:
+        # ── 27: contact-invalid linear result is never 'feasible' ──
+        _z4 = np.zeros((1, 1, 1, 4)); _z3 = np.zeros((1, 1, 1))
+        _sw27 = _RSw27(front_rates_Npm=np.array([20000.]), rear_rates_Npm=np.array([20000.]),
+                       case_labels=['deliberately invalid contact'], speeds_mps=(15.,), dlc=_z4 + .2,
+                       travel_usage=_z4 + .5, travel_peak_m=_z4 + .01, damper_velocity_rms_mps=_z4,
+                       damper_velocity_peak_mps=_z4, contact_loss_fraction_linear=_z4 + .1,
+                       min_load_N=_z4 - 100, body_heave_acc_rms_mps2=_z3,
+                       settle_pass=np.ones_like(_z3, dtype=bool), pitch_to_bounce=_z3 + .5,
+                       front_settle_s=_z3 + 1, rear_settle_s=_z3 + 1, stop_margin_m=.02)
+        _sel27 = _sw27.select()
+        if _sel27['status'] == 'feasible' or _sel27['n_feasible'] != 0 or _sel27.get('contact_ok', True):
+            _af.append(f"27: -100 N / 10 % contact loss selected as status={_sel27['status']!r}, "
+                       f"n_feasible={_sel27['n_feasible']}")
+    except Exception as _ex:
+        _af.append(f'27: crashed {type(_ex).__name__}: {_ex}')
+    if _af:
+        fails += 1
+    print(f'audit 21-24,27   : taper {_d21:.1f} N m (page {_dp21:.1f}); cut {_a22:+.5f} m/s^2; '
+          f'tyre-limited brake {_b0:.2f}->{_b1:.2f}; trac drive {_dt0:.4f}->{_dt1:.4f}, '
+          f'torque drive {_dq0:.3f}->{_dq1:.3f}; spring {_lap24:.1f}/{_ex24:.1f} N; '
+          f'ride contact -> {_sel27["status"][:22]!r}   '
+          + ('pass' if not _af else 'UNEXPECTED FAIL: ' + '; '.join(_af)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbA; _tbA.print_exc()
+    print(f'audit 21-24,27   : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
 # ── ACKERMANN SWEEP MUST NOT MOVE WITH THE SETTING IT SWEEPS.
 #    A sweep whose answer depends on where the car's rack happens to sit is
 #    reading noise, not Ackermann — and that bug has already happened in this
@@ -1969,12 +2861,10 @@ except Exception as _e:
 #    THE RACK 25 mm fore-aft (the same perturbation that swung this car
 #    +40.8% -> +64.5% as built), rebuilding, and demanding the capability
 #    table come back bit-for-bit identical.
-#    ALSO gated here: 100% Ackermann must not be special BY CONSTRUCTION.
-#    At exactly 100% the two front wheels get the SAME slip angle, so if the
-#    objective were maximised there automatically the whole sweep would be a
-#    tautology.  It is not: measured, the unconstrained optimum sits past
-#    +100% (+125% at 5 m, +150% at 8 m), so 100% wins a +/-100% sweep only as
-#    a boundary, never because the split vanishes there.
+#    Also verify the explicit Ackermann input reaches the per-wheel slip
+#    outputs.  At 100% the slips must be equal; endpoint settings must produce
+#    different splits.  A capability argmax at 100% is a valid data-dependent
+#    result (or a plateau tie), not evidence of a construction tautology.
 print('-' * 64)
 try:
     from vahan.laptime import AckermannStationModel as _ASM
@@ -1991,7 +2881,10 @@ try:
         else:
             _PCT7 = [-100.0, 0.0, 100.0]
             _RAD7 = (3.5, 10.0)
-            _GG7 = (0.8, 1.4)
+            # 2.0 g added (2026-09-22): with only 0.8/1.4 g no cell of the
+            # current car ever became front-limited, so the ay-capability
+            # comparison had nothing finite to compare (all inf -> NaN).
+            _GG7 = (0.8, 1.4, 2.0)
 
             def _tbl7(_ss):
                 _m = _ASM(_tm7, _ss, _PCT7, grip_multiplier=0.65)
@@ -2035,7 +2928,53 @@ try:
                            f'-> {_ack_after:.2f}% at +{_rack_mm:.0f} mm) — the '
                            f'perturbation is not live, so this gate proves '
                            f'nothing')
-            _dmax = float(np.nanmax(np.abs(_a7._ay_cap - _b7._ay_cap)))
+            # inf-AWARE comparison (Astra F-08, 2026-09-22).  _ay_cap stores
+            # inf for "never front-limited inside the g ladder" — a VALID state,
+            # which ay_front_cap_g maps to 'no cap'.  The old line took
+            # nanmax(|inf - inf|) = nanmax(nan...) = nan when EVERY cell was inf
+            # (v147/v148: the 3.5 m / -100 % cell holds 1817.6 N against a
+            # 1810.6 N demand at 1.4 g, so no cell ever crosses) and reported
+            # "capability moved nan g" — measuring nothing.  Equal entries
+            # (incl. matching infs) now diff to 0; a finite<->inf flip or a NaN
+            # on either side is a real change / invalid state and stays nan
+            # -> fails.  The finite FORCE CEILING the crossing is built from is
+            # also compared directly, so the gate always measures something.
+            def _inv_diff(_x, _y):
+                _x = np.asarray(_x, float); _y = np.asarray(_y, float)
+                _same = (_x == _y)
+                _d = np.where(_same, 0.0, np.abs(_x - _y))
+                return np.where(np.isfinite(_d) | _same, _d, np.nan)
+            _dd7 = _inv_diff(_a7._ay_cap, _b7._ay_cap)
+            _dmax = float(np.max(_dd7)) if np.all(np.isfinite(_dd7)) else float('nan')
+            _n_lim7 = int(np.isfinite(_a7._ay_cap).sum())
+            _n_inf7 = int(np.isposinf(_a7._ay_cap).sum())
+            _W7 = float(_ss7a._veh.total_mass_kg) * 9.81 * float(_ss7a._veh.front_weight_fraction)
+            # Ceiling compared only at rungs where the front pair still COVERS
+            # the demand (both builds).  Measured 2026-09-22 on v148: moving the
+            # rack 25 mm also changes the car's bump steer / camber slightly
+            # (front camber 0.0009 deg, Fz 0.016 N at 1.4 g) — a real kinematic
+            # change, not the Ackermann setting.  Below the limit that moves the
+            # ceiling <= 0.007 N; on the 2.0 g rung, where the front is already
+            # past its limit (demand 2586 N vs ceiling ~2000 N), the saturated
+            # slip fallback amplifies it to 2.35 N.  That rung only feeds the
+            # interpolated crossing, which the ay gate above already bounds.
+            _dce = _inv_diff(_a7._ceil, _b7._ceil)
+            _cov7 = ((_a7._ceil >= _a7._demand[:, :, None])
+                     & (_b7._ceil >= _b7._demand[:, :, None]))
+            _dceil_N = (float(np.max(_dce[_cov7])) if _cov7.any() and np.all(np.isfinite(_dce[_cov7]))
+                        else float('nan'))
+            _dceil_all_N = float(np.nanmax(_dce)) if np.isfinite(_dce).any() else float('nan')
+            if not (np.all(np.isfinite(_a7._ceil)) and np.all(np.isfinite(_b7._ceil))):
+                _f7.append('front-axle force ceiling table has non-finite cells '
+                           f'({int((~np.isfinite(_a7._ceil)).sum())} before, '
+                           f'{int((~np.isfinite(_b7._ceil)).sum())} after the rack move)')
+            elif not (_dceil_N <= 1e-4 * _W7):
+                _f7.append(f'the sub-limit front-axle force ceiling moved {_dceil_N:.3e} N '
+                           f'(tolerance {1e-4 * _W7:.3f} N = 1e-4 g of front axle '
+                           f"weight) when only the car's own Ackermann changed")
+            if _n_lim7 == 0:
+                _f7.append('no cell became front-limited, so the ay comparison '
+                           'compared only inf sentinels (widen the g ladder)')
             # Tolerance is PHYSICAL, not bitwise.  This was 1e-12 g, which is
             # unsatisfiable by construction: SteadyStateSolver keeps a
             # warm-start cache, so back-to-back solves are not bitwise
@@ -2047,33 +2986,138 @@ try:
             # the car's own setting into the sweep still trips it while
             # solver round-off does not.
             _AY_INVARIANCE_TOL = 1e-4
-            if not np.isfinite(_dmax) or _dmax > _AY_INVARIANCE_TOL:
+            # The crossing is linearly interpolated between the last covered rung
+            # and the first SATURATED one (laptime._cross).  The saturated rung's
+            # margin moves by the rack's REAL kinematic change amplified by the
+            # saturated slip fallback (documented above, ~2 N) — that is not a
+            # leak, and the sub-limit ceiling gate above bounds any leak strictly.
+            # So each cell may move by 1e-4 g PLUS exactly that rung's first-order
+            # effect: d(ay)/d(m_sat) = dg * m_cov / (m_cov - m_sat)^2 (2026-09-23,
+            # v149 tripped 2.3e-4 g from this alone).
+            _g7 = np.asarray(_GG7, float); _sat_ay = 0.0; _cell_bad = []
+            for _i7 in range(len(_RAD7)):
+                for _k7 in range(len(_PCT7)):
+                    _ma = _a7._ceil[_i7, :, _k7] - _a7._demand[_i7, :]
+                    _mb = _b7._ceil[_i7, :, _k7] - _b7._demand[_i7, :]
+                    _allow = _AY_INVARIANCE_TOL
+                    for _j7 in range(1, len(_g7)):
+                        if _ma[_j7 - 1] > 0 >= _ma[_j7]:
+                            _sens = (_g7[_j7] - _g7[_j7 - 1]) * _ma[_j7 - 1] / (_ma[_j7 - 1] - _ma[_j7]) ** 2
+                            _c = abs(_sens * (_mb[_j7] - _ma[_j7])); _sat_ay = max(_sat_ay, _c)
+                            _allow += _c
+                            break
+                    _dc = _dd7[_i7, _k7]
+                    if not np.isfinite(_dc) or _dc > _allow:
+                        _cell_bad.append((_RAD7[_i7], _PCT7[_k7], float(_dc), _allow))
+            print(f'ackermann sweep  : saturated-rung propagation up to {_sat_ay:.2e} g '
+                  f'(allowance per cell = 1e-4 g + that); cells over: {len(_cell_bad)}')
+            if _cell_bad or not np.isfinite(_dmax):
                 _f7.append(f'the swept capability moved by {_dmax:.3e} g when '
                            f'only the CAR\'S OWN Ackermann changed — the '
                            f'sweep is reading its own setting')
-            # tautology check: 100% gives EQUAL front slip angles, and must
-            # still not be the automatic winner of a wider sweep
+            # Explicit-input response: 100% gives equal front slips, while
+            # settings on either side change their split.  This inspects the
+            # solver output, rather than assuming where a measured tyre-force
+            # optimum is allowed to sit.
             _d7 = _saf7(_tm7, _ss7a, 5.0, 1.2, ack_range=(-100.0, 200.0),
                         n=13, grip_multiplier=0.65)
             _p7 = np.asarray(_d7['ackermann_pct'], float)
             _u7 = np.asarray(_d7['useful_N'], float)
-            _k100 = int(np.argmin(np.abs(_p7 - 100.0)))
-            if int(np.argmax(_u7)) == _k100:
-                _f7.append('100% Ackermann is the argmax of a -100..+200% '
-                           'sweep — that is exactly where the two front slip '
-                           'angles become equal, so the win is tautological')
+            _d100 = _saf7(_tm7, _ss7a, 5.0, 1.2, ack_range=(100.0, 100.0),
+                          n=1, grip_multiplier=0.65)['best']
+            _dlo = _saf7(_tm7, _ss7a, 5.0, 1.2, ack_range=(-100.0, -100.0),
+                         n=1, grip_multiplier=0.65)['best']
+            _dhi = _saf7(_tm7, _ss7a, 5.0, 1.2, ack_range=(200.0, 200.0),
+                         n=1, grip_multiplier=0.65)['best']
+            _split100 = float(_d100['inner_slip_deg'] - _d100['outer_slip_deg'])
+            _split_lo = float(_dlo['inner_slip_deg'] - _dlo['outer_slip_deg'])
+            _split_hi = float(_dhi['inner_slip_deg'] - _dhi['outer_slip_deg'])
+            if not (np.isfinite(_split100) and np.isfinite(_split_lo) and np.isfinite(_split_hi)
+                    and abs(_split100) <= 1e-9
+                    and abs(_split_lo - _split100) > 1e-6
+                    and abs(_split_hi - _split100) > 1e-6):
+                _f7.append('Ackermann input did not produce equal 100% slips and distinct endpoint splits')
+            _u_span = float(np.nanmax(_u7) - np.nanmin(_u7))
+            if not (np.all(np.isfinite(_u7)) and np.isfinite(_u_span)):
+                _f7.append('Ackermann capability sweep returned non-finite force')
             if _f7:
                 fails += 1
             print(f'ackermann sweep  : rack +{_rack_mm:.0f} mm moved as-built '
                   f'{_ack_before:+.1f}% -> {_ack_after:+.1f}%, swept '
-                  f'capability moved {_dmax:.1e} g; best of -100..+200% is '
-                  f'{_p7[int(np.argmax(_u7))]:+.0f}% (not 100%)   '
+                  f'capability moved {_dmax:.1e} g ({_n_lim7} front-limited / {_n_inf7} never-limited cells), '
+                  f'sub-limit force ceiling moved {_dceil_N:.1e} N (all rungs {_dceil_all_N:.1e} N); 100% slip split {_split100:+.3e} deg, '
+                  f'-100/+200% {_split_lo:+.3f}/{_split_hi:+.3f} deg; force span {_u_span:.2f} N; '
+                  f'plateau {_d7["plateau_pct_lo"]:+.0f}..{_d7["plateau_pct_hi"]:+.0f}%   '
                   + ('pass' if not _f7 else
                      'UNEXPECTED FAIL: ' + '; '.join(_f7)))
 except Exception as _e:
     fails += 1
     import traceback as _tb7; _tb7.print_exc()
     print(f'ackermann sweep  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── ONE ACKERMANN PERCENT (Astra F-08, 2026-09-22).  FAILING-THEN-PASSING: the
+#    GUI pair readout (and its twin, the kinematic Ackermann curve) built a
+#    radius from the MEAN wheel angle and took a linear angle ratio, so YMD's
+#    EXACT 100 % pair (cot d_out - cot d_in = t/L) read 99.2 % at 10 deg and
+#    94.8 % at 30 deg of steer; the dynamics sensitivity used yet another linear
+#    ratio.  All now go through vahan.ackermann.ackermann_pct_from_pair /
+#    ackermann_pair_from_pct.  Gate: pairs built by YMD at -100/0/+50/+100/+200 %
+#    over 1..40 deg of mean steer, both turn directions, read back EXACTLY by the
+#    GUI readout; the kinematic curve reads the same; the sensitivity's
+#    tyre-wanted % equals the canonical % of the pair it requires (and exactly
+#    100 with zero slip).
+print('-' * 64)
+try:
+    from vahan.ymd import _ackermann_split as _aks8
+    from vahan.ackermann import ackermann_pct_from_pair as _apf8
+    from vahan.metrics_catalog import compute_ackermann_post as _cap8
+    from vahan.dynamics import _ideal_ackermann_pct as _iap8
+    from gui.main_window import _ackermann_from_pair as _gap8
+    from types import SimpleNamespace as _NS8
+    _L8, _t8 = 1.537, 1.222
+    _f8 = []; _worst8 = 0.0; _w100 = 0.0
+    for _mean in (1.0, 5.0, 10.0, 20.0, 30.0, 40.0):
+        for _pc in (-100.0, 0.0, 50.0, 100.0, 200.0):
+            for _sg in (+1.0, -1.0):                 # left / right turn
+                _sfl, _sfr = _aks8(_sg * _mean, _pc, _t8, _L8)
+                # steer (+ = left) -> toe-in: toe_L = -steer_FL, toe_R = +steer_FR
+                _rd = _gap8(-_sfl, _sfr, _L8, _t8, inner=None)
+                _err = abs(_rd - _pc) if np.isfinite(_rd) else float('inf')
+                _worst8 = max(_worst8, _err)
+                if _pc == 100.0:
+                    _w100 = max(_w100, _err)
+    if not _worst8 < 1e-6:
+        _f8.append(f'GUI readout of YMD-built pairs off by up to {_worst8:.3g} points')
+    # kinematic Ackermann curve (optimizer rack targeting) on an exact 100 % sweep
+    _st8 = np.linspace(-30.0, 30.0, 25)
+    _toe8 = np.array([(-_aks8(_s, 100.0, _t8, _L8)[0]) for _s in _st8])
+    _k8 = _cap8(_toe8, _st8, _L8, _t8)
+    _kv = _k8[np.isfinite(_k8)]
+    _kerr = float(np.max(np.abs(_kv - 100.0))) if _kv.size else float('inf')
+    if not (_kv.size >= 20 and _kerr < 1e-6):
+        _f8.append(f'kinematic curve reads an exact 100 % sweep off by {_kerr:.3g} points ({_kv.size} finite)')
+    # dynamics sensitivity: zero slip -> exactly 100; nonzero slip -> canonical % of the required pair
+    class _T8:
+        def __init__(self, k): self.k = k
+        def slip_angle_for_Fy(self, Fy, Fz, cam): return self.k * Fy / Fz
+    _veh8 = _NS8(wheelbase_m=_L8, front_track_m=_t8)
+    _res8 = _NS8(Fy={'FL': 900., 'FR': 500.}, Fz={'FL': 1100., 'FR': 450.}, inclination={})
+    _s0 = _iap8(_res8, _T8(0.0), _veh8, 5.0)
+    _s1 = _iap8(_res8, _T8(2.0), _veh8, 5.0)
+    _gi = np.degrees(np.arctan(_L8 / (5.0 - _t8 / 2))); _go = np.degrees(np.arctan(_L8 / (5.0 + _t8 / 2)))
+    _s1_ref = _apf8(_gi + 2.0 * 500. / 450., _go + 2.0 * 900. / 1100., _t8, _L8)   # inner = lighter FR
+    if not (abs(_s0 - 100.0) < 1e-9 and abs(_s1 - _s1_ref) < 1e-9):
+        _f8.append(f'sensitivity ideal Ackermann {_s0:.4f} (zero slip, want 100) / {_s1:.4f} vs canonical {_s1_ref:.4f}')
+    if _f8:
+        fails += 1
+    print(f'ackermann definition: exact 100 % pair reads {100.0 - _w100:.6f} % in the GUI at 1..40 deg '
+          f'(old mean-angle readout: 94.8 % at 30 deg); YMD round trip -100..+200 % worst {_worst8:.1e} pts; '
+          f'kinematic curve worst {_kerr:.1e} pts; sensitivity zero-slip {_s0:.3f} %   '
+          + ('pass' if not _f8 else 'UNEXPECTED FAIL: ' + '; '.join(_f8)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tb8; _tb8.print_exc()
+    print(f'ackermann definition: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
 # ── LAP-CAP fix (2026-08-03): the Ackermann lap chain must cap each station by
 #    WHOLE-CAR trimmed grip (ymd ay_trim_max, both axles), NOT the front-axle
@@ -2169,11 +3213,419 @@ except Exception as _em:
     import traceback as _tbm; _tbm.print_exc()
     print(f'corner moments   : UNEXPECTED FAIL ({type(_em).__name__}: {_em})')
 
+# ── MEMBER-LOAD FREE BODIES (2026-09-22 repair of the loads audit) ──────────
+#    Hand-computable synthetic corners + the real design car.  Frame: +X = car
+#    left, +Y = REARWARD, +Z = up.  Each line FAILED on the pre-repair code:
+#      brake body   : brake torque changed the member forces (internal couple
+#                     booked as external -> 2x braking moment in the links)
+#      lateral sign : FL at +1.5 g != FR at -1.5 g (Fy magnitude, one direction)
+#      arm body     : pushrod on the UCA treated as a 6th upright member
+#      rocker/ARB   : spring = |pushrod| x wheel MR (3000 vs 3750 N), paired
+#                     ARB averaging left -270 N·m on a free pivot
+#      validity     : no valid/cond fields, singular geometry returned numbers
+#      view pose    : load view re-solved every corner at ZERO travel
+print('-' * 64)
+from types import SimpleNamespace as _LNS
+from vahan import loads as _LL
+_LA = np.array
+_Lbp, _Lup = _LL.BrakeParams(), _LL.UprightParams()
+
+
+def _l_corner(push_on='upright'):
+    """Synthetic corner: flat A-arms at z 0.3/0.1, lateral tie rod, patch 50 mm
+    outboard of the joints, R = 0.2 m.  Hand-computable member forces."""
+    _s = _LNS(uca_front=_LA([0.3, -0.15, 0.3]), uca_rear=_LA([0.3, 0.15, 0.3]),
+              uca_outer=_LA([0.6, 0, 0.3]), lca_front=_LA([0.3, -0.15, 0.1]),
+              lca_rear=_LA([0.3, 0.15, 0.1]), lca_outer=_LA([0.6, 0, 0.1]),
+              tr_inner=_LA([0.3, 0.1, 0.2]), tr_outer=_LA([0.6, 0.1, 0.2]),
+              wheel_center=_LA([0.65, 0, 0.2]), spin_axis=_LA([1.0, 0, 0]), travel=0.0,
+              rocker_pivot=_LA([np.nan] * 3), rocker_spring_pt=_LA([np.nan] * 3),
+              spring_chassis_pt=_LA([np.nan] * 3))
+    if push_on == 'upright':      # vertical pushrod on the upright
+        _s.pushrod_outer, _s.pushrod_inner = _LA([0.6, 0, 0.2]), _LA([0.6, 0, 0.6])
+    else:                         # vertical pushrod on the UCA, 100 mm in from the BJ
+        _s.pushrod_outer, _s.pushrod_inner = _LA([0.5, 0, 0.3]), _LA([0.5, 0, 0.7])
+    return _s
+
+
+_L_MEM = ('uca_front_N', 'uca_rear_N', 'lca_front_N', 'lca_rear_N', 'tierod_N', 'pushrod_N')
+
+# 1. BRAKE BODY: wheel+hub+upright+caliper; pad/rotor friction is internal.
+try:
+    _f = []
+    _b0 = _LL.compute_corner_loads(_l_corner('uca'), 1000., 0., -1500., 0., _Lbp, _Lup, 0.2, pushrod_body='uca')
+    _b1 = _LL.compute_corner_loads(_l_corner('uca'), 1000., 0., -1500., 300., _Lbp, _Lup, 0.2, pushrod_body='uca')
+    _dmax = max(abs(getattr(_b0, k) - getattr(_b1, k)) for k in _L_MEM)
+    if _dmax > 1e-9:
+        _f.append(f'brake torque changed member forces by {_dmax:.1f} N (internal couple booked)')
+    _st = _l_corner('uca'); _jf = _b1.joint_forces
+    _cp = _LL.contact_patch_point(_st.wheel_center, _st.spin_axis, 0.2)
+    _Fs = _jf['uca'] + _jf['lca'] + _jf['tie'] + _LL.patch_force_world(-1500., 0., 1000.)
+    _Mp = sum(np.cross(np.asarray(getattr(_st, p)) - _cp, _jf[k])
+              for p, k in (('uca_outer', 'uca'), ('lca_outer', 'lca'), ('tr_outer', 'tie')))
+    if np.linalg.norm(_Fs) > 1e-6 or np.linalg.norm(_Mp) > 1e-6:
+        _f.append(f'joint forces do not balance the tyre force alone (|F| {np.linalg.norm(_Fs):.2g}, |M| {np.linalg.norm(_Mp):.2g})')
+    if _LL.patch_force_world(-1500., 0., 0.)[1] <= 0:
+        _f.append('braking force not REARWARD (+Y)')
+    _bi = _LL.compute_corner_loads(_l_corner('uca'), 1000., 0., -1500., 300., _Lbp, _Lup, 0.2,
+                                   pushrod_body='uca', brakes_inboard=True)
+    _Mwc = sum(np.cross(np.asarray(getattr(_st, p)) - _st.wheel_center, _bi.joint_forces[k])
+               for p, k in (('uca_outer', 'uca'), ('lca_outer', 'lca'), ('tr_outer', 'tie')))
+    if abs(_Mwc[0]) > 1e-6:
+        _f.append(f'inboard brakes: links react {_Mwc[0]:.1f} N·m about the axle (should be 0)')
+    # frame guard: the design car's front axle must be at smaller Y than the rear
+    if not (float(win._solvers['FL'].solve(0.).wheel_center[1])
+            < float(win._solvers['RL'].solve(0.).wheel_center[1])):
+        _f.append('design frame is not +Y rearward — loads.py sign mapping needs review')
+    # real car: 1.5 g braking, outboard brakes -> member forces independent of T
+    _Lcl = win._solvers['FL'].solve(0.)
+    _r0 = _LL.compute_corner_loads(_Lcl, 1017., 0., -1339., 0., _Lbp, _Lup, 0.203,
+                                   pushrod_body=win._solvers['FL']._pushrod_body)
+    _r1 = _LL.compute_corner_loads(_Lcl, 1017., 0., -1339., 272., _Lbp, _Lup, 0.203,
+                                   pushrod_body=win._solvers['FL']._pushrod_body)
+    _dcar = max(abs(getattr(_r0, k) - getattr(_r1, k)) for k in _L_MEM)
+    if _dcar > 1e-9:
+        _f.append(f'design car: brake torque moved members {_dcar:.1f} N')
+    if _f:
+        fails += 1
+    print(f'loads brake body : brake torque internal (max member change {_dmax:.1e} N, car {_dcar:.1e} N), '
+          f'tyre force closes alone, inboard-brake shaft path   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads brake body : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 2. LATERAL SIGN: member solver, corner moments and arrows use ONE world vector;
+#    a left-hand turn must be the exact mirror of a right-hand turn.
+try:
+    from gui import wheel_package as _LWP
+    _f = []
+    _lr = _LWP.compute_case(win, 1.5, 0.0)[0]
+    _ll = _LWP.compute_case(win, -1.5, 0.0)[0]
+    _mm = max(abs(getattr(_lr['FL'], k) - getattr(_ll['FR'], k)) for k in _L_MEM + ('spring_force_N',))
+    _den = max(abs(getattr(_lr['FL'], k)) for k in _L_MEM)
+    if not (_mm <= 1e-6 * _den):
+        _f.append(f'FL right-turn vs FR left-turn differ by {_mm:.1f} N (not mirror images)')
+    if not (_lr['FL'].Fy_N < 0 and _lr['FR'].Fy_N < 0):
+        _f.append('right-hand turn tyre forces must point to -X (car right)')
+    _st = _lr['FL'].state
+    _m = _LL.corner_moments(Fx=0., Fy=_lr['FL'].Fy_N, Fz=_lr['FL'].Fz_N, wheel_center=_st.wheel_center,
+                            spin_axis=_st.spin_axis, lca_outer=_st.lca_outer, uca_outer=_st.uca_outer,
+                            wheel_radius_m=0.203)
+    _k = _LA(_st.uca_outer) - _LA(_st.lca_outer); _k /= np.linalg.norm(_k)
+    _cp = _LL.contact_patch_point(_st.wheel_center, _st.spin_axis, 0.203)
+    _kp = float(_k @ np.cross(_cp - _LA(_st.lca_outer), _LL.patch_force_world(0., _lr['FL'].Fy_N, _lr['FL'].Fz_N)))
+    if abs(_m['kingpin_Nm'] - _kp) > 1e-9:
+        _f.append('corner_moments uses a different lateral world sign than the member solver')
+    if _f:
+        fails += 1
+    print(f'loads lateral sign: right/left turn mirror max diff {_mm:.1e} N, FL Fy {_lr["FL"].Fy_N:.0f} N (toward -X), '
+          f'kingpin {_m["kingpin_Nm"]:.1f} N·m on the member-solver vector   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads lateral sign: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 3. ARM BODY: pushrod on a control arm -> upright + arm as two bodies at the BJ.
+try:
+    _f = []
+    _u = _LL.compute_corner_loads(_l_corner('upright'), 1000., 0., 0., 0., _Lbp, _Lup, 0.2)
+    _exp_u = {'pushrod_N': -1000., 'uca_front_N': -139.7542486, 'uca_rear_N': -139.7542486,
+              'lca_front_N': 139.7542486, 'lca_rear_N': 139.7542486, 'tierod_N': 0.}
+    _a = _LL.compute_corner_loads(_l_corner('uca'), 1000., 0., 0., 0., _Lbp, _Lup, 0.2, pushrod_body='uca')
+    # hand: arm moment about its pivot axis: 0.3*Fz = 0.2*|P| -> P = -1500; leg
+    # reaction S/2 = (0.125, 0, 0.25) Fz -> axial -0.1118 Fz + shear 0.2562 Fz
+    _exp_a = {'pushrod_N': -1500., 'uca_front_N': -111.8033989, 'uca_rear_N': -111.8033989,
+              'lca_front_N': 139.7542486, 'lca_rear_N': 139.7542486, 'tierod_N': 0.,
+              'uca_front_shear_N': 256.1737691, 'uca_bj_V': -1000.}
+    for _nm, _c, _e in (('upright-mounted', _u, _exp_u), ('UCA-mounted', _a, _exp_a)):
+        for _kk, _vv in _e.items():
+            if abs(getattr(_c, _kk) - _vv) > 1e-6:
+                _f.append(f'{_nm} {_kk} {getattr(_c, _kk):.4f} != hand {_vv:.4f}')
+    # real car, independent VIRTUAL WORK: F_s = -(F.dcp + F_u.dwc) / dL_spring
+    def _kabsch(P, Q):
+        pc, qc = P.mean(0), Q.mean(0); U_, S_, Vt = np.linalg.svd((P - pc).T @ (Q - qc))
+        R_ = Vt.T @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U_.T))]) @ U_.T
+        return R_, qc - R_ @ pc
+    _vw = 0.0
+    for _lb in ('FL', 'RL'):
+        _sv = win._solvers[_lb]; _s0 = _sv.solve(0.004)
+        _c = _LL.compute_corner_loads(_s0, 1200., -900., 0., 0., _Lbp, _Lup, 0.203,
+                                      pushrod_body=_sv._pushrod_body, rocker_axis=_sv._rocker_axis,
+                                      unsprung_mass_kg=13., accel_world=(-8., 0., 0.))
+        _sp, _sm = _sv.solve(0.004 + 1e-5), _sv.solve(0.004 - 1e-5)
+        _pp = lambda x: np.array([x.uca_outer, x.lca_outer, x.tr_outer], float)
+        _cp = _LL.contact_patch_point(_s0.wheel_center, _s0.spin_axis, 0.203)
+        _Rp, _tp = _kabsch(_pp(_s0), _pp(_sp)); _Rm, _tm_ = _kabsch(_pp(_s0), _pp(_sm))
+        _dcp = (_Rp @ _cp + _tp) - (_Rm @ _cp + _tm_)
+        _dwc = _LA(_sp.wheel_center) - _LA(_sm.wheel_center)
+        _Fu = 13. * (_LA([0, 0, -9.81]) - _LA([-8., 0, 0]))
+        _Fvw = -(_LL.patch_force_world(0., -900., 1200.) @ _dcp + _Fu @ _dwc) / (_sp.spring_length - _sm.spring_length)
+        _vw = max(_vw, abs(_c.spring_force_N - _Fvw) / abs(_Fvw))
+        if not _c.valid or _vw > 1e-5:
+            _f.append(f'{_lb}: statics spring {_c.spring_force_N:.2f} N vs virtual work {_Fvw:.2f} N')
+    if _f:
+        fails += 1
+    print(f'loads arm body   : hand pushrod -1000/-1500 N, UCA leg -111.8 N + 256.2 N shear; '
+          f'car statics vs virtual work {_vw:.1e} rel   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads arm body   : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 4. ROCKER / ARB: spring from the rocker's own lever balance; every rocker and
+#    the bar close exactly.
+try:
+    _f = []
+    _S, _bs, _m0 = _LL.rocker_required_spring(
+        pushrod_inner=_LA([0.10, 0, 0]), pushrod_outer=_LA([0.10, -0.3, 0]), pushrod_N=-3000.,
+        rocker_pivot=_LA([0, 0, 0]), rocker_axis=_LA([0, 0, 1.]),
+        rocker_spring_pt=_LA([0, 0.08, 0]), spring_chassis_pt=_LA([-0.25, 0.08, 0]))
+    if abs(_S - 3750.) > 1e-9:
+        _f.append(f'lever example spring {_S:.1f} N != 3750 N (a/b = 0.10/0.08)')
+    _fb = _LL.rocker_arb_freebody(
+        pushrod_inner=_LA([0.10, 0, 0]), pushrod_outer=_LA([0.10, -0.3, 0]), pushrod_N=-3000.,
+        rocker_pivot=_LA([0, 0, 0]), rocker_axis=_LA([0, 0, 1.]),
+        rocker_spring_pt=_LA([0, 0.08, 0]), spring_chassis_pt=_LA([-0.25, 0.08, 0]),
+        spring_force_N=3000., arb_drop_top=_LA([-0.06, 0, 0]), arb_arm_end=_LA([-0.06, 0.2, 0]),
+        m0_opposite=0.)
+    if abs(_fb['axis_moment_residual_Nm']) > 1e-9:
+        _f.append(f'paired rocker leaves {_fb["axis_moment_residual_Nm"]:.1f} N·m on a free pivot')
+    # anchor NOT written by the loads code: the dynamics model's own static
+    # spring force (sprung corner weight / motion ratio)
+    _l0, _v0 = _LWP.compute_case(win, 0.0, 0.0)[:2]
+    _sfs = {}
+    for _lb, _attr in (('FL', 'static_spring_force_front_N'), ('RL', 'static_spring_force_rear_N')):
+        _ref = float(getattr(_v0, _attr, 0.0) or 0.0)
+        _sfs[_lb] = (_l0[_lb].spring_force_N, _ref)
+        if _ref > 0 and abs(_l0[_lb].spring_force_N - _ref) > 1e-3 * _ref:
+            _f.append(f'{_lb} static spring {_l0[_lb].spring_force_N:.1f} N != dynamics static {_ref:.1f} N')
+    _ld = _LWP.compute_case(win, 1.5, 0.0)[0]
+    _bar = {}
+    for _ax, (_a1, _a2) in (('F', ('FL', 'FR')), ('R', ('RL', 'RR'))):
+        _bar[_ax] = _ld[_a1].arb_bar_torque_Nm + _ld[_a2].arb_bar_torque_Nm
+        if abs(_bar[_ax]) > 1e-9 or not np.isfinite(_ld[_a1].arb_link_N):
+            _f.append(f'{_ax} ARB bar not balanced ({_bar[_ax]:.3g} N·m) / link {_ld[_a1].arb_link_N}')
+    _res = []
+    for _lb in ('FL', 'FR', 'RL', 'RR'):
+        _c = _ld[_lb]; _s = _c.state
+        _g = _LWP.arb_geometry_fn(win)(_lb, _s)
+        _fb = _LL.rocker_arb_freebody(
+            pushrod_inner=_s.pushrod_inner, pushrod_outer=_s.pushrod_outer, pushrod_N=_c.pushrod_N,
+            rocker_pivot=_s.rocker_pivot, rocker_axis=win._solvers[_lb]._rocker_axis,
+            rocker_spring_pt=_s.rocker_spring_pt, spring_chassis_pt=_s.spring_chassis_pt,
+            spring_force_N=_c.spring_force_N, arb_drop_top=_g['drop_top'], arb_arm_end=_g['arm_end'])
+        _t = float(_fb['F_arb'] @ _fb['u_arb'])
+        _res.append(abs(_fb['axis_moment_residual_Nm']))
+        if abs(_t - _c.arb_link_N) > 1e-6 * max(1., abs(_t)):
+            _f.append(f'{_lb} view drop-link {_t:.1f} N != core {_c.arb_link_N:.1f} N')
+    if _f:
+        fails += 1
+    print(f'loads rocker/ARB : lever example 3750 N, static spring F {_sfs["FL"][0]:.0f}/{_sfs["FL"][1]:.0f} '
+          f'R {_sfs["RL"][0]:.0f}/{_sfs["RL"][1]:.0f} N (loads/dynamics), paired residual {_fb["axis_moment_residual_Nm"]:.1e}; '
+          f'car @1.5 g bar balance F {_bar["F"]:.1e} R {_bar["R"]:.1e} N·m, '
+          f'links F ±{abs(_ld["FL"].arb_link_N):.0f} R ±{abs(_ld["RL"].arb_link_N):.0f} N, '
+          f'rocker residual max {max(_res):.1e} N·m   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads rocker/ARB : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 5. VALIDITY: rank-deficient / ill-conditioned -> valid False + NaN, never numbers.
+try:
+    _f = []
+    _ok = _LL.compute_corner_loads(_l_corner(), 1000., 0., 0., 0., _Lbp, _Lup, 0.2)
+    if not (_ok.valid and _ok.cond_number < 100):
+        _f.append(f'well-posed corner flagged (cond {_ok.cond_number:.3g})')
+    _sd = _l_corner(); _sd.uca_rear = _sd.uca_front.copy()          # 5 independent links
+    _bad = _LL.compute_corner_loads(_sd, 1000., 0., 0., 0., _Lbp, _Lup, 0.2)
+    if _bad.valid or np.isfinite(_bad.pushrod_N):
+        _f.append('rank-deficient corner reported as a valid solution')
+    _conds = []
+    for _eps in (5e-2, 1e-4):      # tie rod swung toward the LCA-front line
+        _sn = _l_corner(); _sn.tr_outer = _LA([0.6, 0.0 + _eps, 0.1]); _sn.tr_inner = _LA([0.3, -0.15 + _eps, 0.1])
+        _cn = _LL.compute_corner_loads(_sn, 1000., 300., 0., 0., _Lbp, _Lup, 0.2)
+        _conds.append((_cn.cond_number, _cn.valid))
+    if not (_conds[1][0] > _conds[0][0] and not _conds[1][1]):
+        _f.append(f'near-toggle not flagged {_conds}')
+    _ld = _LWP.compute_case(win, 1.5, 0.0)[0]
+    for _lb in ('FL', 'FR', 'RL', 'RR'):
+        _c = _ld[_lb]
+        if not (_c.valid and _c.cond_number < 100):
+            _f.append(f'design car {_lb} invalid/ill-conditioned ({_c.cond_number:.3g}: {_c.invalid_reason})')
+
+    class _Boom:
+        def solve(self, t):
+            raise RuntimeError('no converge')
+    _res = _LWP.compute_case(win, 1.5, 0.0)[3]
+    import warnings as _Lw
+    with _Lw.catch_warnings(record=True) as _Lwarn:
+        _Lw.simplefilter('always')
+        _fl = _LL.compute_all_corners({'FL': _Boom(), 'FR': win._solvers['FR'], 'RL': win._solvers['RL'],
+                                       'RR': win._solvers['RR']}, _res, _Lbp, _Lbp, _Lup, _Lup, 0.203)
+    if not any('WITHOUT veh' in str(_w.message) for _w in _Lwarn):
+        _f.append('compute_all_corners without veh did not warn (silent incompleteness)')
+    if _fl['FL'].valid or np.isfinite(_fl['FL'].pushrod_N) or np.isfinite(_fl['FL'].residual):
+        _f.append('failed kinematic solve reported as a zero-force, zero-residual solution')
+    if _f:
+        fails += 1
+    print(f'loads validity   : synthetic cond {_ok.cond_number:.1f}, rank-5 -> invalid/NaN, near-toggle cond '
+          f'{_conds[0][0]:.3g}->{_conds[1][0]:.3g} flagged, car cond max '
+          f'{max(_ld[l].cond_number for l in _ld):.1f}, failed solve -> invalid   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads validity   : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 6. LOAD VIEW = the solved pose + the core caliper/bearing vectors.
+try:
+    _f = []
+    _ld, _v6, _u6, _r6 = _LWP.compute_case(win, 1.5, 0.0)[:4]
+    # the corner that MOVES most (since 2026-09-22 the jacking heave is fed
+    # back, so the loaded FL's roll bump and the body lift nearly cancel on
+    # the default car — the unloaded FR carries the clear travel)
+    _c6 = max(('FL', 'FR'), key=lambda c: abs(float(_r6.travel[c])))
+    _its = _LWP._load_items(win, 1.5, 0.0, only_corner=_c6)
+    _bj = [it for it in _its if 'upper ball joint' in it[3]]
+    _dyn = _LA(_ld[_c6].state.uca_outer); _stat = _LA(win._solvers[_c6].solve(0.).uca_outer)
+    if not _bj or np.linalg.norm(_LA(_bj[0][0]) - _dyn) > 1e-9:
+        _f.append('upper ball-joint arrow not at the solved dynamic pose')
+    _trav = float(_r6.travel[_c6])
+    if abs(_trav) < 0.5:
+        _f.append(f'test needs roll travel, got {_trav:.2f} mm')
+    _up2 = _LL.UprightParams(caliper_vertical_mounts=False, caliper_angle_deg=90.0)
+    _r, _t, _w = _LL.caliper_frame(_up2)
+    if not (np.allclose(_r, [0, 1, 0]) and np.allclose(_t, [0, 0, 1])):
+        _f.append(f'manual clock 90 deg must be the trailing edge (+Y) with disc moving UP there, got r {_r} t {_t}')
+    _cb = _LL.ComponentLoads(brake_torque_Nm=300.)
+    _LL._compute_caliper_bolt_loads(_cb, _Lbp, _up2)
+    # trailing-edge pad: disc surface moves up -> friction on caliper up (+V)
+    if not (_cb.caliper_upper_V > 0 and _cb.caliper_lower_V > 0):
+        _f.append('trailing caliper lugs not loaded upward by the disc')
+    _bk = _LWP.compute_case(win, 0.0, -1.5)[0]['FL']
+    _cal = [it for it in _LWP._load_items(win, 0.0, -1.5, only_corner='FL') if 'CALIPER' in it[3]]
+    if len(_cal) != 2 or any(not np.allclose(_LA(a[1]), _LA(b[1])) for a, b in zip(_cal, _bk.caliper_lugs)):
+        _f.append('caliper arrows are not the core lug forces')
+    if _f:
+        fails += 1
+    print(f'loads view pose  : BJ arrow at dynamic pose ({np.linalg.norm(_dyn - _stat) * 1000:.1f} mm from the '
+          f'static one, travel {_trav:+.1f} mm), caliper arrows = table lugs, clock 90 deg = trailing edge   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads view pose  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 6b. CALIPER / BEARING DOMAIN (Astra F-03, 2026-09-22).  FAILING-THEN-PASSING:
+#     the old code clamped the signed pad-to-bolt-line offset l4 to zero, so a
+#     120 mm disc / 90 mm pad / 100 mm bolt line at 450 N.m left a 50.0 N.m
+#     moment imbalance on the caliper free body (751.8 N.m worst over Astra's
+#     seed-88 sweep); a 0.5 mm bearing spacing returned plausible 0 N loads and a
+#     pad outside the disc was accepted.  Now: l4 signed, residual ~1e-13,
+#     pad-outside-disc rejected (NaN + caliper_valid False), bad bearing spacing
+#     NaN + bearing_valid False, and the live car's Loads-page path still valid.
+try:
+    _f = []
+    def _cal_res(_bp, _up, _T, _fr, _wc):
+        _c = _LL.ComponentLoads(brake_torque_Nm=_T)
+        _LL._compute_caliper_bolt_loads(_c, _bp, _up, _fr, _wc)
+        if not _c.caliper_lugs:
+            return _c, float('nan')
+        _M = sum((np.cross(_p - _wc, _fv) for _p, _fv in _c.caliper_lugs), np.zeros(3))
+        _Fp = _T / (_bp.pad_radius_mm / 1000.0)
+        _tg = np.cross(_bp.pad_radius_mm / 1000.0 * _fr[0], _Fp * _fr[1])
+        return _c, float(np.linalg.norm(_M - _tg))
+    _bpx = _LL.BrakeParams(rotor_dia_mm=240, pad_radius_mm=90,
+                           caliper_mount_height_mm=20, caliper_bolt_spacing_mm=60)
+    _upx = _LL.UprightParams(caliper_angle_deg=0, caliper_vertical_mounts=True)
+    _wcx = np.array([.7, 0., .2])
+    _frx = _LL.caliper_frame(_upx, [1, 0, 0], _wcx, _wcx + np.array([0, .1, 0]))
+    _cx, _rx = _cal_res(_bpx, _upx, 450., _frx, _wcx)
+    _Hx = abs(_cx.caliper_upper_H)
+    if abs(_bpx.caliper_l4_mm + 10.0) > 1e-9:
+        _f.append(f'signed l4 should be -10 mm, got {_bpx.caliper_l4_mm:.2f}')
+    if not (_cx.caliper_valid and np.isfinite(_rx) and _rx < 1e-6):
+        _f.append(f'signed-offset fixture moment residual {_rx:.4g} N.m (was 50.0 when clamped)')
+    if abs(_Hx - 5000. * 0.010 / 0.060) > 1e-6:
+        _f.append(f'radial lug couple {_Hx:.1f} N, expected F*|l4|/l5 = 833.3 N')
+    _rng6 = np.random.default_rng(88); _worst6 = 0.; _nrej6 = 0; _nout6 = 0; _bad6 = 0
+    for _ in range(1000):
+        _bpr = _LL.BrakeParams(pad_radius_mm=_rng6.uniform(55, 130), rotor_dia_mm=_rng6.uniform(180, 300),
+                               caliper_mount_height_mm=_rng6.uniform(10, 45),
+                               caliper_bolt_spacing_mm=_rng6.uniform(30, 100))
+        _upr = _LL.UprightParams(bearing_spacing_mm=_rng6.uniform(20, 90),
+                                 bearing_inboard_offset_mm=_rng6.uniform(10, 70),
+                                 caliper_angle_deg=_rng6.uniform(0, 360),
+                                 caliper_vertical_mounts=bool(_rng6.integers(0, 2)))
+        _wcr = np.array([_rng6.choice([-1, 1]) * .7, 0, .2])
+        _trr = _wcr + np.array([0, _rng6.uniform(-.2, .2), _rng6.uniform(-.1, .1)])
+        _frr = _LL.caliper_frame(_upr, [1, 0, 0], _wcr, _trr)
+        _rng6.uniform(0, 6000); _rng6.uniform(-4000, 4000); _rng6.uniform(-3000, 3000)
+        _cr, _rr6 = _cal_res(_bpr, _upr, _rng6.uniform(0, 700), _frr, _wcr)
+        _outside = _bpr.pad_radius_mm >= 0.5 * _bpr.rotor_dia_mm
+        _nout6 += int(_outside)
+        if not _cr.caliper_valid:
+            _nrej6 += 1
+            if np.isfinite(_cr.caliper_upper_V):
+                _bad6 += 1                          # rejected but still a number
+        elif np.isfinite(_rr6):
+            _worst6 = max(_worst6, _rr6)
+    if _nrej6 != _nout6 or _bad6:
+        _f.append(f'pad-outside-disc cases {_nout6}, rejected {_nrej6}, rejected-but-numeric {_bad6}')
+    if _worst6 > 1e-6:
+        _f.append(f'accepted caliper geometry moment residual {_worst6:.4g} N.m (was 751.8 clamped)')
+    _cbx = _LL.ComponentLoads(Fz_N=1500., Fy_N=1200., Fx_N=-800., brake_torque_Nm=300.)
+    _LL._compute_bearing_loads(_cbx, _LL.BrakeParams(), _LL.UprightParams(bearing_spacing_mm=0.5), 0.203, -1.0)
+    if _cbx.bearing_valid or np.isfinite(_cbx.bearing_outer_V) or not _cbx.bearing_invalid_reason:
+        _f.append(f'0.5 mm bearing spacing returned outer V {_cbx.bearing_outer_V} valid={_cbx.bearing_valid} '
+                  f'(must be NaN + invalid, not a plausible zero)')
+    _ldk = _LWP.compute_case(win, 0.0, -1.5)[0]
+    _car_bad = [f'{_k}: {_v.caliper_invalid_reason or _v.bearing_invalid_reason}'
+                for _k, _v in _ldk.items() if not (_v.caliper_valid and _v.bearing_valid)]
+    if _car_bad:
+        _f.append('live car Loads path invalid: ' + '; '.join(_car_bad))
+    if _f:
+        fails += 1
+    print(f'caliper/bearing domain: signed l4 fixture residual {_rx:.1e} N.m (clamped: 50.0), lug couple '
+          f'{_Hx:.1f} N; sweep {_nrej6}/{_nout6} pad-outside rejected, accepted worst {_worst6:.1e} N.m '
+          f'(clamped: 751.8); 0.5 mm bearing -> {"NaN+invalid" if not _cbx.bearing_valid else "numbers"}; '
+          f'live car 4 corners valid={not _car_bad}   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbc; _tbc.print_exc()
+    print(f'caliper/bearing domain: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 7. SIGN CONTRACT with dynamics.py: SteadyStateResult.Fx/Fy are MAGNITUDES and
+#    brake torque is braking-only; signed_wheel_forces supplies the direction.
+try:
+    _f = []
+    for _lat, _lon in ((1.5, 0.), (-1.5, 0.), (0., -1.5), (0., 1.0)):
+        _rr = win._build_dynamics_solver().solve(_lat, _lon)
+        for _lb in ('FL', 'FR', 'RL', 'RR'):
+            if _rr.Fx.get(_lb, 0.) < 0 or _rr.Fy.get(_lb, 0.) < 0:
+                _f.append(f'dynamics now stores SIGNED Fx/Fy ({_lb} @ {_lat},{_lon}) — update signed_wheel_forces')
+            _sx, _sy, _sz = _LL.signed_wheel_forces(_rr, _lb)
+            if (_lon < 0 and _sx > 0) or (_lon > 0 and _sx < 0) or (_lat > 0 and _sy > 0) or (_lat < 0 and _sy < 0):
+                _f.append(f'{_lb} @ ({_lat},{_lon}): wrong signed direction ({_sx:.0f}, {_sy:.0f})')
+    if _f:
+        fails += 1
+    print(f'loads sign contract: dynamics magnitudes -> signed (brake -Fx, right turn -Fy) on 4 cases   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(sorted(set(_f))[:4])))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'loads sign contract: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
 # ── PACKAGING SYSTEM (vahan/packaging.py): the ONE validity oracle both the
 #    manual page and the generator run.  Two invariants: (a) the untouched
-#    current design config must validate PASS against its own baseline — the
-#    baseline is by definition a valid packaging solution (wheel points
-#    identical, rates equal, laws met, clash set unchanged); (b) the isometry
+#    current design config must meet the absolute geometry laws, even against
+#    its own baseline (a baseline can itself be defective); (b) the isometry
 #    primitives must round-trip: mirror∘mirror = identity and rotate(+a)∘
 #    rotate(−a) = identity to 1e-9 m, or the "rates preserved exactly" claim
 #    the transforms are built on is false.
@@ -2181,13 +3633,91 @@ print('-' * 64)
 try:
     import glob as _gp, re as _rp
     from vahan import packaging as _pkgm
+    # Rule 04 strict-metric regression.  Start with a known orthogonal triad in
+    # the X=0 rocker plate, then translate the whole ARB 48 mm along the plate
+    # normal.  Translation preserves that reference construction's triad but
+    # must fail the physical-plate gate.
+    _r04_hp = {'rocker_pivot': np.array([0.0, 0.0, 0.0]),
+               'pushrod_inner': np.array([0.0, 0.1, 0.0]),
+               'rocker_spring_pt': np.array([0.0, 0.0, 0.1])}
+    _r04_arb = {'arb_drop_top': np.array([0.048, 0.1, 0.1]),
+                'arb_arm_end': np.array([0.048, 0.0, 0.1]),
+                'arb_pivot': np.array([0.048, 0.0, 0.0])}
+    _r04_synth = _pkgm.arb_drop_link_plate_metrics(_r04_hp, _r04_arb)
+    assert np.isclose(_r04_synth['drop_top_signed_mm'], 48.0)
+    assert np.isclose(_r04_synth['arm_end_signed_mm'], 48.0)
+    assert np.isclose(_r04_synth['direction_deg'], 0.0)
+    assert not _pkgm.arb_drop_link_plate_compliant(_r04_synth, 3.0)
+
+    # Saved v114 is the real defect: the project declares a +48 mm standoff,
+    # but declarations do not move the physical plate or alter compliance.
+    import json as _r04_json
+    _v114_paths = _gp.glob('configs/2027_v114_*.vahan')
+    assert len(_v114_paths) == 1, _v114_paths
+    with open(_v114_paths[0], encoding='utf-8') as _r04_f:
+        _v114 = _r04_json.load(_r04_f)
+    _v114_m = _pkgm.arb_drop_link_plate_metrics(_v114['front_hp'],
+                                                 _v114['front_arb'])
+    assert float(_v114['car']['front_arb_drop_standoff_mm']) == 48.0
+    assert not _pkgm.arb_drop_link_plate_compliant(_v114_m, 3.0)
+    print(f'Rule 04 strict    : synthetic 48.0/48.0 mm rejected; v114 '
+          f'{_v114_m["drop_top_signed_mm"]:+.1f}/'
+          f'{_v114_m["arm_end_signed_mm"]:+.1f} mm rejected   pass')
     _pcfgs = _gp.glob('configs/2027_v*.vahan')
-    _pdes = max(_pcfgs, key=lambda p: int((_rp.search(r'2027_v(\d+)', p) or [0, -1]).__getitem__(1))
-                if _rp.search(r'2027_v(\d+)', p) else -1) if _pcfgs else None
+    _pdes = os.environ.get('VAHAN_DESIGN') or (max(_pcfgs, key=lambda p: int((_rp.search(r'2027_v(\d+)', p) or [0, -1]).__getitem__(1))
+                if _rp.search(r'2027_v(\d+)', p) else -1) if _pcfgs else None)
     if _pdes:
         win._load_project_from_path(_pdes); win._rebuild_solvers(0.)
+        _gl0 = _pkgm._axle_geometry_laws(win, 'front')
+        print(f"packaging window : {os.path.basename(_pdes)} standoff {win._car.get('front_arb_drop_standoff_mm')} waiver {bool(win._car.get('front_arb_rule04_waiver'))} "
+              f"laws coplanar {_gl0['coplanar_mm']:.2f} in-plane {_gl0['arb_drop_top_inplane_mm']:.2f}/{_gl0['arb_arm_end_inplane_mm']:.2f} mm")
         _pbase = _pkgm.capture_baseline(win)
         _pres = _pkgm.validate(win, _pbase)
+        # Waiver/standoff strings are retained as diagnostics only.  Even with
+        # both present, the shared validator must reject physical 48 mm offsets.
+        import copy as _triad_copy
+        from unittest.mock import patch as _triad_patch
+        _meta_bad = _triad_copy.deepcopy(_pbase['geometry']['front'])
+        _meta_bad.update(arb_drop_top_plate_signed_mm=48.0,
+                         arb_arm_end_plate_signed_mm=48.0,
+                         arb_drop_top_inplane_mm=48.0,
+                         arb_arm_end_inplane_mm=48.0,
+                         arb_is_bottom=False,
+                         arb_inplane_waived=True)
+        _old_so = win._car.get('front_arb_drop_standoff_mm')
+        _old_wv = win._car.get('front_arb_rule04_waiver')
+        win._car['front_arb_drop_standoff_mm'] = 48.0
+        win._car['front_arb_rule04_waiver'] = 'diagnostic metadata only'
+        with _triad_patch.object(_pkgm, '_axle_geometry_laws', return_value=_meta_bad):
+            _meta_result = _pkgm.validate(win, _pbase, axles=('front',),
+                                          stop_early=True, skip_clash=True)
+        if _old_so is None:
+            win._car.pop('front_arb_drop_standoff_mm', None)
+        else:
+            win._car['front_arb_drop_standoff_mm'] = _old_so
+        if _old_wv is None:
+            win._car.pop('front_arb_rule04_waiver', None)
+        else:
+            win._car['front_arb_rule04_waiver'] = _old_wv
+        assert any(c['name'] == 'arb_drop_top_inplane_mm'
+                   for c in _meta_result.failures()), _meta_result.checks
+        # A matching 93-degree baseline must fail; a corrected 90-degree
+        # candidate must pass even when that baseline still says 93 degrees.
+        _triad_base = _triad_copy.deepcopy(_pbase)
+        _triad_good = _pkgm._axle_geometry_laws(win, 'front').copy()
+        for _tk in ('triad_bar_blade_deg', 'triad_blade_drop_deg', 'triad_bar_drop_deg'):
+            _triad_good[_tk] = 90.0
+        _triad_bad = dict(_triad_good, triad_bar_drop_deg=93.0)
+        _triad_base['geometry']['front'] = _triad_bad.copy()
+        with _triad_patch.object(_pkgm, '_axle_geometry_laws', return_value=_triad_bad):
+            _bad_triad_result = _pkgm.validate(win, _triad_base, axles=('front',),
+                                              stop_early=True, skip_clash=True)
+        with _triad_patch.object(_pkgm, '_axle_geometry_laws', return_value=_triad_good):
+            _good_triad_result = _pkgm.validate(win, _triad_base, axles=('front',),
+                                               stop_early=True, skip_clash=True)
+        assert any(c['name'] == 'triad_bar_drop_deg' for c in _bad_triad_result.failures())
+        assert _good_triad_result.ok, _good_triad_result.failures()
+        print('ARB triad target : rejects matching non-square baseline; accepts corrected 90 deg   pass')
         _pfails = ['%s %s' % (c['axle'], c['name']) for c in _pres.failures()]
         _b0 = _pkgm.get_bundle(win, 'front')
         _mmb = _pkgm.mirror_about_pushrod_plane(_pkgm.mirror_about_pushrod_plane(_b0))
@@ -2240,6 +3770,92 @@ except Exception as _er:
     fails += 1
     import traceback as _tbr; _tbr.print_exc()
     print(f'relocate IK      : UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── TYRE SPEED / CONDITIONING WINDOW (2026-09-15, rim-matched TTC surface) ────
+#    TireModel(speed_window_kph=(lo, hi)) keeps one test-speed block after the
+#    warm-up discard; the app honours car['tire_speed_window_kph'] on both tyre
+#    load sites.  Checked on the design's own tyre file (data never printed).
+print('-' * 64)
+try:
+    from vahan.tire_model import TireModel as _TMw, load_tire_data as _ltd
+    _tp = None
+    try: _tp = wD._dynamics_panel.get_tire_path()
+    except Exception: _tp = None
+    if _tp and os.path.exists(_tp):
+        _psi_w = float(wD._dynamics_panel.get_tire_pressure_psi())
+        _m_all = _TMw.from_file(_tp, pressure_psi=_psi_w)
+        _m_win = _TMw.from_file(_tp, pressure_psi=_psi_w, speed_window_kph=(38.234, 42.234))
+        # a file whose whole conditioned block already sits inside the window keeps every sample (equal counts);
+        # a file with other test speeds must lose them (strictly fewer)
+        try:
+            _v_all = np.asarray(_ltd(_tp).velocity_kph, float); _outside = bool(np.any((_v_all < 38.234) | (_v_all > 42.234)))
+        except Exception:
+            _outside = None
+        _cnt_ok = (0 < _m_win.samples_selected < _m_all.samples_selected) if _outside else (0 < _m_win.samples_selected <= _m_all.samples_selected)
+        _ok_w = (_m_win.speed_window_kph == (38.234, 42.234) and _m_all.speed_window_kph is None
+                 and _cnt_ok and len(_m_win._fz_axis) >= 3)
+        _bad_w = False
+        try:
+            _TMw.from_file(_tp, pressure_psi=_psi_w, speed_window_kph=(400.0, 401.0)); _bad_w = True   # must refuse an empty window
+        except ValueError:
+            pass
+        # the app path: a project-declared window reaches the loaded model
+        _saved_car = dict(wD._car); wD._car['tire_speed_window_kph'] = [38.234, 42.234]
+        try:
+            wD._on_tire_file(_tp); _app_w = getattr(wD._tire_model, 'speed_window_kph', None)
+        finally:
+            wD._car = _saved_car; wD._on_tire_file(_tp)
+        # after the restore the model must carry the DESIGN's own declared window (None when the config declares none)
+        _dw = _saved_car.get('tire_speed_window_kph')
+        _dw = (float(_dw[0]), float(_dw[1])) if _dw else None
+        _ok_w = _ok_w and (not _bad_w) and _app_w == (38.234, 42.234) and getattr(wD._tire_model, 'speed_window_kph', None) == _dw
+        if not _ok_w:
+            fails += 1
+        print(f'tyre speed window: {os.path.basename(_tp)} all-speed {_m_all.samples_selected} samples -> 38.2-42.2 km/h {_m_win.samples_selected} samples, '
+              f'fz axis {len(_m_win._fz_axis)} centres, empty window refused={not _bad_w}, app honours car key={_app_w == (38.234, 42.234)}   {"pass" if _ok_w else "UNEXPECTED FAIL"}')
+    else:
+        print('tyre speed window: no tyre file on the design config — skipped')
+except Exception as _etw:
+    fails += 1
+    print(f'tyre speed window: UNEXPECTED FAIL ({type(_etw).__name__}: {_etw})')
+
+# ── PROJECT DECLARATIONS DO NOT LEAK ACROSS LOADS (2026-09-14) ──────────────
+#    car keys a project declares (keep-out, ARB rod-end standoff, Rule 04 waiver,
+#    steering-stop note) must vanish when a project WITHOUT them is loaded into the
+#    same window.  Before the fix the car-panel carry-forward kept them, so the
+#    net judged v106 with v105's -18 mm spacer (coplanar 15.3 mm, a phantom fail).
+print('-' * 64)
+try:
+    import glob as _gl, json as _jl
+    _DECL = ('keepout_step', 'front_arb_drop_standoff_mm', 'rear_arb_drop_standoff_mm',
+             'front_arb_rule04_waiver', 'rear_arb_rule04_waiver', 'steering_stop_note')
+    _decl_of = {}
+    for _p in sorted(_gl.glob('configs/2027_v*.vahan')):
+        try:
+            _decl_of[_p] = {k for k in _jl.load(open(_p, encoding='utf-8')).get('car', {}) if k in _DECL}
+        except Exception:
+            pass
+    _pair = None
+    for _a, _ka in _decl_of.items():
+        for _b, _kb in _decl_of.items():
+            if _ka - _kb:
+                _pair = (_a, _b, _ka - _kb); break
+        if _pair: break
+    if _pair:
+        _a, _b, _leak_keys = _pair
+        win._load_project_from_path(_a); win._load_project_from_path(_b); win._rebuild_solvers(0.)
+        _leaked = sorted(k for k in _leak_keys if k in win._car)
+        _lok = not _leaked
+        if not _lok:
+            fails += 1
+        print(f'declaration leak : load {os.path.basename(_a)[:22]} then {os.path.basename(_b)[:22]} -> leaked {_leaked or "none"} of {sorted(_leak_keys)}   {"pass" if _lok else "UNEXPECTED FAIL"}')
+        if _pdes:
+            win._load_project_from_path(_pdes); win._rebuild_solvers(0.)
+    else:
+        print('declaration leak : no config pair with differing declarations — skipped')
+except Exception as _el:
+    fails += 1
+    print(f'declaration leak : UNEXPECTED FAIL ({type(_el).__name__}: {_el})')
 
 # ── DAMPER MOTION SIGN (2026-08-26): a matched |motion ratio| can still be a
 #    sign-inverted rocker — the pushrod acting as a PULLROD (damper EXTENDS in
@@ -2418,6 +4034,1206 @@ except Exception as _ea:
     import traceback as _tba; _tba.print_exc()
     print(f'acceleration     : UNEXPECTED FAIL ({type(_ea).__name__}: {_ea})')
 
+# Native tire drawing must lean in the direction of the alignment readout.
+# This catches the former sign reversal on BOTH sides at neutral steering.
+try:
+    from vahan.kinematics import road_plane_camber_deg
+    _wc = MainWindow()
+    _wc._rebuild_solvers(0.)
+    for _requested_camber in (-2., 2.):
+        _wc._alignment['front_camber_deg'] = _requested_camber
+        _wc._alignment['rear_camber_deg'] = _requested_camber
+        _draw, _ = _wc._assemble_corners_draw(
+            {label: 0. for label in ('FL', 'FR', 'RL', 'RR')}, 0.)
+        assert len(_draw) == 4
+        for _corner in _draw:
+            _side = 'left' if _corner['label'].endswith('L') else 'right'
+            _actual = road_plane_camber_deg(_corner['spin_axis'], side=_side)
+            assert abs(_actual - _requested_camber) < 1e-7, (
+                _corner['label'], _requested_camber, _actual)
+    _wc.close()
+    print('alignment visual : signed road-plane camber matches all four corners   pass')
+except Exception as _ec:
+    fails += 1
+    print(f'alignment visual : UNEXPECTED FAIL ({type(_ec).__name__}: {_ec})')
+
 print('-' * 64)
+try:
+    wD._rebuild_solvers(0.)
+    _sv = wD._build_dynamics_solver()._veh
+    _supports = []
+    for _label, _suffix in [('FL', 'front'), ('RL', 'rear')]:
+        _sol = wD._solvers[_label]
+        _mr = abs(_sol.solve(.001).spring_length - _sol.solve(-.001).spring_length) / .002
+        _supports.append(getattr(_sv, f'static_spring_force_{_suffix}_N') * _mr * 2)
+    assert np.isclose(sum(_supports), _sv.sprung_mass_kg * 9.81, rtol=1e-8)
+    _sprung_moment = (_sv.total_mass_kg * 9.81 * _sv.cg_to_front_axle_m
+                       - _sv.unsprung_mass_rear_kg * 9.81 * _sv.wheelbase_m)
+    assert np.isclose(_supports[1] * _sv.wheelbase_m, _sprung_moment, rtol=1e-8)
+    print('spring support   : sprung weight and axle moment conserved   pass')
+except Exception as _spring_error:
+    fails += 1
+    print(f'spring support   : UNEXPECTED FAIL ({type(_spring_error).__name__}: {_spring_error})')
+
+try:
+    import unittest as _steering_unittest
+    from test_steering_direction import SteeringDirectionTests
+    import test_pushrod_envelope as _pushrod_envelope_tests
+    _direction_result = _steering_unittest.TestResult()
+    _steering_unittest.defaultTestLoader.loadTestsFromTestCase(
+        SteeringDirectionTests).run(_direction_result)
+    _steering_unittest.defaultTestLoader.loadTestsFromModule(
+        _pushrod_envelope_tests).run(_direction_result)
+    if not _direction_result.wasSuccessful():
+        raise AssertionError(str(_direction_result.failures + _direction_result.errors))
+    print(f'steering/envelope: {_direction_result.testsRun} signed linkage/input/inverse/save/body checks   pass')
+except Exception as _direction_error:
+    fails += 1
+    print(f'steering direction: UNEXPECTED FAIL ({_direction_error})')
+
+# ── Ride page (Ctrl+8) + THE RIDE-RATE SOLVE (vahan/ride_solve.py).  The page
+#    must build offscreen on the current config, its inputs must land in the
+#    car dict and survive save->load, and its blocking solve must reproduce a
+#    direct vahan.ride_solve call on the SAME VehicleParams; the page's study
+#    numbers must equal vahan.ride's periodic_response recomputed here, and
+#    the reported spring rates must realise the chosen ride rates on that
+#    VehicleParams (ONE MODEL: the page only calls and plots).
+try:
+    import glob as _gr, re as _rre, tempfile as _rtmp
+    from dataclasses import replace as _rreplace
+    _rcfgs = _gr.glob('configs/2027_v*.vahan')
+    _rcur = (max(_rcfgs, key=lambda p: int(_rre.search(r'2027_v(\d+)', p).group(1))
+                 if _rre.search(r'2027_v(\d+)', p) else -1) if _rcfgs else None)
+    if _rcur is None:
+        print('ride page        : no config — skipped')
+    else:
+        from vahan import ride_solve as _RS
+        from gui.ride_page import RidePage as _RidePage
+        _wr = MainWindow(); _wr._load_project_from_path(_rcur); _wr._rebuild_solvers(0.)
+        _wr._switch_page(7)
+        _rp = _wr._ride_page
+        assert isinstance(_rp, _RidePage) and _wr._pages.currentIndex() == 7, 'Ride page not on Ctrl+8 / index 7'
+        # small deterministic study; inputs must write straight into the car dict
+        _rp._npts.setValue(3); _rp._v_n.setValue(2); _rp._seed_n.setValue(1)
+        _rp._coh.setCurrentText('coherent'); _rp._pitch_I.setValue(90.); _rp._damp['RR'].setValue(1234.)
+        assert _wr._car['ride_pitch_inertia_kgm2'] == 90. and _wr._car['ride_damping_wheel_Nspm'][3] == 1234.
+        _inp = _rp.inputs()
+        assert _inp.pitch_inertia_kgm2 == 90. and _inp.corner_damping_Nspm[3] == 1234. and len(_inp.speeds_mps) == 2
+        _study = _rp.analyse_current(); assert _study is not None, _rp._status.text()
+        _sel = _rp.run_solve(blocking=True); assert _sel is not None, _rp._status.text()
+        # reference: the same solve straight from vahan.ride_solve on the same VehicleParams
+        _veh = _wr._build_dynamics_solver()._veh
+        _fr, _rr, _, _ = _rp.sweep_grids(_veh)
+        _sw = _RS.sweep_ride_rates(_veh, _inp, _fr, _rr)
+        _ref = _RS.describe_selection(_sw, _veh, _inp, **_rp._motion())
+        assert np.allclose(_sw.dlc, _rp.last_sweep.dlc) and np.allclose(_sw.pitch_to_bounce, _rp.last_sweep.pitch_to_bounce)
+        assert (_ref['i_front'], _ref['j_rear'], _ref['status']) == (_sel['i_front'], _sel['j_rear'], _sel['status'])
+        assert abs(_ref['front_spring_rate_Npm'] - _sel['front_spring_rate_Npm']) < 1e-9
+        # chosen springs realise the chosen ride rates through VehicleParams itself
+        _chk = _rreplace(_veh, spring_rate_front_Npm=_sel['front_spring_rate_Npm'],
+                         spring_rate_rear_Npm=_sel['rear_spring_rate_Npm'])
+        assert np.isclose(_chk.ride_rate_front_Npm, _sel['front_ride_rate_Npm'], rtol=1e-9)
+        assert np.isclose(_chk.ride_rate_rear_Npm, _sel['rear_ride_rate_Npm'], rtol=1e-9)
+        # study DLC == vahan.ride periodic_response recomputed here
+        _m0, _case0, _model = _study['metrics'][0], _study['cases'][0], _study['model']
+        _load = _model.periodic_response(_case0.dt_s, _case0.road_heights_m)['dynamic_tire_load_N'] + _model.baseline_loads
+        _dlc = np.sqrt(np.mean((_load - _load.mean(0)) ** 2, 0)) / _load.mean(0)
+        assert np.allclose(_dlc, _m0.dlc), (_dlc, _m0.dlc)
+        # ride_* keys round-trip through save -> load
+        _rpath = os.path.join(_rtmp.gettempdir(), '_vahan_ride_roundtrip.vahan')
+        _wr._save_project_to_path(_rpath)
+        _wr2 = MainWindow(); _wr2._load_project_from_path(_rpath)
+        assert _wr2._car['ride_pitch_inertia_kgm2'] == 90. and _wr2._car['ride_damping_wheel_Nspm'][3] == 1234.
+        assert _wr2._car['ride_coherence'] == 'coherent' and _wr2._car['ride_sweep_points'] == 3
+        _wr.close(); _wr2.close()
+        print(f'ride page        : Ctrl+8 built; solve {_sel["status"]}: front {_sel["front_ride_frequency_Hz"]:.2f} / '
+              f'rear {_sel["rear_ride_frequency_Hz"]:.2f} Hz -> {_sel["front_spring_rate_lbf_in"]:.0f} / '
+              f'{_sel["rear_spring_rate_lbf_in"]:.0f} lbf/in, worst DLC {_sel["worst_dlc"]:.3f}; '
+              f'== vahan.ride_solve, == vahan.ride, car-dict save/load   pass')
+except Exception as _er:
+    fails += 1
+    import traceback as _tbr; _tbr.print_exc()
+    print(f'ride page        : UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── Corner Speed page (Ctrl+9) + vahan/corner_speed.py.  The page must build
+#    offscreen on the design config; its blocking compute must return the
+#    orchestration function's own rows, and those rows must equal a DIRECT call
+#    of the ONE trim engine (vahan.ymd.trim_sweep_ackermann) on the same solver;
+#    the curves on the figure and the table cells must BE those rows (compute /
+#    draw split); the aero row must carry the app's own per-g package at that
+#    radius; the steering-lock radius must be the bicycle radius of the front
+#    toes solved at the full-rack handwheel; and the per-corner grip budget must
+#    land every case at utilization 1.0 by the steady-state solver's OWN
+#    per-corner utilization (ONE MODEL: the page only calls and plots).
+try:
+    import math as _csmath
+    from gui.corner_speed_page import CornerSpeedPage as _CornerSpeedPage
+    from vahan import corner_speed as _CS
+    from vahan.ymd import (G as _G_ymd, trim_sweep_ackermann as _cs_trim,
+                           build_loads_table as _cs_table)
+    from vahan.kinematics import KinematicMetrics as _CSKM
+    import glob as _gcs
+    # OWN glob: the coplanar block above rebinds the module-level _cfgs to the
+    # v28 list, so _highest_config(_cfgs) here would judge v28, not the design.
+    _cscfgs = _gcs.glob('configs/2027_v*.vahan')
+    _cscur = os.environ.get('VAHAN_DESIGN') or _highest_config(_cscfgs)
+    if _cscur is None:
+        print('corner speed     : no config — skipped')
+    else:
+        _wcs = MainWindow(); _wcs._load_project_from_path(_cscur); _wcs._rebuild_solvers(0.)
+        _wcs._switch_page(8)
+        _csp = _wcs._corner_speed_page
+        assert isinstance(_csp, _CornerSpeedPage) and _wcs._pages.currentIndex() == 8, \
+            'Corner Speed page not on Ctrl+9 / index 8'
+        # tiny study: two radii (the larger must be solved first), aero on, no lock row
+        _csp._radii_txt.setText('12, 20'); _csp._add_lock.setChecked(False); _csp._aero_chk.setChecked(True)
+        _cscfg = _csp.speed_config()
+        assert _cscfg['radii'] == [20.0, 12.0], _cscfg['radii']
+        assert _cscfg['ackermann_probed'] and np.isfinite(_cscfg['ackermann_pct']), _cscfg
+        # steering lock = bicycle radius of the two front toes with the rack at its stop
+        _lk = _cscfg['lock']
+        _hand = _CS.full_lock_handwheel_deg(_wcs._steer)
+        assert np.isclose(_hand, float(_wcs._steer['total_rack_travel_mm'])
+                          / float(_wcs._steer['rack_travel_per_rev_mm']) * 180.0)
+        _lsolv = MainWindow._build_corner_solvers(_wcs._all_corner_hp(), _wcs._steer, _wcs._topology, _hand)
+        _tl = float(_CSKM(_lsolv['FL'].solve(0.), 'left').toe)
+        _tr = float(_CSKM(_lsolv['FR'].solve(0.), 'right').toe)
+        _wb = float(_wcs._car['wheelbase_mm']) / 1000.
+        assert np.isfinite(_lk['lock_radius_m']) and np.isclose(
+            _lk['lock_radius_m'], _wb / _csmath.tan(_csmath.radians(0.5 * (abs(_tl) + abs(_tr))))), _lk
+        assert 1.0 < _lk['lock_radius_m'] < 8.0, _lk
+        _csrows = _csp.run_corner_speed(blocking=True)
+        assert _csrows is not None and len(_csrows) == 4, _csp._speed_progress.text()
+        assert [(r['radius_m'], r['aero']) for r in _csrows] == [(20., False), (20., True), (12., False), (12., True)]
+        for _r in _csrows:
+            assert _r['converged'] and np.isfinite(_r['ay_g']) and _r['ay_g'] > 0.5 \
+                and np.isfinite(_r['N_beta_Nm_per_deg']), _r
+            assert np.isclose(_r['speed_mps'] ** 2, _r['ay_g'] * _G_ymd * _r['radius_m'], rtol=1e-12), _r
+            assert np.isclose(_r['speed_kph'], _r['speed_mps'] * 3.6) and _r['stable'] == (_r['N_beta_Nm_per_deg'] < 0)
+        # rows == a DIRECT call of the ONE trim engine on the same solver (20 m, no aero)
+        _ss_cs = _wcs._build_dynamics_solver()
+        _tire_cs = _ss_cs._tire if _wcs._tire_model is None else _wcs._tire_model
+        _direct = _cs_trim(_tire_cs, _ss_cs, radius_m=20.0, ackermann_list=(_cscfg['ackermann_pct'],),
+                           grip_multiplier=float(_ss_cs._mu_scale), aero_Fz_per_g=None,
+                           loads_table=_cs_table(_ss_cs, None))[0]
+        _r20 = _csrows[0]
+        assert np.isclose(_r20['ay_g'], _direct['Ay_trim_max'], rtol=1e-9) \
+            and np.isclose(_r20['N_beta_Nm_per_deg'], _direct['N_beta'], rtol=1e-6), (_r20, _direct)
+        # aero row: the per-g package the page fed the engine is the app's own at that radius
+        _was_aero = _wcs._aero_active; _wcs._aero_active = True
+        try:
+            _ag20 = _wcs._get_aero_Fz_per_g(radius_m=20.0)
+        finally:
+            _wcs._aero_active = _was_aero
+        assert _ag20 and np.isclose(_cscfg['aero_by_radius'][20.0]['FL'], _ag20['FL']) \
+            and np.isclose(_csrows[1]['aero_per_g_N'], sum(_ag20.values())), (_cscfg['aero_by_radius'], _ag20)
+        assert np.isclose(_csrows[1]['downforce_N'], _csrows[1]['aero_per_g_N'] * _csrows[1]['ay_g'])
+        # compute/draw split: both figure axes carry exactly the rows' series; the table too
+        _axs = _csp.speed_slot.fig.get_axes(); assert len(_axs) == 2, len(_axs)
+        _aero_lab = 'aero: ' + _cscfg['aero_text']
+        for _ax, _key in ((_axs[0], 'speed_kph'), (_axs[1], 'ay_g')):
+            _lines = {ln.get_label(): ln for ln in _ax.get_lines() if not ln.get_label().startswith('_')}
+            assert set(_lines) == {'no aero', _aero_lab}, list(_lines)
+            for _aero, _lab in ((False, 'no aero'), (True, _aero_lab)):
+                _R, _V, _A = _CS.corner_speed_series(_csrows, _aero)
+                assert np.array_equal(np.asarray(_lines[_lab].get_xdata(), float), _R)
+                assert np.array_equal(np.asarray(_lines[_lab].get_ydata(), float), _V if _key == 'speed_kph' else _A)
+        assert _csp.speed_table.rowCount() == 4
+        for _i, _r in enumerate(_csrows):
+            assert (_csp.speed_table.item(_i, 0).text(), _csp.speed_table.item(_i, 2).text(),
+                    _csp.speed_table.item(_i, 3).text()) == (f'{_r["radius_m"]:.2f}', f'{_r["ay_g"]:.3f}', f'{_r["speed_kph"]:.1f}')
+        _cstxt = _CS.corner_speed_table_text(_csrows)
+        assert _cstxt.count('\n') == 4 and f'{_r20["ay_g"]:.3f}' in _cstxt
+        # per-corner grip budget: two g levels for the curves, a short bisection
+        _csp._grip_g.setValue(1.2)
+        _csstudy = _csp.run_grip_budget(blocking=True, iters=10, sweep_g=[1.0, 1.5])
+        assert _csstudy is not None and _csstudy is _csp.last_study and len(_csstudy['cases']) == 2, _csp._grip_progress.text()
+        _glines = {ln.get_label(): ln for ln in _csp.grip_slot.fig.get_axes()[0].get_lines()
+                   if not ln.get_label().startswith('_')}
+        for _label, _case in _csstudy['cases'].items():
+            _lim = _case['corner_limit']; _at = _lim['at_limit']
+            assert _lim['binding'] in ('FL', 'FR', 'RL', 'RR') and _at is not None and 'corners' in _at \
+                and not _lim['hit_upper_bound'] and _lim['n_failed_solves'] == 0, _lim
+            assert abs(_at['worst_utilization'] - 1.0) < 0.02 \
+                and _at['corners'][_lim['binding']]['utilization'] == _at['worst_utilization'], _lim
+            # the pair budget (the app's criterion) can never bind before the worst single tyre
+            assert _case['axle_limit']['limit_g'] >= _lim['limit_g'] - 1e-9, (_case['axle_limit'], _lim)
+            # == the steady-state solver's OWN per-corner utilization at that g with that aero
+            _res = _ss_cs.solve(_at['lateral_g'], 0.0, aero_Fz=_at['aero_Fz_applied'])
+            for _c in ('FL', 'FR', 'RL', 'RR'):
+                _d = _at['corners'][_c]
+                assert np.isclose(_d['utilization'], _res.utilization[_c], rtol=1e-9) \
+                    and np.isclose(_d['Fz_N'], _res.Fz[_c]) \
+                    and np.isclose(_d['inclination_deg'], _res.inclination[_c]), (_c, _d)
+                assert np.isclose(_d['demand_N'], np.hypot(_res.Fy[_c], _res.Fx.get(_c, 0.0))) \
+                    and np.isclose(_d['demand_N'] / _d['budget_N'], _d['utilization']), (_c, _d)
+            _u12 = _case['at_g']
+            assert np.isclose(_u12['lateral_g'], 1.2) \
+                and all(np.isfinite(_u12['corners'][_c]['utilization']) for _c in ('FL', 'FR', 'RL', 'RR')), _u12
+            # plotted utilization curves == the study's sweep, per corner
+            assert _case['sweep']['g'] == [1.0, 1.5], _case['sweep']['g']
+            for _c in ('FL', 'FR', 'RL', 'RR'):
+                _ln = _glines[f'{_c} {_label}']
+                assert np.array_equal(np.asarray(_ln.get_xdata(), float), np.asarray(_case['sweep']['g'])) \
+                    and np.array_equal(np.asarray(_ln.get_ydata(), float),
+                                       np.asarray(_case['sweep']['utilization'][_c])), (_c, _label)
+        _noaero = _csstudy['cases']['no aero']
+        _aerocase = [v for k, v in _csstudy['cases'].items() if k != 'no aero'][0]
+        assert _aerocase['spec'].get('aero_Fz') and sum(_aerocase['spec']['aero_Fz'].values()) > 0, _aerocase['spec']
+        assert _aerocase['corner_limit']['limit_g'] > _noaero['corner_limit']['limit_g'], 'downforce must raise the per-corner limit'
+        assert _csp.grip_table.rowCount() == 16, _csp.grip_table.rowCount()   # 2 cases x (chosen g + at limit) x 4 corners
+        _wcs.close()
+        print(f'corner speed     : Ctrl+9 built; 20 m trim {_r20["ay_g"]:.3f} g / {_r20["speed_kph"]:.1f} km/h '
+              f'(== vahan.ymd direct), with aero {_csrows[1]["ay_g"]:.3f} g; lock radius {_lk["lock_radius_m"]:.2f} m; '
+              f'per-corner limit {_noaero["corner_limit"]["limit_g"]:.3f} g ({_noaero["corner_limit"]["binding"]}) / '
+              f'aero {_aerocase["corner_limit"]["limit_g"]:.3f} g, axle-aggregate {_noaero["axle_limit"]["limit_g"]:.3f} g '
+              f'(== SteadyStateSolver.solve); figure == rows, table == rows   pass')
+except Exception as _ecs:
+    fails += 1
+    import traceback as _tbcs; _tbcs.print_exc()
+    print(f'corner speed     : UNEXPECTED FAIL ({type(_ecs).__name__}: {_ecs})')
+
+# ── IK + dynamics-recommendation integrity (2026-09-22 audit, groups 1-2) ───────────
+# Each line was a confirmed defect (DESIGN_2027/binder_run/ASTRA_AUDIT_VERIFY_ik_sens_20260922.md
+# items 1-4, 8-9); these checks FAILED on the pre-fix code and pass after the fix.
+def _ik_gate(name, fn):
+    global fails
+    try:
+        msg = fn()
+        print(f'{name}: {msg}   pass')
+    except Exception as _eik:
+        fails += 1
+        import traceback as _tbik; _tbik.print_exc()
+        print(f'{name}: UNEXPECTED FAIL ({type(_eik).__name__}: {_eik})')
+
+try:
+    from vahan import optimizer as _OPT
+    from vahan import packaging as _PKik
+    _ikw = MainWindow(); _ikw._load_project_from_path(_design); _ikw._rebuild_solvers(0.)
+    _ikw._motion_panel._motion = 'heave'; _ikw._run_sweep()
+    _ikhp = _ikw._ik_live_geometry('front')
+except Exception as _eik0:
+    _ikw = None; fails += 1
+    print(f'IK integrity setup: UNEXPECTED FAIL ({type(_eik0).__name__}: {_eik0})')
+
+if _ikw is not None:
+    def _ik_arb_metrics():
+        # was: NameError swallowed -> arb_angle/arb_drop_travel/arb_mr all NaN
+        _x = np.asarray(_ikw._x_arr, float)
+        _msg = []
+        for _axle, _lbl in (('front', 'FL'), ('rear', 'RL')):
+            _hp = _ikw._ik_live_geometry(_axle)
+            _body = (_ikw._topology.front if _axle == 'front' else _ikw._topology.rear).damper_mount.value
+            _c = _OPT._evaluate_sweep(_hp, _x / 1000.0, pushrod_body=_body,
+                                      metric_keys=['arb_angle', 'arb_drop_travel', 'arb_mr'])
+            _zero = np.abs(_x) < 1e-9
+            assert np.all(np.isfinite(_c['arb_angle'])) and np.all(np.isfinite(_c['arb_drop_travel'])) \
+                and np.all(np.isfinite(_c['arb_mr'][~_zero])), {k: int(np.isnan(v).sum()) for k, v in _c.items()}
+            # ONE MODEL: the IK's ARB curve == the app's own graph curve for that corner
+            _g = np.asarray(_ikw._sweep_results[_lbl]['arb_angle'], float)
+            _m = np.isfinite(_g)
+            _d = float(np.max(np.abs(_c['arb_angle'][_m] - _g[_m])))
+            assert _m.sum() > 10 and _d < 1e-6, (_axle, int(_m.sum()), _d)
+            _msg.append(f'{_lbl} bar angle at +{_x[-1]:.0f} mm {_c["arb_angle"][-1]:+.3f} deg (graph diff {_d:.1e})')
+        # live: moving the blade end changes the bar angle
+        _hp2 = {k: np.array(v, float) for k, v in _ikhp.items()}
+        _hp2['arb_arm_end'][2] += 0.001
+        _t3 = np.array([-0.005, 0.0, 0.005])
+        _a = _OPT._evaluate_sweep(_ikhp, _t3, metric_keys=['arb_angle'])['arb_angle']
+        _b = _OPT._evaluate_sweep(_hp2, _t3, metric_keys=['arb_angle'])['arb_angle']
+        assert abs(_b[2] - _a[2]) > 1e-4, (_a, _b)
+        _ik = _OPT.InverseSolver(_ikhp, travel_mm=(-5, 5), n_points=3, axle='front')
+        _ik.add_target('arb_angle', 1.0)
+        _ik.set_variables([_OPT.DesignVar('arb_arm_end', 2, 0.001)])
+        _r = _ik.solve('local')
+        assert np.isfinite(_r['primary_max_error']) and np.all(np.isfinite(_r['curves']['arb_angle'])), _r['primary_max_error']
+        return '; '.join(_msg) + f'; ARB IK solve max error {_r["primary_max_error"]:.3f} deg (finite)'
+    _ik_gate('IK ARB metrics   ', _ik_arb_metrics)
+
+    def _ik_solver_contract():
+        # was: .success/.status discarded, NaN primary error, Apply always shown
+        from types import SimpleNamespace as _SN
+        assert not _OPT._ls_diag(_SN(status=0, success=False, message='max nfev', x=np.zeros(1), nfev=500), 'x')['success']
+        assert _OPT._ls_diag(_SN(status=2, success=True, message='ok', x=np.zeros(1), nfev=5), 'x')['success']
+        _ik = _OPT.InverseSolver(_ikhp, travel_mm=(-400, 400), n_points=5, axle='front')
+        _ik.add_target('camber', -1.0)
+        _ik.set_variables([_OPT.DesignVar('uca_outer', 2, 0.001)])
+        _r = _ik.solve('local')
+        assert not _r['applicable'] and any('not solved at' in s for s in _r['reject_reasons']), _r['reject_reasons']
+        _p = _ikw._ik_panel
+        _p.show_result(_r)
+        assert _p._apply_btn.isHidden() and 'NOT APPLICABLE' in _p._status.text(), _p._status.text()
+        _fake = dict(_r, applicable=True, reject_reasons=[])
+        _fake.pop('axle')
+        _p.show_result(_fake)
+        assert _p._apply_btn.isHidden(), 'result without an axle must not be applicable'
+        return (f'+-400 mm camber solve: {_r["reject_reasons"][0][:60]}...; Apply hidden; '
+                f'axle-less result refused')
+    _ik_gate('IK solve contract', _ik_solver_contract)
+
+    def _ik_axle_binding():
+        # was: STALE_AXLE_APPLY rear (front solution written onto the rear axle)
+        _p = _ikw._ik_panel
+        _ik = _OPT.InverseSolver(_ikhp, travel_mm=(-10, 10), n_points=3, axle='front')
+        _ik.add_target('camber', _OPT._evaluate_sweep(_ikhp, _ik.travel, metric_keys=['camber'])['camber'])
+        _ik.set_variables([_OPT.DesignVar('uca_outer', 2, 0.0005)])
+        _r = _ik.solve('local')
+        assert _r['applicable'], _r['reject_reasons']
+        _rear0 = {k: np.array(v, float) for k, v in _ikw._rear_hp.items()}
+        _p.show_result(_r)
+        assert not _p._apply_btn.isHidden()
+        _cap = []
+        _p.apply_requested.connect(_cap.append)
+        try:
+            _p._axle.setCurrentIndex(1)            # user flips the selector to Rear after the solve
+            # (a) geometry edited after the solve -> refused, nothing written
+            _ikw._front_hp['uca_front'] = _ikw._front_hp['uca_front'] + np.array([0., 0., 0.001])
+            _front_edit = {k: np.array(v, float) for k, v in _ikw._front_hp.items()}
+            _p._on_apply()
+            assert _cap and _cap[-1]['axle'] == 'front', _cap[-1]['axle'] if _cap else None
+            assert all(np.array_equal(_ikw._front_hp[k], _front_edit[k]) for k in _front_edit), 'stale apply wrote front'
+            assert all(np.array_equal(_ikw._rear_hp[k], _rear0[k]) for k in _rear0), 'stale apply wrote rear'
+            assert _p._last_result is None and 'geometry changed' in _p._status.text(), _p._status.text()
+            # (b) fresh solve on unchanged geometry, selector still on Rear -> lands on FRONT only
+            _ikw._front_hp['uca_front'] = _ikw._front_hp['uca_front'] - np.array([0., 0., 0.001])
+            _hp_b = _ikw._ik_live_geometry('front')
+            _ik2 = _OPT.InverseSolver(_hp_b, travel_mm=(-10, 10), n_points=3, axle='front')
+            _ik2.add_target('camber', _OPT._evaluate_sweep(_hp_b, _ik2.travel, metric_keys=['camber'])['camber'])
+            _ik2.set_variables([_OPT.DesignVar('uca_outer', 2, 0.0005)])
+            _r2 = _ik2.solve('local')
+            _p.show_result(_r2)
+            _p._on_apply()
+            assert _cap[-1]['axle'] == 'front'
+            assert all(np.array_equal(_ikw._rear_hp[k], _rear0[k]) for k in _rear0), 'front result touched rear'
+            assert np.allclose(_ikw._front_hp['uca_outer'], _r2['hp']['uca_outer'], atol=0), 'front not applied'
+        finally:
+            _p.apply_requested.disconnect(_cap.append)
+        return 'selector on Rear -> emitted axle=front; stale geometry refused; rear untouched'
+    _ik_gate('IK axle binding  ', _ik_axle_binding)
+
+    def _ik_chain_rule():
+        # was: 3-point residual vs the ORIGINAL plane; spring_chassis_pt +100 mm invisible (~1e-14)
+        _hp = _ikw._ik_live_geometry('front')
+        _t = _PKik.Tolerances()
+        assert (_OPT.CHAIN_COPLANAR_GATE_MM, _OPT.ARB_INPLANE_GATE_MM, _OPT.ROCKER_AXIS_GATE_DEG) == \
+            (_t.coplanar_mm, _t.arb_inplane_mm, _t.rocker_axis_deg)
+        _ik = _OPT.InverseSolver(_hp, travel_mm=(0, 0), n_points=1, axle='front')
+        _ik.add_target('camber', 0.0)
+        _ik.set_variables([_OPT.DesignVar('spring_chassis_pt', 1, 0.2)])
+        _x0 = _ik.ds.x0(); _x1 = _x0.copy(); _x1[0] += 0.1
+        _names = _ik._chain_residual_names(_OPT.static_chain_rule_metrics(_hp))
+        _i = _names.index('spring_chassis_pt') - len(_names)   # chain residuals are last
+        _r0 = _ik._residuals(_x0)[_i]; _r1 = _ik._residuals(_x1)[_i]
+        _m1 = _OPT.static_chain_rule_metrics(_ik.ds.unpack(_x1))
+        _off = _m1['static_signed_mm']['spring_chassis_pt']
+        assert abs(_r1 - _r0) > 10 and np.isclose(_r1, _off / _OPT.CHAIN_RESIDUAL_UNIT_MM), (_r0, _r1, _off)
+        assert _OPT.chain_rule_violations(_m1), 'moved spring eye must violate Rule 01'
+        # same shared checker as the packaging laws (FL corner, static)
+        _laws = _PKik._axle_geometry_laws(_ikw, 'front')
+        _m0 = _OPT.static_chain_rule_metrics(_hp)
+        assert abs(_m0['coplanar_static_mm'] - _laws['corner_static_mm']['FL']) < 1e-6, (_m0['coplanar_static_mm'], _laws['corner_static_mm'])
+        # Rule 02: moving a plate point re-derives the axis as the new plate normal
+        _ik2 = _OPT.InverseSolver(_hp, travel_mm=(0, 0), n_points=1, axle='front')
+        _ik2.add_target('camber', 0.0)
+        _ik2.set_variables([_OPT.DesignVar('rocker_spring_pt', 1, 0.01)])
+        _x = _ik2.ds.x0(); _x[0] += 0.008
+        _m2 = _OPT.static_chain_rule_metrics(_ik2.ds.unpack(_x))
+        assert _m2['rocker_axis_normal_error_deg'] <= _OPT.ROCKER_AXIS_GATE_DEG, _m2['rocker_axis_normal_error_deg']
+        return (f'spring chassis eye +100 mm -> {abs(_off):.2f} mm off the current plane, residual '
+                f'{_r0:.2f} -> {_r1:.2f}; FL static {_m0["coplanar_static_mm"]:.4f} mm == packaging law; '
+                f'axis re-derived ({_m2["rocker_axis_normal_error_deg"]:.1e} deg)')
+    _ik_gate('IK chain rule    ', _ik_chain_rule)
+
+    _ikw.close()
+
+def _recommend_units():
+    # was: spring 200 lbf/in -> 1750, CG 1200 mm -> 2.5 mm, bias 55 % -> 0.85 % (SI bounds on display values)
+    from types import SimpleNamespace as _SN
+    from vahan.dynamics import DynamicsSensitivity as _DS, SENSITIVITY_OUTPUTS as _SO
+    _v = _SN(front_track_m=1.2, rear_track_m=1.2, motion_ratio_front=1.0, motion_ratio_rear=1.0,
+             arb_rate_front_Npm=0, arb_rate_rear_Npm=0, wheel_rate_front_Npm=30000, wheel_rate_rear_Npm=30000)
+    _eff = {k: 1.0 for k in _SO}
+    _a = {'vehicle_params': _v, 'baseline': {k: 1.0 for k in _SO},
+          'sensitivities': [{'key': k, 'knob': n, 'unit': u, 'category': 'parameter', 'current_value': c,
+                             'effects': _eff, 'implementations': []}
+                            for k, n, u, c in [('spring_rate_front_Npm', 'Spring', 'lbf/in', 200.0),
+                                               ('cg_to_front_axle_m', 'CG', 'mm', 1200.0),
+                                               ('front_brake_bias', 'Bias', '%', 55.0)]]}
+    _s = _DS.__new__(_DS); _s._base_veh = _v
+    _out = {}
+    for _tgt in (-50.0, 50.0):
+        _rec = {r['key']: r for r in _s.recommend(_a, 'roll_angle_deg', _tgt)}
+        _out[_tgt] = _rec
+        _sp, _cg, _bb = (_rec['spring_rate_front_Npm'], _rec['cg_to_front_axle_m'], _rec['front_brake_bias'])
+        assert np.isclose(_sp['new_value'], 200.0 + _tgt) and not _sp['clamped'], _sp['new_value']
+        assert np.isclose(_cg['new_value'], 1200.0 + _tgt) and not _cg['clamped'], _cg['new_value']
+        _bexp = min(85.0, max(40.0, 55.0 + _tgt))
+        assert np.isclose(_bb['new_value'], _bexp) and _bb['clamped'], _bb['new_value']
+        assert np.isclose(_bb['predicted_delta'], _bexp - 55.0), _bb['predicted_delta']
+    # GUI row prints the per-row (clamped) prediction and flags the clamp
+    from gui.panels import DynamicsOptPanel as _DOP
+    _p = _DOP(); _p._analysis = _a
+    _p._target_combo.setCurrentIndex(_p._target_combo.findData('roll_angle_deg'))
+    _p._target_delta.setValue(-50.0)
+    _p._on_recommend_impl()
+    _rows = {_p._sens_table.item(i, 0).text(): _p._sens_table.item(i, 1).text()
+             for i in range(_p._sens_table.rowCount())}
+    assert 'LIMITED' in _rows['Bias'] and '1.00 -> -14.00' in _rows['Bias'], _rows['Bias']
+    assert 'LIMITED' not in _rows['Spring'] and '1.00 -> -49.00' in _rows['Spring'], _rows['Spring']
+    return (f'-50 target: spring 200 -> {_out[-50.0]["spring_rate_front_Npm"]["new_value"]:.0f} lbf/in, '
+            f'CG 1200 -> {_out[-50.0]["cg_to_front_axle_m"]["new_value"]:.0f} mm, bias 55 -> '
+            f'{_out[-50.0]["front_brake_bias"]["new_value"]:.0f} % (LIMITED, reaches -15 of -50); '
+            f'+50: bias -> {_out[50.0]["front_brake_bias"]["new_value"]:.0f} %')
+_ik_gate('recommend units  ', _recommend_units)
+
+# ── JACKING (2026-09-22): the solver's own lateral-force -> body-lift ───────
+# Hand case: a symmetric axle, IC 0.3 m up and 1.0 m past the centreline,
+# contact patches on the ground at x = +/-0.6 m, tyre force toward -X
+# (a positive-g turn in this solver loads the LEFT/+X side).  Per wheel
+# Fz_jack = Fy_x * dz/dx:  outer (left)  -1000 * (0.3/-1.6) = +187.5 N (lifts),
+# inner (right) -500 * (0.3/+1.6) = -93.75 N  ->  axle +93.75 N.  With the IC
+# line through the roll centre, dz/dx = RC/(t/2) exactly (RC = 0.1125 m here).
+try:
+    from vahan.dynamics import (jacking_force_on_body as _jfb,
+                                corner_jacking_line as _cjl)
+    _fo, _to = _jfb(-1000.0, (-1.6, 0.3), 0.0)
+    _fi, _ti = _jfb(-500.0, (1.6, 0.3), 0.0)
+    _jf_hand = []
+    if abs(_fo - 187.5) > 1e-9 or abs(_fi + 93.75) > 1e-9:
+        _jf_hand.append(f'hand case {_fo:.3f}/{_fi:.3f} N, want +187.5/-93.75')
+    _rc = 0.6 * 0.3 / 1.6          # line from (0.6,0) to (-1.0,0.3) crosses x=0 here
+    if abs(abs(_to) - _rc / 0.6) > 1e-12:
+        _jf_hand.append(f'tan {_to} != RC/(t/2) {_rc / 0.6}')
+    # body roll tips the line: +roll (left side down) steepens the outer line
+    _fo_r, _ = _jfb(-1000.0, (-1.6, 0.3), np.radians(1.0))
+    if not _fo_r > _fo:
+        _jf_hand.append('positive roll did not steepen the loaded-side line')
+    # equal side forces on a symmetric axle cancel exactly
+    if abs(_jfb(-800.0, (-1.6, 0.3))[0] + _jfb(-800.0, (1.6, 0.3))[0]) > 1e-9:
+        _jf_hand.append('equal forces on a symmetric axle do not cancel')
+    # the app: v147 (the user's reference) headless, through _build_dynamics_solver
+    import glob as _gj
+    _jc = (sorted(_gj.glob('configs/2027_v147_*.vahan'))
+           or [_highest_config(_gj.glob('configs/2027_v*.vahan'))])[0]
+    _wj = MainWindow(); _wj._load_project_from_path(_jc); _wj._rebuild_solvers(0.)
+    _ssj = _wj._build_dynamics_solver()
+    _r0 = _ssj.solve(0.0)
+    if abs(_r0.jacking_force_front_N) > 1e-6 or abs(_r0.jacking_force_rear_N) > 1e-6:
+        _jf_hand.append(f'0 g jacking {_r0.jacking_force_front_N}/{_r0.jacking_force_rear_N} N')
+    _rj = _ssj.solve(1.5)
+    # self-consistency: the per-corner numbers re-derive from the solver's own
+    # Fy magnitudes, its IC lines and its roll (nothing re-solved here)
+    _phi = np.radians(_rj.roll_angle_deg)
+    for _c in ('FL', 'FR', 'RL', 'RR'):
+        _stc = _ssj._solvers[_c].solve(_rj.travel[_c] / 1000.0)
+        _cp, _dd = _cjl(_stc, 'left' if _c.endswith('L') else 'right', _ssj._veh.tire_radius_m)
+        _want = _jfb(-abs(_rj.Fy[_c]) * _rj.Fy_sign.get(_c, 1.0), _dd, _phi)[0]
+        if abs(_want - _rj.jacking_corner_N[_c]) > 0.5:
+            _jf_hand.append(f'{_c} jacking {_rj.jacking_corner_N[_c]:.2f} N, re-derived {_want:.2f} N')
+    _kw = (_ssj._veh.wheel_rate_front_Npm, _ssj._veh.wheel_rate_rear_Npm)
+    if abs(_rj.jacking_heave_front_mm - _rj.jacking_force_front_N / (2 * _kw[0]) * 1000) > 1e-9:
+        _jf_hand.append('front heave != F / (2 wheel rate)')
+    if not (_rj.jacking_force_rear_N > 0 and _rj.jacking_force_front_N > 0):
+        _jf_hand.append('roll centres above ground must LIFT the body in a corner')
+    # feedback converged (only when the feedback is on; off by default since 2026-09-23):
+    # the heave fed into the kinematics = the heave it causes
+    if _ssj.jacking_feedback and abs(_rj.jacking_heave_applied_rear_mm - _rj.jacking_heave_rear_mm) > 0.15:
+        _jf_hand.append(f'feedback not converged: applied {_rj.jacking_heave_applied_rear_mm:.3f} '
+                        f'vs caused {_rj.jacking_heave_rear_mm:.3f} mm')
+    # mirror: a left turn lifts the body by the same amount, WITH static toe
+    # (v147 rear 0.25 deg).  FAILED before the 2026-09-22 toe-hand fix: rear
+    # 290.1 N vs 274.2 N at +/-1.5 g — the pair split kept +toe on the LEFT
+    # wheel whichever side was loaded.
+    _rm = _ssj.solve(-1.5)
+    for _ax, _a1, _a2 in (('front', _rj.jacking_force_front_N, _rm.jacking_force_front_N),
+                          ('rear', _rj.jacking_force_rear_N, _rm.jacking_force_rear_N)):
+        if abs(_a1 - _a2) > 1e-6:
+            _jf_hand.append(f'{_ax} left / right turn jacking differ {_a1:.4f}/{_a2:.4f} N')
+    if abs(float(_ssj._veh.toe_rear_deg)) < 1e-9:
+        _jf_hand.append('v147 has no rear toe: the mirror check lost its teeth')
+    if _jf_hand:
+        fails += 1
+    print(f'jacking          : hand case +187.5/-93.75 N, tan = RC/(t/2); {os.path.basename(_jc)[:9]} '
+          f'@1.5 g front {_rj.jacking_force_front_N:+.1f} N -> {_rj.jacking_heave_front_mm:+.2f} mm, '
+          f'rear {_rj.jacking_force_rear_N:+.1f} N -> {_rj.jacking_heave_rear_mm:+.2f} mm '
+          f'(feedback {'on' if _ssj.jacking_feedback else 'off'}, {_rj.jacking_feedback_passes} passes; roll {_rj.roll_angle_deg:.3f} deg)   '
+          + ('pass' if not _jf_hand else 'UNEXPECTED FAIL: ' + '; '.join(_jf_hand)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbj; _tbj.print_exc()
+    print(f'jacking          : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── DYNAMICS CAMBER-vs-g PINNED (2026-09-23): the 2026 baseline's camber curve from the
+# steady-state solver must equal the committed solver's (git 50c8073) to 0.02 deg.  The
+# jacking-heave feedback, on by default for one day, drooped the whole axle and turned the
+# outer-front camber at 1.5 g from -0.43 to -0.29 deg (v147 inner rear +3 deg at 2 g) —
+# "camber is atrocious in the dynamics sweep and disagrees with the kinematics sweep".
+# Feedback is OFF unless car['jacking_feedback'] is true; jacking is still reported.
+try:
+    _cb = MainWindow(); _cb._load_project_from_path(os.path.join('configs', '2026_baseline.vahan')); _cb._rebuild_solvers(0.)
+    _ssb = _cb._build_dynamics_solver()
+    _ref = {0.5: {'FL': -0.141, 'FR': +0.139, 'RL': -0.109, 'RR': +0.107},
+            1.0: {'FL': -0.284, 'FR': +0.275, 'RL': -0.219, 'RR': +0.212},
+            1.5: {'FL': -0.429, 'FR': +0.409, 'RL': -0.330, 'RR': +0.316},
+            2.0: {'FL': -0.577, 'FR': +0.542, 'RL': -0.444, 'RR': +0.419}}
+    _cbf = []
+    if getattr(_ssb, 'jacking_feedback', False):
+        _cbf.append('jacking feedback is ON by default')
+    _worst = 0.0
+    for _g, _row in _ref.items():
+        _r = _ssb.solve(_g, 0.)
+        for _c, _v in _row.items():
+            _d = abs(float(_r.camber[_c]) - _v); _worst = max(_worst, _d)
+            if _d > 0.02:
+                _cbf.append(f'{_c} @{_g} g camber {_r.camber[_c]:+.3f} vs committed {_v:+.3f}')
+    if _cbf:
+        fails += 1
+    print(f'dyn camber pinned: 2026 baseline camber-vs-g vs committed solver, worst {_worst:.3f} deg (tol 0.02); '
+          f'jacking feedback {"ON" if getattr(_ssb, "jacking_feedback", False) else "off"}   '
+          + ('pass' if not _cbf else 'UNEXPECTED FAIL: ' + '; '.join(_cbf[:4])))
+except Exception as _e:
+    fails += 1
+    print(f'dyn camber pinned: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── ONE GRIP SCALE (2026-09-22): every consumer reads MainWindow.grip_scale ──
+try:
+    _gf = []
+    _wg = _wj
+    _wg.set_grip_scale(0.83)
+    _ssg = _wg._build_dynamics_solver()
+    if abs(_ssg._mu_scale - 0.83) > 1e-12:
+        _gf.append(f'solver scale {_ssg._mu_scale}')
+    from vahan.laptime import LapSimulator as _LSg, AckermannStationModel as _ASMg
+    if abs(_LSg(_ssg).grip_scale - 0.83) > 1e-12:
+        _gf.append('lap sim does not default to the project scale')
+    if abs(_ASMg(_ssg._tire, _ssg, [0.0]).gm - 0.83) > 1e-12:
+        _gf.append('Ackermann station model does not default to the project scale')
+    _wg._switch_page(1)                       # lazily builds the Laptime page
+    if abs(float(_wg._laptime_page._grip.value()) - 0.83) > 1e-9:
+        _gf.append('Laptime page box is not a mirror of the project scale')
+    _wg._laptime_page._grip.setValue(0.77)     # editing a mirror sets THE scale
+    if abs(_wg.grip_scale() - 0.77) > 1e-9:
+        _gf.append('editing the Laptime box did not set the project scale')
+    if abs(_wg._laptime_page.build_sim().grip_scale - 0.77) > 1e-9:
+        _gf.append('Laptime page sim not on the project scale')
+    _wg._switch_page(0)
+    _wg.set_grip_scale(0.70)
+    _ssg = _wg._build_dynamics_solver()
+    _rows = _ssg.limits_at_grip_scales([0.7, 1.0])
+    _a7 = _ssg.max_accel_g()
+    if abs(_rows[0]['traction_g'] - _a7['traction_g']) > 1e-12:
+        _gf.append('per-scale row != single-scale readout')
+    if not (_rows[1]['traction_g'] > _rows[0]['traction_g'] * 1.2
+            and _rows[1]['braking_g'] / _rows[0]['braking_g'] > 1.42):
+        _gf.append(f'traction/brake do not follow the grip scale {_rows}')
+    if abs(_ssg._mu_scale - 0.70) > 1e-12:
+        _gf.append('limits_at_grip_scales did not restore the scale')
+    # differential: a ZERO bias cap is a cap, not "uncapped"
+    from vahan.differential import Differential as _Dg
+    if _Dg(kind='spool').yaw_moment_Nm(200.0, 1.2, 0.2, True, max_bias_N=0.0) != 0.0:
+        _gf.append('zero diff bias cap not honoured')
+    # acceleration model: no hidden mu, no private grip default
+    from vahan.acceleration import AccelerationModel as _AMg
+    try:
+        _AMg(300, 0.2, 0.55, None, 0, 1, 1.2, 0.5, 3.5, grip_scale=0.7)
+        _gf.append('acceleration model accepted no tyre')
+    except ValueError:
+        pass
+    if _wg._dynamics_panel.grip_scale_list() != [0.7, 1.0]:
+        _gf.append(f'grip list {_wg._dynamics_panel.grip_scale_list()}')
+    if _gf:
+        fails += 1
+    print(f'grip scale       : one scale -> solver/lap/Ackermann/page mirrors; traction '
+          f'{_rows[0]["traction_g"]:.3f}/{_rows[1]["traction_g"]:.3f} g, brake '
+          f'{_rows[0]["braking_g"]:.3f}/{_rows[1]["braking_g"]:.3f} g at x0.70/x1.00; zero diff cap honoured   '
+          + ('pass' if not _gf else 'UNEXPECTED FAIL: ' + '; '.join(_gf)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbg; _tbg.print_exc()
+    print(f'grip scale       : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── STEERING INPUTS = THE project steer block after a load (2026-09-22) ─────
+try:
+    _sf = []
+    _w0 = MainWindow()
+    _stale = (_w0._dynamics_panel._cached_max_steer, _w0._dynamics_panel._cached_steer_ratio)
+    _w0._load_project_from_path(_jc); _w0._rebuild_solvers(0.)
+    _loaded = (_w0._dynamics_panel._cached_max_steer, _w0._dynamics_panel._cached_steer_ratio)
+    _w0._update_min_turn_radius()
+    _fresh = (_w0._dynamics_panel._cached_max_steer, _w0._dynamics_panel._cached_steer_ratio)
+    if not np.allclose(_loaded, _fresh):
+        _sf.append(f'lock values after load {_loaded} != recomputed {_fresh}')
+    _vs = _w0._build_dynamics_solver()._veh
+    for _k in ('rack_travel_per_rev_mm', 'total_rack_travel_mm'):
+        if abs(getattr(_vs, _k) - float(_w0._steer[_k])) > 1e-12:
+            _sf.append(f'VehicleParams.{_k} {getattr(_vs, _k)} != steer block {_w0._steer[_k]}')
+    if abs(_vs.max_steer_angle_deg - _fresh[0]) > 1e-9:
+        _sf.append('VehicleParams max steer != geometric lock')
+    # optimiser steer mode: the rack comes from the steer block (not 60)
+    import vahan.optimizer as _OPTs
+    from vahan.steering import rack_travel_from_handwheel_deg as _rth
+    try:
+        _OPTs.InverseSolver(dict(_w0._front_hp), travel_mm=(-30, 30), n_points=3,
+                            motion='steer', axle='front')
+        _sf.append('steer-mode IK accepted no steer block')
+    except ValueError:
+        pass
+    _ik_s = _OPTs.InverseSolver(dict(_w0._front_hp), travel_mm=(-30, 30), n_points=3,
+                                motion='steer', axle='front', steer_params=dict(_w0._steer))
+    if _ik_s.steer_params != dict(_w0._steer):
+        _sf.append('IK steer_params != project steer block')
+    _c_a = _OPTs._evaluate_sweep(dict(_w0._front_hp), np.array([-30., 0., 30.]), 'left', 'uca',
+                                 ['toe'], {}, motion='steer', steer_params=dict(_w0._steer))
+    _alt = dict(_w0._steer); _alt['rack_travel_per_rev_mm'] = 2 * float(_alt['rack_travel_per_rev_mm'])
+    _c_b = _OPTs._evaluate_sweep(dict(_w0._front_hp), np.array([-30., 0., 30.]), 'left', 'uca',
+                                 ['toe'], {}, motion='steer', steer_params=_alt)
+    if not abs(float(_c_a['toe'][2]) - float(_c_b['toe'][2])) > 0.05:
+        _sf.append('IK steer sweep does not respond to the steer block rack mm/rev')
+    if abs(_rth(30.0, _w0._steer) * 1000
+           - 30.0 * float(_w0._steer['rack_travel_per_rev_mm']) / 360.0
+           * _w0._steer.get('rack_direction', 1)) > 1e-9:
+        _sf.append('handwheel->rack conversion')
+    if _sf:
+        fails += 1
+    print(f'steer inputs sync: startup lock {_stale[0]:.1f} deg / {_stale[1]:.2f} -> after load '
+          f'{_loaded[0]:.1f} deg / {_loaded[1]:.2f} ({os.path.basename(_jc)[:9]}, rack '
+          f'{_w0._steer["rack_travel_per_rev_mm"]} mm/rev, {_w0._steer["total_rack_travel_mm"]} mm); '
+          f'VehicleParams + IK read the steer block   '
+          + ('pass' if not _sf else 'UNEXPECTED FAIL: ' + '; '.join(_sf)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbs; _tbs.print_exc()
+    print(f'steer inputs sync: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── CONTROL-ARM SPHERICAL BEARINGS page (Ctrl+0, user 2026-09-23) ───────────
+# SKF plain-bearing inputs per inboard pickup, two bore orientations.  Hand checks
+# on the design car: the arm rotation about its pickup line equals the angle
+# between the outer joint's perpendicular radii; bore 'pivot' is the pickup line
+# and 'normal' is perpendicular to it; a rotation about the pickup line is pure
+# TURNING for 'pivot' (tilt 0) and pure TILT for 'normal' (turning 0) — in every
+# row of the page; each row's cycle half-angle = half the arm swing; Fr^2 + Fa^2
+# = |F|^2 for the pickup force at both ends of every cycle.
+try:
+    from vahan import spherical_bearings as _SBn
+    _bw = MainWindow(); _bw._load_project_from_path(_design); _bw._rebuild_solvers(0.)
+    _bw._switch_page(9)
+    _bd = _bw._bearings_page.refresh()
+    _bf = []
+    _brows = [r for r in _bd['rows'] if not r.get('invalid')]
+    if len(_brows) != 2 * 4 * 2 * 4 or len(_bd['rows']) != len(_brows):
+        _bf.append(f"{len(_brows)} valid rows of {len(_bd['rows'])} (want 64 valid)")
+    _st0 = _bw._solvers['FL'].solve(0.0); _st1 = _bw._solvers['FL'].solve(0.02)
+    for _arm in ('uca', 'lca'):
+        _u = _SBn.pivot_axis(_st0, _arm); _th = _SBn.arm_angle_rad(_st0, _st1, _arm)
+        _p = lambda v: v - (v @ _u) * _u
+        _a0 = _p(getattr(_st0, f'{_arm}_outer') - getattr(_st0, f'{_arm}_front'))
+        _a1 = _p(getattr(_st1, f'{_arm}_outer') - getattr(_st1, f'{_arm}_front'))
+        _hand = np.arccos(np.clip(_a0 @ _a1 / np.linalg.norm(_a0) / np.linalg.norm(_a1), -1, 1))
+        if abs(abs(_th) - _hand) > 1e-9:
+            _bf.append(f'{_arm} rotation {abs(_th):.6f} != hand {_hand:.6f} rad')
+        _bn, _bp = _SBn.bore_axis(_st0, _arm, 'normal'), _SBn.bore_axis(_st0, _arm, 'pivot')
+        if abs(_bn @ _u) > 1e-9 or abs(_bp @ _u - 1.0) > 1e-9:
+            _bf.append(f'{_arm} bore axes wrong: normal.u {_bn @ _u:.2e}, pivot.u {_bp @ _u:.6f}')
+        _tn = _SBn.swing_twist_deg(_u, _th, _bn); _tp = _SBn.swing_twist_deg(_u, _th, _bp)
+        if abs(_tn[0]) > 1e-9 or abs(_tn[1] - abs(np.degrees(_th))) > 1e-9 or abs(_tp[1]) > 1e-9 or abs(abs(_tp[0]) - abs(np.degrees(_th))) > 1e-9:
+            _bf.append(f'{_arm} swing-twist split wrong: normal {_tn}, pivot {_tp}')
+    for _r in _brows:
+        if _r['orientation'] == 'pivot' and _r['tilt_half_deg'] > 1e-6:
+            _bf.append(f"{_r['corner']} {_r['pickup']} pivot bore shows tilt {_r['tilt_half_deg']:.2e}"); break
+        if _r['orientation'] == 'normal' and _r['half_angle_deg'] > 1e-6:
+            _bf.append(f"{_r['corner']} {_r['pickup']} normal bore shows turning {_r['half_angle_deg']:.2e}"); break
+        if abs(max(_r['half_angle_deg'], _r['tilt_half_deg']) - _r['arm_swing_deg'] / 2) > 1e-6:
+            _bf.append(f"{_r['corner']} {_r['pickup']} half angle != half the arm swing"); break
+        # rod end INLINE with its leg (user 2026-09-26): built-in tilt = 0 for the plane-normal bolt,
+        # 90 - (leg-to-pickup-line angle) for the pickup-line bolt; worst tilt >= built-in
+        _sts = _bw._solvers[_r['corner']].solve(0.0); _arm, _pk = _r['pickup'].split('_')
+        _lg = getattr(_sts, f'{_arm}_outer') - getattr(_sts, _r['pickup']); _lg = _lg / np.linalg.norm(_lg)
+        _want = 0.0 if _r['orientation'] == 'normal' else 90.0 - np.degrees(np.arccos(abs(_lg @ _SBn.pivot_axis(_sts, _arm))))
+        if abs(_r['tilt_installed_deg'] - _want) > 1e-6 or _r['tilt_worst_deg'] < _r['tilt_installed_deg'] - 1e-9:
+            _bf.append(f"{_r['corner']} {_r['pickup']} {_r['orientation']} built-in tilt {_r['tilt_installed_deg']:.3f} != hand {_want:.3f}"); break
+    # force split at the ends: recompute one case directly through the Loads-page path
+    from gui import wheel_package as _WPb
+    _Lb = _WPb.compute_case(_bw, 2.0, 0.0)[0]['FL']
+    for _k, _F in _Lb.chassis_forces.items():
+        if not _k.startswith(('uca', 'lca')):
+            continue
+        for _o in ('normal', 'pivot'):
+            _fr, _fa = _SBn.split_force(_F, _SBn.bore_axis(_st0, _k[:3], _o))
+            if abs(_fr ** 2 + _fa ** 2 - float(_F @ _F)) > 1e-6 * max(1.0, float(_F @ _F)):
+                _bf.append(f'{_k} {_o}: Fr^2+Fa^2 != |F|^2'); break
+    _bmax = max((_r['tilt_worst_deg'] for _r in _brows if _r['orientation'] == 'normal'), default=float('nan'))
+    print(f"bearings page    : {len(_brows)} rows (FL+RL x 4 pickups x 2 bores x 4 cycles); ride period "
+          f"{_bd['osc']['F']:.3f}/{_bd['osc']['R']:.3f} s; worst tilt (bore normal to arm plane, full travel) "
+          f"{_bmax:.2f} deg; rotation/split/force hand checks 1e-9"
+          + ('' if not _bf else '   UNEXPECTED FAIL: ' + '; '.join(_bf)))
+    if _bf:
+        fails += 1
+    # ROD-END SWIVEL LIMIT (user 2026-09-29): the built-in angle of the rod end
+    # (90 - leg-to-pickup-line angle; 0 for the plane-normal bolt) must stay
+    # under the ~27 deg a rod end swivels.  REPORT every pickup in both bore
+    # orientations; FAIL only when a pickup is over in BOTH (no orientation
+    # works).  The page's flag must agree with the module's rule, and the
+    # cases must carry a speed + the aero of the Dynamics-panel package.
+    try:
+        from gui import bearings_page as _BPn
+        _sw = _BPn.swivel_summary(_bd['rows']); _lim = float(_bd['swivel_limit_deg'])
+        _swf = []
+        if abs(_lim - _SBn.SWIVEL_LIMIT_DEG) > 1e-9 or abs(_lim - 27.0) > 1e-9:
+            _swf.append(f'limit {_lim} != 27 deg')
+        for _r in _brows:
+            if bool(_r['over_limit']) != (_r['tilt_installed_deg'] > _lim + 1e-9):
+                _swf.append(f"{_r['corner']} {_r['pickup']} {_r['orientation']} flag != built-in angle > limit"); break
+        _txt = []; _both = []
+        for _c in ('FL', 'RL'):
+            for _pk in ('uca_front', 'uca_rear', 'lca_front', 'lca_rear'):
+                _n = _sw[(_c, _pk, 'normal')]; _p = _sw[(_c, _pk, 'pivot')]
+                _txt.append(f"{_c} {_pk}: normal {_n[0]:.1f} {'OVER' if _n[1] else 'ok'} / pivot {_p[0]:.1f} {'OVER' if _p[1] else 'ok'}")
+                if _n[1] and _p[1]:
+                    _both.append(f'{_c} {_pk}')
+        if _both:
+            _swf.append('over the limit in BOTH orientations: ' + ', '.join(_both))
+        _ca_ok = all(ca['speed_kph'] > 0 for _, ca in _bd['cases_aero'])
+        if not _ca_ok:
+            _swf.append('a load case has no speed')
+        if _swf:
+            fails += 1
+        print(f'rod-end swivel   : built-in angle vs {_lim:.0f} deg (bolt normal to arm plane / along pickup line): '
+              + '; '.join(_txt) + '; cases '
+              + ', '.join(f"{nm.split(' ')[0]} {ca['speed_kph']:.0f} km/h aero {ca['total_N']:.0f} N" for nm, ca in _bd['cases_aero'])
+              + ('   pass' if not _swf else '   UNEXPECTED FAIL: ' + '; '.join(_swf)))
+    except Exception as _e:
+        fails += 1
+        print(f'rod-end swivel   : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+except Exception as _e:
+    fails += 1
+    import traceback as _tbb; _tbb.print_exc()
+    print(f'bearings page    : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── BUILD TOLERANCE page (Ctrl+Shift+1, user 2026-09-26): aero heave + CG tolerance ──
+# Aero heave: the table's downforce = Cl·A·½ρv² split by the CoP, and at low
+# load its heave equals the hand estimate (axle load/2)/ride rate within 3 %
+# (the nonlinear curve and the linear ride rate agree near static).  Tolerance
+# band maths on a synthetic line (y = 2x, allowance 1 -> band +-0.5).  A short
+# CG sweep (no lap sims) must leave the design CG untouched and move the grip
+# limit / roll in the physical direction (higher CG -> more roll).
+try:
+    from vahan import cg_tolerance as _CTn
+    from gui import build_tolerance_page as _BTn
+    _tw = MainWindow(); _tw._load_project_from_path(_design); _tw._rebuild_solvers(0.)
+    _tw._switch_page(10)
+    _tf = []
+    _at = _BTn.aero_ride(_tw, radii_m=(15.0,), speeds_kph=[0.0, 30.0, 60.0, 100.0])
+    _pk = _at['package']; _st = _at['straight']
+    _v = 30.0 / 3.6; _D = _pk['cla_m2'] * 0.5 * _pk['rho'] * _v * _v
+    if abs(_st['downforce_N'][1] - _D) > 1e-6 * max(1.0, _D):
+        _tf.append(f"downforce {_st['downforce_N'][1]:.3f} != hand {_D:.3f} N")
+    _veh = _tw._build_dynamics_solver()._veh
+    _hf = (_D * (1 - _pk['cop_rear']) / 2) / _veh.ride_rate_front_Npm * 1000
+    _hr = (_D * _pk['cop_rear'] / 2) / _veh.ride_rate_rear_Npm * 1000
+    if _D > 0 and (abs(_st['ride_drop_mm']['FL'][1] / _hf - 1) > 0.03 or abs(_st['ride_drop_mm']['RL'][1] / _hr - 1) > 0.03):
+        _tf.append(f"30 km/h straight ride-height loss {_st['ride_drop_mm']['FL'][1]:.3f}/{_st['ride_drop_mm']['RL'][1]:.3f} vs hand {_hf:.3f}/{_hr:.3f} mm")
+    # ONE MODEL: the page's straight-line travel IS the solver's aero sink (no second heave model)
+    if abs(_st['travel_mm']['FL'][3] - _st['aero_sink_mm']['F'][3]) > 1e-9 or not (_st['aero_sink_mm']['F'][3] > 0):
+        _tf.append(f"straight travel {_st['travel_mm']['FL'][3]:.4f} != solver aero sink {_st['aero_sink_mm']['F'][3]:.4f} mm")
+    _cn = _at['corners'][0]; _ok = np.isfinite(_cn['travel_mm']['FL'])
+    if not (_ok.any() and np.all(_cn['travel_mm']['FL'][_ok][1:] > _cn['travel_mm']['FR'][_ok][1:])):
+        _tf.append('in the corner the outside wheel does not compress more than the inside wheel')
+    if not (_at['brake']['travel_mm']['FL'][3] > _st['travel_mm']['FL'][3] and _at['accel']['travel_mm']['RL'][3] > _st['travel_mm']['RL'][3]):
+        _tf.append('braking does not dive the front / acceleration does not squat the rear')
+    _lo, _hi = _CTn.band([-2, -1, 0, 1, 2], [-4, -2, 0, 2, 4], 0.0, 0.0, 1.0, 'both')
+    if abs(_lo + 0.5) > 1e-9 or abs(_hi - 0.5) > 1e-9:
+        _tf.append(f'band maths {_lo}, {_hi} (want -0.5, +0.5)')
+    _z0 = _tw._car['cg_z_mm']
+    _sw = _BTn.cg_sweep(_tw, 'height', [-10.0, 0.0, 10.0], with_lap=False)
+    if _tw._car['cg_z_mm'] != _z0:
+        _tf.append('design CG not restored after the sweep')
+    _rl = [m['roll_deg_per_g'] for m in _sw['metrics']]
+    if not (_rl[0] < _rl[1] < _rl[2]):
+        _tf.append(f'roll not rising with CG height: {_rl}')
+    print(f"build tolerance  : aero {_pk['label']} -> straight 100 km/h wheel travel F {_st['travel_mm']['FL'][3]:.2f} / R "
+          f"{_st['travel_mm']['RL'][3]:.2f} mm (braking front {_at['brake']['travel_mm']['FL'][3]:+.1f}, accel rear "
+          f"{_at['accel']['travel_mm']['RL'][3]:+.1f}); 15 m corner at the limit outside/inside {np.nanmax(_cn['travel_mm']['FL']):.1f}/"
+          f"{np.nanmin(_cn['travel_mm']['FR']):.1f} mm; roll per 10 mm CG height "
+          f"{(_rl[2] - _rl[0]) / 2:+.4f} deg/g"
+          + ('' if not _tf else '   UNEXPECTED FAIL: ' + '; '.join(_tf)))
+    if _tf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbt; _tbt.print_exc()
+    print(f'build tolerance  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── PITCH TRAVEL + AERO SINK in the solver's corner travel (2026-09-26, ONE MODEL) ──
+# Failing-then-passing: before 2026-09-26 solve(0, -1.6) left every corner at 0 mm
+# (pitch was a reported angle only) and aero load never sank the body.  Now:
+#   braking  : front bump = heave curve at (1 - anti-dive)·m_s·|ax|·h_s/L / 2 per wheel,
+#              rear droop at (1 - anti-lift)·same;  accel: rear bump (1 - anti-squat), front droop;
+#   aero     : sink = heave curve at the aero load per wheel.
+# Hand check against the LINEAR wheel rate (within 6 %: the curve is progressive).
+try:
+    _pw = MainWindow(); _pw._load_project_from_path(_design); _pw._rebuild_solvers(0.)
+    _pss = _pw._build_dynamics_solver(); _pv = _pss._veh; _pa = _pss.anti_fractions(); _pf = []
+    _pr0 = _pss.solve(0.0, 0.0)
+    if any(abs(_pr0.travel[c]) > 1e-9 for c in _pr0.travel):
+        _pf.append('static solve has non-zero travel')
+    for _g in (-1.6, 1.0):
+        _r = _pss.solve(0.0, _g)
+        _dF = _pv.sprung_mass_kg * abs(_g) * 9.81 * _pv.sprung_cg_height_m / _pv.wheelbase_m / 2
+        if _g < 0:
+            _hf, _hr = _dF * (1 - _pa['dive']) / _pv.wheel_rate_front_Npm * 1000, -_dF * (1 - _pa['lift']) / _pv.wheel_rate_rear_Npm * 1000
+        else:
+            _hf, _hr = -_dF / _pv.wheel_rate_front_Npm * 1000, _dF * (1 - _pa['squat']) / _pv.wheel_rate_rear_Npm * 1000
+        if abs(_r.travel['FL'] / _hf - 1) > 0.06 or abs(_r.travel['RL'] / _hr - 1) > 0.06 or abs(_r.travel['FL'] - _r.travel['FR']) > 1e-6:
+            _pf.append(f'{_g:+.1f} g travel F {_r.travel["FL"]:.2f} R {_r.travel["RL"]:.2f} vs hand {_hf:.2f} {_hr:.2f} mm')
+        _pang = np.degrees(np.arctan((_r.pitch_travel_front_mm - _r.pitch_travel_rear_mm) / 1000 / _pv.wheelbase_m))
+        if abs(_r.pitch_angle_deg - _pang) > 1e-9:
+            _pf.append(f'pitch angle {_r.pitch_angle_deg:.4f} != travel-derived {_pang:.4f}')
+    _aero = {'FL': 200.0, 'FR': 200.0, 'RL': 230.0, 'RR': 230.0}
+    _ra = _pss.solve(0.0, 0.0, aero_Fz=_aero)
+    _haf, _har = 200.0 / _pv.wheel_rate_front_Npm * 1000, 230.0 / _pv.wheel_rate_rear_Npm * 1000
+    if abs(_ra.travel['FL'] / _haf - 1) > 0.06 or abs(_ra.travel['RL'] / _har - 1) > 0.06 or abs(_ra.travel['FL'] - _ra.aero_heave_front_mm) > 1e-9:
+        _pf.append(f'aero sink F {_ra.travel["FL"]:.3f} R {_ra.travel["RL"]:.3f} vs hand {_haf:.3f} {_har:.3f} mm')
+    _rb16 = _pss.solve(0.0, -1.6)
+    _pss.pitch_travel = False; _pss.aero_heave = False
+    _roff = _pss.solve(0.0, -1.6, aero_Fz=_aero)
+    if any(abs(_roff.travel[c]) > 1e-9 for c in _roff.travel):
+        _pf.append('switches off but travel still non-zero')
+    print(f"pitch + aero sink: anti dive/lift/squat {100 * _pa['dive']:.1f}/{100 * _pa['lift']:.1f}/{100 * _pa['squat']:.1f} %; "
+          f"1.6 g braking front {_rb16.travel['FL']:+.1f} / rear {_rb16.travel['RL']:+.1f} mm; "
+          f"hand checks within 6 %"
+          + ('' if not _pf else '   UNEXPECTED FAIL: ' + '; '.join(_pf)))
+    if _pf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbp; _tbp.print_exc()
+    print(f'pitch + aero sink: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── STEER-SWEEP TURN RADIUS + SWEEP MOTION RATIO graphs (2026-09-29, failing-then-passing) ──
+# (1) compute_turn_radius_post averaged the two RAW toe angles (opposite sign
+#     conventions per side), so a steered pair nearly cancelled: v150 read 25.5 m
+#     at full lock where corner_speed.lock_radius_m reads 2.25 m.  Now the mean
+#     steer is (FR toe - FL toe)/2; the sweep's |R| at both lock ends must match
+#     lock_radius_m within 5 % and carry opposite signs.
+# (2) _do_sweep's motion-ratio curve was the cumulative secant from the station
+#     nearest t=0 divided by the travel from ZERO: NaN at t=0 on a grid holding 0,
+#     0.0 + 0.82/0.37 spikes on a grid that misses 0, 0.011 off the tangent at
+#     +-30 mm.  Now every station is the +-1 mm tangent MR (packaging._tangent_mr,
+#     = the dynamics' solver_mr) within 1e-3 on both grids, with no NaN hole.
+try:
+    from vahan import corner_speed as _CSr
+    from vahan import packaging as _PKr
+    from vahan.kinematics import KinematicMetrics as _KMr
+    _rw = MainWindow(); _rw._load_project_from_path(_design); _rw._rebuild_solvers(0.)
+    _rf = []
+    _hand_r = _CSr.full_lock_handwheel_deg(_rw._steer)
+    _job_r = _rw._snapshot_sweep_job()
+    _job_r['motion'] = 'steer'; _job_r['lo'] = -_hand_r; _job_r['hi'] = _hand_r
+    _sr = _rw._compute_sweep(_job_r)['sweep_results']
+    _trr = np.asarray(_sr['FL']['turn_radius'], float)
+    _lsr = MainWindow._build_corner_solvers(_rw._all_corner_hp(), _rw._steer, _rw._topology, _hand_r)
+    _lock_r = _CSr.lock_radius_m(float(_KMr(_lsr['FL'].solve(0.), 'left').toe),
+                                 float(_KMr(_lsr['FR'].solve(0.), 'right').toe),
+                                 float(_rw._car['wheelbase_mm']) / 1000.)
+    if not (np.isfinite(_trr[0]) and np.isfinite(_trr[-1]) and np.isfinite(_lock_r)):
+        _rf.append(f'turn radius at lock not finite: sweep {_trr[0]}, {_trr[-1]}; lock_radius_m {_lock_r}')
+    else:
+        for _e_r in (_trr[0], _trr[-1]):
+            if abs(abs(_e_r) / _lock_r - 1) > 0.05:
+                _rf.append(f'sweep turn radius at lock {_e_r:.2f} m vs lock_radius_m {_lock_r:.2f} m (>5 %)')
+        if np.sign(_trr[0]) == np.sign(_trr[-1]):
+            _rf.append('turn radius has the same sign at both lock ends')
+        if not np.isnan(_trr[len(_trr) // 2]):
+            _rf.append('turn radius at zero steer is not NaN (infinite radius expected)')
+    if not np.array_equal(np.isnan(_trr), np.isnan(np.asarray(_sr['FR']['turn_radius'], float))) \
+            or not np.allclose(_trr, _sr['FR']['turn_radius'], equal_nan=True):
+        _rf.append('FL and FR turn-radius arrays differ')
+    _mr_static = {}
+    for _lbl_r in ('FL', 'RL'):
+        _sol_r = _rw._solvers[_lbl_r]
+        _mr_static[_lbl_r] = _PKr.solver_mr(_sol_r)
+        for _n_r in (81, 80):      # 81 holds t=0 exactly (1 mm step); 80 misses it
+            _t_r = np.linspace(-0.030, 0.050, _n_r)
+            _mr_r = np.asarray(_rw._do_sweep(_sol_r, _t_r, 'left', is_front=_lbl_r == 'FL',
+                                             label=_lbl_r)['motion_ratio'], float)
+            _i0 = int(np.argmin(np.abs(_t_r)))
+            if not np.isfinite(_mr_r[_i0 - 1:_i0 + 2]).all():
+                _rf.append(f'{_lbl_r} n={_n_r}: MR hole at the static station {_mr_r[_i0 - 1:_i0 + 2]}')
+            _fin = np.where(np.isfinite(_mr_r))[0]
+            if len(_fin) < 0.8 * _n_r:
+                _rf.append(f'{_lbl_r} n={_n_r}: only {len(_fin)} of {_n_r} MR stations finite')
+            _worst = 0.0
+            for _k in _fin:
+                _worst = max(_worst, abs(_mr_r[_k] - _PKr._tangent_mr(_sol_r, float(_t_r[_k]))))
+            if _worst > 1e-3:
+                _rf.append(f'{_lbl_r} n={_n_r}: MR curve off the +-1 mm tangent MR by {_worst:.5f} (>1e-3)')
+            if _n_r == 81 and abs(_mr_r[_i0] - _mr_static[_lbl_r]) > 1e-3:
+                _rf.append(f'{_lbl_r}: MR at t=0 {_mr_r[_i0]:.4f} != static solver_mr {_mr_static[_lbl_r]:.4f}')
+    print(f'turn radius + MR : sweep |R| at full lock {abs(_trr[0]):.2f} / {abs(_trr[-1]):.2f} m vs lock_radius_m '
+          f'{_lock_r:.2f} m (was 25.5 m); MR curve = tangent MR within 1e-3 on the 81 (holds 0) and 80 (misses 0) '
+          f'grids, static FL {_mr_static["FL"]:.4f} / RL {_mr_static["RL"]:.4f}'
+          + ('' if not _rf else '   UNEXPECTED FAIL: ' + '; '.join(_rf)))
+    if _rf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbr; _tbr.print_exc()
+    print(f'turn radius + MR : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── 3-D ROLL-CENTRE SPHERE = THE GRAPH (ONE MODEL, 2026-10-01) ──────────────
+# The view's RC sphere was still built from the pickup MIDPOINT while every graph
+# used the Rule-17 instant-axis construction since 2026-09-09 (found by the
+# measure-mode planning pass).  Gate: with the car at design position the sphere
+# the view draws sits at KinematicMetrics.roll_center_height on both axles.
+try:
+    from vahan.kinematics import KinematicMetrics as _KMsph
+    _ws = MainWindow(); _ws._load_project_from_path(_design); _ws._rebuild_solvers(0.)
+    _ws._motion_panel.go_to_static()
+    _sph = {}
+    _ws.view3d.update_rc = lambda f, r: _sph.update(front=f, rear=r)
+    _ws._show_rc = True; _ws._update_3d(light=False)
+    _sf = []
+    for _ax, _lbl in (('front', 'FL'), ('rear', 'RL')):
+        _g = float(_KMsph(_ws._solvers[_lbl].solve(0.0), 'left').roll_center_height) * 1000.0
+        _p = _sph.get(_ax)
+        if _p is None or abs(float(_p[2]) * 1000.0 - _g) > 0.01 or abs(float(_p[0])) > 1e-6:
+            _sf.append(f"{_ax} sphere {'missing' if _p is None else f'{float(_p[2]) * 1000:.3f} mm (x {float(_p[0]) * 1000:.2f})'} vs graph {_g:.3f} mm")
+    print(f"rc sphere = graph : front {float(_sph['front'][2]) * 1000:.2f} / rear {float(_sph['rear'][2]) * 1000:.2f} mm at design position"
+          + ('' if not _sf else '   UNEXPECTED FAIL: ' + '; '.join(_sf)))
+    if _sf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbsph; _tbsph.print_exc()
+    print(f'rc sphere = graph : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── FSAE CHASSIS BAYS (user 2026-09-23) ─────────────────────────────────────
+# car['fsae_chassis'] replaces the pickup-to-pickup chassis stand-ins with frame
+# tubes: node = arm leg (ball joint -> pickup) continued 38.1 mm past the pickup.
+# Gated: OFF (absent key / enabled False) reproduces the old member set exactly;
+# ON nodes are hand-computable from the file; tube vs tube is never a clash, a
+# member bolted at a pickup is checked against the tube minus its bracket zone;
+# the auto diagonal is deterministic and the full-state audit runs.  The ON
+# clash list on the design is REPORTED (a packaging finding, not a gate).
+try:
+    import json as _jfs, copy as _cfs
+    from vahan import chassis as _CHfs, packaging as _PKfs
+    from vahan.interference import full_members as _fmfs, full_member_specs as _fsfs, \
+        pair_gap_mm as _pgfs, clashes as _clfs
+    from vahan.keepout import window_members as _wmfs
+    _ff = []
+    _wfs = MainWindow(); _wfs._load_project_from_path(_design); _wfs._rebuild_solvers(0.)
+    if 'fsae_chassis' in _wfs._car:
+        _ff.append('a file without the key loaded with fsae_chassis set (must be OFF)')
+    _cdfs, _ = _wfs._assemble_corners_draw({l: 0. for l in ('FL', 'FR', 'RL', 'RR')}, 0.0, light=True)
+    _byfs = {c['label']: c for c in _cdfs}
+    _car_off = dict(_wfs._car); _car_off.pop('fsae_chassis', None)
+    _car_dis = dict(_car_off); _car_dis['fsae_chassis'] = _CHfs.default_settings(False)
+    _pv = np.zeros(3)
+    def _sig_fs(ms):
+        return [(m['name'], tuple(np.round(m['a'], 12)), tuple(np.round(m['b'], 12)), m['r']) for m in ms]
+    for _lb, _c in _byfs.items():
+        _m_off = _fmfs(_c['pts'], _car_off, arb_pivot=_pv, arb_od_mm=12.7)
+        if _sig_fs(_m_off) != _sig_fs(_fmfs(_c['pts'], _car_dis, arb_pivot=_pv, arb_od_mm=12.7)):
+            _ff.append(f'{_lb}: enabled=False member set != absent-key member set')
+        _names = [m['name'] for m in _m_off]
+        _exp = [nm for nm, ka, kb, rr in _fsfs() if _c['pts'].get(ka) is not None and _c['pts'].get(kb) is not None]
+        if [n for n in _names if n in _exp] != _exp or any(m.get('chassis') for m in _m_off) \
+                or 'UCA chassis cross member' not in _names:
+            _ff.append(f'{_lb}: OFF member set is not the pre-feature spec list')
+    if not any(m['name'].endswith('LCA inner chassis member') for m in _wmfs(_wfs, 0.0, 0.0)):
+        _ff.append('OFF keep-out member set lost the LCA inner stand-in')
+    # ON: nodes hand-computed straight from the file's numbers
+    _raw = _jfs.load(open(_design, encoding='utf-8'))
+    _wfs._car['fsae_chassis'] = _CHfs.default_settings(True); _wfs._fsae_chassis_cache = None
+    _cdfs, _ = _wfs._assemble_corners_draw({l: 0. for l in ('FL', 'FR', 'RL', 'RR')}, 0.0, light=True)
+    _byfs = {c['label']: c for c in _cdfs}
+    _node_err = 0.0
+    for _lb, _blk in (('FL', 'front_hp'), ('RL', 'rear_hp'), ('FR', 'front_hp'), ('RR', 'rear_hp')):
+        _mx = np.array([-1., 1., 1.]) if _lb in ('FR', 'RR') else np.ones(3)
+        for _pk, _ok in (('uca_front', 'uca_outer'), ('uca_rear', 'uca_outer'),
+                         ('lca_front', 'lca_outer'), ('lca_rear', 'lca_outer')):
+            _P = np.array(_raw[_blk][_pk]) * _mx; _O = np.array(_raw[_blk][_ok]) * _mx
+            _hand = _P + 0.0381 * (_P - _O) / np.linalg.norm(_P - _O)
+            _node_err = max(_node_err, float(np.linalg.norm(_byfs[_lb]['pts']['chassis_node_' + _pk] - _hand)) * 1000.)
+            if abs(float(np.linalg.norm(_byfs[_lb]['pts']['chassis_node_' + _pk] - _P)) * 1000. - 38.1) > 1e-6:
+                _ff.append(f'{_lb} {_pk} node not 38.1 mm from its pickup')
+    if _node_err > 1e-6:
+        _ff.append(f'node vs hand calc {_node_err:.2e} mm')
+    _m_on = _fmfs(_byfs['FL']['pts'], _wfs._car, arb_pivot=_pv, arb_od_mm=12.7)
+    _tubes = [m for m in _m_on if m.get('chassis')]
+    if 'UCA chassis cross member' in [m['name'] for m in _m_on] or len(_tubes) != 5 \
+            or any(abs(m['r'] - 0.0127) > 1e-12 for m in _tubes):
+        _ff.append(f'ON member set: {len(_tubes)} tubes (need 4 + 1 diagonal, 25.4 mm OD, stand-in removed)')
+    if any(m.endswith('LCA inner chassis member') for m in (x['name'] for x in _wmfs(_wfs, 0.0, 0.0))):
+        _ff.append('ON keep-out member set still carries the LCA inner stand-in')
+    # designed contacts: arm leg bolted at a tube's bracket pickup is checked against the tube
+    # minus its bracket zone; tube vs tube never; a member crossing mid-span still counts
+    # (15 mm node offset so the untrimmed tube WOULD overlap the leg at the bracket: -5.6 mm)
+    _t = {'name': 'chassis tube X', 'a': np.array([0., 0., 0.]), 'b': np.array([0., .3, 0.]), 'r': .0127,
+          'chassis': True, 'joints': [(np.array([.015, 0., 0.]), 'a')], 'bracket_trim': .015 + .0127}
+    _leg = {'name': 'arm', 'a': np.array([.015, 0., 0.]), 'b': np.array([.2, -.1, 0.]), 'r': .0079}
+    _cross = {'name': 'rod', 'a': np.array([-.1, .15, 0.]), 'b': np.array([.1, .15, 0.]), 'r': .0079}
+    _t2 = dict(_t); _t2['name'] = 'chassis tube Y'
+    _t0 = dict(_t); _t0['joints'] = []
+    if _pgfs(_leg, _t) is None or _pgfs(_leg, _t) < 0 or not (_pgfs(_leg, _t0) < 0) \
+            or _pgfs(_t, _t2) is not None \
+            or not (_pgfs(_cross, _t) < 0) or len(_clfs([_t, _leg, _cross, _t2])) != 2:
+        _ff.append('designed-contact rules (bracket trim / frame vs frame / mid-span hit)')
+    # auto diagonal: deterministic, = the larger worst-case clearance
+    _r1 = _PKfs.fsae_resolve_diagonals(_wfs); _r2 = _PKfs.fsae_resolve_diagonals(_wfs)
+    for _ax in ('front', 'rear'):
+        _g = {d: _r1['gaps'][_ax][d]['gap_mm'] for d in _CHfs.EXPLICIT_DIAGONALS}
+        _best = 'ucar_lcaf' if _g['ucar_lcaf'] > _g['ucaf_lcar'] + 1e-6 else 'ucaf_lcar'
+        if _r1[_ax] != _r2[_ax] or _r1['gaps'][_ax] != _r2['gaps'][_ax] or _r1[_ax] != _best:
+            _ff.append(f'{_ax} auto diagonal not deterministic / not the larger clearance')
+    _au = _PKfs.full_state_audit(_wfs)
+    if _au['states'] != 39 or _au['closure_errors']:
+        _ff.append(f'ON full-state audit: {_au["states"]} states, {len(_au["closure_errors"])} closure errors')
+    _ch_neg = [r for r in _au['negatives'] if 'chassis' in r['a'] + r['b']]
+    _tight = min(_ch_neg, key=lambda r: r['gap_mm']) if _ch_neg else None
+    # PER-AXLE explicit choice (user 2026-09-23): diagonal_front / diagonal_rear each
+    # reach only their own bays (FL/FR vs RL/RR), the audit runs with them and its
+    # diagonal-vs-member gaps equal the resolution pass's; a legacy single
+    # 'diagonal' key = both axles unless a per-axle key overrides it; front explicit
+    # + rear auto resolves only the rear (the front keeps its explicit choice).
+    _zero = {l: 0. for l in ('FL', 'FR', 'RL', 'RR')}
+    _dname = {d: _CHfs.DIAGONAL_TUBES[d][0] for d in _CHfs.EXPLICIT_DIAGONALS}
+    def _diag_of(win):
+        _cd, _ = win._assemble_corners_draw(_zero, 0.0, light=True)
+        out = {}
+        for c in _cd:
+            names = [m['name'] for m in _fmfs(c['pts'], win._car, arb_pivot=_pv, arb_od_mm=12.7)
+                     if m['name'].startswith(_CHfs.DIAGONAL_NAME_PREFIX)]
+            out[c['label']] = (c['pts'].get(_CHfs.DIAG_PTS_KEY), names)
+        return out
+    for _df, _dr in (('ucar_lcaf', 'ucaf_lcar'), ('ucaf_lcar', 'ucar_lcaf')):
+        _wfs._car['fsae_chassis'] = dict(_CHfs.default_settings(True),
+                                         diagonal_front=_df, diagonal_rear=_dr)
+        _wfs._fsae_chassis_cache = None
+        if _PKfs.fsae_ensure_resolved(_wfs) is not None or _PKfs.fsae_auto_is_stale(_wfs):
+            _ff.append('both axles explicit still asks for the auto resolution')
+        for _lb, (_d, _names) in _diag_of(_wfs).items():
+            _want = _df if _lb.startswith('F') else _dr
+            if _d != _want or _names != [_dname[_want]]:
+                _ff.append(f'{_lb} explicit per-axle diagonal: got {_d} / {_names}, want {_want}')
+        _au2 = _PKfs.full_state_audit(_wfs)
+        if _au2['states'] != 39 or _au2['closure_errors']:
+            _ff.append(f'per-axle explicit audit: {_au2["states"]} states / {len(_au2["closure_errors"])} closure errors')
+        for _ax, _want in (('front', _df), ('rear', _dr)):
+            _pfx = 'F' if _ax == 'front' else 'R'
+            _rows = [r for r in _au2['worst_per_pair']
+                     if any(n.startswith(_pfx) and n.endswith(_dname[_want]) for n in (r['a'], r['b']))]
+            _g_res = _r1['gaps'][_ax][_want]['gap_mm']
+            if _g_res < 10.0 and (not _rows or abs(min(r['gap_mm'] for r in _rows) - _g_res) > 1e-6):
+                _ff.append(f'{_ax} explicit {_want}: audit gap != resolution gap {_g_res:.3f}')
+    _leg = _CHfs.normalise({'enabled': True, 'diagonal': 'ucar_lcaf'})
+    if (_leg['diagonal_front'], _leg['diagonal_rear']) != ('ucar_lcaf', 'ucar_lcaf') or 'diagonal' in _leg:
+        _ff.append('legacy single diagonal key does not apply to both axles')
+    _leg = _CHfs.normalise({'enabled': True, 'diagonal': 'ucar_lcaf', 'diagonal_rear': 'auto'})
+    if (_leg['diagonal_front'], _leg['diagonal_rear']) != ('ucar_lcaf', 'auto'):
+        _ff.append('per-axle key does not override the legacy diagonal key')
+    _wfs._car['fsae_chassis'] = {'enabled': True, 'diagonal': 'ucar_lcaf', 'diagonal_rear': 'auto'}
+    _wfs._fsae_chassis_cache = None
+    if not _PKfs.fsae_auto_is_stale(_wfs) or _PKfs.fsae_ensure_resolved(_wfs) is None:
+        _ff.append('front explicit + rear auto does not resolve the rear')
+    _mix = _diag_of(_wfs)
+    if any(_mix[l][0] != 'ucar_lcaf' for l in ('FL', 'FR')) or any(_mix[l][0] != _r1['rear'] for l in ('RL', 'RR')):
+        _ff.append(f'mixed explicit/auto: front {_mix["FL"][0]} (want ucar_lcaf), rear {_mix["RL"][0]} (want auto {_r1["rear"]})')
+    # TRANSVERSE tubes (user/chassis 2026-09-23): rear ON by default = 4 halves per rear
+    # corner, each node -> the car centreline (X = 0), same OD; front none unless set;
+    # OFF removes them.  Chassis-fixed obstructions: the sprocket disc derived from the
+    # imported STEP (checked against a direct hand read of the same mesh: largest radial
+    # extent about the X axis, the ring's X span), the diff housing from the car dict;
+    # tube vs obstruction gaps come out of the full-state audit ONCE ('chassis-fixed').
+    _wfs._car['fsae_chassis'] = _CHfs.default_settings(True); _wfs._fsae_chassis_cache = None
+    _cdt, _ = _wfs._assemble_corners_draw(_zero, 0.0, light=True)
+    for _c in _cdt:
+        _tr = [m for m in _fmfs(_c['pts'], _wfs._car, arb_pivot=_pv, arb_od_mm=12.7) if _CHfs.is_transverse(m)]
+        if _c['label'].startswith('F'):
+            if _tr:
+                _ff.append(f'{_c["label"]}: transverse tubes present with transverse_front False')
+            continue
+        if len(_tr) != 4 or any(abs(m['b'][0]) > 1e-12 or abs(m['r'] - 0.0127) > 1e-12 for m in _tr) \
+                or any(np.linalg.norm(m['a'] - _c['pts']['chassis_node_' + k]) > 1e-9
+                       for m, (_n, k) in zip(_tr, _CHfs.TRANSVERSE_TUBES)):
+            _ff.append(f'{_c["label"]}: transverse halves != 4 x (node -> X=0, 25.4 mm OD)')
+    _wfs._car['fsae_chassis'] = dict(_CHfs.default_settings(True), transverse_rear=False, transverse_front=True)
+    _cdt, _ = _wfs._assemble_corners_draw(_zero, 0.0, light=True)
+    _ntr = {c['label']: len([m for m in _fmfs(c['pts'], _wfs._car, arb_pivot=_pv, arb_od_mm=12.7) if _CHfs.is_transverse(m)]) for c in _cdt}
+    if _ntr != {'FL': 4, 'FR': 4, 'RL': 0, 'RR': 0}:
+        _ff.append(f'transverse setting per axle not honoured: {_ntr}')
+    _wfs._car['fsae_chassis'] = _CHfs.default_settings(True); _wfs._fsae_chassis_cache = None
+    _parts = _CHfs.fixed_obstructions(_wfs)
+    _pnames = [p['name'] for p in _parts]
+    _sp = [p for p in _parts if 'disc' in p]
+    _mesh = next((p for p in (_wfs._imported_parts or []) if 'sprocket' in str(p.get('name', '')).lower()), None)
+    if _mesh is None:
+        _ff.append('no imported sprocket part on the design (needed for the chassis-fixed check)')
+    elif not _sp:
+        _ff.append('sprocket disc not derived from the imported mesh')
+    else:
+        _V = np.asarray(_mesh['verts'], float); _d = _sp[0]['disc']
+        _rad = np.linalg.norm(_V[:, 1:] - _d['c'][1:], axis=1)          # hand read about the X axis
+        _ring = _rad >= 0.9 * _rad.max()
+        if abs(_rad.max() - _d['R_mm']) > 1e-6 or abs(_V[_ring, 0].min() - _d['x0_mm']) > 1e-6 \
+                or abs(_V[_ring, 0].max() - _d['x1_mm']) > 1e-6 \
+                or np.linalg.norm(_V[_ring].mean(0)[1:] - _d['c'][1:]) > 1e-6:
+            _ff.append('sprocket disc (R / X span / centre) != hand read of the mesh')
+        # primitive (signed distance = smallest way out): a tube through the disc centre
+        # along Y is inside by the half-thickness -> -(h + r); a tube along X on the rim
+        # at R + r grazes = 0; one 3 mm above the rim = +3
+        _cyl = _sp[0]['cyls'][0]
+        _c = np.asarray(_cyl['c'])
+        _g_thru = _CHfs.segment_cylinder_gap_mm(_c + [0, -1, 0], _c + [0, 1, 0], 0.0127, _cyl)
+        _g_graze = _CHfs.segment_cylinder_gap_mm(_c + [-1, 0, _cyl['R'] + 0.0127], _c + [1, 0, _cyl['R'] + 0.0127], 0.0127, _cyl)
+        _g_3 = _CHfs.segment_cylinder_gap_mm(_c + [-1, 0, _cyl['R'] + 0.0157], _c + [1, 0, _cyl['R'] + 0.0157], 0.0127, _cyl)
+        if abs(_g_thru + (_cyl['h'] + 0.0127) * 1000.) > 1e-6 or abs(_g_graze) > 1e-6 or abs(_g_3 - 3.0) > 1e-6:
+            _ff.append(f'cylinder gap primitive: through {_g_thru:.3f} (want {-(_cyl["h"] + 0.0127) * 1000.:.3f}), graze {_g_graze:.3f} (want 0), +3 {_g_3:.3f}')
+    # The car-dict diff proxy is an obstruction only while it is SHOWN (user 2026-09-23: the
+    # yellow stand-in is deleted when the real diff STEP is imported; the STEP envelope covers it).
+    _show_proxy = bool(getattr(_wfs, '_car', {}).get('show_diff_body', False))
+    if _show_proxy and not any('diff housing' in n for n in _pnames):
+        _ff.append('diff housing obstruction missing (proxy shown)')
+    if not _show_proxy and any('diff housing (car dict' in n for n in _pnames):
+        _ff.append('hidden diff proxy still counted as an obstruction')
+    _au3 = _PKfs.full_state_audit(_wfs)
+    _fx = _au3.get('fixed_part_gaps', [])
+    _fx_tr = [r for r in _fx if 'transverse' in r['a'] and 'sprocket disc' in r['b']]
+    if len(_fx_tr) != 8 or not all(r['travel'] == 'chassis-fixed' for r in _au3['worst_per_pair'] if 'sprocket' in r['b'] or 'diff housing' in r['b']):
+        _ff.append(f'chassis-fixed audit rows: {len(_fx_tr)} transverse-vs-sprocket rows (want 8), or a fixed pair tagged per state')
+    _sp_min = min((r['gap_mm'] for r in _fx_tr), default=float('nan'))
+    if _ff:
+        fails += 1
+    print(f'fsae chassis bays : OFF = old member set; ON nodes = pickup + 38.1 mm along the leg '
+          f'(hand calc {_node_err:.1e} mm); auto front {_r1["front"]} / rear {_r1["rear"]} (deterministic); '
+          f'ON audit {len(_au["negatives"])} negatives, {len(_ch_neg)} with chassis tubes'
+          + (f', tightest {_tight["a"]} vs {_tight["b"]} {_tight["gap_mm"]:.1f} mm (reported)' if _tight else '')
+          + '; per-axle explicit front/rear + legacy key + mixed auto'
+          + f'; rear transverse halves x4, sprocket disc from STEP, tightest transverse vs sprocket {_sp_min:.1f} mm (reported)'
+          + '   ' + ('pass' if not _ff else 'UNEXPECTED FAIL: ' + '; '.join(_ff)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbfs; _tbfs.print_exc()
+    print(f'fsae chassis bays : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# Dynamics camber contract: model -> sweep -> plot/table, with separate
+# chassis/road/tire frames. These fixtures require no private TTC data.
+try:
+    import unittest as _camber_unittest
+    import test_dynamics_camber as _camber_core
+    import test_dynamics_camber_ui as _camber_ui
+    _camber_suite = _camber_unittest.TestSuite([
+        _camber_unittest.defaultTestLoader.loadTestsFromModule(_camber_core),
+        _camber_unittest.defaultTestLoader.loadTestsFromModule(_camber_ui),
+    ])
+    _camber_run = _camber_unittest.TextTestRunner(verbosity=1).run(_camber_suite)
+    fails += len(_camber_run.failures) + len(_camber_run.errors)
+    print(f'dynamics camber contract: {_camber_run.testsRun} tests; '
+          + ('pass' if _camber_run.wasSuccessful() else 'UNEXPECTED FAIL'))
+except Exception as _e:
+    fails += 1
+    print(f'dynamics camber contract: UNEXPECTED FAIL ({_e})')
+
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)

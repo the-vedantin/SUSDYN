@@ -37,6 +37,36 @@ from typing import Optional
 import numpy as np
 
 
+# ── THE project steer block ────────────────────────────────────────────────
+# The rack is described in ONE place: the project's 'steer' block
+# (MainWindow._steer, saved as "steer" in every .vahan).  Every consumer —
+# kinematic steer sweeps, the IK optimiser's steer mode, VehicleParams, the
+# steering-geometry map, effort, Ackermann probes — reads these keys from that
+# block.  No consumer may carry its own rack number.
+STEER_BLOCK_KEYS = ('rack_travel_per_rev_mm', 'total_rack_travel_mm',
+                    'rack_direction')
+
+
+def rack_travel_from_handwheel_deg(steer_wheel_deg: float,
+                                   steer_params: dict) -> float:
+    """Rack translation (m) for a steering-wheel angle (deg), from the
+    project steer block: deg * mm_per_rev / 360 * direction, clamped to
+    +/- half the total rack stroke.  Missing rack keys raise — a silent
+    fallback number is how two consumers end up on two different racks."""
+    if not steer_params or 'rack_travel_per_rev_mm' not in steer_params \
+            or 'total_rack_travel_mm' not in steer_params:
+        raise KeyError('steer block must give rack_travel_per_rev_mm and '
+                       'total_rack_travel_mm (project "steer" block)')
+    per_rev = float(steer_params['rack_travel_per_rev_mm'])
+    half = float(steer_params['total_rack_travel_mm']) / 2.0
+    direction = steer_params.get('rack_direction', 1)
+    if direction not in (-1, 1):
+        raise ValueError('rack_direction must be +1 or -1')
+    travel_mm = float(steer_wheel_deg) * per_rev / 360.0 * direction
+    travel_mm = float(np.clip(travel_mm, -half, half))
+    return travel_mm / 1000.0
+
+
 @dataclass
 class SteeringGeometry:
     """
@@ -46,7 +76,8 @@ class SteeringGeometry:
     and inverse lookups are vectorised and robust against non-linearity.
     The *front* axle is modelled symmetrically — the "representative"
     road-wheel angle used for conversions is the average of FL and FR
-    toe magnitudes (signed so +rack → +road-wheel).
+    neutral-subtracted wheel yaw. Its sign follows the solved linkage,
+    including linkages whose yaw decreases with physical +X rack travel.
 
     Attributes
     ----------
@@ -73,6 +104,11 @@ class SteeringGeometry:
     max_rack_half_m: float
     max_road_wheel_rad: float
     overall_ratio_deg_per_deg: float
+    rack_direction: int = 1
+
+    def __post_init__(self):
+        if self.rack_direction not in (-1, 1):
+            raise ValueError('rack_direction must be +1 or -1')
 
     # ── Construction ────────────────────────────────────────────────────
 
@@ -83,7 +119,8 @@ class SteeringGeometry:
                    front_hp_fr: dict,
                    rack_travel_per_rev_mm: float,
                    total_rack_travel_mm: float,
-                   n_samples: int = 11) -> "SteeringGeometry":
+                   n_samples: int = 11,
+                   rack_direction: int = 1) -> "SteeringGeometry":
         """
         Build the mapping by probing the kinematic solver at a grid of
         rack travels.
@@ -92,8 +129,7 @@ class SteeringGeometry:
         ----------
         front_solver_factory : callable
             ``front_solver_factory(rack_m: float, side: str) -> float``
-            returns the road-wheel angle (rad, signed ISO: +toe-out =
-            positive for left corner under +rack).  ``side`` is 'FL' or
+            returns toe-in angle in RADIANS on each side. ``side`` is 'FL' or
             'FR'.  Any solver failure should return ``np.nan`` — this
             routine masks NaNs and falls back to the nearest valid
             sample.
@@ -112,9 +148,12 @@ class SteeringGeometry:
         # Sample rack positions symmetrically about zero
         rack_grid = np.linspace(-max_rack_half_m, +max_rack_half_m, int(n_samples))
 
-        # Probe road-wheel at each rack position.  Sign convention:
-        # positive rack → left turn → FL toe-in (-) / FR toe-in (+)?
-        # We average |toe| and assign the sign of the rack input.
+        # Physical left-turn yaw is (FR toe-in - FL toe-in)/2.
+        # Remove static alignment; never infer turn direction from rack sign.
+        neutral_fl = float(front_solver_factory(0., 'FL'))
+        neutral_fr = float(front_solver_factory(0., 'FR'))
+        if not np.all(np.isfinite([neutral_fl, neutral_fr])):
+            raise ValueError('Steering probe needs valid neutral toe on both corners')
         rw = np.zeros_like(rack_grid)
         for i, rm in enumerate(rack_grid):
             try:
@@ -123,10 +162,7 @@ class SteeringGeometry:
                 if not (np.isfinite(a_fl) and np.isfinite(a_fr)):
                     rw[i] = np.nan
                     continue
-                # Representative road-wheel angle = (|FL| + |FR|) / 2
-                # with the sign taken from rack direction.
-                mag = 0.5 * (abs(a_fl) + abs(a_fr))
-                rw[i] = np.sign(rm) * mag if rm != 0 else 0.0
+                rw[i] = 0.5 * ((a_fr-neutral_fr) - (a_fl-neutral_fl))
             except Exception:
                 rw[i] = np.nan
 
@@ -138,6 +174,7 @@ class SteeringGeometry:
                 overall_ratio_deg_per_deg=6.0,          # generic FSAE fallback
                 rack_travel_per_rev_mm=rack_travel_per_rev_mm,
                 max_rack_half_m=max_rack_half_m,
+                rack_direction=rack_direction,
             )
 
         mask = ~np.isnan(rw)
@@ -152,7 +189,7 @@ class SteeringGeometry:
             drw_drack = 0.02  # fallback slope
         # Steering-wheel angle (deg) to rack (m): sw_deg × (per_rev_mm / 360) / 1000
         drack_dsw_deg = rack_travel_per_rev_mm / (360.0 * 1000.0)  # m per degree
-        dsw_deg_drw_deg = 1.0 / max(abs(drw_drack * drack_dsw_deg * np.pi / 180.0),
+        dsw_deg_drw_deg = 1.0 / max(abs(drw_drack * drack_dsw_deg * 180.0 / np.pi),
                                     1e-9)
 
         max_rw = float(np.nanmax(np.abs(rw)))
@@ -163,6 +200,7 @@ class SteeringGeometry:
             max_rack_half_m=float(max_rack_half_m),
             max_road_wheel_rad=max_rw,
             overall_ratio_deg_per_deg=float(dsw_deg_drw_deg),
+            rack_direction=rack_direction,
         )
 
     @classmethod
@@ -170,7 +208,8 @@ class SteeringGeometry:
                           overall_ratio_deg_per_deg: float,
                           rack_travel_per_rev_mm: float,
                           max_rack_half_m: float,
-                          n_samples: int = 11) -> "SteeringGeometry":
+                          n_samples: int = 11,
+                          rack_direction: int = 1) -> "SteeringGeometry":
         """
         Fallback constructor using a pure linear model.
 
@@ -188,7 +227,7 @@ class SteeringGeometry:
         drw_rad_drack_m  = np.radians(drw_deg_drack_mm) * 1000.0
 
         rack_grid = np.linspace(-max_rack_half_m, +max_rack_half_m, int(n_samples))
-        rw = drw_rad_drack_m * rack_grid
+        rw = drw_rad_drack_m * rack_grid * rack_direction
         max_rw = float(abs(rw).max())
         return cls(
             rack_m_grid=rack_grid,
@@ -197,6 +236,7 @@ class SteeringGeometry:
             max_rack_half_m=float(max_rack_half_m),
             max_road_wheel_rad=max_rw,
             overall_ratio_deg_per_deg=float(overall_ratio_deg_per_deg),
+            rack_direction=rack_direction,
         )
 
     # ── Forward lookups ──────────────────────────────────────────────────
@@ -209,7 +249,7 @@ class SteeringGeometry:
     def road_wheel_from_steering_wheel(self, sw_deg) -> np.ndarray:
         """Road-wheel angle (rad) at a given steering-wheel angle (deg)."""
         sw_deg = np.asarray(sw_deg, float)
-        rack_m = sw_deg * (self.rack_travel_per_rev_mm / 360.0) / 1000.0
+        rack_m = sw_deg * (self.rack_travel_per_rev_mm / 360.0) / 1000.0 * self.rack_direction
         return self.road_wheel_from_rack(rack_m)
 
     # ── Inverse lookups ──────────────────────────────────────────────────
@@ -231,7 +271,7 @@ class SteeringGeometry:
     def steering_wheel_from_road_wheel(self, rw_rad) -> np.ndarray:
         """Steering-wheel angle (deg) required for the given road-wheel angle."""
         rack_m = self.rack_from_road_wheel(rw_rad)
-        return rack_m * 1000.0 * 360.0 / max(self.rack_travel_per_rev_mm, 1e-6)
+        return rack_m * 1000.0 * 360.0 / max(self.rack_travel_per_rev_mm, 1e-6) * self.rack_direction
 
     def rack_mm_from_road_wheel(self, rw_rad) -> np.ndarray:
         """Convenience: rack position in mm (for per-step logging)."""

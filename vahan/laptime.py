@@ -12,9 +12,12 @@ SAME models the rest of Vahan uses (single-model rule):
                      torque curve or the torque-plateau/constant-power model,
                      minus drag; VehicleParams.drive_force_at_v_N is the
                      no-gearbox fallback
-  * driveline      — ROTATING INERTIA as equivalent mass: every longitudinal
-                     acceleration is divided by (1 + m_eq/m), and the engine
-                     term is referred through the total ratio SQUARED
+  * driveline      — ROTATING INERTIA as equivalent mass: a TORQUE-limited
+                     acceleration is divided by (1 + m_eq/m), the engine term
+                     referred through the total ratio SQUARED; a TYRE-limited
+                     one is not (only the undriven wheels ride along in
+                     traction; braking has no torque limit modelled, so the
+                     stop is tyre-limited and inertia-invariant)
   * driver         — a real gearshift: torque cut for a dead time, a minimum
                      interval between shifts, and hysteresis on the decision
   * steering       — an optional AckermannStationModel caps each station's
@@ -71,6 +74,10 @@ def aero_heave_mm(downforce_axle_N: float, ride_rate_Npm: float) -> float:
     wheels carries half the axle load against its ride rate (wheel rate in
     series with the tire), so heave = (D_axle/2) / ride_rate."""
     return (float(downforce_axle_N) / 2.0) / max(float(ride_rate_Npm), 1.0) * 1000.0
+
+
+
+from .heave_curve import wheel_force_curves, heave_split_mm   # the ONE heave model (moved 2026-09-26)
 
 
 def required_ride_rate_Npm(downforce_axle_N: float, max_heave_mm: float) -> float:
@@ -231,10 +238,13 @@ class AckermannStationModel:
     R_NO_EFFECT_M = 50.0          # beyond this: no modifier, measured dead
 
     def __init__(self, tire_model, solver, pct_list,
-                 grip_multiplier: float = 0.65, aero=False):
+                 grip_multiplier: float | None = None, aero=False):
         self.tire = tire_model
         self.solver = solver
         self.pct = np.asarray(sorted(float(p) for p in pct_list), float)
+        # None = THE project grip scale the solver carries (no private 0.65).
+        if grip_multiplier is None:
+            grip_multiplier = float(getattr(solver, '_mu_scale', 1.0))
         self.gm = float(grip_multiplier)
         self.aero = aero
         self.built = False
@@ -587,7 +597,7 @@ class LapSimulator:
                  cda_m2: float | None = None,
                  air_density: float | None = None,
                  aero_cop_rear_frac: float = 0.5,
-                 grip_scale: float = 1.0,
+                 grip_scale: float | None = None,
                  static_rh_front_mm: float = 50.0,
                  static_rh_rear_mm: float = 50.0):
         self.ss = ss_solver
@@ -603,9 +613,13 @@ class LapSimulator:
         self.rho = float(air_density if air_density is not None
                          else self.veh.air_density_kg_m3)
         self.cop_rear = float(np.clip(aero_cop_rear_frac, 0.0, 1.0))
-        # Track/test grip derate: TTC belt data over-reads real asphalt grip;
-        # teams typically run the sim at ~0.6-0.7 of belt μ.  Scales lateral
-        # AND longitudinal grip (not power).
+        # Track/test grip derate: TTC belt data over-reads real asphalt grip.
+        # Scales lateral AND longitudinal grip (not power).  None = THE
+        # project grip scale the solver already carries (ss._mu_scale, set by
+        # the app from MainWindow.grip_scale()) — there is no private lap-sim
+        # default any more (it was 0.65 on the page vs 0.70 on Dynamics).
+        if grip_scale is None:
+            grip_scale = float(getattr(ss_solver, '_mu_scale', 1.0))
         self.grip_scale = float(np.clip(grip_scale, 0.1, 1.5))
         # Optional GEARBOX (set via set_gearbox).  None -> fall back to the
         # VehicleParams single-ratio drive_force model.
@@ -869,11 +883,31 @@ class LapSimulator:
         return I / (r * r)
 
     def _inertia_div(self, gear: int = 0) -> float:
-        """1 + m_eq/m — divide every longitudinal acceleration by this."""
+        """1 + m_eq/m for the WHOLE driveline (engine coupled).  This is the
+        divisor for a TORQUE-limited acceleration only (see _ax_drive /
+        _ax_brake): it does NOT apply to a tyre-force-limited one."""
         if self._I_wheel_f <= 0 and self._I_wheel_r <= 0 and self._I_engine <= 0:
             return 1.0
         return 1.0 + self.equivalent_mass_kg(gear) \
             / max(float(self.veh.total_mass_kg), 1.0)
+
+    def _free_wheel_mass_kg(self) -> float:
+        """Equivalent mass (kg) of the UNDRIVEN wheels only: 2*I/r^2.  Their
+        spin-up torque comes from their OWN tyres (a rearward ground force on
+        the car), not from the driven tyres' friction budget, so it stays in
+        the traction-limited branch.  RWD -> fronts, FWD -> rears, AWD -> 0."""
+        r = max(float(self.veh.tire_radius_m), 1e-3)
+        dt = str(getattr(self.veh, 'drivetrain', 'RWD') or 'RWD').upper()
+        if dt == 'AWD':
+            return 0.0
+        I = self._I_wheel_r if dt == 'FWD' else self._I_wheel_f
+        return 2.0 * I / (r * r)
+
+    def _wheels_only_mass_kg(self) -> float:
+        """Equivalent mass (kg) of all four wheels, engine DECOUPLED (clutch
+        open / dogs out during a shift)."""
+        r = max(float(self.veh.tire_radius_m), 1e-3)
+        return 2.0 * (self._I_wheel_f + self._I_wheel_r) / (r * r)
 
     # ── aero helpers ────────────────────────────────────────────────────
     def _q(self, v):                       # dynamic pressure
@@ -887,32 +921,28 @@ class LapSimulator:
 
     # ── ride-height heave through the REAL (possibly nonlinear) wheel rate ──
     def _build_rate_curves(self):
-        """Precompute, per axle, the cumulative wheel force vs compression
-        using MR(travel) from the corner solver, so a progressive/exponential
-        MR genuinely reduces aero heave.  Cached on the instance."""
+        """Precompute, per axle, the INCREMENTAL wheel force vs bump travel
+        from the corner solver's spring length, so a progressive MR genuinely
+        reduces aero heave.  Cached on the instance.
+
+        Virtual work on a corner-spring corner: spring compression c(q) at
+        wheel travel q, motion ratio MR(q) = dc/dq, spring force
+        F_s(q) = F_s0 + K_s·c(q)  (F_s0 = static spring force incl. preload).
+        The wheel force that balances it is F_w = F_s·MR, so the INCREMENT
+        over static is
+            ΔF_w(q) = (F_s0 + K_s·c(q))·MR(q) − F_s0·MR(0)
+        and its tangent dF_w/dq = K_s·MR² + F_s·dMR/dq — the SAME two-term
+        wheel rate VehicleParams uses at static (RCVD 16.3:
+        K_s·IR² + F_s·dIR/dδ with static_spring_force_* and mr_slope_*).
+        Until 2026-09-22 this integrated K_s·MR² only and dropped the
+        F_s·dMR/dq term (audit item 24: 485.69 N vs exact 608.2 N at 20 mm on
+        c = q + 2.5q², MR = 1 + 5q, K_s 22 kN/m, F_s0 1 kN — 20 % low).
+        F_s0 comes from the ONE car (veh.static_spring_force_*_N, set from
+        the kinematic sweep); 0 when unset, which still keeps K_s·c·dMR/dq."""
         if getattr(self, '_rate_curves', None) is not None:
             return self._rate_curves
-        out = {}
-        for ax, label, mr0, spr in (
-            ('F', 'FL', self.veh.motion_ratio_front, self.veh.spring_rate_front_Npm),
-            ('R', 'RL', self.veh.motion_ratio_rear, self.veh.spring_rate_rear_Npm)):
-            ts = np.linspace(0.0, 0.08, 41)              # 0..80 mm bump
-            sv = self.ss._solvers.get(label)
-            mr = np.full_like(ts, float(mr0))
-            if sv is not None:
-                try:
-                    sl = np.array([sv.solve(float(t)).spring_length for t in ts])
-                    mr = np.abs(np.gradient(sl, ts))
-                    mr = np.clip(mr, 0.05, 5.0)
-                except Exception:
-                    pass
-            k_wheel = float(spr) * mr ** 2               # N/m at each travel
-            fcum = np.concatenate([[0.0], np.cumsum(
-                0.5 * (k_wheel[1:] + k_wheel[:-1]) * np.diff(ts))])
-            out[ax] = dict(ts=ts, fcum=fcum,
-                           kt=max(float(self.veh.tire_rate_Npm), 1.0))
-        self._rate_curves = out
-        return out
+        self._rate_curves = wheel_force_curves(self.veh, self.ss._solvers)
+        return self._rate_curves
 
     def _aero_heave_mm(self, curve, aero_load_per_wheel: float) -> float:
         """Heave (mm) of one wheel under an additional aero load, through the
@@ -1067,53 +1097,115 @@ class LapSimulator:
             v = 0.5 * (v + v_new)
         return float(v)
 
+    def _traction_g0(self) -> float:
+        """Grip-limited forward accel (g) at zero lateral g, from the
+        solver's weight-transfer fixed point run AT this sim's grip scale
+        (mu scaled inside the fixed point — the old code scaled the answer,
+        which ignored that a derated tyre also transfers less load)."""
+        prev = getattr(self.ss, '_mu_scale', 1.0)
+        self.ss._mu_scale = self.grip_scale
+        try:
+            a = float(self.ss._traction_g_dynamic(0.0))
+        finally:
+            self.ss._mu_scale = prev
+        return a
+
     def _ax_drive(self, v: float, ay: float, gear: int = 0,
                   torque_cut: bool = False, kappa: float = 0.0) -> float:
-        """Available forward accel (m/s²): min(power, traction) on the
-        remaining friction circle, minus drag, DIVIDED by the rotating-inertia
-        factor (1 + m_eq/m).
+        """Net longitudinal accel (m/s², SIGNED — negative = the car is
+        losing speed) under full throttle on the remaining friction circle.
+
+        Newton, straight-line, rolling without slip (a = r·alpha), RWD shown
+        (FWD swaps the axles; AWD has no free wheels).  Unknowns: a, and the
+        driven-tyre ground force F_d.  Knowns: wheel force the engine torque
+        could make with a massless driveline F_T = T_e·eta·N/r (_force_in_gear),
+        resistance D (aero drag + front-tyre scrub), and
+            m_eq_d = [2·I_driven + I_engine·N²]/r²  (spun by the engine torque)
+            m_eq_f = 2·I_free/r²                    (spun by their own tyres)
+          body               : m·a = F_d − m_eq_f·a − D
+          driven wheel+engine: F_d = F_T − m_eq_d·a
+        Two independent limits, BOTH must hold:
+          (1) torque  : a ≤ (F_T − D) / (m + m_eq_d + m_eq_f)
+          (2) traction: F_d ≤ F_trac (driven-tyre friction), so
+                        a ≤ (F_trac − D) / (m + m_eq_f)
+        and the car does the smaller.  Rotating inertia of the ENGINE and the
+        DRIVEN wheels does not appear in (2): when the driven tyres are at
+        their friction limit, the ground force is set by the tyre, and the
+        extra engine torque needed to spin the driveline up is simply torque
+        the engine had spare.  (Before 2026-09-22 the min() was divided by
+        the whole-driveline factor, charging inertia against a tyre limit.)
+
+        The result is NOT clipped at zero: with the torque cut, or with
+        drive force below drag + scrub (top speed, or a corner taken at the
+        full lateral limit so no longitudinal tyre force is left), the car
+        slows down.  It used to return max(0, …) — the car held speed with no
+        force to do it (audit 2026-09-22 item 22: 0.0 vs −1.29155 m/s²).
 
         gear        1-based gear the car is actually in (0 = let the
                     instantaneous picker choose).  It sets both the drive
                     force AND the engine's referred inertia.
-        torque_cut  True while a gearshift is in progress: no drive force at
-                    all, the car coasts against drag."""
+        torque_cut  True while a gearshift is in progress: no drive force,
+                    and the dogs are out so the ENGINE is decoupled — only
+                    the four wheels' inertia rides with the car while it
+                    coasts against drag + scrub."""
         m = self.veh.total_mass_kg
         ay_cap = self._ay_max_local(v, kappa)
         circle = np.sqrt(max(0.0, 1.0 - (ay / max(ay_cap, 1e-6)) ** 2))
         # traction (driven axle, weight transfer) — reuse the solver's fixed
         # point but with aero-augmented load handled via μ at speed
-        a_trac = self.ss._traction_g_dynamic(0.0) * G * circle * self.grip_scale
+        a_trac = self._traction_g0() * G * circle
         # aero load scales the traction ceiling (downforce raises it; net
         # LIFT lowers it — clamped non-negative)
         a_trac *= max(1.0 + self.downforce_N(v) / (m * G), 0.0)
+        # Resistance D: aero drag plus FRONT-TYRE SCRUB — the steered front
+        # tyres make force across the car's path as well as at the corner,
+        # and that component only slows it down.  A force on the car, never
+        # a ceiling, so it sits outside both limits below.
+        D = self.drag_N(v) + self.scrub_drag_N(v, kappa)
+        F_trac = a_trac * m                    # driven-tyre friction limit, N
+        m_f = self._free_wheel_mass_kg()       # undriven wheels (own tyres)
         if torque_cut:
-            F_pwr = 0.0
-        elif v > 0.5:
-            if gear and self._gears:
-                F_pwr = self._force_in_gear(v, gear)[0]
-            else:
-                F_pwr = self._drive_force(v)   # gearbox-aware when set
+            # shift in progress: no drive torque, engine decoupled — coast.
+            return float(-D / (m + self._wheels_only_mass_kg()))
+        # (2) traction-limited branch: engine/driven-wheel inertia absent
+        a_tyre = (F_trac - D) / (m + m_f)
+        if v <= 0.5:
+            # launch: the clutch slips and holds the engine near peak torque,
+            # so the tyre, not the torque, is the limit (unchanged behaviour)
+            return float(a_tyre)
+        if gear and self._gears:
+            F_T = self._force_in_gear(v, gear)[0]
         else:
-            F_pwr = a_trac * m
-        a_pwr = F_pwr / m
-        # NOTE the drag term is OUTSIDE the min(): drag is a force on the car,
-        # not a ceiling.  Aero drag plus FRONT-TYRE SCRUB — the steered front
-        # tyres make force across the car's path as well as at the corner, and
-        # that component only slows it down.  Everything is then divided by
-        # the equivalent-mass factor, because the same net force has to spin
-        # the wheels and the crank up as well as push the car.
-        resist = (self.drag_N(v) + self.scrub_drag_N(v, kappa)) / m
-        return max(0.0, (min(a_pwr, a_trac) - resist)
-                   / self._inertia_div(gear))
+            F_T = self._drive_force(v)         # gearbox-aware when set
+        # (1) torque-limited branch: the whole coupled driveline spins up
+        m_all = m * self._inertia_div(gear)    # m + m_eq_d + m_eq_f
+        a_torque = (F_T - D) / m_all
+        return float(min(a_torque, a_tyre))
 
     def _ax_brake(self, v: float, ay: float, gear: int = 0,
                   kappa: float = 0.0) -> float:
-        """Available braking decel (m/s², positive) — all four tires on the
-        remaining circle, plus drag and front-tyre scrub helping, divided by
-        the rotating-inertia factor.  The brakes must absorb the wheels' and
-        (clutch engaged) the engine's rotational energy too, so the car stops
-        SLOWER, not faster."""
+        """Available braking decel (m/s², positive) — all four tyres on the
+        remaining friction circle, plus drag and front-tyre scrub helping.
+
+        Newton, braking magnitudes positive, rolling without slip:
+          body  : m·a = F_ground + D
+          wheels: T_brake = F_ground·r + I_eq·a/r    (I_eq incl. the engine
+                                                     referred through N² while
+                                                     the clutch is engaged)
+        TYRE-limited (F_ground = F_max = m·ay_max·circle):
+            a = (F_max + D) / m                — rotating inertia ABSENT.
+        The spinning parts do not make the car heavier in the translational
+        balance; they only raise the brake TORQUE needed to hold the tyres at
+        F_max (the brakes must also absorb the rotational energy).
+        TORQUE-limited (T_brake = T_max): a = (T_max/r + D)/(m + m_eq) — the
+        only case in which inertia slows the stop.  No hydraulic / rotor
+        torque limit is modelled here (the brakes are assumed able to lock
+        the tyres, i.e. T_max ≥ F_max·r + I_eq·a/r), so the tyre branch is
+        the answer.  Until 2026-09-22 the tyre branch was divided by
+        (1 + m_eq/m) — audit item 23: 9.81 -> 6.622 m/s², a 32.5 % stop
+        penalty with no brake-torque limit anywhere in the model.  `gear` is
+        kept for the call signature (it would set the engine's referred
+        inertia in a future torque-limited branch)."""
         m = self.veh.total_mass_kg
         # The CIRCLE is measured against the LOCAL cap: if the corner speed
         # was set by the front axle running out of steering-geometry
@@ -1124,9 +1216,9 @@ class LapSimulator:
         # it against the brakes as well was double-counting.
         ay_cap = self._ay_max_local(v, kappa)
         circle = np.sqrt(max(0.0, 1.0 - (ay / max(ay_cap, 1e-6)) ** 2))
-        return (self._ay_max(v) * circle
-                + (self.drag_N(v) + self.scrub_drag_N(v, kappa)) / m) \
-            / self._inertia_div(gear)
+        F_max = m * self._ay_max(v) * circle          # tyre force limit, N
+        D = self.drag_N(v) + self.scrub_drag_N(v, kappa)
+        return float((F_max + D) / m)
 
     # ── the three passes ─────────────────────────────────────────────────
     def simulate(self, track: Track, n_detail: int = 60,
@@ -1182,10 +1274,11 @@ class LapSimulator:
             since += dt_i
             cut_left = max(cut_left - dt_i, 0.0)
 
-        # pass 3 — backward braking.  The gear here is only used for the
-        # engine's referred inertia (the brakes, not the engine, make the
-        # force), so the instantaneous picker is the right source: it is the
-        # gear the car is in at that speed.
+        # pass 3 — backward braking.  Tyre-limited (see _ax_brake): rotating
+        # inertia raises the brake torque needed, not the stopping distance,
+        # so the gear no longer changes the decel.  It is still passed (the
+        # instantaneous picker = the gear the car is in at that speed) for a
+        # future brake-torque-limited branch.
         _prog('Backward (braking) pass…', 45)
         v_b = vcap.copy()
         v_b[-1] = vcap[-1]
@@ -1278,6 +1371,17 @@ class LapSimulator:
                               float(d) * self.cop_rear / 2.0) for d in down])
         res.rh_front_mm = self.rh_front0 - heave_f_mm
         res.rh_rear_mm = self.rh_rear0 - heave_r_mm
+        # the rate curve covers 0-80 mm of bump; beyond it np.interp would
+        # silently clamp the heave — SAY so instead of reporting a floor
+        for _nm, _cv, _share in (('front', curves['F'], 1.0 - self.cop_rear),
+                                 ('rear', curves['R'], self.cop_rear)):
+            _ld = float(np.max(down)) * _share / 2.0
+            if _ld > float(_cv['fcum'][-1]):
+                res.notes.append(
+                    f'aero heave {_nm}: {_ld:.0f} N per wheel exceeds the '
+                    f'{_cv["fcum"][-1]:.0f} N the 0-{_cv["ts"][-1]*1000:.0f} mm '
+                    f'rate curve covers — ride height there is CLAMPED, not '
+                    f'solved (out of modelled travel)')
         # Load-sensitivity note: aero can push a tire past the tested load
         # range.  The grip there DOES fall with load (load sensitivity, applied
         # via peak_mu's extended decline + grip-force ceiling) — the only
@@ -1361,8 +1465,11 @@ class LapSimulator:
         r_t = max(self.veh.tire_radius_m, 1e-3)
         track_r = float(getattr(self.veh, 'rear_track_m', 1.2))
         # grip cap on the force bias: the driven axle can't bias more force
-        # than its tires can transmit (~ its peak μ × axle load).
-        mu0 = self._mu_at_speed(15.0) / max(self.grip_scale, 1e-3)
+        # than its tires can transmit (~ its peak μ × axle load) — on the
+        # SAME road as the rest of the lap (grip-scaled, like the steady-state
+        # solver's own diff cap).  It used to divide the scale back out and
+        # cap the diff on raw belt grip.
+        mu0 = self._mu_at_speed(15.0)
         Fz_rear = self.veh.total_mass_kg * G * (1.0 - self.veh.front_weight_fraction)
         max_bias = mu0 * Fz_rear
         ratio = float(getattr(self.veh, 'total_drive_ratio', 10.0) or 10.0)

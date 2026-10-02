@@ -26,11 +26,12 @@ not capture.
 ## How Vahan checks it
 `vahan.packaging._axle_geometry_laws` reports the three angles:
 `triad_bar_blade_deg`, `triad_blade_drop_deg`, `triad_bar_drop_deg`. When a
-solution is built or relocated, the ARB is constructed to hold the baseline triad
-angles by construction, and the oracle compares them to the baseline.
+solution is built or relocated, target 90 degrees for all three angles. The
+oracle compares against 90 degrees, even if the starting geometry is not square.
 
 ## Tolerance
-Within 1 degree of the baseline triad angles.
+Within 1 degree of 90 degrees for the numerical acceptance check. Nominal design
+target is exactly 90/90/90. A non-square baseline does not grant an exception.
 
 ## History — a wrong reading of this rule (2026-09-01)
 An earlier version of this file said the bar↔drop angle was "a consequence of

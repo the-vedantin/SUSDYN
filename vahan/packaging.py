@@ -33,7 +33,14 @@ from dataclasses import dataclass, field, asdict
 
 import numpy as np
 
-from .interference import clashes, full_members, connected_for
+from .interference import (clashes, full_members, connected_for, rim_barrel_gap,
+                           cross_corner_clashes, rocker_plate_gaps,
+                           rocker_plate_style_for, rocker_pr_full_length_fork_for,
+                           rocker_pr_full_length_fork_clear_gap_for)
+from .interference import arb_blade_dogleg_params_for
+from .interference import arb_member_kwargs
+from .interference import rocker_pr_full_length_fork_jog_for
+from .interference import rocker_plate_physical_options_for
 from .kinematics import KinematicMetrics
 
 # ── which points belong to whom ──────────────────────────────────────────────
@@ -72,8 +79,9 @@ class Tolerances:
     motion_ratio_pct:  float = 1.0
     arb_rate_pct:      float = 2.0
     coplanar_mm:       float = 3.0    # hard geometric law (<0.1 at design)
+    rocker_axis_deg:   float = 1e-4   # Rule 02: axis normal to physical plate
     arb_inplane_mm:    float = 3.0    # ARB drop link in rocker plane at static
-    triad_deg:         float = 1.0    # bar/blade/drop mutual angles vs baseline
+    triad_deg:         float = 1.0    # bar/blade/drop mutual angles from 90 degrees
     clash_worsen_mm:   float = 0.25   # standing near-miss may not get worse
     arb_mount_shift_mm: float = 100.0 # bar re-mount may move at most this far
                                       # from the baseline chassis mount (a bar
@@ -208,6 +216,123 @@ def _chain_plane(bundle):
     c = pts.mean(0)
     _, _, vt = np.linalg.svd(pts - c)
     return c, vt[-1]
+
+
+def _physical_rocker_plane(hp, outboard_sign: float = 1.0):
+    """Origin and stable unit normal of the three-attach rocker plate."""
+    pivot = np.asarray(hp['rocker_pivot'], float)
+    pushrod = np.asarray(hp['pushrod_inner'], float)
+    spring = np.asarray(hp['rocker_spring_pt'], float)
+    normal = np.cross(pushrod - pivot, spring - pivot)
+    nn = float(np.linalg.norm(normal))
+    if nn < 1e-12:
+        return pivot, np.full(3, np.nan)
+    normal /= nn
+    if float(normal @ np.array([float(outboard_sign), 0.0, 0.0])) < 0.0:
+        normal = -normal
+    return pivot, normal
+
+
+def actuation_chain_plate_metrics(states, outboard_sign: float = 1.0,
+                                  rocker_axis=None, arb=None) -> dict:
+    """Rule 01/02 metrics for one corner at its static design position.
+
+    ``states`` retains its historical iterable interface, but only the state
+    nearest zero travel is acceptance data.  The physical plane is the corner's
+    static rocker plane through pivot, pushrod-inner and spring pickup.  The
+    pushrod outer, both spring eyes and, when ``arb`` is supplied, both drop-link
+    endpoints are measured against that same plane.  Left and right corners are
+    evaluated independently by :func:`_axle_geometry_laws`; wheel travel does
+    not redefine or extend this static assembly rule.
+    """
+    states = list(states)
+    if not states:
+        raise ValueError('at least one solved state is required')
+
+    def point(state, key):
+        return np.asarray(state[key] if isinstance(state, dict)
+                          else getattr(state, key), float)
+
+    static_travel, static = min(states, key=lambda item: abs(float(item[0])))
+    if abs(float(static_travel)) > 1e-12:
+        raise ValueError('static actuation-plane metrics require an explicit zero-travel state')
+    static_hp = {k: point(static, k) for k in
+                 ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')}
+    origin, normal = _physical_rocker_plane(static_hp, outboard_sign)
+    keys = ('pushrod_outer', 'pushrod_inner', 'rocker_pivot',
+            'rocker_spring_pt', 'spring_chassis_pt')
+    named = [(k, point(static, k)) for k in keys]
+    if arb is not None:
+        named.extend((('arb_drop_top', np.asarray(arb['arb_drop_top'], float)),
+                      ('arb_arm_end', np.asarray(arb['arb_arm_end'], float))))
+    if not np.all(np.isfinite(normal)):
+        return {'coplanar_mm': float('nan'), 'coplanar_static_mm': float('nan'),
+                'chain_best_fit_mm': float('nan'),
+                'rocker_axis_normal_error_deg': float('nan'),
+                'worst_point': None, 'worst_travel_m': float('nan'),
+                'static_signed_mm': {k: float('nan') for k, _ in named}}
+    names = [k for k, _ in named]
+    chain = np.array([p for _, p in named])
+    signed = (chain - origin) @ normal * 1000.0
+    static_signed = {k: float(v) for k, v in zip(names, signed)}
+    i = int(np.argmax(np.abs(signed)))
+    worst = (abs(float(signed[i])), names[i], 0.0)
+    c = chain.mean(0)
+    _, _, vt = np.linalg.svd(chain - c)
+    best_fit = float(np.abs((chain - c) @ vt[-1]).max()) * 1000.0
+    axis = (point(static, 'rocker_axis_pt') - point(static, 'rocker_pivot')
+            if rocker_axis is None else np.asarray(rocker_axis, float))
+    axis_n = float(np.linalg.norm(axis))
+    axis_error = (float('nan') if axis_n < 1e-12 else
+                  float(np.degrees(np.arccos(np.clip(abs(float((axis / axis_n) @ normal)),
+                                                     -1.0, 1.0)))))
+    return {'coplanar_mm': worst[0],
+            'coplanar_static_mm': worst[0],
+            'chain_best_fit_mm': best_fit,
+            'rocker_axis_normal_error_deg': axis_error,
+            'worst_point': worst[1], 'worst_travel_m': worst[2],
+            'static_signed_mm': static_signed}
+
+
+def arb_drop_link_plate_metrics(hp, arb, outboard_sign: float = 1.0) -> dict:
+    """Measure a drop link against the physical rocker plate.
+
+    The plate is the plane through ``rocker_pivot``, ``pushrod_inner`` and
+    ``rocker_spring_pt``.  Inputs are in metres; reported distances are in
+    millimetres.  The normal is oriented toward the corner's outboard X
+    direction so endpoint signs are stable between left and right corners.
+    ``direction_deg`` is the signed angle from the plate of the vector from
+    drop top to arm end (zero means its direction is parallel to the plate).
+
+    Project metadata is deliberately not an input.  A spacer or waiver may
+    describe noncompliant hardware, but cannot change Rule 04's geometry.
+    """
+    pivot, normal = _physical_rocker_plane(hp, outboard_sign)
+    if not np.all(np.isfinite(normal)):
+        return {'drop_top_signed_mm': float('nan'),
+                'arm_end_signed_mm': float('nan'),
+                'direction_deg': float('nan')}
+    drop_top = np.asarray(arb['arb_drop_top'], float)
+    arm_end = np.asarray(arb['arb_arm_end'], float)
+    link = arm_end - drop_top
+    ln = float(np.linalg.norm(link))
+    direction = (float('nan') if ln < 1e-12 else
+                 float(np.degrees(np.arcsin(np.clip(float((link / ln) @ normal),
+                                                    -1.0, 1.0)))))
+    return {'drop_top_signed_mm': float((drop_top - pivot) @ normal) * 1000.0,
+            'arm_end_signed_mm': float((arm_end - pivot) @ normal) * 1000.0,
+            'direction_deg': direction}
+
+
+def arb_drop_link_plate_compliant(metrics: dict, tolerance_mm: float,
+                                  control_arm_arb: bool = False) -> bool:
+    """Rule 04 acceptance from the shared physical-plate measurements."""
+    if control_arm_arb:
+        return True
+    distances = (metrics.get('drop_top_signed_mm'),
+                 metrics.get('arm_end_signed_mm'))
+    return all(v is not None and np.isfinite(v) and abs(float(v)) <= tolerance_mm
+               for v in distances)
 
 
 def refit_arb(bundle: dict, ref_bundle: dict) -> dict:
@@ -516,53 +641,66 @@ def _rates(win) -> dict:
 
 
 def _axle_geometry_laws(win, axle: str) -> dict:
-    """Hard geometric laws for one axle, same math as the regression net's
-    'design actuation' gate: (1) full-chain coplanarity across travel INCLUDING
-    pushrod_outer; (2) ARB drop link in the rocker plane at static (both ends);
-    (3) triad angles bar/blade/drop at static."""
-    label = _LABEL[axle]
-    solver = win._solvers[label]
+    """Hard physical geometry laws shared with the design-actuation net.
+
+    Rules 01/02/04 are static assembly checks performed independently on the
+    left and right corners. Rule 03 checks the bar/blade/drop triad.
+    """
     arb = win._front_arb if axle == 'front' else win._rear_arb
     out = {}
-    # (1) coplanarity: SVD plane through the whole chain at 3 travels
-    cop = 0.0
-    for t in (-0.025, 0.0, 0.025):
-        st = solver.solve(t)
-        P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
-        pts = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
-                        P('rocker_spring_pt'), P('spring_chassis_pt'),
-                        np.asarray(arb['arb_drop_top'], float) * 1000.0])
-        c = pts.mean(0); _, _, vt = np.linalg.svd(pts - c)
-        cop = max(cop, float(np.abs((pts - c) @ vt[-1]).max()))
-    out['coplanar_mm'] = cop
-    # (2) drop link in-plane at static, both ends, against the chain plane.
-    #     This is a BELLCRANK-ARB law (bar rides the rocker, so its blade + drop
-    #     link must lie in the rocker plane).  A BOTTOM / control-arm ARB mounts
-    #     the torsion bar low on the chassis (well below the rocker) with a long
-    #     drop link down to it — the bar is chassis-fixed and the drop link is a
-    #     two-force member (rod ends), so it is never in bending regardless of
-    #     plane.  Detect that layout (bar pivot mounted far below the rocker)
-    #     and EXEMPT the in-plane check for it; the triad + rate + clash laws
-    #     still apply.
-    st = solver.solve(0.0)
+    labels = ('FL', 'FR') if axle == 'front' else ('RL', 'RR')
+    corner_metrics, plate_metrics, states = {}, {}, {}
+    for label in labels:
+        solver = win._solvers[label]
+        st = solver.solve(0.0); states[label] = st
+        mirror = (np.array([1.0, 1.0, 1.0]) if label[1] == 'L'
+                  else np.array([-1.0, 1.0, 1.0]))
+        corner_arb = {k: np.asarray(v, float) * mirror for k, v in arb.items()
+                      if k in ('arb_drop_top', 'arb_arm_end', 'arb_pivot')}
+        corner_metrics[label] = actuation_chain_plate_metrics(
+            [(0.0, st)], outboard_sign=mirror[0], arb=corner_arb,
+            rocker_axis=np.asarray(solver.hp.rocker_axis_pt, float)
+            - np.asarray(solver.hp.rocker_pivot, float))
+        static_hp = {k: np.asarray(getattr(st, k), float) for k in
+                     ('rocker_pivot', 'pushrod_inner', 'rocker_spring_pt')}
+        plate_metrics[label] = arb_drop_link_plate_metrics(
+            static_hp, corner_arb, outboard_sign=mirror[0])
+
+    worst_label = max(labels, key=lambda x: corner_metrics[x]['coplanar_mm'])
+    out.update(corner_metrics[worst_label])
+    out['coplanar_mm'] = max(corner_metrics[x]['coplanar_mm'] for x in labels)
+    out['coplanar_static_mm'] = out['coplanar_mm']
+    out['chain_best_fit_mm'] = max(corner_metrics[x]['chain_best_fit_mm'] for x in labels)
+    out['rocker_axis_normal_error_deg'] = max(
+        corner_metrics[x]['rocker_axis_normal_error_deg'] for x in labels)
+    out['corner_static_mm'] = {x: corner_metrics[x]['coplanar_mm'] for x in labels}
+    out['corner_axis_error_deg'] = {
+        x: corner_metrics[x]['rocker_axis_normal_error_deg'] for x in labels}
+
+    # Rule 04 uses each corner's own physical static rocker plane. Only an
+    # explicit CONTROL_ARM topology is exempt; metadata remains diagnostic.
+    st = states[labels[0]]
     P = lambda k: np.asarray(getattr(st, k), float) * 1000.0
-    pl = np.array([P('pushrod_outer'), P('pushrod_inner'), P('rocker_pivot'),
-                   P('rocker_spring_pt'), P('spring_chassis_pt')])
-    c0 = pl.mean(0); _, _, vt = np.linalg.svd(pl - c0)
-    n = vt[-1]
-    _rk_z = float(P('rocker_pivot')[2])
-    _bar_z = float(np.asarray(arb['arb_pivot'], float)[2] * 1000.0)
-    is_bottom_arb = (_rk_z - _bar_z) > 120.0     # bar >120 mm below the rocker
+    axle_topology = getattr(getattr(win, '_topology', None), axle, None)
+    arb_type = getattr(getattr(axle_topology, 'arb_type', None), 'value', None)
+    is_bottom_arb = (arb_type == 'control_arm')
     out['arb_is_bottom'] = bool(is_bottom_arb)
-    if is_bottom_arb:
-        out['arb_drop_top_inplane_mm'] = 0.0
-        out['arb_arm_end_inplane_mm'] = 0.0
-    else:
-        dt_off = float(abs((np.asarray(arb['arb_drop_top'], float) * 1000 - c0) @ n))
-        ae_off = float(abs((np.asarray(arb['arb_arm_end'], float) * 1000 - c0) @ n))
-        out['arb_drop_top_inplane_mm'] = dt_off
-        out['arb_arm_end_inplane_mm'] = ae_off
-    # (3) triad: torsion bar (X axis) / blade (pivot->arm end) / drop link
+    def signed_worst(key):
+        return max((plate_metrics[x][key] for x in labels), key=abs)
+    out['arb_drop_top_plate_signed_mm'] = signed_worst('drop_top_signed_mm')
+    out['arb_arm_end_plate_signed_mm'] = signed_worst('arm_end_signed_mm')
+    out['arb_link_to_plate_deg'] = signed_worst('direction_deg')
+    # Retain the established absolute-distance keys for existing consumers.
+    out['arb_drop_top_inplane_mm'] = max(
+        abs(plate_metrics[x]['drop_top_signed_mm']) for x in labels)
+    out['arb_arm_end_inplane_mm'] = max(
+        abs(plate_metrics[x]['arm_end_signed_mm']) for x in labels)
+    out['arb_drop_standoff_mm'] = float(
+        getattr(win, '_car', {}).get(f'{axle}_arb_drop_standoff_mm', 0.0) or 0.0)
+    out['arb_link_plane_offset_mm'] = max(
+        (0.5 * (plate_metrics[x]['drop_top_signed_mm']
+                + plate_metrics[x]['arm_end_signed_mm']) for x in labels), key=abs)
+    # (4) triad: torsion bar (X axis) / blade (pivot->arm end) / drop link
     pv = np.asarray(arb['arb_pivot'], float)
     ae = np.asarray(arb['arb_arm_end'], float)
     dtp = np.asarray(arb['arb_drop_top'], float)
@@ -575,10 +713,66 @@ def _axle_geometry_laws(win, axle: str) -> dict:
         if cu < 1e-12 or cv < 1e-12:
             return float('nan')
         return float(np.degrees(np.arccos(np.clip(np.dot(u, v) / (cu * cv), -1, 1))))
+    # Preserve waiver metadata for diagnostics only; it never changes compliance.
+    out['arb_inplane_waived'] = bool(getattr(win, '_car', {}).get(f'{axle}_arb_rule04_waiver'))
     out['triad_bar_blade_deg'] = ang(bar, blade)
     out['triad_blade_drop_deg'] = ang(blade, drop)
     out['triad_bar_drop_deg'] = ang(bar, drop)
+    # (4) damper fore-aft cant at static (|Y rocker_spring_pt - Y spring_chassis_pt|).
+    #     The net limits it to 25 mm on the REAR (damper lies across the car);
+    #     the front damper runs fore-aft by design, so callers gate rear only.
+    out['damper_cant_fore_aft_mm'] = float(abs(P('rocker_spring_pt')[1] - P('spring_chassis_pt')[1]))
     return out
+
+
+def front_arb_hoop_line_gap_mm(win, margin_travel: bool = True) -> dict:
+    """Rule 19 (user, 2026-09-14): every FRONT ARB member (torsion bar, blades, drop
+    links, drop-top rod ends) stays AHEAD of the front-hoop line — the line through
+    the LCA-aft and UCA-aft chassis pickups in the side view, extended upward.
+    For each ARB point the line's Y at that height is Y_line(Z) = y_lca + (Z - z_lca)
+    * (y_uca - y_lca) / (z_uca - z_lca) (a vertical line when the two pickups share
+    Y, as on v101+).  gap = Y_line(Z) - (Y_point + radius), mm, positive = ahead.
+    Evaluated on the assembled corners at droop / static / bump (the arm end and drop
+    top move with the rocker and the bar).  Returns {'gap_mm', 'worst', 'line'}."""
+    hp = win._front_hp
+    yl, zl = (float(hp['lca_rear'][1]) * 1000.0, float(hp['lca_rear'][2]) * 1000.0)
+    yu, zu = (float(hp['uca_rear'][1]) * 1000.0, float(hp['uca_rear'][2]) * 1000.0)
+    slope = (yu - yl) / (zu - zl) if abs(zu - zl) > 1e-6 else 0.0
+    y_line = lambda z: yl + (z - zl) * slope
+    od = float(win._dynamics_panel._arb_OD_f.value())
+    apv = np.asarray(win._front_arb['arb_pivot'], float) * 1000.0
+    lo, hi = travel_range_m(win); lo = min(lo, -0.025); hi = max(hi, 0.025)
+    RE, LINK = 8.0, 6.35
+    worst = (float('inf'), '')
+    stations = [(lo, 'droop'), (0.0, 'static'), (hi, 'bump')] if margin_travel else [(0.0, 'static')]
+    for t, nm in stations:
+        try:
+            corners, _ = win._assemble_corners_draw({l: float(t) for l in ('FL', 'FR', 'RL', 'RR')}, 0.0, light=True)
+        except Exception:
+            return {'gap_mm': float('nan'), 'worst': 'assembly failed at %s' % nm, 'line': (yl, zl, yu, zu)}
+        p = [c for c in corners if c['label'] == 'FL'][0]['pts']
+        dt = np.asarray(p['arb_drop_top'], float) * 1000.0
+        ae = np.asarray(p.get('arb_arm_end_world', p.get('arb_arm_end', apv / 1000.0)), float) * 1000.0
+        for label, pt, r in (('torsion bar', apv, od / 2.0), ('arm end', ae, RE), ('drop top', dt, RE)):
+            g = y_line(pt[2]) - (pt[1] + r)
+            if g < worst[0]:
+                worst = (float(g), '%s at %s (%s Y %.1f Z %.1f)' % (label, nm, 'front ARB', pt[1], pt[2]))
+        # Blade and link bodies: use the same routed physical segments as all
+        # other production collision consumers, rather than a straight chord.
+        akw = arb_member_kwargs(win._car, 'front',
+            float(win._dynamics_panel._arb_blade_w_f.value()),
+            float(win._dynamics_panel._arb_blade_t_f.value()))
+        fm = full_members(p, win._car, arb_pivot=np.asarray(win._front_arb['arb_pivot']),
+                          arb_od_mm=od, **akw)
+        for member in (m for m in fm if m['name'] in ('ARB blade', 'ARB drop link')):
+            label = 'blade' if member['name'] == 'ARB blade' else 'drop link'
+            a = np.asarray(member['a'])*1000.0; b = np.asarray(member['b'])*1000.0
+            r = float(member['r'])*1000.0
+            for f in np.linspace(0.0, 1.0, 9):
+                q = a + (b - a) * f; g = y_line(q[2]) - (q[1] + r)
+                if g < worst[0]:
+                    worst = (float(g), '%s at %s (Y %.1f Z %.1f)' % (label, nm, q[1], q[2]))
+    return {'gap_mm': worst[0], 'worst': worst[1], 'line': (yl, zl, yu, zu)}
 
 
 def _clash_stations(win) -> list:
@@ -587,15 +781,28 @@ def _clash_stations(win) -> list:
     return [('full droop', lo), ('static', 0.0), ('full bump', hi)]
 
 
-def _clash_sweep(win) -> dict:
-    """Full-member clash lists at static, full bump and full droop, using the
+def _clash_sweep(win, travel_stations_m=None) -> dict:
+    """Full-member clash lists at static, full bump and full droop (or supplied
+    travel stations), using the current solver steering/rack position and the
     SAME member set the GUI interference view runs (vahan.interference
     .full_members: arms + tie rod + pushrod + ball-joint spheres + coilover +
-    ARB drop link/torsion bar + rocker hardware + driveshaft)."""
+    ARB drop link/torsion bar + rocker hardware + driveshaft).
+    Incomplete or non-closing geometry raises instead of reporting no clashes.
+    """
     out = {}
-    for name, t in _clash_stations(win):
+    fsae_ensure_resolved(win)       # FSAE chassis bays: 'auto' diagonal current (no-op when off)
+    stations = (_clash_stations(win) if travel_stations_m is None else
+                [(f'{float(t) * 1000:+.3f} mm', float(t)) for t in travel_stations_m])
+    for name, t in stations:
         travels = {l: float(t) for l in ('FL', 'FR', 'RL', 'RR')}
-        corners_draw, _ = win._assemble_corners_draw(travels, 0.0)
+        corners_draw, _ = win._assemble_corners_draw(
+            travels, getattr(win, '_solver_rack_travel_m', 0.0))
+        if len(corners_draw) != 4:
+            raise ValueError(f'Incomplete corner geometry at {name}')
+        for corner in corners_draw:
+            if corner.get('geometry_errors'):
+                raise ValueError(f"{corner['label']} at {name}: " +
+                                 '; '.join(corner['geometry_errors']))
         # rear half-shafts from the LIVE solved states (ONE MODEL)
         ds = {}
         try:
@@ -614,23 +821,62 @@ def _clash_sweep(win) -> dict:
         except Exception:
             ds = {}
         found = []
+        members_by_corner = {}
         for c in corners_draw:
             label = c['label']
             arb = win._front_arb if label[0] == 'F' else win._rear_arb
             apv = aod = None
+            panel = getattr(win, '_dynamics_panel', None)
+
+            def _panel_value(name, default=0.0):
+                control = getattr(panel, name, None)
+                return float(control.value()) if control is not None else float(default)
             try:
                 if arb and 'arb_pivot' in arb:
                     apv = np.asarray(arb['arb_pivot'], float)
-                    aod = float(getattr(win._dynamics_panel,
-                                        '_arb_OD_f' if label[0] == 'F'
-                                        else '_arb_OD_r').value())
+                    aod = _panel_value('_arb_OD_f' if label[0] == 'F' else '_arb_OD_r')
             except Exception:
                 pass
+            _akw = arb_member_kwargs(win._car, label,
+                _panel_value('_arb_blade_w_f' if label[0] == 'F' else '_arb_blade_w_r'),
+                _panel_value('_arb_blade_t_f' if label[0] == 'F' else '_arb_blade_t_r'))
             mem = full_members(c['pts'], win._car, arb_pivot=apv, arb_od_mm=aod,
-                               driveshaft_seg=ds.get(label))
+                               driveshaft_seg=ds.get(label),
+                               **_akw)
+            members_by_corner[label] = mem
+            # Include the same physical plate test used by the live renderer.
+            # Capsule-to-capsule checks alone miss rods passing through its face.
+            for member_name, plate_gap in rocker_plate_gaps(
+                    c['pts'], mem,
+                    half_t=float(win._car.get(
+                        'rocker_plate_thickness_mm', 6.0))/2000.0,
+                    **rocker_plate_physical_options_for(win._car, label)):
+                # Geometry designed at exactly 3 mm can evaluate a few
+                # femtometres low after repeated rigid transforms.  A 1 nm
+                # numeric tolerance prevents false failures without relaxing
+                # the physical clearance requirement.
+                if plate_gap < 0.003 - 1e-9:
+                    found.append({'corner': label, 'a': member_name,
+                                  'b': 'rocker plate',
+                                  'gap_mm': float(plate_gap) * 1000.0 - 3.0,
+                                  'surface_gap_mm': float(plate_gap) * 1000.0})
             for cl in clashes(mem, connected=connected_for(label)):
                 found.append({'corner': label, 'a': cl['a'], 'b': cl['b'],
                               'gap_mm': cl['gap_mm']})
+            if 'rim_barrel_width_mm' in win._car:
+                for member in mem:
+                    clearance = rim_barrel_gap(member, c['pts']['wheel_center'],
+                        c['spin_axis'], float(win._car['tire_rim_dia_mm']) / 2000.,
+                        float(win._car['rim_barrel_width_mm']) / 2000.) * 1000.
+                    if clearance < 3.0:
+                        found.append({'corner': label, 'a': member['name'],
+                            'b': 'rim barrel + 3 mm clearance',
+                            'gap_mm': clearance - 3.0,
+                            'surface_gap_mm': clearance})
+        for hit in cross_corner_clashes(members_by_corner):
+            found.append({'corner': hit['a_corner']+'/'+hit['b_corner'],
+                          'a': hit['a_corner']+' '+hit['a'],
+                          'b': hit['b_corner']+' '+hit['b'], 'gap_mm': hit['gap_mm']})
         out[name] = found
     return out
 
@@ -653,8 +899,8 @@ def damper_motion_sign(win, axle: str) -> float:
 
 def capture_baseline(win) -> dict:
     """Snapshot of EVERY held parameter from the currently loaded model.
-    This is the reference validate() judges candidates against; the untouched
-    model must always validate PASS against its own baseline."""
+    This is the reference validate() judges relative parameters against.
+    Absolute physical laws can reject a baseline that is itself defective."""
     base = {'wheel_points': {}, 'wheel_metrics': {}, 'geometry': {},
             'damper_sign': {}}
     for axle in ('front', 'rear'):
@@ -712,8 +958,8 @@ def validate(win, baseline: dict, tol: Tolerances = None,
       1. wheel-locating points — if byte-identical to baseline, every wheel
          parameter is held EXACTLY by construction (recorded as zero-delta);
          if ANY moved, the wheel metrics are re-measured and compared.
-      2. geometric laws: full-chain coplanarity (<tol.coplanar_mm), ARB drop
-         link in the rocker plane at static, triad angles vs baseline.
+      2. geometric laws: independent left/right static full-chain coplanarity,
+         rocker-axis normality, static ARB link endpoints, and triad angles.
       3. rates: MR f/r and ARB rate f/r vs baseline (percent).
       4. clash sweep at static / full bump / full droop with the FULL member
          set: no new pair vs baseline, no standing pair worse by
@@ -771,14 +1017,27 @@ def validate(win, baseline: dict, tol: Tolerances = None,
         g = _axle_geometry_laws(win, axle)
         bg = baseline['geometry'][axle]
         res.add('coplanar_mm', axle, g['coplanar_mm'], 0.0, tol.coplanar_mm,
-                g['coplanar_mm'] <= tol.coplanar_mm, ' mm')
+                np.isfinite(g['coplanar_mm']) and g['coplanar_mm'] <= tol.coplanar_mm,
+                ' mm')
+        res.add('rocker_axis_normal_error_deg', axle,
+                g['rocker_axis_normal_error_deg'], 0.0, tol.rocker_axis_deg,
+                np.isfinite(g['rocker_axis_normal_error_deg'])
+                and g['rocker_axis_normal_error_deg'] <= tol.rocker_axis_deg,
+                ' deg')
+        _rule04_ok = arb_drop_link_plate_compliant(
+            {'drop_top_signed_mm': g['arb_drop_top_plate_signed_mm'],
+             'arm_end_signed_mm': g['arb_arm_end_plate_signed_mm']},
+            tol.arb_inplane_mm, g.get('arb_is_bottom', False))
         for k in ('arb_drop_top_inplane_mm', 'arb_arm_end_inplane_mm'):
             res.add(k, axle, g[k], 0.0, tol.arb_inplane_mm,
-                    g[k] <= tol.arb_inplane_mm, ' mm')
+                    _rule04_ok,
+                    ' mm' + (' (control-arm ARB: Rule 04 exempt)'
+                              if g.get('arb_is_bottom', False) else ''))
         for k in ('triad_bar_blade_deg', 'triad_blade_drop_deg',
                   'triad_bar_drop_deg'):
-            d = abs(g[k] - bg[k])
-            res.add(k, axle, g[k], bg[k], tol.triad_deg, d <= tol.triad_deg,
+            # A non-square baseline is not permission to preserve that defect.
+            d = abs(g[k] - 90.0)
+            res.add(k, axle, g[k], 90.0, tol.triad_deg, d <= tol.triad_deg,
                     ' deg')
     if stop_early and not res.ok:
         res.aborted_after = 'geometric laws'
@@ -994,3 +1253,631 @@ def generate_solutions(win, axle: str = 'front', n_target: int = 100,
         with open(os.path.join(out_dir, 'pkg_index.json'), 'w') as f:
             json.dump(result, f, indent=1, default=float)
     return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DESIGN CITY primitives (2026-09-09) — the packaging search used by
+#  design_city.py.  Everything below is a MEASUREMENT or a GEOMETRIC
+#  TRANSFORM on the ONE model; nothing re-implements physics.
+# ═════════════════════════════════════════════════════════════════════════════
+# Rocker hardware (user-supplied 2026-07-25, same numbers as the regression
+# net's design-actuation gate): 1.5 in OD pivot bearing, drop-link / rod-end
+# ball joints 0.315 in RADIUS.
+ROCKER_BEARING_R_MM = 0.5 * 38.1
+ROD_END_R_MM = 0.315 * 25.4
+RACK_HOUSING_R_M = 0.01905          # 1.5 in OD steering rack housing proxy
+LCA_MEMBER_R_M = 0.008              # LCA-inner chassis member proxy radius
+
+
+def retarget_side_view_ic(hp: dict, ic_y_m: float, ic_z_m: float) -> dict:
+    """Aim both wishbone planes at a new SIDE-VIEW instant centre (Y, Z) by moving
+    the four chassis pickups in HEIGHT only.
+
+    Each new arm plane is spanned by (a) the arm's present FRONT-VIEW line through its
+    ball joint (plane cut at the ball joint's Y station - what sets camber gain and the
+    roll-centre construction) and (b) the side-view line ball joint -> new instant
+    centre. Pickup X and Y (the chassis node in plan view) and every outboard point are
+    untouched. A point coincident with a moved pickup (toe link on the arm's bracket)
+    moves with it. Returns a new hardpoint dict.
+    """
+    out = {k: np.array(v, float) for k, v in hp.items()}
+    y_hat = np.array([0., 1., 0.])
+    for arm in ('uca', 'lca'):
+        pa, pb, po = (np.asarray(hp[f'{arm}_{e}'], float) for e in ('front', 'rear', 'outer'))
+        normal = np.cross(pb - pa, po - pa)
+        front_view = np.cross(normal, y_hat)                 # in the arm plane, in the plane Y = const
+        side_view = np.array([0., float(ic_y_m) - po[1], float(ic_z_m) - po[2]])
+        new_normal = np.cross(front_view, side_view)
+        if abs(new_normal[2]) < 1e-9 or np.linalg.norm(side_view) < 1e-6:
+            raise ValueError(f'{arm}: degenerate plane for that instant centre')
+        for end in ('front', 'rear'):
+            key = f'{arm}_{end}'
+            old = np.asarray(hp[key], float)
+            new = old.copy()
+            new[2] = po[2] - (new_normal[0] * (old[0] - po[0]) + new_normal[1] * (old[1] - po[1])) / new_normal[2]
+            for other, val in hp.items():
+                if other != key and np.allclose(np.asarray(val, float), old, atol=1e-9):
+                    out[other] = new.copy()
+            out[key] = new
+    return out
+
+
+def _copy_bundle(bundle: dict) -> dict:
+    return {'hp': {k: np.array(v, float) for k, v in bundle['hp'].items()},
+            'arb': {k: np.array(v, float) for k, v in bundle['arb'].items()}}
+
+
+def rotate_arb_drop_top(bundle: dict, angle_deg: float) -> dict:
+    """Swing arb_drop_top about the rocker pivot IN THE CHAIN PLANE, radius
+    held (the v99 front-ARB pose knob).  Follow with an ARB re-hang
+    (refit_arb / refit_arb_variants) and a rate retune."""
+    c, n = _chain_plane(bundle)
+    piv = np.asarray(bundle['hp']['rocker_pivot'], float)
+    r = np.asarray(bundle['arb']['arb_drop_top'], float) - piv
+    r = r - n * float(np.dot(r, n))
+    L = float(np.linalg.norm(r))
+    if L < 1e-9:
+        raise ValueError('drop top coincides with the rocker pivot')
+    u = r / L
+    a = np.radians(angle_deg)
+    out = _copy_bundle(bundle)
+    out['arb']['arb_drop_top'] = piv + L * (u * np.cos(a) + np.cross(n, u) * np.sin(a))
+    return out
+
+
+def set_drop_link_length(bundle: dict, length_m: float) -> dict:
+    """Lengthen / shorten the drop link along its own line; the blade (pivot -
+    arm end) is carried rigidly so the triad angles survive."""
+    out = _copy_bundle(bundle)
+    d = out['arb']['arb_drop_top']; e0 = out['arb']['arb_arm_end']; p0 = out['arb']['arb_pivot']
+    u = (e0 - d) / np.linalg.norm(e0 - d)
+    e1 = d + float(length_m) * u
+    out['arb']['arb_arm_end'] = e1
+    out['arb']['arb_pivot'] = e1 + (p0 - e0)
+    return out
+
+
+def scale_spring_lever(bundle: dict, s: float, hold_damper_length: bool = True) -> dict:
+    """Scale the (rocker_spring_pt - rocker_pivot) lever by s inside the rocker
+    plane.  With hold_damper_length the chassis damper eye slides along the
+    damper's own line so the static damper length is unchanged (a different
+    rocker shape, same damper).  Follow with retune_mr() on the pushrod lever
+    so the motion ratio is restored."""
+    out = _copy_bundle(bundle)
+    pv = out['hp']['rocker_pivot']
+    sp0 = out['hp']['rocker_spring_pt']
+    sc0 = out['hp']['spring_chassis_pt']
+    sp1 = pv + float(s) * (sp0 - pv)
+    out['hp']['rocker_spring_pt'] = sp1
+    if hold_damper_length:
+        d = sc0 - sp0
+        out['hp']['spring_chassis_pt'] = sp1 + d       # same vector -> same length
+        if 'damper_chassis_pt' in out['hp'] and out['hp']['damper_chassis_pt'] is not None:
+            out['hp']['damper_chassis_pt'] = out['hp']['damper_chassis_pt'] + (sp1 - sp0)
+    return out
+
+
+def slide_pickup(bundle: dict, key: str, d_mm: float) -> dict:
+    """Slide one inboard arm pickup (uca_front/uca_rear/lca_front/lca_rear)
+    along ITS OWN arm line toward (+) / away from (-) the outer ball joint.
+    This DOES touch a wheel-locating point (the pivot axis direction moves),
+    so the parameter gate decides whether the wheel curves survived."""
+    out = _copy_bundle(bundle)
+    outer = 'uca_outer' if key.startswith('uca') else 'lca_outer'
+    a = out['hp'][key]; b = out['hp'][outer]
+    u = (b - a) / np.linalg.norm(b - a)
+    out['hp'][key] = a + u * (float(d_mm) / 1000.0)
+    return out
+
+
+SPRING_PAIR_KEYS = ('rocker_spring_pt', 'spring_chassis_pt', 'damper_chassis_pt')
+
+
+def swing_spring_about_rocker_axis(bundle: dict, angle_deg: float) -> dict:
+    """Rotate the SPRING pair (rocker_spring_pt + spring_chassis_pt, and the
+    damper chassis eye when present) about the rocker AXIS by angle_deg.
+    The rocker turns about that same axis, so spring length vs rocker angle
+    is unchanged: |R(theta) Q s - Q c| = |R(theta) s - c| (rotations about one
+    axis commute).  Motion-ratio curve, damper lengths, travel range and
+    every rate are therefore held BY CONSTRUCTION; only the rocker shape and
+    the coilover's chassis mount move (both stay in the rocker plane).
+    The exact family the Design City search is built on."""
+    p0, n = rocker_plane(bundle)
+    a = np.radians(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    out = _copy_bundle(bundle)
+    for k in SPRING_PAIR_KEYS:
+        if k in out['hp'] and out['hp'][k] is not None:
+            v = out['hp'][k] - p0
+            out['hp'][k] = p0 + v * c + np.cross(n, v) * s + n * np.dot(n, v) * (1 - c)
+    return out
+
+
+PICKUP_PARTNER = {'uca_front': 'uca_rear', 'uca_rear': 'uca_front',
+                  'lca_front': 'lca_rear', 'lca_rear': 'lca_front'}
+
+
+def slide_pickup_along_axis(bundle: dict, key: str, d_mm: float,
+                            min_spacing_mm: float = 60.0) -> dict:
+    """Slide ONE inboard arm pickup (uca_front/uca_rear/lca_front/lca_rear)
+    along the arm's PIVOT AXIS — the line through the two inboard pickups.
+    The axis line is unchanged, so the outer ball joint sweeps the SAME
+    circle: every wheel curve is identical by construction (the 0.1 % gate
+    still re-measures it).  What changes is the chassis bracket location
+    and the arm's own tube geometry (clash-checked downstream).
+    +d moves the pickup TOWARD its partner (shorter pickup spacing);
+    raises if the spacing would fall under min_spacing_mm."""
+    partner = PICKUP_PARTNER[key]
+    out = _copy_bundle(bundle)
+    a = out['hp'][key]; b = out['hp'][partner]
+    span = float(np.linalg.norm(b - a))
+    u = (b - a) / span
+    new = a + u * (float(d_mm) / 1000.0)
+    if float(np.linalg.norm(b - new)) * 1000.0 < min_spacing_mm:
+        raise ValueError(f'{key} slide {d_mm:+.1f} mm leaves {np.linalg.norm(b - new) * 1000:.1f} mm '
+                         f'to {partner} (< {min_spacing_mm} mm)')
+    out['hp'][key] = new
+    return out
+
+
+def rocker_hw_gaps(bundle: dict) -> dict:
+    """Rocker HARDWARE separations (mm, negative = overlap) exactly as the
+    regression net's design-actuation gate computes them: every pickup's
+    rod end vs the pivot bearing, and rod ends vs each other.  The v99
+    +60 deg pose passed every proxy audit with the pushrod and drop rod
+    ends 2.3 mm apart — both audits skip pairs whose endpoints are within
+    6 mm — so this gate must run on every accepted pose."""
+    hp, arb = bundle['hp'], bundle['arb']
+    pv = np.asarray(hp['rocker_pivot'], float) * 1000
+    picks = {'pushrod': np.asarray(hp['pushrod_inner'], float) * 1000,
+             'spring': np.asarray(hp['rocker_spring_pt'], float) * 1000,
+             'ARB': np.asarray(arb['arb_drop_top'], float) * 1000}
+    out = {}
+    for n, p in picks.items():
+        out[f'{n}_rodend_vs_bearing'] = float(np.linalg.norm(p - pv)) - ROCKER_BEARING_R_MM - ROD_END_R_MM
+    ks = list(picks)
+    for i in range(len(ks)):
+        for j in range(i + 1, len(ks)):
+            out[f'{ks[i]}_vs_{ks[j]}_rodends'] = float(np.linalg.norm(picks[ks[i]] - picks[ks[j]])) - 2 * ROD_END_R_MM
+    return out
+
+
+def full_state_audit(win, n_rack: int = 13, near_mm: float = 10.0,
+                     focus: str = None, chassis_diagonal: str = None) -> dict:
+    """The 39-state proxy interference audit from the v99 builder, now a
+    reusable feature: droop / static / bump x n_rack rack positions, every
+    corner's full member set (vahan.interference.full_members) PLUS the
+    LCA-inner chassis member proxies, the steering-rack housing (1.5 in OD),
+    both torsion bars (pivot to mirrored pivot) and the rear driveshafts
+    (vahan.driveshaft), all pairs cross-corner.  Pairs sharing an endpoint
+    within 6 mm are one joint and skipped (so run rocker_hw_gaps too).
+
+    FSAE chassis bays ON (car['fsae_chassis']): full_members carries the bay
+    tubes and the LCA-inner stand-in is dropped; the 'auto' diagonal is
+    resolved first (fsae_ensure_resolved).  ``chassis_diagonal`` forces a
+    diagonal for this audit only ('ucaf_lcar' / 'ucar_lcaf' / 'both');
+    ``focus`` keeps only pairs whose member names contain that text.
+    Returns {'states', 'negatives', 'warnings', 'closure_errors',
+    'worst_per_pair', 'min_gap_mm'}."""
+    import types as _types
+    from .interference import pair_gap_mm
+    from .driveshaft import package as ds_package
+    from .chassis import settings as _fsae_settings
+    fsae = _fsae_settings(win._car)
+    _prev_override = getattr(win, '_fsae_diag_override', None)
+    if fsae is not None and chassis_diagonal is None and not _prev_override:
+        fsae_ensure_resolved(win)
+    if chassis_diagonal is not None:
+        win._fsae_diag_override = chassis_diagonal
+    try:
+        return _full_state_audit(win, n_rack, near_mm, focus, fsae, _types, pair_gap_mm, ds_package)
+    finally:
+        if chassis_diagonal is not None:
+            win._fsae_diag_override = _prev_override
+
+
+def _full_state_audit(win, n_rack, near_mm, focus, fsae, _types, pair_gap_mm, ds_package):
+    lo, hi = win._spring_travel_range(win._solvers['FL'], 'FL')
+    lo = min(lo, -0.025); hi = max(hi, 0.025)
+    rack_half = float(win._steer['total_rack_travel_mm']) / 2000.0
+    racks = np.linspace(-rack_half, rack_half, int(n_rack))
+    worst = {}
+    closure = []
+    n_states = 0
+    for tname, t in (('full_droop', lo), ('static', 0.0), ('full_bump', hi)):
+        for rt in racks:
+            n_states += 1
+            corners, _ = win._assemble_corners_draw(
+                {l: float(t) for l in ('FL', 'FR', 'RL', 'RR')}, float(rt), light=True)
+            by = {c['label']: c for c in corners}
+            errs = [c['label'] for c in corners if c.get('geometry_errors')]
+            if errs or len(by) != 4:
+                closure.append({'travel': tname, 'rack_mm': float(rt * 1000),
+                                'corners': errs or ['missing corner']})
+                continue
+            members = []; rear_states = {}
+            for label, c in by.items():
+                arb = win._front_arb if label.startswith('F') else win._rear_arb
+                apv = np.asarray(arb['arb_pivot'], float)
+                od = float(getattr(win._dynamics_panel,
+                                   '_arb_OD_f' if label.startswith('F') else '_arb_OD_r').value())
+                if label.startswith('R'):
+                    rear_states[label] = _types.SimpleNamespace(
+                        wheel_center=np.asarray(c['pts']['wheel_center']),
+                        spin_axis=np.asarray(c['spin_axis']))
+                front = label.startswith('F')
+                akw = arb_member_kwargs(win._car, label,
+                    float(getattr(win._dynamics_panel, '_arb_blade_w_f' if front else '_arb_blade_w_r').value()),
+                    float(getattr(win._dynamics_panel, '_arb_blade_t_f' if front else '_arb_blade_t_r').value()))
+                for m in full_members(c['pts'], win._car, arb_pivot=apv, arb_od_mm=od, **akw):
+                    m = dict(m); m['name'] = label + ' ' + m['name']; members.append(m)
+                hp = c['pts']
+                if fsae is None:        # FSAE chassis bays replace this stand-in when ON
+                    members.append({'name': label + ' LCA inner chassis member',
+                                    'a': np.asarray(hp['lca_front']), 'b': np.asarray(hp['lca_rear']),
+                                    'r': LCA_MEMBER_R_M})
+            from .interference import rack_members as _rack_members
+            members.extend(_rack_members(win._car, by['FL']['pts']['tie_rod_inner'], by['FR']['pts']['tie_rod_inner']))
+            for axle, arb in (('front', win._front_arb), ('rear', win._rear_arb)):
+                p = np.asarray(arb['arb_pivot'], float); q = p.copy(); q[0] = -p[0]
+                od = float(getattr(win._dynamics_panel,
+                                   '_arb_OD_f' if axle == 'front' else '_arb_OD_r').value())
+                members.append({'name': axle + ' ARB torsion bar', 'a': p, 'b': q, 'r': od / 2000.0})
+            try:
+                pkg = ds_package(win._car, rear_states) if len(rear_states) == 2 else {}
+            except Exception:
+                pkg = {}
+            for label in ('RL', 'RR'):
+                if pkg and label in pkg:
+                    members.append({'name': label + ' driveshaft',
+                                    'a': np.asarray(pkg[label]['inner']), 'b': np.asarray(pkg[label]['outer']),
+                                    'r': float(win._car.get('driveshaft_dia_mm', 25.4)) / 2000.0})
+            for i, a in enumerate(members):
+                for b in members[i + 1:]:
+                    if focus and focus not in a['name'] and focus not in b['name']:
+                        continue
+                    # the front tie rod hangs off the rack bar: rod, joint and rack are one mechanism, never a clash pair
+                    if ('steering rack' in a['name'] + b['name']) and any(k in a['name'] + b['name'] for k in ('tie / toe rod', 'tie inner', 'tie rod')) and (a['name'][:1] == 'F' or b['name'][:1] == 'F' or a['name'].startswith('front') or b['name'].startswith('front')): continue
+                    # shared endpoint within 6 mm = one joint; chassis frame vs frame and
+                    # bracket zones of the FSAE chassis bays are designed contacts
+                    gap = pair_gap_mm(a, b, 0.006)
+                    if gap is None:
+                        continue
+                    if gap < near_mm:
+                        k = (a['name'], b['name'])
+                        if k not in worst or gap < worst[k][0]:
+                            worst[k] = (float(gap), tname, float(rt * 1000))
+    # FSAE chassis bays: the tubes vs the CHASSIS-FIXED obstructions (sprocket
+    # disc from the imported STEP, diff housing) — nothing in these pairs moves,
+    # so they are checked ONCE from the static assembly, not per state.
+    fixed_rows = []
+    if fsae is not None:
+        from .chassis import fixed_obstructions, fixed_part_gaps, is_chassis
+        parts = fixed_obstructions(win)
+        if parts:
+            corners, _ = win._assemble_corners_draw(
+                {l: 0.0 for l in ('FL', 'FR', 'RL', 'RR')}, 0.0, light=True)
+            tubes = []
+            for c in corners:
+                for m in full_members(c['pts'], win._car):
+                    if is_chassis(m):
+                        m = dict(m); m['name'] = c['label'] + ' ' + m['name']; tubes.append(m)
+            for row in fixed_part_gaps(tubes, parts):
+                if focus and focus not in row['a'] and focus not in row['b']:
+                    continue
+                fixed_rows.append(row)
+                if row['gap_mm'] < near_mm:
+                    k = (row['a'], row['b'])
+                    if k not in worst or row['gap_mm'] < worst[k][0]:
+                        worst[k] = (float(row['gap_mm']), 'chassis-fixed', 0.0)
+    rows = [{'a': k[0], 'b': k[1], 'gap_mm': v[0], 'travel': v[1], 'rack_mm': v[2]}
+            for k, v in sorted(worst.items(), key=lambda kv: kv[1][0])]
+    return {'states': n_states, 'closure_errors': closure, 'fixed_part_gaps': fixed_rows,
+            'negatives': [r for r in rows if r['gap_mm'] < 0.0],
+            'warnings': [r for r in rows if 0.0 <= r['gap_mm'] < 3.0],
+            'worst_per_pair': rows,
+            'min_gap_mm': rows[0]['gap_mm'] if rows else float(near_mm)}
+
+
+def fsae_resolve_diagonals(win) -> dict:
+    """Resolve the FSAE chassis-bay 'auto' diagonal per axle (left/right are
+    mirrored) with the full-state audit machinery: ONE full_state_audit pass
+    with BOTH candidate diagonals present, pairs restricted to the diagonals,
+    every other member (arms, links, rocker hardware, coilover, ARB, rack,
+    torsion bars, driveshafts) over droop/static/bump x 13 rack positions.
+    Chassis tube vs chassis tube is one frame and never counts.  Per axle the
+    diagonal with the LARGER worst-case clearance wins; a tie within 1e-6 mm
+    goes to 'ucaf_lcar' (deterministic).  Caches the result on the window
+    (win._fsae_chassis_cache, keyed by vahan.chassis.settings_signature) and
+    returns it: {'sig', 'front', 'rear', 'gaps': {axle: {diag: row}}}."""
+    from .chassis import (settings_signature, DIAGONAL_TUBES, EXPLICIT_DIAGONALS)
+    res = full_state_audit(win, near_mm=1e9, focus='chassis diagonal',
+                           chassis_diagonal='both')
+    gaps = {'front': {}, 'rear': {}}
+    for row in res['worst_per_pair']:
+        for side in ('a', 'b'):
+            nm = row[side]
+            for diag, (dname, _ka, _kb) in DIAGONAL_TUBES.items():
+                if nm.endswith(dname):
+                    axle = 'front' if nm[:1] == 'F' else 'rear'
+                    other = row['b' if side == 'a' else 'a']
+                    cur = gaps[axle].get(diag)
+                    if cur is None or row['gap_mm'] < cur['gap_mm']:
+                        gaps[axle][diag] = {'gap_mm': float(row['gap_mm']), 'diagonal': nm,
+                                            'other': other, 'travel': row['travel'],
+                                            'rack_mm': row['rack_mm']}
+    out = {'sig': settings_signature(win), 'gaps': gaps,
+           'closure_errors': res['closure_errors']}
+    for axle in ('front', 'rear'):
+        g1 = gaps[axle].get('ucaf_lcar', {}).get('gap_mm', float('inf'))
+        g2 = gaps[axle].get('ucar_lcaf', {}).get('gap_mm', float('inf'))
+        out[axle] = 'ucar_lcaf' if g2 > g1 + 1e-6 else 'ucaf_lcar'
+    win._fsae_chassis_cache = out
+    return out
+
+
+def fsae_ensure_resolved(win) -> dict | None:
+    """Return the live auto-diagonal resolution, recomputing it only when the
+    feature is ON, at least one axle's diagonal is 'auto', and any input changed
+    since the cached one.  None when the feature is off or both axles' diagonals
+    are explicit (per-axle keys diagonal_front / diagonal_rear)."""
+    from .chassis import settings as _fsae_settings, settings_signature, any_auto
+    s = _fsae_settings(win._car)
+    if not any_auto(s):                 # off, or both axles chosen explicitly
+        return None
+    if getattr(win, '_fsae_diag_override', None):
+        return getattr(win, '_fsae_chassis_cache', None)
+    cache = getattr(win, '_fsae_chassis_cache', None)
+    if cache and cache.get('sig') == settings_signature(win):
+        return cache
+    return fsae_resolve_diagonals(win)
+
+
+def fsae_auto_is_stale(win) -> bool:
+    """True when the feature is ON with 'auto' on at least one axle and the
+    cached choice no longer matches the live inputs (the 3D view keeps drawing
+    the cached choice)."""
+    from .chassis import settings as _fsae_settings, settings_signature, any_auto
+    s = _fsae_settings(win._car)
+    if not any_auto(s):                 # off, or both axles chosen explicitly
+        return False
+    cache = getattr(win, '_fsae_chassis_cache', None)
+    return not cache or cache.get('sig') != settings_signature(win)
+
+
+def handwheel_lock_deg(win) -> float:
+    """Handwheel angle at full rack lock (deg) from the config's stroke and
+    rack travel per turn — the value the net's lock sweeps use."""
+    return (float(win._steer['total_rack_travel_mm'])
+            / float(win._steer['rack_travel_per_rev_mm'])) * 180.0
+
+
+def clash_negatives_at_locks(win) -> dict:
+    """_clash_sweep (droop/static/bump, full member set + rim guard) at rack
+    centre and both full locks.  Returns {'negatives': n, 'worst_mm', 'pairs'};
+    raises if any station fails to close (the sweep refuses to report
+    no-clash on geometry that did not solve)."""
+    hand = handwheel_lock_deg(win)
+    negs, worst, pairs = 0, 1e9, []
+    fsae_ensure_resolved(win)       # resolve 'auto' at the design steer, before the lock rebuilds
+    try:
+        for h in (0.0, hand, -hand):
+            win._rebuild_solvers(h)
+            for station, hits in _clash_sweep(win).items():
+                for hh in hits:
+                    worst = min(worst, hh['gap_mm'])
+                    if hh['gap_mm'] < 0.0:
+                        negs += 1
+                        pairs.append({'lock_deg': h, 'station': station, **hh})
+    finally:
+        win._rebuild_solvers(0.0)
+    return {'negatives': negs, 'worst_mm': worst if worst < 1e9 else None, 'pairs': pairs}
+
+
+def rate_match_arb(win, bundle: dict, axle: str, target_rate: float,
+                   ref_bundle: dict, tol: float = 2e-4) -> tuple:
+    """Hold the ARB wheel rate to target_rate within tol (relative): first
+    the BLADE-length knob (keeps the drop top where the pose put it, so the
+    rocker hardware gaps survive), then the drop-radius knob as fallback.
+    Returns (bundle, rate, knob_used).  Leaves the window on the result."""
+    set_bundle(win, axle, bundle)
+    r0 = panel_arb_rate(win, axle)
+    if abs(r0 - target_rate) / target_rate <= tol:
+        return bundle, r0, 'none'
+    try:
+        b2, _sc, r2 = retune_arb_blade(win, bundle, axle, target_rate, ref_bundle,
+                                       s_lo=0.35, s_hi=3.5, iters=26)
+        Lb = float(np.linalg.norm(b2['arb']['arb_pivot'] - b2['arb']['arb_arm_end']) * 1000)
+        if 50.0 <= Lb <= 220.0 and abs(r2 - target_rate) / target_rate <= tol:
+            set_bundle(win, axle, b2)
+            return b2, r2, 'blade'
+    except Exception:
+        pass
+    b2, _m, r2 = retune_arb(win, bundle, axle, target_rate, ref_bundle,
+                            m_lo=0.05, m_hi=6.0, iters=26)
+    set_bundle(win, axle, b2)
+    return b2, r2, 'drop_radius'
+
+
+# ── the parameter vector: EVERY number the gate holds ────────────────────────
+REL_TOL = 1e-3          # 0.1 % — the Design City gate
+# Physical scale per unit family: the absolute floor is REL_TOL * scale, so a
+# parameter whose baseline sits near zero (toe, MR slope, a toe-curve station)
+# is judged against 0.1 % of its physical scale instead of 0.1 % of ~0.
+PARAM_SCALES = {
+    'deg': 1.0,          # angles (camber/toe/caster/KPI, curve stations, bump steer)
+    'deg/mm': 0.01,      # camber gain
+    'mm': 10.0,          # scrub, trail, RC height, damper lengths, sag, travel
+    'N/m': 1000.0,       # wheel / ride / ARB rates
+    'Nm/rad': 1000.0,    # roll stiffness
+    '%': 10.0,           # anti-dive/squat, Ackermann, LLTD, roll distribution, stroke use
+    'Hz': 1.0,           # ride frequency
+    'deg/g': 1.0,        # roll gradient, understeer gradient, roll angle at 1 g
+    'ratio': 0.1,        # motion ratio (spring / wheel)
+    '1/m': 1.0,          # motion-ratio slope
+    'sign': 1.0,         # damper motion sign (exact)
+}
+CURVE_STATIONS_MM = (-30.0, -20.0, -10.0, 0.0, 10.0, 20.0, 30.0, 40.0, 50.0)
+
+
+def _tangent_mr(solver, t_m: float, dt: float = 0.001) -> float:
+    sp = solver.solve(t_m + dt); sm = solver.solve(t_m - dt)
+    return float(abs(sp.spring_length - sm.spring_length) / (2 * dt))
+
+
+def parameter_vector(win) -> dict:
+    """EVERY parameter the Design City gate holds, measured from the LIVE
+    model in `win` (ONE MODEL: corner solvers, KinematicMetrics, the metrics
+    catalog's anti-dive/squat, the dynamics VehicleParams build, the panel's
+    ride-frequency and roll-gradient formulas, the steady-state solver at
+    1 g).  Returns an ordered {name: {'value', 'unit', 'axle', 'scale'}}."""
+    from .metrics_catalog import _anti_dive, _anti_squat
+    out = {}
+
+    def add(name, value, unit, axle):
+        out[name] = {'value': float(value) if value is not None and np.isfinite(float(value)) else float('nan'),
+                     'unit': unit, 'axle': axle, 'scale': PARAM_SCALES[unit]}
+    car = win._car
+    anti_kw = {'cg_height_m': car.get('cg_z_mm', 280.) / 1000.,
+               'wheelbase_m': car.get('wheelbase_mm', 1537.) / 1000.,
+               'front_brake_bias': car.get('front_brake_bias_pct', 65.) / 100.,
+               'rear_drive_bias': 1.0}
+    stroke_mm = float(win._motion_panel.stroke_mm)
+    for axle, label in (('front', 'FL'), ('rear', 'RL')):
+        solver = win._solvers[label]
+        m0 = KinematicMetrics(solver.solve(0.0), 'left')
+        s0 = m0.summary()
+        for key, unit in (('camber_deg', 'deg'), ('toe_deg', 'deg'), ('caster_deg', 'deg'),
+                          ('kpi_deg', 'deg'), ('scrub_radius_mm', 'mm'),
+                          ('mechanical_trail_mm', 'mm'), ('roll_center_height_mm', 'mm')):
+            add(f'{axle}.{key}', s0[key], unit, axle)
+        if axle == 'front':
+            add('front.anti_dive_pct', _anti_dive(m0, **anti_kw), '%', axle)
+        else:
+            add('rear.anti_squat_pct', _anti_squat(m0, **anti_kw), '%', axle)
+        # curves across fixed stations (independent of the travel range)
+        cam, toe = {}, {}
+        for t in CURVE_STATIONS_MM:
+            try:
+                s = KinematicMetrics(solver.solve(t / 1000.0), 'left').summary()
+                cam[t] = float(s['camber_deg']); toe[t] = float(s['toe_deg'])
+            except Exception:
+                cam[t] = float('nan'); toe[t] = float('nan')
+            add(f'{axle}.camber_at_{t:+.0f}mm_deg', cam[t], 'deg', axle)
+            add(f'{axle}.toe_at_{t:+.0f}mm_deg', toe[t], 'deg', axle)
+        add(f'{axle}.camber_gain_deg_per_mm', (cam[20.0] - cam[-20.0]) / 40.0, 'deg/mm', axle)
+        toes = [toe[t] for t in (-20.0, -10.0, 0.0, 10.0, 20.0)]
+        try:
+            toes += [float(KinematicMetrics(solver.solve(t), 'left').toe) for t in (-0.025, 0.025)]
+        except Exception:
+            toes.append(float('nan'))
+        add(f'{axle}.bump_steer_deg', max(toes) - min(toes), 'deg', axle)
+        # motion ratio, its slope and curve; damper lengths and stroke use
+        mr0 = _tangent_mr(solver, 0.0)
+        add(f'{axle}.motion_ratio', mr0, 'ratio', axle)
+        add(f'{axle}.mr_slope_per_m', (_tangent_mr(solver, 0.010) - _tangent_mr(solver, -0.010)) / 0.020, '1/m', axle)
+        for t in (-30.0, -20.0, 20.0, 40.0, 50.0):
+            try:
+                add(f'{axle}.motion_ratio_at_{t:+.0f}mm', _tangent_mr(solver, t / 1000.0), 'ratio', axle)
+            except Exception:
+                add(f'{axle}.motion_ratio_at_{t:+.0f}mm', float('nan'), 'ratio', axle)
+        L = {}
+        for t in (-30.0, -25.0, 0.0, 25.0, 50.0):
+            try:
+                L[t] = float(solver.solve(t / 1000.0).spring_length) * 1000.0
+            except Exception:
+                L[t] = float('nan')
+        add(f'{axle}.damper_length_static_mm', L[0.0], 'mm', axle)
+        add(f'{axle}.damper_length_at_-30mm_mm', L[-30.0], 'mm', axle)
+        add(f'{axle}.damper_length_at_+50mm_mm', L[50.0], 'mm', axle)
+        add(f'{axle}.stroke_used_over_pm25mm_mm', L[-25.0] - L[25.0], 'mm', axle)
+        add(f'{axle}.stroke_used_over_pm25mm_pct', (L[-25.0] - L[25.0]) / stroke_mm * 100.0 if stroke_mm > 0 else float('nan'), '%', axle)
+        lo, hi = win._spring_travel_range(solver, label)
+        add(f'{axle}.travel_droop_mm', lo * 1000.0, 'mm', axle)
+        add(f'{axle}.travel_bump_mm', hi * 1000.0, 'mm', axle)
+        add(f'{axle}.damper_motion_sign', damper_motion_sign(win, axle), 'sign', axle)
+        # ARB motion ratio (wheel travel / arm-tip travel, the panel's own
+        # derivation) at static AND at +-25 mm: a drop link swung off its arc
+        # tangent keeps the static rate and loses it in bump (v74 rate cliff),
+        # so the static rate alone cannot certify an ARB re-hang.
+        for t in (-25.0, 0.0, 25.0):
+            try:
+                g = win._compute_arb_geometry_from_kinematics(axle[0].upper(), travel_m=t / 1000.0)
+                add(f'{axle}.arb_motion_ratio_at_{t:+.0f}mm', g['mr'] if g else float('nan'), 'ratio', axle)
+            except Exception:
+                add(f'{axle}.arb_motion_ratio_at_{t:+.0f}mm', float('nan'), 'ratio', axle)
+    # steering (front)
+    try:
+        add('front.ackermann_at_lock_pct', float(win._probe_static_ackermann()), '%', 'front')
+    except Exception:
+        add('front.ackermann_at_lock_pct', float('nan'), '%', 'front')
+    # rates / ride / roll from the dynamics build (the numbers the roll
+    # gradient and load transfer actually run on)
+    ss = win._build_dynamics_solver()
+    veh = ss._veh
+    for axle, sfx in (('front', 'front'), ('rear', 'rear')):
+        add(f'{axle}.spring_rate_Npm', getattr(veh, f'spring_rate_{sfx}_Npm'), 'N/m', axle)
+        wr = getattr(veh, f'wheel_rate_{sfx}_Npm'); rr = getattr(veh, f'ride_rate_{sfx}_Npm')
+        add(f'{axle}.wheel_rate_Npm', wr, 'N/m', axle)
+        add(f'{axle}.ride_rate_Npm', rr, 'N/m', axle)
+        frac = veh.front_weight_fraction if axle == 'front' else veh.rear_weight_fraction
+        m_c = veh.sprung_mass_kg * frac / 2.0
+        add(f'{axle}.ride_frequency_Hz', np.sqrt(rr / m_c) / (2 * np.pi) if (m_c > 0 and rr > 0) else 0.0, 'Hz', axle)
+        add(f'{axle}.arb_rate_Npm', getattr(veh, f'arb_rate_{sfx}_Npm'), 'N/m', axle)
+        add(f'{axle}.roll_stiffness_Nm_per_rad', getattr(veh, f'roll_stiffness_{sfx}_Npm_rad'), 'Nm/rad', axle)
+    rs_f, rs_r = veh.roll_stiffness_front_Npm_rad, veh.roll_stiffness_rear_Npm_rad
+    rs_t = rs_f + rs_r
+    add('car.roll_stiffness_front_pct', rs_f / rs_t * 100.0 if rs_t > 0 else 50.0, '%', 'car')
+    rc_f = out['front.roll_center_height_mm']['value'] / 1000.0
+    rc_r = out['rear.roll_center_height_mm']['value'] / 1000.0
+    a_frac = veh.cg_to_front_axle_m / max(veh.wheelbase_m, 1e-6)
+    h_ra = rc_f + (rc_r - rc_f) * a_frac
+    h_arm = max(veh.sprung_cg_height_m - h_ra, 0.0)
+    add('car.roll_gradient_deg_per_g', np.degrees(veh.sprung_mass_kg * 9.80665 * h_arm / rs_t) if rs_t > 0 else float('nan'), 'deg/g', 'car')
+    try:
+        sag = veh.static_sag(preload_front_mm=float(win._motion_panel.preload_front_mm),
+                             preload_rear_mm=float(win._motion_panel.preload_rear_mm),
+                             stroke_mm=stroke_mm, mr_front=veh.motion_ratio_front,
+                             mr_rear=veh.motion_ratio_rear)
+        add('front.static_sag_shock_mm', sag['sag_shock_front_mm'], 'mm', 'front')
+        add('rear.static_sag_shock_mm', sag['sag_shock_rear_mm'], 'mm', 'rear')
+    except Exception:
+        add('front.static_sag_shock_mm', float('nan'), 'mm', 'front')
+        add('rear.static_sag_shock_mm', float('nan'), 'mm', 'rear')
+    try:
+        r1 = ss.solve(1.0)
+        tot_f = r1.elastic_lt_front_N + r1.geometric_lt_front_N + r1.unsprung_lt_front_N
+        tot_r = r1.elastic_lt_rear_N + r1.geometric_lt_rear_N + r1.unsprung_lt_rear_N
+        add('car.lltd_front_at_1g_pct', tot_f / (tot_f + tot_r) * 100.0 if (tot_f + tot_r) > 0 else 50.0, '%', 'car')
+        add('car.roll_angle_at_1g_deg', r1.roll_angle_deg, 'deg/g', 'car')
+        add('car.understeer_gradient_deg_per_g', r1.understeer_gradient_deg, 'deg/g', 'car')
+    except Exception:
+        for k in ('car.lltd_front_at_1g_pct', 'car.roll_angle_at_1g_deg', 'car.understeer_gradient_deg_per_g'):
+            add(k, float('nan'), '%' if 'pct' in k else 'deg/g', 'car')
+    return out
+
+
+def compare_parameters(base: dict, cur: dict, rel: float = REL_TOL) -> list:
+    """Row per parameter: baseline, value, absolute tolerance
+    (max(rel*|baseline|, rel*scale)), deviation in % of max(|baseline|,
+    scale) and the verdict.  A NaN on either side fails unless both are NaN
+    (an unavailable metric may not silently pass)."""
+    rows = []
+    for name, b in base.items():
+        c = cur.get(name, {'value': float('nan')})
+        bv, cv = float(b['value']), float(c['value'])
+        scale = float(b['scale'])
+        tol = max(rel * abs(bv), rel * scale)
+        if np.isnan(bv) and np.isnan(cv):
+            ok, dev, dev_pct = True, 0.0, 0.0
+        elif np.isnan(bv) or np.isnan(cv):
+            ok, dev, dev_pct = False, float('nan'), float('nan')
+        else:
+            dev = cv - bv
+            ok = abs(dev) <= tol
+            dev_pct = abs(dev) / max(abs(bv), scale) * 100.0
+        rows.append({'name': name, 'unit': b['unit'], 'axle': b['axle'], 'baseline': bv,
+                     'value': cv, 'deviation': dev, 'deviation_pct': dev_pct,
+                     'tolerance_abs': tol, 'floor_abs': rel * scale,
+                     'floor_active': rel * scale > rel * abs(bv), 'ok': bool(ok)})
+    return rows

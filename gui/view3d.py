@@ -12,6 +12,7 @@ Mouse controls (Onshape style via direct Qt events):
 
 import numpy as np
 from vispy import scene, app as vispy_app
+from vispy.visuals.transforms import STTransform
 
 vispy_app.use_app('pyqt6')
 
@@ -399,6 +400,71 @@ def build_tire_mesh(center, spin_axis, outer_r, rim_r, half_w, n=48):
     return _merge(parts)
 
 
+_RIM_FACE_CACHE = {}
+RIM_N = 48      # points per revolved ring (the net uses it to index the drawn stations)
+
+
+def build_rim_profile_mesh(center, spin_axis_inboard, profile, n=RIM_N):
+    """The REAL wheel from the manufacturer's STEP-derived profile
+    (vahan.wheel_profile.barrel_profile_from_step JSON, car['wheel_profile']).
+
+    Surface of revolution of the profile's inner surface ``r_inner_mm(d_mm)``
+    about the wheel spin axis -- the barrel wall (drop centre, bead seats,
+    lips) and the dish into the centre disc / hub -- plus the centre disc's
+    inboard face at ``disc_d_mm`` (the solid the clearance gate treats as
+    impassable) and the two flange lips at ``flange_d_mm`` out to
+    ``flange_r_mm``.  Axial station d is measured INBOARD from the wheel
+    centre (the tyre centre plane), exactly as vahan.wheel_profile measures
+    member clearance, so what is drawn IS the surface the "real wheel
+    profile" gate measures against.
+
+    center: wheel centre (m).  spin_axis_inboard: spin axis pointing toward
+    the car centreline.  Returns (vertices, faces) in metres.  The first
+    ``len(profile['d_mm']) * n`` vertices are the revolved profile, station
+    by station (used by the regression net to compare against the profile).
+    """
+    c = np.asarray(center, float)
+    w = _norm(np.asarray(spin_axis_inboard, float))
+    u, v = _perp_frame(w)
+    d = np.asarray(profile['d_mm'], float) * 1e-3
+    r = np.asarray(profile['r_inner_mm'], float) * 1e-3
+    ok = np.isfinite(d) & np.isfinite(r)
+    d, r = d[ok], r[ok]
+    S = len(d)
+    if S < 2:
+        return (np.zeros((3, 3), np.float32), np.array([[0, 1, 2]], np.uint32))
+    key = (S, n)
+    if key not in _RIM_FACE_CACHE:
+        theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        i = np.arange(n); j = (i + 1) % n
+        faces = []
+        for s in range(S - 1):
+            a = s * n; b = (s + 1) * n
+            faces.append(np.column_stack([a + i, a + j, b + j]))
+            faces.append(np.column_stack([a + i, b + j, b + i]))
+        _RIM_FACE_CACHE[key] = (np.cos(theta), np.sin(theta),
+                                np.vstack(faces).astype(np.uint32))
+    ct, st, rev_faces = _RIM_FACE_CACHE[key]
+    ring = np.outer(ct, u) + np.outer(st, v)                      # (n, 3)
+    verts = (c[None, None, :] + d[:, None, None] * w[None, None, :]
+             + r[:, None, None] * ring[None, :, :]).reshape(S * n, 3)
+    parts = [(verts.astype(np.float32), rev_faces)]
+    # centre disc inboard face (solid disc: hub to the barrel wall at that station)
+    disc_d = float(profile.get('disc_d_mm', float('nan'))) * 1e-3
+    if np.isfinite(disc_d) and d.min() <= disc_d <= d.max():
+        r_disc = float(np.interp(disc_d, d, r))
+        parts.append(_annulus_mesh(c + disc_d * w, w, 0.0, r_disc, n))
+    # flange lips (rim OD) at the two flange stations
+    fl_r = float(profile.get('flange_r_mm', float('nan'))) * 1e-3
+    for fd in profile.get('flange_d_mm', []) or []:
+        fd = float(fd) * 1e-3
+        if np.isfinite(fl_r) and d.min() <= fd <= d.max():
+            r_in = float(np.interp(fd, d, r))
+            if fl_r > r_in:
+                parts.append(_annulus_mesh(c + fd * w, w, r_in, fl_r, n))
+    return _merge(parts)
+
+
 def build_cylinder_between(p0, p1, radius, n=14):
     """Closed cylinder (with end caps) spanning p0 → p1 at given radius.
 
@@ -568,6 +634,7 @@ HP_NAMES = [
 _C_CHASSIS = (0.35, 0.65, 1.00, 1.0)
 _C_MOVING  = (1.00, 0.35, 0.35, 1.0)
 _C_SEL     = (1.00, 0.92, 0.23, 1.0)
+_RIM_RGBA  = (0.62, 0.63, 0.66, 0.95)   # real rim: neutral grey (never blue)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -621,6 +688,22 @@ class View3D:
         self._member_r = self._member_r_full
         self._thick_on  = True          # navcube "Thickness" toggle state
         self._rocker_half_t = 0.003     # bellcrank = 6 mm flat PLATE (extruded, not tubed)
+        self._rocker_plate_style = 'legacy'
+        self._front_rocker_plate_style = None
+        self._rear_rocker_plate_style = None
+        self._rocker_plate_clear_gap_m = 0.024
+        self._rocker_spring_clevis_clear_gap_m = 0.069
+        self._front_rocker_spring_clevis_setback_m = None
+        self._rear_rocker_spring_clevis_setback_m = None
+        self._front_rocker_pr_full_length_fork = False
+        self._rear_rocker_pr_full_length_fork = False
+        self._front_rocker_pr_full_length_fork_clear_gap_m = 0.024
+        self._rear_rocker_pr_full_length_fork_clear_gap_m = 0.024
+        self._front_rocker_pr_full_length_fork_jog = (0.0, 0.68, 0.76, 0.87, 0.95)
+        self._rear_rocker_pr_full_length_fork_jog = (0.0, 0.68, 0.76, 0.87, 0.95)
+        self._rocker_plate_t_m = 0.006
+        self._rocker_main_arm_width_m = 0.0381
+        self._rocker_arb_arm_width_m = 0.0254
         # ARB drawn as a SOLID TUBE too (was a thin line).
         self._arb_mesh = scene.Mesh(
             vertices=np.zeros((3, 3), np.float32),
@@ -664,6 +747,14 @@ class View3D:
 
         # Per-corner meshes (4 corners max)
         self._tire_meshes    = [self._new_mesh((0.18, 0.18, 0.18, 0.6)) for _ in range(4)]
+        # REAL rim (manufacturer STEP profile, car['wheel_profile']) revolved
+        # about the solved spin axis -- neutral grey.  Empty (old plain tyre
+        # cylinder only) until set_wheel_profile() is given a profile.
+        self._rim_meshes     = [self._new_mesh(_RIM_RGBA) for _ in range(4)]
+        self._wheel_profile  = None
+        # ground plane height (m, chassis frame) = mean of the four solved
+        # contact patches at the CURRENT travel; updated every update_scene.
+        self._ground_z = 0.0
         self._upright_meshes = [self._new_mesh((0.50, 0.40, 0.30, 0.30)) for _ in range(4)]
         # Ball-joint spheres (1" dia envelope) + upright mounting VOLUME per
         # corner — makes the packaging visible and gives the interference check
@@ -705,6 +796,7 @@ class View3D:
         # Interference mode so only the force vectors keep colour.
         self._car_meshes = (
             [(m, (0.18, 0.18, 0.18, 0.6)) for m in self._tire_meshes]
+            + [(m, _RIM_RGBA) for m in self._rim_meshes]
             + [(m, (0.50, 0.40, 0.30, 0.30)) for m in self._upright_meshes]
             + [(m, (0.85, 0.85, 0.88, 0.92)) for m in self._balljoint_meshes]
             + [(m, (0.55, 0.42, 0.30, 0.26)) for m in self._uprightvol_meshes]
@@ -984,6 +1076,17 @@ class View3D:
         self._tire_rim_r   = rim_r
         self._tire_half_w  = half_w
 
+    def set_wheel_profile(self, profile):
+        """Real wheel profile dict (vahan.wheel_profile JSON) or None for the
+        plain tyre cylinder.  Takes effect on the next update_scene."""
+        self._wheel_profile = profile if (profile and 'd_mm' in profile) else None
+
+    def ground_height_m(self) -> float:
+        """Height (m, chassis frame) the ground plane is drawn at = mean of the
+        four solved contact patches (wheel centre minus tyre radius) at the
+        travel of the last update_scene."""
+        return float(self._ground_z)
+
     def set_selected(self, name):
         self._selected = name
 
@@ -1095,6 +1198,75 @@ class View3D:
         self._roll_axis_vis.visible = visible
         self._canvas.update()
 
+    def set_keepout(self, faces, visible: bool = True):
+        """Draw a chassis keep-out solid (Rule 18) — a list of planar face dicts with
+        'verts' in metres from vahan.keepout — as a translucent red block with its
+        edges.  faces=None or visible=False hides it."""
+        if not hasattr(self, '_keepout_mesh'):
+            self._keepout_mesh = scene.Mesh(
+                vertices=np.zeros((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.uint32),
+                color=(0.95, 0.20, 0.20, 0.16), parent=self._view.scene)
+            self._keepout_mesh.set_gl_state('translucent', cull_face=False, depth_test=True)
+            self._keepout_edges = scene.Line(
+                pos=np.zeros((2, 3), np.float32), color=(0.95, 0.25, 0.25, 0.9),
+                connect='segments', width=1.5, antialias=True, parent=self._view.scene)
+        if not faces or not visible:
+            self._keepout_mesh.visible = False; self._keepout_edges.visible = False
+            self._canvas.update(); return
+        V, F, E = [], [], []
+        for f in faces:
+            vs = np.asarray(f['verts'], np.float32); i0 = len(V); V.extend(vs.tolist())
+            for k in range(1, len(vs) - 1):
+                F.append([i0, i0 + k, i0 + k + 1])
+            for k in range(len(vs)):
+                E.append(vs[k]); E.append(vs[(k + 1) % len(vs)])
+        self._keepout_mesh.set_data(vertices=np.array(V, np.float32), faces=np.array(F, np.uint32),
+                                    color=(0.95, 0.20, 0.20, 0.16))
+        self._keepout_edges.set_data(pos=np.array(E, np.float32), color=(0.95, 0.25, 0.25, 0.9))
+        self._keepout_mesh.visible = True; self._keepout_edges.visible = True
+        self._canvas.update()
+
+    # Neutral warm grey-white: reads as frame steel, never blue (colourblind palette).
+    CHASSIS_TUBE_RGBA = (0.86, 0.84, 0.78, 0.92)
+
+    def set_chassis_tubes(self, members):
+        """Draw the FSAE chassis-bay tubes (vahan.chassis.bay_members capsules:
+        dicts with 'a', 'b', 'r' in metres) as solid tubes with a ball at each
+        welded node.  Empty / None hides them.  The same capsules are the clash
+        bodies full_members() checks, so what is drawn is what is checked."""
+        if not hasattr(self, '_chassis_tube_mesh'):
+            try:
+                self._chassis_tube_mesh = scene.Mesh(
+                    vertices=np.zeros((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.uint32),
+                    color=self.CHASSIS_TUBE_RGBA, shading='smooth', parent=self._view.scene)
+            except Exception:
+                self._chassis_tube_mesh = self._new_mesh(self.CHASSIS_TUBE_RGBA)
+            self._chassis_tube_mesh.visible = False
+        if not members:
+            self._chassis_tube_mesh.visible = False
+            self._canvas.update(); return
+        VV, FF, off = [], [], 0
+        nodes = {}
+        for m in members:
+            a = np.asarray(m['a'], float); b = np.asarray(m['b'], float); r = float(m['r'])
+            if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+                continue
+            v, f = build_cylinder_between(a, b, r, n=16)
+            VV.append(np.asarray(v, np.float32)); FF.append(np.asarray(f) + off); off += len(v)
+            for p in (a, b):
+                nodes[tuple(np.round(p, 6))] = (p, r)
+        for p, r in nodes.values():
+            v, f = build_sphere(p, r * 1.02)
+            VV.append(np.asarray(v, np.float32)); FF.append(np.asarray(f) + off); off += len(v)
+        if not VV:
+            self._chassis_tube_mesh.visible = False
+            self._canvas.update(); return
+        self._chassis_tube_mesh.set_data(vertices=np.concatenate(VV).astype(np.float32),
+                                         faces=np.concatenate(FF).astype(np.uint32),
+                                         color=self.CHASSIS_TUBE_RGBA)
+        self._chassis_tube_mesh.visible = True
+        self._canvas.update()
+
     def update_pitch_axis(self, pitch_center_xyz, half_width: float = 1.0):
         """
         Draw the pitch axis as a LATERAL line (along X) through the pitch center.
@@ -1153,16 +1325,36 @@ class View3D:
         mk_pos   = []
         mk_col   = []
         self._hp_snap = []
+        _patch_z = []             # contact-patch heights of every solved corner
 
         for ci, corner in enumerate(corners):
             pts  = corner['pts']
             spin = corner['spin_axis']
             wc   = pts['wheel_center']
+            if np.all(np.isfinite(np.asarray(wc, float))):
+                _patch_z.append(float(np.asarray(wc, float)[2]) - self._tire_outer_r)
+            _axle_style = (self._front_rocker_plate_style
+                           if str(corner.get('label', '')).startswith('F')
+                           else self._rear_rocker_plate_style)
+            _rocker_style = _axle_style or self._rocker_plate_style
+            _spring_setback = (self._front_rocker_spring_clevis_setback_m
+                               if str(corner.get('label', '')).startswith('F')
+                               else self._rear_rocker_spring_clevis_setback_m)
+            _pr_full_fork = (self._front_rocker_pr_full_length_fork
+                             if str(corner.get('label', '')).startswith('F')
+                             else self._rear_rocker_pr_full_length_fork)
+            _pr_fork_gap = (self._front_rocker_pr_full_length_fork_clear_gap_m
+                            if str(corner.get('label', '')).startswith('F')
+                            else self._rear_rocker_pr_full_length_fork_clear_gap_m)
+            _pr_fork_jog = (self._front_rocker_pr_full_length_fork_jog
+                            if str(corner.get('label', '')).startswith('F')
+                            else self._rear_rocker_pr_full_length_fork_jog)
 
             # corner isolation (wheel-package view): hide the other corners
             if self._isolate and corner.get('label') != self._isolate:
                 _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
                 _pose_mesh(self._tire_meshes[ci], vertices=_z, faces=_t)
+                _pose_mesh(self._rim_meshes[ci], vertices=_z, faces=_t)
                 _pose_mesh(self._upright_meshes[ci], vertices=_z, faces=_t)
                 _pose_mesh(self._rocker_meshes[ci], vertices=_z, faces=_t)
                 _pose_mesh(self._spring_meshes[ci], vertices=_z, faces=_t)
@@ -1270,11 +1462,71 @@ class View3D:
                 # bellcrank = flat PLATE: extrude the quad by the plate thickness
                 # (a machined plate, not a tube frame).  Thin the plate with the
                 # thickness toggle so it reads as an outline when OFF.
-                _ht = self._rocker_half_t if self._thick_on else 0.0004
-                _poly = [pts[k] for k in rk4]
-                rv, rf = build_prism(_poly, _ht)
-                _pose_mesh(self._rocker_meshes[ci], vertices=rv, faces=rf)
-                _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
+                # The plate is flat through pivot / pushrod / spring attach.  A drop
+                # top that sits OFF that plane is a rod end on a STANDOFF STUD
+                # (Rule 04 doc, declared car[<axle>_arb_drop_standoff_mm]): the
+                # plate keeps its tab at the projected point and the stud is drawn
+                # as a short cylinder out to the rod end — the same solid the
+                # clash model (vahan.interference.rocker_plate_poly) uses.
+                _ht = ((0.5*self._rocker_plate_t_m
+                        if _rocker_style in ('double_shear_arms', 'local_clevis_arms')
+                        else self._rocker_half_t) if self._thick_on else 0.0004)
+                if _rocker_style in ('double_shear_arms', 'local_clevis_arms'):
+                    from vahan.interference import (rocker_double_shear_polys,
+                                                    rocker_local_clevis_polys,
+                                                    rocker_plate_poly)
+                    _builder = (rocker_local_clevis_polys
+                                if _rocker_style == 'local_clevis_arms'
+                                else rocker_double_shear_polys)
+                    try:
+                        _polys = _builder(
+                            pts, clear_gap_m=self._rocker_plate_clear_gap_m,
+                            plate_t_m=self._rocker_plate_t_m,
+                            spring_clevis_clear_gap_m=self._rocker_spring_clevis_clear_gap_m,
+                            spring_clevis_setback_m=_spring_setback,
+                            pr_full_length_fork=_pr_full_fork,
+                            pr_full_length_fork_clear_gap_m=_pr_fork_gap,
+                            pr_full_length_fork_negative_cheek_jog_m=_pr_fork_jog[0],
+                            pr_full_length_fork_jog_fractions=_pr_fork_jog[1:],
+                            main_arm_width_m=self._rocker_main_arm_width_m,
+                            arb_arm_width_m=self._rocker_arb_arm_width_m)
+                    except ValueError:
+                        # Collision validation fails closed on malformed local
+                        # clevis geometry.  The live view must remain usable and
+                        # conspicuous, so draw the conservative filled legacy
+                        # plate instead of hiding the rocker.
+                        _fallback = rocker_plate_poly(pts)
+                        _polys = [] if _fallback is None else [_fallback]
+                    _vv, _ff, _off = [], [], 0
+                    for _poly in _polys:
+                        _v, _f = build_prism(_poly, _ht)
+                        _vv.append(_v); _ff.append(np.asarray(_f, np.uint32) + _off)
+                        _off += len(_v)
+                        _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
+                    if _vv:
+                        _pose_mesh(self._rocker_meshes[ci],
+                                   vertices=np.vstack(_vv).astype(np.float32),
+                                   faces=np.vstack(_ff).astype(np.uint32))
+                    else:
+                        _pose_mesh(self._rocker_meshes[ci],
+                                   vertices=np.zeros((3, 3), np.float32),
+                                   faces=np.array([[0, 1, 2]], np.uint32))
+                else:
+                    _A, _B, _C = (np.asarray(pts['rocker_pivot'], float),
+                                  np.asarray(pts['pushrod_inner'], float),
+                                  np.asarray(pts['rocker_spring_pt'], float))
+                    _nrm = _cross3(_B - _A, _C - _A); _lnn = np.linalg.norm(_nrm)
+                    _dt = np.asarray(pts['arb_drop_top'], float)
+                    _tab = _dt.copy(); _stud = 0.0
+                    if _lnn > 1e-12:
+                        _nrm = _nrm / _lnn; _stud = float((_dt - _A) @ _nrm); _tab = _dt - _stud * _nrm
+                    _poly = [_A, _tab, _B, _C]
+                    rv, rf = build_prism(_poly, _ht)
+                    if abs(_stud) > 0.001 and not self._motion_lod:
+                        _sv, _sf = build_cylinder_between(_tab, _dt, 0.005)
+                        rf = np.vstack([rf, np.asarray(_sf, np.uint32) + len(rv)]); rv = np.vstack([rv, _sv]).astype(np.float32)
+                    _pose_mesh(self._rocker_meshes[ci], vertices=rv, faces=rf)
+                    _rocker_polys.append([np.asarray(p, float).copy() for p in _poly])
             elif _have(rk3):
                 _ht = self._rocker_half_t if self._thick_on else 0.0004
                 _poly = [pts[k] for k in rk3]
@@ -1295,6 +1547,22 @@ class View3D:
                 wc, spin,
                 self._tire_outer_r, self._tire_rim_r, self._tire_half_w)
             _pose_mesh(self._tire_meshes[ci], vertices=tv, faces=tf)
+
+            # REAL rim: the manufacturer profile revolved about the solved spin
+            # axis at this travel / steer, inboard = toward the car centreline
+            # (the same axial convention the wheel-profile clearance gate uses).
+            # No profile -> mesh stays empty and the tyre alone is the wheel.
+            if self._wheel_profile is not None:
+                _wcv = np.asarray(wc, float)
+                _s = _norm(np.asarray(spin, float))
+                if abs((_wcv + _s * 0.01)[0]) > abs(_wcv[0]):
+                    _s = -_s
+                rv_, rf_ = build_rim_profile_mesh(_wcv, _s, self._wheel_profile)
+                _pose_mesh(self._rim_meshes[ci], vertices=rv_, faces=rf_)
+            else:
+                _pose_mesh(self._rim_meshes[ci],
+                           vertices=np.zeros((3, 3), np.float32),
+                           faces=np.array([[0, 1, 2]], np.uint32))
 
             # wheel bearings: two spheres on the spin axis, INBOARD of the
             # wheel centre-line — the exact l1/offset the bearing loads use.
@@ -1385,6 +1653,20 @@ class View3D:
                 mk_col.append(c)
                 self._hp_snap.append((name, p.copy(), corner['label']))
 
+        # ── ground plane follows the TYRES ────────────────────────────────
+        # The view is chassis-fixed: in a heave sweep the wheels move and the
+        # chassis stays, so a ground drawn at a fixed height hides that the
+        # chassis (sprocket, diff, floor) is dropping toward the road.  Draw
+        # the ground through the mean contact patch of the four solved corners
+        # at the CURRENT travel (wheel centre minus tyre radius); in bump the
+        # ground rises toward the chassis, as the road really does.
+        if _patch_z:
+            self._ground_z = float(np.mean(_patch_z))
+            try:
+                self._ground.transform = STTransform(translate=(0.0, 0.0, self._ground_z))
+            except Exception:
+                pass
+
         # Record EXACTLY what this frame draws for the members, so an external
         # consumer (the HTML binder dump) can reproduce the GUI 1:1.  These are
         # MESHES now (tubes / plates), so they are invisible to a Line.set_data
@@ -1464,14 +1746,24 @@ class View3D:
                                  np.asarray(s[1], float).copy()) for s in arb_segs]
                                if _arb_show else [])
         if _arb_show:
-            ap = np.array([p for seg in arb_segs for p in seg], np.float32)
+            ap = np.array([p for seg in arb_segs for p in seg[:2]], np.float32)
             self._last_arb_pos = ap
             _acol = ((0.55, 0.55, 0.57, 0.9)
                      if self._view_mode in ('load', 'interference')
                      else (0.90, 0.80, 0.10, 1.0))
             if self._thick_on:
-                _asegs = [(seg[0], seg[1], _acol) for seg in arb_segs]
-                av, af, ac = _tube_segments(_asegs, self._member_r, n=10)
+                _av, _af, _ac, _off = [], [], [], 0
+                for _seg in arb_segs:
+                    _radius = float(_seg[2]) if len(_seg) > 2 else self._member_r
+                    if np.linalg.norm(np.asarray(_seg[1])-np.asarray(_seg[0])) < 1e-12:
+                        _v, _f = build_sphere(_seg[0], _radius, n_lat=8, n_lon=10)
+                    else:
+                        _v, _f = build_cylinder_between(_seg[0], _seg[1], _radius, n=10)
+                    _av.append(_v); _af.append(_f + _off)
+                    _ac.append(np.tile(np.asarray(_acol, np.float32), (len(_v), 1)))
+                    _off += len(_v)
+                av = np.concatenate(_av); af = np.concatenate(_af).astype(np.uint32)
+                ac = np.concatenate(_ac)
                 _pose_mesh(self._arb_mesh, vertices=av, faces=af, vertex_colors=ac,
                            color_sig=(self._view_mode,))
             else:
@@ -1501,10 +1793,8 @@ class View3D:
                     and np.all(np.isfinite(pts['rocker_spring_pt'])) \
                     and np.all(np.isfinite(pts['spring_chassis_pt'])):
                 # Pick OD: damper for collapsed-rocker (DIRECT) case,
-                # spring otherwise.  We use rocker_pivot == pushrod_inner
-                # as the marker for "rocker collapsed → this segment is
-                # the damper alone" (same heuristic used for the rocker
-                # mesh).
+                # spring otherwise.  The declared OD spans the full endpoints;
+                # no unprovided perch or eye transition is inferred here.
                 if ('rocker_pivot' in pts and 'pushrod_inner' in pts
                         and float(np.linalg.norm(
                             pts['rocker_pivot'] - pts['pushrod_inner'])) < 1e-4):

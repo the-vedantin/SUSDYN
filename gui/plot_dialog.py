@@ -133,5 +133,18 @@ class PlotDialog(QDialog):
         self.setWindowTitle(title)
         self.resize(1000, 700)
         lay = QVBoxLayout(self)
-        self.canvas = _ExportCanvas(fig)
+        self.canvas = ReadableCanvas(fig)   # hover-to-read + copy on every popup plot
         lay.addWidget(self.canvas)
+
+
+class ReadableCanvas(_ExportCanvas):
+    """THE graph canvas for every page (user 2026-09-26: "no hover to read, no
+    copy graph ... i need reading features for all graphs"): hover anywhere to
+    read every curve's value at the cursor (gui.main_window.HoverAnnotator,
+    the reader the main curves already use) + right-click copy / save (as
+    displayed or light theme).  Drop-in for FigureCanvasQTAgg(fig)."""
+
+    def __init__(self, fig):
+        super().__init__(fig)
+        from gui.main_window import HoverAnnotator      # lazy: main_window imports this module
+        self.hover = HoverAnnotator(self)

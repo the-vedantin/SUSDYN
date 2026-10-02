@@ -1,39 +1,25 @@
-# Rule 01 — Coplanarity / nothing in bending
+# Rule 01 — Per-corner static actuation coplanarity
 
-## The rule
-The full actuation chain lies in one plane, and stays in that plane across the
-whole wheel-travel range. The chain is: pushrod outer, pushrod inner, rocker
-pivot, rocker spring eye, and spring/damper chassis mount. Because every member
-sits in the plane, no member is loaded in bending — each carries only tension,
-compression, or torsion.
+## Authoritative user clarification — 2026-09-15
 
-## Why
-A pushrod, rocker, or drop link that leaves the plane of its motion gets loaded
-sideways and bends. Bending members are heavy (they need section to resist it)
-and they flex, which corrupts the motion ratio. Keeping the chain planar keeps
-every link a clean two-force or torsion member.
+At STATIC ride position, independently at EACH corner, the pushrod outer and inner joint centres, rocker pivot, rocker spring eye, spring/damper chassis eye, and both bellcrank drop-link joint centres must lie in that corner's actuation plane. Left and right corners do not share a plane. Front and rear do not share a plane.
 
-## The subtle part — across travel, not just static
-It is easy to build the five points coplanar at static. The hard requirement is
-that they STAY coplanar as the wheel moves. The wheel-side pushrod foot travels
-on an arc; the actuation plane must contain that arc, and the rocker must turn
-about the plane normal (see Rule 02) so the inboard points stay in the plane.
-A design that is coplanar at static but drifts out of plane across travel still
-violates this rule.
+Use the static plane through that corner's rocker pivot, pushrod-inner attachment and spring eye. Check the actual joint centres against it, without subtracting declared offsets. The rocker axis is normal to that corner's plane (Rule 02). Rule 04 also applies to the drop-link endpoints.
 
-## How Vahan checks it
-`vahan.packaging._axle_geometry_laws` fits a best plane (SVD) through the five
-chain points at three travel positions (full droop, static, full bump) and
-reports the largest out-of-plane distance as `coplanar_mm`. The regression net's
-"design actuation" gate does the same.
+Static coplanarity is the acceptance requirement. Do not demand that the wheel-side pushrod pickup stay in that fixed plane throughout travel, and do not repackage the dampers to make that happen. Across travel, continue to check physical clearance, damper stroke, kinematic closure, rod-end articulation and loads. Out-of-plane travel displacement may be reported as a diagnostic; it is not a static-coplanarity failure.
+
+Preserve the intended damper packaging and use local geometry adjustments. Repackaging is not authorized merely because a stronger, invented plane constraint is easier to satisfy elsewhere.
 
 ## Tolerance
-- Design target: under 0.1 mm at static.
-- Accepted in the packaging tolerance set: 3.0 mm across travel (the arc of the
-  pushrod foot makes a small unavoidable residual; the baseline sits near 1.1 mm).
 
-## History
-- The pushrod being 22 mm out of plane (v33) was caught only after the gate was
-  extended to include the pushrod itself, not just the rocker plate points.
-- Raising the actuation while holding the pushrod foot fixed re-tilts the plane;
-  the chain must be re-solved to restore coplanarity, not merely translated.
+- Static design target: less than 0.1 mm for the actuation chain.
+- Existing numerical gate: 3.0 mm at static, with actual residuals reported. This does not change the zero-offset design intent.
+- Bellcrank drop-link endpoints: Rule 04's static tolerance, with actual endpoint distances reported.
+
+## Physical interpretation
+
+A spherical-ended rod can articulate while acting as a two-force member; nonplanar travel does not alone prove bending of that rod. Rockers, mounts, pins and bearings still carry loads and require structural checks. Coplanarity alone is not a strength certification.
+
+## Superseded interpretation
+
+The previous fixed-plane-through-full-travel acceptance and the v115/v116 redesign based on it were rejected by the user on 2026-09-15. They must not be reinstated as design requirements.

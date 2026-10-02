@@ -34,6 +34,7 @@ import math
 import os
 
 import numpy as np
+from gui.plot_dialog import ReadableCanvas
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
@@ -146,7 +147,7 @@ class _Slot(QFrame):
         lay.addWidget(self._cap)
 
         self.fig = Figure(facecolor=_FIG_BG, layout='constrained')
-        self.canvas = FigureCanvas(self.fig)
+        self.canvas = ReadableCanvas(self.fig)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding,
                                   QSizePolicy.Policy.Expanding)
         self.canvas.setMinimumHeight(300)
@@ -163,7 +164,7 @@ class _Slot(QFrame):
 
         try:
             from gui.main_window import HoverAnnotator
-            self._hover = HoverAnnotator(self.canvas)
+            self._hover = self.canvas.hover
         except Exception:
             self._hover = None
 
@@ -783,12 +784,12 @@ class AckermannPage(QWidget):
             asb = 0.0
         return {
             'radius': float(self._radius.value()),
-            'grip': float(self._grip.value()),
+            'grip': float(self._main.grip_scale()),
             'pair_g': float(self._pair_g.value()),
             'g_list': g_list, 'radii': radii, 'sweep': sweep,
             'aero': aero, 'as_built_pct': asb, 'as_built_probed': asb_ok,
             'do_lap': bool(self._do_lap.isChecked()),
-            'lap_grip': float(self._lap_grip.value()),
+            'lap_grip': float(self._main.grip_scale()),
         }
 
     # ── run ─────────────────────────────────────────────────────────────
@@ -883,7 +884,7 @@ class AckermannPage(QWidget):
             return
         if not hasattr(self, '_popup_hovers'):
             self._popup_hovers = []
-        self._popup_hovers.append(HoverAnnotator(canvas))
+        self._popup_hovers.append(getattr(canvas, 'hover', None) or HoverAnnotator(canvas))
 
     def _ack_aero(self, radius_m: float):
         """The car's REAL aero, sized at this corner radius, applied BY DEFAULT
@@ -915,7 +916,7 @@ class AckermannPage(QWidget):
         from vahan.laptime import Track, LapSimulator
         from gui.laptime_page import _TRACKS
         veh = solver._veh
-        base = float(self._lap_grip.value())
+        base = float(self._main.grip_scale())
         avgs, peaks = [], []
         for _label, fname in _TRACKS:
             path = os.path.join(_repo_root(), 'tracks', fname)
@@ -985,7 +986,7 @@ class AckermannPage(QWidget):
             fig = Figure(figsize=(15.5, 11.5))
             fig, trim = plot_ymd_ackermann_grid(
                 tm, ss, radius_m=float(self._radius.value()),
-                grip_multiplier=float(self._grip.value()),
+                grip_multiplier=float(self._main.grip_scale()),
                 aero_Fz_per_g=aero, fig=fig)
             dlg = QDialog(self)
             dlg.setWindowTitle(self._beta_title(
@@ -1004,7 +1005,7 @@ class AckermannPage(QWidget):
             _pcts = [r['pct'] for r in trim]
             mm = mmm_metrics_sweep(
                 tm, _ss2, _pcts, radius_m=float(self._radius.value()),
-                grip_multiplier=float(self._grip.value()),
+                grip_multiplier=float(self._main.grip_scale()),
                 aero_Fz_per_g=aero, loads_table=_tbl)
             rows = [' RCVD Chapter 8 moment-diagram readings per Ackermann '
                     'setting (docs/rcvd_ref/ch08):',
@@ -1046,7 +1047,7 @@ class AckermannPage(QWidget):
                 'background:#0e0e10; color:#e8e8ec; '
                 'border:1px solid #2a2a2a; border-radius:4px;')
             lay.addWidget(txt)
-            _cv = FigureCanvas(fig)
+            _cv = ReadableCanvas(fig)
             lay.addWidget(_cv)
             self._attach_hover(_cv)
             dlg.show()
@@ -1078,7 +1079,7 @@ class AckermannPage(QWidget):
             tm = mw._tire_model
             if tm is None:
                 raise RuntimeError('no tyre model loaded')
-            grip = float(self._grip.value())
+            grip = float(self._main.grip_scale())
             R = float(self._radius.value())
             pcts = [-100, -60, -30, 0, 30, 60, 100]
             # Fine g sweep for a smooth ideal curve; runs past the grip limit so
@@ -1353,7 +1354,7 @@ class AckermannPage(QWidget):
                 'font-size:11.5px; background:#161310; padding:9px;'
                 'border:1px solid #E53935; border-radius:4px;')
             lay.addWidget(verdict_lbl)
-            _cv = FigureCanvas(fig)
+            _cv = ReadableCanvas(fig)
             lay.addWidget(_cv, 1)
             self._attach_hover(_cv)
             dlg.show()
@@ -1390,7 +1391,7 @@ class AckermannPage(QWidget):
             res = build_ackermann_report(
                 mw, out_html=out,
                 radius_m=float(self._radius.value()),
-                grip_multiplier=float(self._grip.value()))
+                grip_multiplier=float(self._main.grip_scale()))
             ev = res['evidence']
             if res['premise_holds']:
                 self._status.setText(

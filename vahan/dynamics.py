@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 from .solver import SuspensionConstraints
-from .kinematics import KinematicMetrics
+from .kinematics import KinematicMetrics, road_plane_camber_deg
 from .tire_model import wheel_inclination_deg
 
 
@@ -100,12 +100,15 @@ class VehicleParams:
 
     # ── ROTATING INERTIA (equivalent mass) ───────────────────────────────
     # Every spinning part has to be accelerated as well as the car, so the
-    # SAME tyre force produces LESS acceleration than F/m.  Referred to the
+    # SAME engine / brake TORQUE produces LESS acceleration.  Referred to the
     # wheels, the extra ("equivalent") mass is
     #     m_eq = [ 2*(I_wheel_front + I_wheel_rear) + I_engine * ratio^2 ]
     #            / tyre_radius^2
-    # and every longitudinal acceleration — drive AND brake — is divided by
-    # (1 + m_eq/m).  The engine term is amplified by the SQUARE of the total
+    # and a TORQUE-limited acceleration is divided by (1 + m_eq/m).  A TYRE-
+    # limited one is not: at the friction limit the ground force is fixed by
+    # the tyre, and inertia only raises the torque needed (brakes / engine)
+    # — see vahan/laptime.py _ax_drive / _ax_brake (audit 2026-09-22, item
+    # 23).  The engine term is amplified by the SQUARE of the total
     # ratio, so on a 9.75:1 first gear a 0.05 kg*m^2 crank behaves like ~115 kg.
     # Ignoring this always FLATTERS the lap time.
     #
@@ -701,14 +704,15 @@ class SteadyStateResult:
     roll_angle_deg: float = 0.0
     pitch_angle_deg: float = 0.0
 
-    # Per-corner suspension travel (m)
+    # Per-corner suspension travel (mm)
     travel: dict = field(default_factory=dict)
 
     # Per-corner KINEMATIC camber at operating point (deg, chassis-relative,
     # vehicle-frame sign) — what the kinematic graphs show.
     camber: dict = field(default_factory=dict)
-    # Per-corner GROUND camber (deg, vehicle-frame sign): kinematic + static
-    # alignment + body roll.  This is the wheel's real lean on the road.
+    # Per-corner GROUND camber (deg, negative = top inboard), from the solved
+    # spin axis with the renderer's alignment rotation and body roll applied.
+    # Scope: flat road, current corner steer, no pitch-induced travel yet.
     camber_ground: dict = field(default_factory=dict)
     # Per-corner SIGNED tyre inclination angle (deg) as fed to the tyre model
     # — camber_ground through vahan.tire_model.wheel_inclination_deg with
@@ -731,8 +735,11 @@ class SteadyStateResult:
     # Tire utilization (0–1 at grip limit; >1 if demand exceeds μ·Fz)
     utilization: dict = field(default_factory=dict)
 
-    # Per-corner lateral force (N, positive = outboard)
+    # Per-corner lateral force MAGNITUDE (N).  Direction: toward the turn
+    # centre unless Fy_sign says -1 (that wheel pushes AGAINST its axle's net
+    # force — static toe at low g).
     Fy: dict = field(default_factory=dict)
+    Fy_sign: dict = field(default_factory=dict)
 
     # Per-corner longitudinal force (N, positive = forward)
     Fx: dict = field(default_factory=dict)
@@ -756,6 +763,47 @@ class SteadyStateResult:
     understeer_gradient_deg: float = 0.0
     diff_yaw_Nm: float = 0.0         # differential yaw moment at this point
 
+    # ── JACKING (RCVD §17.3, printed p.614-615, Fig. 17.8(b)) ─────────────
+    # Each tyre's lateral force, drawn from its contact patch to that
+    # corner's front-view instant centre, has a VERTICAL component that the
+    # links put straight into the sprung mass.  Per corner, ground frame,
+    # + = pushes the body UP (N).  Summed per axle = the axle jacking force.
+    jacking_corner_N: dict = field(default_factory=dict)
+    # tan of the contact-patch -> instant-centre line in the GROUND frame
+    # (body roll included), signed as dz/dx.  Kept so the number can be
+    # re-derived by hand from what the app shows.
+    jacking_line_tan: dict = field(default_factory=dict)
+    jacking_force_front_N: float = 0.0
+    jacking_force_rear_N: float = 0.0
+    # Body rise at each axle the jacking force causes (mm, + = body UP):
+    # axle jacking force / (2 x wheel rate).  WHEEL rate, not ride rate: the
+    # jacking force is internal between wheel and body, so the axle's total
+    # tyre load (and the tyre deflection) does not change — only the springs.
+    jacking_heave_front_mm: float = 0.0
+    jacking_heave_rear_mm: float = 0.0
+    # Body rise that was actually fed back into the kinematics (mm).  Equals
+    # the jacking heave above to within the feedback tolerance when the
+    # feedback is on (SteadyStateSolver.jacking_feedback) and converged.
+    jacking_heave_applied_front_mm: float = 0.0
+    jacking_heave_applied_rear_mm: float = 0.0
+    jacking_feedback_passes: int = 0
+    # Suspension sink of each axle under the aero load (mm, + = body DOWN =
+    # bump on both wheels), through the ONE heave curve (vahan.heave_curve:
+    # progressive wheel rate).  Already INSIDE `travel` when
+    # SteadyStateSolver.aero_heave is on (default).  Tyre squash is not travel;
+    # it is reported separately (mm, per axle, from the aero load alone).
+    aero_heave_front_mm: float = 0.0
+    aero_heave_rear_mm: float = 0.0
+    aero_tyre_squash_front_mm: float = 0.0
+    aero_tyre_squash_rear_mm: float = 0.0
+    # Wheel travel from PITCH (longitudinal g), per axle, mm, + = bump.  Only
+    # the part of the sprung weight transfer the springs carry: (1 - anti) of
+    # m_s·ax·h_s/L, anti = anti-dive (front, braking) / anti-lift (rear,
+    # braking) / anti-squat (rear, drive) from the kinematic model.  Already
+    # INSIDE `travel` when SteadyStateSolver.pitch_travel is on (default).
+    pitch_travel_front_mm: float = 0.0
+    pitch_travel_rear_mm: float = 0.0
+
     # Convergence info
     iterations: int = 0
 
@@ -769,6 +817,90 @@ G = 9.81  # m/s^2
 # Minimum grip (N) for utilization ratio — avoids div-by-zero; keeps values
 # order-1 when Fz is tiny (unlike a 1e-9 floor, which blows up to 1e12).
 _UTIL_GRIP_FLOOR_N = 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Jacking — lateral tyre force -> vertical force on the sprung mass
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# RCVD §17.3 (printed p.614-615, Fig. 17.8): "the total force at the contact
+# patch is drawn to its reaction point at the instant center ... the vertical
+# component ... will lift the sprung mass"; p.638: high-roll-centre swing axles
+# have "large jacking forces ... cornering forces raise the back of the car".
+#
+# Derivation (front view, one corner).  The wheel/upright is a one-degree-of-
+# freedom body rotating about its instant centre IC; the two links do no
+# virtual work, so they carry any force whose line passes through IC.  Split
+# the tyre's horizontal force Fy (applied at the contact patch CP) into
+#   (1) a component along the line CP -> IC     -> carried by the LINKS
+#   (2) a vertical component at CP              -> carried by the SPRING
+# (the wheel-rate convention: the spring acts as a vertical force at the wheel).
+# With d = IC - CP = (dx, dz):  (1) = Fy * (1, dz/dx), so the links push the
+# body up by  Fz_jack = Fy * dz/dx  and the spring is unloaded by the same
+# amount.  Summed over an axle, the tyre loads do not change (the force is
+# internal to wheel+body), so the body rises by  sum(Fz_jack) / (2 * K_wheel).
+#
+# Body roll: IC and CP come from the kinematic solve in the CHASSIS frame; the
+# tyre force is horizontal in the GROUND frame.  The line is rotated by the
+# body roll before its slope is taken (positive roll = the +X / left side
+# goes down, the solver's convention).  At zero roll with a symmetric axle this
+# reduces EXACTLY to Fy * RC_height / (t/2) per wheel when CP sits on Z = 0.
+
+def resolve_grip_scale(grip_multiplier=None, solver=None) -> float:
+    """THE grip scale for an analysis: an explicit value wins; None means the
+    project scale the SteadyStateSolver carries (solver._mu_scale, set by the
+    app from MainWindow.grip_scale()).  No function keeps a private default
+    multiplier — that is how the lap sim ran at 0.65 while every other page
+    ran at 0.70.  Raises when neither is available."""
+    if grip_multiplier is not None:
+        return float(grip_multiplier)
+    if solver is not None and hasattr(solver, '_mu_scale'):
+        return float(solver._mu_scale)
+    raise ValueError('grip scale not given and no solver carrying the '
+                     'project grip scale')
+
+
+def corner_jacking_line(state, side: str, tire_radius_m: float):
+    """(contact patch [x, z], line direction [dx, dz]) for one corner, both in
+    the CHASSIS front view (metres).  Direction = IC - CP.  Parallel arms (IC
+    at infinity) -> the line runs parallel to the arms, pointed inboard."""
+    from vahan.loads import contact_patch_point
+    cp3 = contact_patch_point(state.wheel_center, state.spin_axis,
+                              float(tire_radius_m))
+    cp = np.array([float(cp3[0]), float(cp3[2])])
+    ic = KinematicMetrics(state, side).ic_front_view
+    if ic is not None:
+        return cp, np.asarray(ic, float) - cp
+    y_ref = float(state.wheel_center[1])
+    a, b = KinematicMetrics._arm_trace_xz(state.lca_front, state.lca_rear,
+                                          state.lca_outer, y_ref)
+    d = np.asarray(b, float) - np.asarray(a, float)
+    if np.sign(d[0]) == np.sign(cp[0]):
+        d = -d                                   # point inboard
+    return cp, d
+
+
+def jacking_force_on_body(fy_x_ground: float, line_dir_chassis,
+                          roll_rad: float = 0.0):
+    """Vertical force (N, ground frame, + = UP) the links put on the sprung
+    mass from one tyre's horizontal force.
+
+    fy_x_ground      tyre force ON THE CAR along ground X (N, signed: + = +X /
+                     toward the left side).
+    line_dir_chassis (dx, dz) of the contact-patch -> IC line, chassis frame.
+    roll_rad         body roll, solver convention (+ = left/+X side down).
+
+    Returns (Fz_body_N, tan_ground) with tan_ground = dz/dx of the line in the
+    ground frame.  A vertical line (IC straight above the patch) cannot carry a
+    horizontal force at all -> (nan, nan)."""
+    dx, dz = float(line_dir_chassis[0]), float(line_dir_chassis[1])
+    c, s = np.cos(float(roll_rad)), np.sin(float(roll_rad))
+    dxg = dx * c + dz * s
+    dzg = -dx * s + dz * c
+    if abs(dxg) < 1e-9:
+        return float('nan'), float('nan')
+    tan_g = dzg / dxg
+    return float(fy_x_ground) * tan_g, tan_g
 
 
 class SteadyStateSolver:
@@ -814,13 +946,42 @@ class SteadyStateSolver:
         self._tire = tire_model                       # front (and default)
         self._tire_rear = tire_model_rear or tire_model
         self._warm = {}  # per-corner warm start cache
-        # Optional grip derate applied to the tire μ when computing
-        # utilization (the friction-circle budget).  1.0 = raw belt μ
-        # (default; the dynamics page is "what the tire data says").  The
-        # lap-time sim sets this to its grip_scale so the utilization plot
-        # is consistent with the lap's grip-derated speed/lat-g — otherwise
-        # the two channels silently disagree by the derate factor.
+        # THE grip scale (belt -> road derate on the tyre's peak mu).  EVERY
+        # grip limit this solver reports uses it: the per-corner budget and
+        # utilization, the axle pair budget, the diff bias cap, the friction-
+        # circle clamp, traction (max_accel_g / _traction_g_dynamic) and
+        # braking.  The app sets it from the ONE project grip scale
+        # (MainWindow.grip_scale(), Dynamics panel "Grip multiplier");
+        # 1.0 here is only the bare-library default (= raw tyre data).
+        # To read limits at several scales use limits_at_grip_scales().
         self._mu_scale = 1.0
+        # Jacking heave fed back into the kinematics (ride height -> RC,
+        # camber, travel).  OFF by default (user, 2026-09-23): with it on,
+        # the whole axle droops by the jacking rise and the camber-vs-g
+        # curve loses the outer-wheel camber (2026 baseline outer front at
+        # 1.5 g: -0.43 -> -0.29 deg; v147 inner rear +3 deg at 2 g) and no
+        # longer agrees with the kinematic sweep.  The jacking force and
+        # rise are still computed and reported every solve.  Turn on with
+        # car['jacking_feedback'] = true (Dynamics panel).  Fixed point on
+        # the per-axle heave, stops when the heave changes by less than
+        # the tolerance (m) or after the pass cap.
+        self.jacking_feedback = False
+        self.jacking_tol_m = 1e-4
+        self.jacking_max_passes = 6
+        # AERO HEAVE (user 2026-09-26, ONE MODEL): downforce sinks the body, so
+        # the corner travel the kinematics are solved at includes it — every
+        # consumer (Dynamics page camber/RC under aero, loads, ride page) sees
+        # the same travel.  Suspension sink per axle from the aero load per
+        # wheel through vahan.heave_curve.  car['aero_heave'] = false turns it
+        # off (then travel is roll + jacking only, as before 2026-09-26).
+        self.aero_heave = True
+        self._heave_curves = None
+        # PITCH TRAVEL (2026-09-26): braking dives the front / accel squats the
+        # rear in the corner travel itself (it used to be a reported angle
+        # only, with every corner left at static).  car['pitch_travel'] = false
+        # turns it off.
+        self.pitch_travel = True
+        self._antis = None
 
     def _tire_for(self, label: str):
         """Tire model for a corner — front tire for FL/FR, rear for RL/RR.
@@ -871,8 +1032,120 @@ class SteadyStateSolver:
               max_iter: int = 15,
               tol_deg: float = 0.002,
               aero_Fz: dict = None) -> SteadyStateResult:
+        """Steady-state equilibrium INCLUDING the jacking heave.
+
+        One pass = _solve_at_heave() (roll / load-transfer / tyre fixed
+        point at a given body heave).  Each pass reports the jacking force and
+        the body rise it causes; with ``jacking_feedback`` on, that rise is
+        fed back as droop on both wheels of the axle and the pass repeats until
+        the heave stops moving (``jacking_tol_m``)."""
+        sink, squash = self.aero_sink_m(aero_Fz)        # + = body down
+        pitch = self.pitch_travel_m(longitudinal_g)     # + = bump
+        down = {k: sink[k] + pitch[k] for k in ('F', 'R')}
+        heave = {'F': -down['F'], 'R': -down['R']}      # heave_m: + = body up
+        res = self._solve_at_heave(lateral_g, longitudinal_g, max_iter,
+                                   tol_deg, aero_Fz, heave)
+        passes = 1
+        if self.jacking_feedback:
+            for _ in range(max(int(self.jacking_max_passes) - 1, 0)):
+                new = {'F': res.jacking_heave_front_mm / 1000.0 - down['F'],
+                       'R': res.jacking_heave_rear_mm / 1000.0 - down['R']}
+                if not all(np.isfinite(x) for x in new.values()):
+                    break
+                if max(abs(new['F'] - heave['F']),
+                       abs(new['R'] - heave['R'])) < float(self.jacking_tol_m):
+                    break
+                heave = new
+                res = self._solve_at_heave(lateral_g, longitudinal_g,
+                                           max_iter, tol_deg, aero_Fz, heave)
+                passes += 1
+        res.jacking_feedback_passes = passes
+        res.aero_heave_front_mm, res.aero_heave_rear_mm = sink['F'] * 1000.0, sink['R'] * 1000.0
+        # the applied body heave = jacking rise - aero sink - pitch; report the JACKING part only
+        res.jacking_heave_applied_front_mm += down['F'] * 1000.0
+        res.jacking_heave_applied_rear_mm += down['R'] * 1000.0
+        res.pitch_travel_front_mm, res.pitch_travel_rear_mm = pitch['F'] * 1000.0, pitch['R'] * 1000.0
+        if self.pitch_travel and longitudinal_g != 0.0:
+            # the body pitch the travel above produces (+ = nose down)
+            res.pitch_angle_deg = float(np.degrees(np.arctan(
+                (pitch['F'] - pitch['R']) / float(self._veh.wheelbase_m))))
+        res.aero_tyre_squash_front_mm, res.aero_tyre_squash_rear_mm = squash['F'] * 1000.0, squash['R'] * 1000.0
+        return res
+
+    def anti_fractions(self) -> dict:
+        """Anti-dive (front, braking), anti-lift (rear, braking) and
+        anti-squat (rear, drive) as FRACTIONS, from the kinematic model at
+        static (vahan.metrics_catalog — the same numbers the sweep plots).
+        Cached per solver (the app rebuilds the solver when the car changes)."""
+        if self._antis is not None:
+            return self._antis
+        v = self._veh
+        out = {'dive': 0.0, 'lift': 0.0, 'squat': 0.0}
+        try:
+            from .metrics_catalog import _anti_dive, _anti_squat, _anti_lift
+            kw = dict(cg_height_m=float(v.cg_height_m), wheelbase_m=float(v.wheelbase_m),
+                      front_brake_bias=float(getattr(v, 'front_brake_bias', 0.65)))
+            if 'FL' in self._solvers:
+                mf = KinematicMetrics(self._solvers['FL'].solve(0.0), 'left')
+                out['dive'] = float(_anti_dive(mf, **kw)) / 100.0
+            if 'RL' in self._solvers:
+                mr = KinematicMetrics(self._solvers['RL'].solve(0.0), 'left')
+                out['lift'] = float(_anti_lift(mr, **kw)) / 100.0
+                out['squat'] = float(_anti_squat(mr, rear_drive_bias=1.0, **{k: kw[k] for k in ('cg_height_m', 'wheelbase_m')})) / 100.0
+        except Exception:
+            pass
+        self._antis = {k: (x if np.isfinite(x) else 0.0) for k, x in out.items()}
+        return self._antis
+
+    def pitch_travel_m(self, longitudinal_g: float) -> dict:
+        """Wheel travel (m, + = bump) of each axle from longitudinal g: the
+        sprung weight transfer m_s·ax·h_s/L per axle, times (1 - anti), per
+        wheel through the ONE heave curve (droop included).  RWD: no front
+        anti under drive."""
+        zero = {'F': 0.0, 'R': 0.0}
+        if not self.pitch_travel or abs(float(longitudinal_g)) < 1e-12:
+            return zero
+        v = self._veh
+        dF = float(v.sprung_mass_kg) * float(longitudinal_g) * G * float(v.sprung_cg_height_m) / float(v.wheelbase_m)
+        a = self.anti_fractions()
+        if dF < 0:        # braking: front loads, rear unloads
+            fF, fR = abs(dF) * (1.0 - a['dive']) / 2.0, -abs(dF) * (1.0 - a['lift']) / 2.0
+        else:             # drive: rear loads (anti-squat), front unloads (no front drive)
+            fF, fR = -dF / 2.0, dF * (1.0 - a['squat']) / 2.0
+        if self._heave_curves is None:
+            from .heave_curve import wheel_force_curves
+            self._heave_curves = wheel_force_curves(self._veh, self._solvers)
+        from .heave_curve import heave_split_mm
+        return {'F': heave_split_mm(self._heave_curves['F'], fF)[0] / 1000.0,
+                'R': heave_split_mm(self._heave_curves['R'], fR)[0] / 1000.0}
+
+    def aero_sink_m(self, aero_Fz: dict | None) -> tuple:
+        """({'F','R'} suspension sink m, {'F','R'} tyre squash m) of each axle
+        under the aero load per wheel (mean of left/right), through the ONE
+        heave curve.  Zero when there is no aero load or aero_heave is off."""
+        zero = {'F': 0.0, 'R': 0.0}
+        if not aero_Fz or not self.aero_heave:
+            return zero, dict(zero)
+        if self._heave_curves is None:
+            from .heave_curve import wheel_force_curves
+            self._heave_curves = wheel_force_curves(self._veh, self._solvers)
+        from .heave_curve import heave_split_mm
+        sink, squash = {}, {}
+        for ax, a, b in (('F', 'FL', 'FR'), ('R', 'RL', 'RR')):
+            load = 0.5 * (float(aero_Fz.get(a, 0.0)) + float(aero_Fz.get(b, 0.0)))
+            s_mm, t_mm = heave_split_mm(self._heave_curves[ax], load)
+            sink[ax], squash[ax] = s_mm / 1000.0, t_mm / 1000.0
+        return sink, squash
+
+    def _solve_at_heave(self, lateral_g: float,
+                        longitudinal_g: float = 0.0,
+                        max_iter: int = 15,
+                        tol_deg: float = 0.002,
+                        aero_Fz: dict = None,
+                        heave_m: dict = None) -> SteadyStateResult:
         """
-        Solve steady-state equilibrium.
+        Solve steady-state equilibrium at a fixed per-axle body heave
+        (heave_m = {'F': m, 'R': m}, + = body UP = droop on both wheels).
 
         Algorithm:
         1. Compute static corner loads (+ optional aero downforce)
@@ -921,19 +1194,24 @@ class SteadyStateSolver:
         # ── Step 3: Iterate ──────────────────────────────────────────────
         result = SteadyStateResult(lateral_g=lateral_g,
                                    longitudinal_g=longitudinal_g)
+        heave_m = heave_m or {}
+        heave_f = float(heave_m.get('F', 0.0))    # + = body up = droop
+        heave_r = float(heave_m.get('R', 0.0))
+        states = {}
 
         for iteration in range(max_iter):
             # 3a. Per-corner travel from roll
-            # Positive roll = body leans right = left side compresses, right extends
-            # Convention: positive travel = bump (compression)
+            # Positive roll = left side compresses, right extends (the body's
+            # +X / left side goes DOWN).  Convention: positive travel = bump.
+            # Jacking heave (body up) is droop on both wheels of the axle.
             roll_travel_front = np.sin(roll_rad) * v.front_track_m / 2
             roll_travel_rear = np.sin(roll_rad) * v.rear_track_m / 2
 
             travels = {
-                'FL': +roll_travel_front,
-                'FR': -roll_travel_front,
-                'RL': +roll_travel_rear,
-                'RR': -roll_travel_rear,
+                'FL': +roll_travel_front - heave_f,
+                'FR': -roll_travel_front - heave_f,
+                'RL': +roll_travel_rear - heave_r,
+                'RR': -roll_travel_rear - heave_r,
             }
 
             # 3b. Solve kinematics at each corner
@@ -943,10 +1221,18 @@ class SteadyStateSolver:
                 side = 'left' if label.endswith('L') else 'right'
                 try:
                     state = self._solve_corner(label, travel_m)
+                    states[label] = state
                     m = KinematicMetrics(state, side)
                     rc_heights[label] = m.roll_center_height
                     cambers[label] = m.camber
-                except Exception:
+                except Exception as exc:
+                    if label in self._solvers:
+                        raise RuntimeError(
+                            f'{label} kinematic solve failed at {travel_m * 1000:.3f} mm: {exc}'
+                        ) from exc
+                    # Bare-library reduced model with no corner geometry.
+                    # A configured linkage failure must never enter this path.
+                    states.pop(label, None)
                     rc_heights[label] = rc_f if label[0] == 'F' else rc_r
                     cambers[label] = 0.0
 
@@ -1029,22 +1315,28 @@ class SteadyStateSolver:
         result.Fz = Fz
         result.travel = {k: v * 1000 for k, v in travels.items()}  # mm
         result.camber = cambers
-        # GROUND camber and the SIGNED tyre inclination.  `cambers` is chassis-
-        # relative (0 at design), so add the static alignment camber and the
-        # body roll: positive roll here = left side compresses = body leans
-        # LEFT, which tips the top of every wheel to the left — outboard (+) on
-        # the left wheels, inboard (-) on the right wheels.  Then map each
-        # wheel to the tyre's SAE inclination through THE ONE helper, with
-        # inner/outer read off this solve's own Fz split (never by label — the
-        # solver's ay sign happens to load the left side).
+        # Ground camber must use the complete spin vector, not the XZ-only
+        # camber projection plus angles (that overstates inclination at steer).
+        # Match the renderer's existing global-Y alignment convention, followed
+        # by body roll about +Y. Positive roll lowers the left (+X) body side.
+        # This preserves current alignment semantics; it is not a new shim or
+        # steering-equilibrium model. Tire-frame inclination remains separate.
         _roll_deg = float(np.degrees(roll_rad))
         _cam_ground = {}
         for label in ('FL', 'FR', 'RL', 'RR'):
             _static = float(getattr(v, 'camber_front_deg' if label[0] == 'F'
                                     else 'camber_rear_deg', 0.0))
             _side = +1.0 if label.endswith('L') else -1.0
-            _cam_ground[label] = (float(cambers.get(label, 0.0)) + _static
-                                  + _side * _roll_deg)
+            _state = states.get(label)
+            _spin = (np.asarray(_state.spin_axis, float) if _state is not None
+                     else np.array([1., 0., 0.]))
+            _angle = np.radians(_side * _static + _roll_deg)
+            _c, _s = np.cos(_angle), np.sin(_angle)
+            _spin_ground = np.array([_c * _spin[0] + _s * _spin[2],
+                                     _spin[1],
+                                     -_s * _spin[0] + _c * _spin[2]])
+            _cam_ground[label] = road_plane_camber_deg(
+                _spin_ground, side='left' if _side > 0 else 'right')
         _incl = {}
         for a_, b_ in (('FL', 'FR'), ('RL', 'RR')):
             _incl[a_] = wheel_inclination_deg(_cam_ground[a_], is_outer=Fz[a_] >= Fz[b_])
@@ -1126,9 +1418,18 @@ class SteadyStateSolver:
             # the physics the stiffness ratio threw away.  Ackermann is NOT
             # applied here: it needs a corner radius, which a generic
             # steady-state point does not carry.  vahan.ackermann does that.
+            _hand = 1.0 if lateral_g >= 0 else -1.0   # turn hand (loaded side)
+
             def _axle_split(labels, fy_axle, toe_deg):
                 """(per-wheel Fy, reference slip angle, hit_capability)."""
-                offs = {labels[0]: +0.5 * toe_deg, labels[1]: -0.5 * toe_deg}
+                # Mirror-consistent: the wheel roles swap with the turn hand
+                # (static toe is symmetric hardware, so a left turn must be
+                # the mirror of a right turn).  The fixed +left / -right
+                # offset gave the two hands different rear force splits
+                # (v147, 0.25 deg rear toe: rear jacking 290.1 vs 274.2 N at
+                # +/-1.5 g) — found 2026-09-22 through the jacking mirror check.
+                offs = {labels[0]: +0.5 * toe_deg * _hand,
+                        labels[1]: -0.5 * toe_deg * _hand}
                 def pair(a):
                     # SIGNED sum, then magnitude.  Summing |Fy| per wheel put a
                     # FLOOR under the axle: with static toe the two wheels sit
@@ -1179,11 +1480,21 @@ class SteadyStateSolver:
                     a_ref = 0.5 * (lo + hi)
                     hit = False
                 out = {}
+                _signed = {}
                 for lb in labels:
                     fzl = max(Fz[lb], 0.0)
-                    out[lb] = (abs(float(self._tire_for(lb).Fy(
-                        a_ref + offs[lb], fzl, _incl.get(lb, 0.0))))
+                    _signed[lb] = (float(self._tire_for(lb).Fy(
+                        a_ref + offs[lb], fzl, _incl.get(lb, 0.0)))
                         if fzl > 1e-6 else 0.0)
+                    out[lb] = abs(_signed[lb])
+                # which way each wheel pushes relative to the axle's net force
+                # (+1 along it, -1 against it: static toe can make the light
+                # wheel fight the loaded one at low g).  result.Fy keeps the
+                # magnitudes (its contract); consumers that need the
+                # direction (jacking) read result.Fy_sign.
+                _net = sum(_signed.values())
+                for lb in labels:
+                    _fy_sign[lb] = (-1.0 if (_signed[lb] * _net < 0.0) else 1.0)
                 if hit:
                     _s = sum(out.values())
                     if _s > 1e-9:
@@ -1193,6 +1504,7 @@ class SteadyStateSolver:
                 return out, a_ref, hit
 
             fy_per_corner = {}
+            _fy_sign = {}
             _sa_ref = {}
             _cap_hit = {}
             for _lbls, _fy_axle, _toe, _ax in (
@@ -1243,6 +1555,7 @@ class SteadyStateSolver:
 
             # Store per-corner forces for component load analysis
             result.Fy = dict(fy_per_corner)
+            result.Fy_sign = dict(_fy_sign)
             result.Fx = dict(fx_per_corner)
             # Brake torque per corner = Fx × tire_radius — ONLY while braking.
             # Under power (ax > 0) the driven-axle Fx is DRIVE force: its hub
@@ -1268,10 +1581,10 @@ class SteadyStateSolver:
                 _tf = float(getattr(v, 'toe_front_deg', 0.0))
                 _tr = float(getattr(v, 'toe_rear_deg', 0.0))
                 result.slip_angle = {
-                    'FL': _sa_ref['F'] + 0.5 * _tf,
-                    'FR': _sa_ref['F'] - 0.5 * _tf,
-                    'RL': _sa_ref['R'] + 0.5 * _tr,
-                    'RR': _sa_ref['R'] - 0.5 * _tr}
+                    'FL': _sa_ref['F'] + 0.5 * _tf * _hand,
+                    'FR': _sa_ref['F'] - 0.5 * _tf * _hand,
+                    'RL': _sa_ref['R'] + 0.5 * _tr * _hand,
+                    'RR': _sa_ref['R'] - 0.5 * _tr * _hand}
                 result.understeer_gradient_deg = _sa_ref['F'] - _sa_ref['R']
             # Demand beyond what an axle pair can physically make is a REAL
             # over-limit condition, not something to round away — surface it so
@@ -1314,7 +1627,52 @@ class SteadyStateSolver:
                 result.brake_torque[label] = (
                     abs(result.Fx.get(label, 0)) * tire_r if ax < 0 else 0.0)
 
+        # ── Step 5: JACKING from this solve's own Fy + kinematic states ───
+        self._fill_jacking(result, states, roll_rad, lateral_g,
+                           heave_f, heave_r)
         return result
+
+    def _fill_jacking(self, result, states: dict, roll_rad: float,
+                      lateral_g: float, heave_f: float, heave_r: float):
+        """Per-corner and per-axle jacking force + the body rise it causes.
+        See corner_jacking_line / jacking_force_on_body for the derivation.
+
+        result.Fy holds MAGNITUDES; every tyre's force on the car points
+        toward the turn centre, i.e. away from the loaded side.  In this
+        solver a positive lateral_g loads the LEFT (+X) side, so the force on
+        the car is along -X.  A wheel whose static toe makes it push AGAINST
+        its axle's net force (low g) is flagged by result.Fy_sign = -1 and
+        its jacking sign flips with it."""
+        v = self._veh
+        direction = -1.0 if lateral_g >= 0 else 1.0
+        corner, tans = {}, {}
+        for label in ('FL', 'FR', 'RL', 'RR'):
+            st = states.get(label)
+            fy = (abs(float((result.Fy or {}).get(label, 0.0)))
+                  * float((result.Fy_sign or {}).get(label, 1.0)))
+            if st is None:
+                corner[label], tans[label] = float('nan'), float('nan')
+                continue
+            side = 'left' if label.endswith('L') else 'right'
+            try:
+                _cp, d = corner_jacking_line(st, side, v.tire_radius_m)
+                fz_j, tan_g = jacking_force_on_body(direction * fy, d, roll_rad)
+            except Exception:
+                fz_j, tan_g = float('nan'), float('nan')
+            corner[label], tans[label] = fz_j, tan_g
+        result.jacking_corner_N = corner
+        result.jacking_line_tan = tans
+        jf = corner['FL'] + corner['FR']
+        jr = corner['RL'] + corner['RR']
+        result.jacking_force_front_N = jf
+        result.jacking_force_rear_N = jr
+        kf, kr = v.wheel_rate_front_Npm, v.wheel_rate_rear_Npm
+        result.jacking_heave_front_mm = (jf / (2.0 * kf) * 1000.0
+                                         if kf > 0 else float('nan'))
+        result.jacking_heave_rear_mm = (jr / (2.0 * kr) * 1000.0
+                                        if kr > 0 else float('nan'))
+        result.jacking_heave_applied_front_mm = heave_f * 1000.0
+        result.jacking_heave_applied_rear_mm = heave_r * 1000.0
 
     def sweep_by_speed(self,
                        v_min_mph: float,
@@ -1351,7 +1709,7 @@ class SteadyStateSolver:
                 'elastic_lt_front_N', 'elastic_lt_rear_N',
                 'geometric_lt_front_N', 'geometric_lt_rear_N',
                 'understeer_gradient_deg']
-        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+        corner_keys = ['Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization']
 
         out = {
             'speed_mph':       v_arr_mph,
@@ -1393,6 +1751,8 @@ class SteadyStateSolver:
                 out[f'Fz_{lbl}'][i]          = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i]      = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i]      = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, float('nan'))
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, float('nan'))
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
         for k in ['understeer_gradient_deg']:
@@ -1575,7 +1935,7 @@ class SteadyStateSolver:
                 'understeer_gradient_deg']
         for k in keys:
             out[k] = np.zeros(n)
-        for ck in ('Fz', 'travel', 'camber', 'utilization'):
+        for ck in ('Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization'):
             for lbl in ('FL', 'FR', 'RL', 'RR'):
                 out[f'{ck}_{lbl}'] = np.zeros(n)
 
@@ -1596,6 +1956,8 @@ class SteadyStateSolver:
                 out[f'Fz_{lbl}'][i]          = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i]      = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i]      = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, float('nan'))
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, float('nan'))
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
         return out
 
@@ -1616,8 +1978,9 @@ class SteadyStateSolver:
         mu_f = float(self._tire.peak_mu(Fz_f, 0.0))        # front tire
         mu_r = float(self._tire_rear.peak_mu(Fz_r, 0.0))   # rear tire
         # Conservative: use the lower of the two so we don't pretend the
-        # rear can save the front when the front saturates first.
-        return min(mu_f, mu_r)
+        # rear can save the front when the front saturates first.  Scaled by
+        # THE grip scale like every other limit.
+        return min(mu_f, mu_r) * float(self._mu_scale)
 
     def _clamp_to_friction_circle(self, lat_g: float,
                                    lon_g: float,
@@ -1722,8 +2085,10 @@ class SteadyStateSolver:
                 'rc_height_front_mm', 'rc_height_rear_mm',
                 'elastic_lt_front_N', 'elastic_lt_rear_N',
                 'geometric_lt_front_N', 'geometric_lt_rear_N',
-                'understeer_gradient_deg']
-        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+                'understeer_gradient_deg',
+                'jacking_force_front_N', 'jacking_force_rear_N',
+                'jacking_heave_front_mm', 'jacking_heave_rear_mm']
+        corner_keys = ['Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization']
 
         out = {'lateral_g': g_arr}
         for k in keys:
@@ -1745,10 +2110,16 @@ class SteadyStateSolver:
             out['geometric_lt_front_N'][i] = r.geometric_lt_front_N
             out['geometric_lt_rear_N'][i] = r.geometric_lt_rear_N
             out['understeer_gradient_deg'][i] = r.understeer_gradient_deg
+            out['jacking_force_front_N'][i] = r.jacking_force_front_N
+            out['jacking_force_rear_N'][i] = r.jacking_force_rear_N
+            out['jacking_heave_front_mm'][i] = r.jacking_heave_front_mm
+            out['jacking_heave_rear_mm'][i] = r.jacking_heave_rear_mm
             for lbl in ['FL', 'FR', 'RL', 'RR']:
                 out[f'Fz_{lbl}'][i] = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i] = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, float('nan'))
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, float('nan'))
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
         # Smooth noisy signals — tire inverse lookup + kinematic solver edges
@@ -1779,7 +2150,7 @@ class SteadyStateSolver:
                 'elastic_lt_front_N', 'elastic_lt_rear_N',
                 'geometric_lt_front_N', 'geometric_lt_rear_N',
                 'understeer_gradient_deg']
-        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+        corner_keys = ['Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization']
 
         out = {'longitudinal_g': g_arr}
         for k in keys:
@@ -1805,6 +2176,8 @@ class SteadyStateSolver:
                 out[f'Fz_{lbl}'][i] = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i] = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, float('nan'))
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, float('nan'))
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
         for k in ['understeer_gradient_deg']:
@@ -1838,7 +2211,7 @@ class SteadyStateSolver:
                 'elastic_lt_front_N', 'elastic_lt_rear_N',
                 'geometric_lt_front_N', 'geometric_lt_rear_N',
                 'understeer_gradient_deg']
-        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+        corner_keys = ['Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization']
 
         out = {'lateral_g': g_arr, 'fixed_longitudinal_g': lon_g}
         for k in keys:
@@ -1878,6 +2251,8 @@ class SteadyStateSolver:
                 out[f'Fz_{lbl}'][i] = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i] = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, float('nan'))
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, float('nan'))
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
         # Smooth understeer gradient
@@ -1929,7 +2304,7 @@ class SteadyStateSolver:
                 'elastic_lt_front_N', 'elastic_lt_rear_N',
                 'geometric_lt_front_N', 'geometric_lt_rear_N',
                 'understeer_gradient_deg']
-        corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+        corner_keys = ['Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization']
 
         out = {
             'speed_kph':      v_arr_kph,
@@ -1965,6 +2340,8 @@ class SteadyStateSolver:
                 out[f'Fz_{lbl}'][i]          = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i]      = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i]      = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, float('nan'))
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, float('nan'))
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
         # Smoothing — same convention as sweep_longitudinal_g
@@ -2010,6 +2387,9 @@ class SteadyStateSolver:
             else:
                 mu = min(float(self._tire.peak_mu(Fz_per, 0.0)),
                          float(self._tire_rear.peak_mu(Fz_per, 0.0)))
+            # THE grip scale scales mu INSIDE the fixed point (a derated tyre
+            # transfers less load onto the driven axle too), not the answer.
+            mu *= float(self._mu_scale)
             mu_eff = float(np.sqrt(max(mu * mu - ay * ay, 0.0)))
             a_new = mu_eff * frac
             if abs(a_new - a_g) < 1e-6:
@@ -2038,8 +2418,11 @@ class SteadyStateSolver:
         # LinearTireModel fallback.  No hardcoded mu literal here.
         Fz_front = W * v.front_weight_fraction / 2
         Fz_rear  = W * v.rear_weight_fraction / 2
-        mu_f = float(self._tire.peak_mu(Fz_front, 0.0))       # front tire
-        mu_r = float(self._tire_rear.peak_mu(Fz_rear,  0.0))  # rear tire
+        # Scaled by THE grip scale (self._mu_scale) — traction and braking
+        # used to read the RAW belt mu while every lateral limit was derated,
+        # so the same car was quoted on two different roads.
+        mu_f = float(self._tire.peak_mu(Fz_front, 0.0)) * float(self._mu_scale)
+        mu_r = float(self._tire_rear.peak_mu(Fz_rear,  0.0)) * float(self._mu_scale)
 
         # Traction limit (depends on driven axle) — WITH longitudinal weight
         # transfer onto the driven axle (fixed-point incl. load-sensitive μ).
@@ -2071,7 +2454,24 @@ class SteadyStateSolver:
             'braking_g': braking_g,
             'mu_front': mu_f,
             'mu_rear': mu_r,
+            'mu_scale': float(self._mu_scale),
         }
+
+    def limits_at_grip_scales(self, scales, speed_kph: float = 0.0) -> list:
+        """Traction / braking limits at each grip scale in ``scales`` (the
+        user's list, e.g. [0.7, 1.0]).  Temporarily sets THE grip scale,
+        evaluates, restores it — the SAME code path as the single-scale
+        readout, so the rows can never disagree with it."""
+        prev = self._mu_scale
+        rows = []
+        try:
+            for sc in scales:
+                self._mu_scale = float(sc)
+                d = self.max_accel_g(speed_kph=speed_kph)
+                rows.append(dict(d))
+        finally:
+            self._mu_scale = prev
+        return rows
 
     # ── Internals ────────────────────────────────────────────────────────
 
@@ -2312,6 +2712,22 @@ SENSITIVITY_KNOBS = [
 ]
 
 
+_LBF_PER_IN_IN_NPM = 175.127      # 1 lbf/in = 175.127 N/m
+
+
+def _si_to_display(value_si: float, unit: str) -> float:
+    """SI knob value -> the display unit the sensitivity table uses
+    (N/m -> lbf/in, m -> mm, fraction -> %).  One conversion for the
+    sensitivity values, current values and recommendation bounds."""
+    if unit == 'lbf/in':
+        return value_si / _LBF_PER_IN_IN_NPM
+    if unit == 'mm':
+        return value_si * 1000.0
+    if unit == '%':
+        return value_si * 100.0
+    return value_si
+
+
 def knobs_for_vehicle(veh: 'VehicleParams') -> list:
     """Topology-aware knob list (single-model): each axle exposes the spring
     elements its mechanism ACTUALLY has, instead of the generic corner-spring
@@ -2424,8 +2840,12 @@ def _ideal_ackermann_pct(result: SteadyStateResult,
         SA_inner = tire.slip_angle_for_Fy(Fy_inner, Fz_inner, camber_inner)
         SA_outer = tire.slip_angle_for_Fy(Fy_outer, Fz_outer, camber_outer)
 
-        required_steer_diff = geo_diff + (SA_inner − SA_outer)
-        ideal_ack%  = required_steer_diff / geo_diff × 100
+        required pair: d_in = geo_inner + SA_inner, d_out = geo_outer + SA_outer
+        ideal_ack%  = CANONICAL % of that pair
+                    = 100 (L/t) (cot d_out − cot d_in)     (vahan.ackermann)
+    (Astra F-08, 2026-09-22: was the linear ratio required_diff/geo_diff, a
+    different scale from the GUI readout and the YMD input; inner/outer are now
+    matched by LOAD — lighter front tyre = inner — never by label.)
     """
     if tire is None or vehicle is None or turn_radius_m is None:
         return float('nan')
@@ -2445,21 +2865,22 @@ def _ideal_ackermann_pct(result: SteadyStateResult,
     if geo_diff < 1e-9:
         return float('nan')
 
-    # We assume a left turn → FL = outer, FR = inner.
-    # (The math is symmetric; the sign convention doesn't change the
-    # Ackermann % because we use magnitudes.)
     Fy = getattr(result, 'Fy', {})
     Fz = getattr(result, 'Fz', {})
     # SIGNED tyre inclination per wheel, already mapped inner/outer by the
     # solve's own Fz split (SteadyStateResult.inclination) — no |camber|.
     incl = getattr(result, 'inclination', None) or {}
+    # Match inner/outer by LOAD (the lighter front tyre is the inner one), never
+    # by label: the solver does not share a fixed idea of turn direction.
+    _o, _i = (('FL', 'FR') if float(Fz.get('FL', 0.0)) >= float(Fz.get('FR', 0.0))
+              else ('FR', 'FL'))
 
-    Fy_outer = abs(Fy.get('FL', 0))
-    Fy_inner = abs(Fy.get('FR', 0))
-    Fz_outer = max(Fz.get('FL', 1.0), 1.0)
-    Fz_inner = max(Fz.get('FR', 1.0), 1.0)
-    cam_outer = float(incl.get('FL', 0.0))
-    cam_inner = float(incl.get('FR', 0.0))
+    Fy_outer = abs(Fy.get(_o, 0))
+    Fy_inner = abs(Fy.get(_i, 0))
+    Fz_outer = max(Fz.get(_o, 1.0), 1.0)
+    Fz_inner = max(Fz.get(_i, 1.0), 1.0)
+    cam_outer = float(incl.get(_o, 0.0))
+    cam_inner = float(incl.get(_i, 0.0))
 
     try:
         SA_outer = tire.slip_angle_for_Fy(Fy_outer, Fz_outer, cam_outer)
@@ -2467,14 +2888,12 @@ def _ideal_ackermann_pct(result: SteadyStateResult,
     except Exception:
         return float('nan')
 
-    # Convert slip angles to radians for consistent units with geo_diff
-    SA_outer_rad = np.radians(SA_outer)
-    SA_inner_rad = np.radians(SA_inner)
-
-    # The tires require this steer-angle difference (inner − outer)
-    required_diff = geo_diff + (SA_inner_rad - SA_outer_rad)
-
-    return float(required_diff / geo_diff * 100)
+    # The steer pair the tyres require, read on the CANONICAL scale (the same
+    # conversion the GUI pair readout and YMD's pair builder use).
+    from .ackermann import ackermann_pct_from_pair
+    d_in = float(np.degrees(geo_inner)) + float(SA_inner)
+    d_out = float(np.degrees(geo_outer)) + float(SA_outer)
+    return float(ackermann_pct_from_pair(d_in, d_out, t, L))
 
 
 class DynamicsSensitivity:
@@ -2501,10 +2920,29 @@ class DynamicsSensitivity:
         # }
     """
 
-    def __init__(self, vehicle: VehicleParams, solvers: dict, tire_model=None):
+    def __init__(self, vehicle: VehicleParams, solvers: dict, tire_model=None,
+                 tire_model_rear=None, mu_scale: float = 1.0):
         self._base_veh = vehicle
         self._solvers = solvers
         self._tire = tire_model
+        # Same rear tyre and the SAME grip scale as the car being analysed —
+        # the perturbed solvers used to fall back to raw mu (1.0) and the
+        # front tyre on both axles, i.e. a different car.
+        self._tire_rear = tire_model_rear
+        self._mu_scale = float(mu_scale)
+
+    @classmethod
+    def from_solver(cls, ss: 'SteadyStateSolver') -> 'DynamicsSensitivity':
+        """Sensitivity on exactly the car a SteadyStateSolver describes."""
+        return cls(ss._veh, ss._solvers, ss._tire,
+                   tire_model_rear=getattr(ss, '_tire_rear', None),
+                   mu_scale=float(getattr(ss, '_mu_scale', 1.0)))
+
+    def _make_solver(self, veh: VehicleParams) -> 'SteadyStateSolver':
+        ss = SteadyStateSolver(veh, self._solvers, self._tire,
+                               tire_model_rear=self._tire_rear)
+        ss._mu_scale = self._mu_scale
+        return ss
 
     def analyze(self, lateral_g: float = 1.2,
                 longitudinal_g: float = 0.0,
@@ -2535,7 +2973,7 @@ class DynamicsSensitivity:
                       turn_radius_m=turn_radius_m)
 
         # ── Baseline: average over samples ──────────────────────────
-        base_solver = SteadyStateSolver(self._base_veh, self._solvers, self._tire)
+        base_solver = self._make_solver(self._base_veh)
         baselines = [_extract_outputs(base_solver.solve(g, longitudinal_g), **_eo_kw)
                      for g in g_samples]
         baseline = {k: float(np.nanmean([b[k] for b in baselines]))
@@ -2555,7 +2993,7 @@ class DynamicsSensitivity:
 
             # Average perturbed outputs over the same g samples
             veh_up = self._perturb_veh(key, base_val + delta)
-            solver_up = SteadyStateSolver(veh_up, self._solvers, self._tire)
+            solver_up = self._make_solver(veh_up)
             _eo_up = dict(tire=self._tire, vehicle=veh_up,
                           turn_radius_m=turn_radius_m)
             outs_up = [_extract_outputs(solver_up.solve(g, longitudinal_g), **_eo_up)
@@ -2564,7 +3002,7 @@ class DynamicsSensitivity:
                       for k in outs_up[0]}
 
             veh_dn = self._perturb_veh(key, base_val - delta)
-            solver_dn = SteadyStateSolver(veh_dn, self._solvers, self._tire)
+            solver_dn = self._make_solver(veh_dn)
             _eo_dn = dict(tire=self._tire, vehicle=veh_dn,
                           turn_radius_m=turn_radius_m)
             outs_dn = [_extract_outputs(solver_dn.solve(g, longitudinal_g), **_eo_dn)
@@ -2573,14 +3011,7 @@ class DynamicsSensitivity:
                       for k in outs_dn[0]}
 
             # Convert delta to display units
-            if unit == 'lbf/in':
-                delta_display = delta / 175.127
-            elif unit == 'mm':
-                delta_display = delta * 1000
-            elif unit == '%':
-                delta_display = delta * 100
-            else:
-                delta_display = delta
+            delta_display = _si_to_display(delta, unit)
 
             # ∂output/∂input (per display unit)
             effects = {}
@@ -2595,14 +3026,7 @@ class DynamicsSensitivity:
                 effects[metric] = d_out / d_in if abs(d_in) > 1e-12 else 0.0
 
             # Current value in display units
-            if unit == 'lbf/in':
-                current_display = base_val / 175.127
-            elif unit == 'mm':
-                current_display = base_val * 1000
-            elif unit == '%':
-                current_display = base_val * 100
-            else:
-                current_display = base_val
+            current_display = _si_to_display(base_val, unit)
 
             impls = self._implementation_hints(key, name, unit, current_display)
 
@@ -2692,12 +3116,21 @@ class DynamicsSensitivity:
                 continue
 
             change_needed = target_delta / effect  # how much to change this knob
+            requested_change = change_needed
 
-            # Clamp to physical bounds
+            # Clamp to physical bounds.  current_value / change_needed are in
+            # DISPLAY units (lbf/in, mm, %) while _BOUNDS is SI, so convert
+            # the bounds into the row's display unit first (2026-09-22 audit:
+            # clamping display values against SI bounds turned 200 lbf/in into
+            # 1750, CG 1200 mm into 2.5 mm, brake bias 55 % into 0.85 %).
             key = s['key']
+            clamped = False
+            bounds_display = None
             if key in _BOUNDS:
-                lo, hi = _BOUNDS[key]
+                lo, hi = (_si_to_display(b, s['unit']) for b in _BOUNDS[key])
+                bounds_display = (lo, hi)
                 new_clamped = max(lo, min(hi, s['current_value'] + change_needed))
+                clamped = abs(new_clamped - (s['current_value'] + change_needed)) > 1e-9
                 change_needed = new_clamped - s['current_value']
                 if abs(change_needed) < 1e-9:
                     continue  # already at bound, skip
@@ -2728,7 +3161,15 @@ class DynamicsSensitivity:
                 'category': s['category'],
                 'current': s['current_value'],
                 'change_needed': change_needed,
+                'requested_change': requested_change,
+                'clamped': clamped,
+                'bounds': bounds_display,          # display units, or None
                 'new_value': new_val,
+                # Linear estimate of the target metric's change from the
+                # change actually recommended (after any clamp) -- NOT the
+                # requested target when the knob hit a bound.
+                'predicted_delta': effect * change_needed,
+                'target_delta': target_delta,
                 'side_effects': side_effects,
                 'implementations': impls,
                 'effectiveness': abs(effect),  # for sorting

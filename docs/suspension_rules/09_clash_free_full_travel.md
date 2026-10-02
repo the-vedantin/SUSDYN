@@ -1,5 +1,15 @@
 # Rule 09 — Clash-free across full travel
 
+## Current acceptance requirement — 2026-09-14 audit correction
+
+An inherited negative gap is not proof that a candidate is collision-free. Run
+the full available member set, rocker geometry, rim and keep-out checks through
+travel and steering, including intermediate states. Report every contact and
+near miss, together with any missing hardware envelopes. A designed mating
+interface must be identified explicitly; arbitrary attachment-length exclusions
+cannot certify unseen hardware. Baseline-relative results below are diagnostic
+history, not permission to retain a physical clash.
+
 ## The rule
 No two members may interfere at any point in the wheel-travel range. The check
 runs at full droop, static, and full bump, using the same member set the GUI
@@ -30,3 +40,11 @@ or makes an existing near-miss WORSE, not by the absolute count.
 
 ## Tolerance
 No new contact; standing near-misses may not worsen by more than 0.25 mm.
+
+## The rocker plate is a solid (2026-09-14)
+The bellcrank is the 6 mm plate the 3D view draws (pivot, drop-top tab, pushrod attach, spring attach,
+flat through the three attach points; an off-plane drop top is a stud). `vahan.interference.rocker_plate_gaps`
+measures every capsule member against that prism — the drop link and pushrod beyond their own rod ends
+(16 mm), the coilover excluded (its eye is on the plate, the spring body is a detail-design item). The
+interference view lights a member red when it passes through the plate; the regression net requires the
+drop link 3 mm clear of its plate at droop / static / bump (v106's 32° link crossed it by 1 mm at droop).

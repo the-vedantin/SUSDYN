@@ -188,17 +188,18 @@ def _ackermann_split(delta_deg, ackermann_pct, t_f, L):
     # cot(d_out) - cot(d_in) = (t_f/L)*(pct/100) EXACTLY — the kinematic
     # Ackermann relation at 100%, parallel at 0%, reverse (outer steered more)
     # when negative.  The inner wheel turns the larger angle for +pct.
-    cot_m = 1.0 / math.tan(math.radians(ad))
-    off = (t_f / (2.0 * L)) * (float(ackermann_pct) / 100.0)
-    d_in = math.degrees(math.atan2(1.0, cot_m - off))     # inner (larger @ +pct)
-    d_out = math.degrees(math.atan2(1.0, cot_m + off))    # outer (smaller @ +pct)
+    # ONE definition (Astra F-08): the canonical pct<->pair conversion lives in
+    # vahan.ackermann; the GUI readout, kinematic curve and sensitivity read
+    # pairs back with its exact inverse.
+    from .ackermann import ackermann_pair_from_pct
+    d_in, d_out = ackermann_pair_from_pct(ad, ackermann_pct, t_f, L)
     # sign/side: left turn (d >= 0) -> FL is inner; right turn -> FR is inner.
     return (d_in, d_out) if d >= 0.0 else (-d_out, -d_in)   # (FL, FR)
 
 
 def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
               radius_m=None, V_mps=None, ackermann_pct=0.0,
-              grip_multiplier=1.0, aero_Fz_per_g=None,
+              grip_multiplier=None, aero_Fz_per_g=None,
               toe_front_deg=0.0, toe_rear_deg=0.0,
               loads_table=None, max_iter=40, tol_g=1e-4, Ay0=0.0,
               include_mz=True):
@@ -226,7 +227,9 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
     """
     if (radius_m is None) == (V_mps is None):
         raise ValueError('give exactly one of radius_m or V_mps')
-    gm = min(max(float(grip_multiplier), 0.05), 1.5)
+    # None = THE project grip scale the solver carries (no private default)
+    from .dynamics import resolve_grip_scale
+    gm = min(max(resolve_grip_scale(grip_multiplier, solver), 0.05), 1.5)
     m, L, l_f, l_r, t_f, t_r = _dims(solver)
     table = loads_table if loads_table is not None else \
         build_loads_table(solver, aero_Fz_per_g)
@@ -340,7 +343,7 @@ def ymd_state(tire_model, solver, beta_deg, delta_deg, *,
 
 def trim_point(tire_model, solver, beta_deg, *,
                radius_m=None, V_mps=None, ackermann_pct=0.0,
-               grip_multiplier=1.0, aero_Fz_per_g=None, loads_table=None,
+               grip_multiplier=None, aero_Fz_per_g=None, loads_table=None,
                delta_range=None, n_scan=14):
     """Find delta where N = 0 at this beta; return that trimmed state.
 
@@ -426,7 +429,7 @@ def trim_point(tire_model, solver, beta_deg, *,
 
 def control_at_point(tire_model, solver, ackermann_list, *, radius_m=None,
                      V_mps=None, beta_deg=-1.0, delta_deg=None, lat_g=None,
-                     grip_multiplier=1.0, aero_Fz_per_g=None,
+                     grip_multiplier=None, aero_Fz_per_g=None,
                      loads_table=None, steps=(0.10, 0.25, 0.50)):
     """Control and stability derivatives at ONE COMMON operating point.
 
@@ -494,7 +497,7 @@ def control_at_point(tire_model, solver, ackermann_list, *, radius_m=None,
 
 
 def mmm_metrics(tire_model, solver, ackermann_pct, *, radius_m=None,
-                V_mps=None, grip_multiplier=1.0, aero_Fz_per_g=None,
+                V_mps=None, grip_multiplier=None, aero_Fz_per_g=None,
                 loads_table=None, control_frac=0.85):
     """The four quantities RCVD Chapter 8 reads off a CN-Ay moment diagram,
     computed the way the book defines them (docs/rcvd_ref/ch08 + ch05).
@@ -613,7 +616,7 @@ def mmm_metrics(tire_model, solver, ackermann_pct, *, radius_m=None,
 
 
 def mmm_metrics_sweep(tire_model, solver, ackermann_list, *, radius_m=None,
-                      V_mps=None, grip_multiplier=1.0, aero_Fz_per_g=None,
+                      V_mps=None, grip_multiplier=None, aero_Fz_per_g=None,
                       loads_table=None, control_frac=0.85):
     """mmm_metrics for each Ackermann setting; shares one loads table."""
     if loads_table is None:
@@ -626,7 +629,7 @@ def mmm_metrics_sweep(tire_model, solver, ackermann_list, *, radius_m=None,
 
 
 def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
-                         grip_multiplier=1.0, aero_Fz_per_g=None,
+                         grip_multiplier=None, aero_Fz_per_g=None,
                          beta_range=None, beta_step=1.5,
                          loads_table=None):
     """Daniel's criterion: for each Ackermann %, the highest trimmed (N = 0)

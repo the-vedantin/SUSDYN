@@ -14,6 +14,7 @@ Credits — powertrain model: 1dFVEngineSolver, Sun Devil Motorsports (MIT).
 from __future__ import annotations
 
 import numpy as np
+from gui.plot_dialog import ReadableCanvas
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
     QDoubleSpinBox, QPushButton, QGroupBox,
@@ -85,7 +86,7 @@ class EnginePage(QWidget):
 
         # ── plot ──────────────────────────────────────────────────────────
         self._fig = Figure(figsize=(9, 5), facecolor='#1b1b1e')
-        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas = ReadableCanvas(self._fig)
         root.addWidget(self._canvas, 1)
 
         self._status = QLabel('')
@@ -126,15 +127,18 @@ class EnginePage(QWidget):
 
     def current_curve(self):
         """(rpm[], torque[], label) for the page's current settings."""
-        import vahan.engine as VE
-        # push the VE-taper knobs (module-level defaults feed ve_target_curve)
-        VE.VE_FALL_START_RPM = float(self._vefall.value())
-        VE.VE_AT_13K = float(self._ve13.value())
-        return engine_curve(self._method.currentText(),
-                            ve_target=float(self._ve.value()),
-                            fmep_a=float(self._fa.value()),
-                            fmep_b=float(self._fb.value()),
-                            anchor_hp=float(self._anchor.value()))
+        return engine_curve(self._method.currentText(), **self._calib())
+
+    def _calib(self) -> dict:
+        """Every calibration knob on the page, passed EXPLICITLY to
+        engine_curve (the VE-taper boxes used to write module globals that
+        ve_target_curve never read — dead controls, audit item 21)."""
+        return dict(ve_target=float(self._ve.value()),
+                    ve_fall_rpm=float(self._vefall.value()),
+                    ve_13k=float(self._ve13.value()),
+                    fmep_a=float(self._fa.value()),
+                    fmep_b=float(self._fb.value()),
+                    anchor_hp=float(self._anchor.value()))
 
     # ── plotting ──────────────────────────────────────────────────────────
     def _refresh(self):
@@ -147,13 +151,7 @@ class EnginePage(QWidget):
         peak_note = ''
         for m in ('raw', 'corrected', 'anchored'):
             try:
-                import vahan.engine as VE
-                VE.VE_FALL_START_RPM = float(self._vefall.value())
-                VE.VE_AT_13K = float(self._ve13.value())
-                c = engine_curve(m, ve_target=float(self._ve.value()),
-                                 fmep_a=float(self._fa.value()),
-                                 fmep_b=float(self._fb.value()),
-                                 anchor_hp=float(self._anchor.value()))
+                c = engine_curve(m, **self._calib())
             except Exception:
                 c = None
             if c is None:

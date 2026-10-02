@@ -377,7 +377,8 @@ class TireModel:
                  sa_bin_deg: float = 0.5,
                  fz_n_bins: int = 8,
                  warmup_pts: int = 1500,
-                 pressure_psi: float = None):
+                 pressure_psi: float = None,
+                 speed_window_kph=None):
         """
         Process raw TTC data into interpolation grids.
 
@@ -401,6 +402,14 @@ class TireModel:
             never reaches it at any load, so the blend smears a real peak
             against a censored one.  None keeps every sample (the old
             behaviour) and sets `pressure_blended = True` so callers can say so.
+        speed_window_kph : (lo, hi) or None
+            SELECT ONE TEST SPEED / CONDITIONING BLOCK.  A TTC run holds
+            several speed sweeps (Round 9 run 6: 15 / 25 / 45 mph); the default
+            keeps every sample above 5 km/h, which pools speeds.  A window
+            keeps only samples with lo <= V <= hi (applied AFTER the warm-up
+            discard), e.g. (38.2, 42.2) for the 25 mph block.  Recorded as
+            `speed_window_kph`; `samples_selected` counts what survived.
+            (2026-09-15: rim-matched 7 in run-6 surface, FABLE reset.)
         """
         self.tire_id = ttc.tire_id
         self.test_id = ttc.test_id
@@ -450,9 +459,23 @@ class TireModel:
 
         # Discard warmup
         n = len(ttc.slip_angle_deg)
+        self.warmup_samples_excluded = int(max(0, min(int(warmup_pts), n)))
         keep = mask_p.copy()
         if warmup_pts < n:
             keep[:warmup_pts] = False
+        # Optional explicit speed / conditioning window (see docstring)
+        self.speed_window_kph = None
+        if speed_window_kph is not None:
+            lo_v, hi_v = (float(speed_window_kph[0]), float(speed_window_kph[1]))
+            if not (np.isfinite(lo_v) and np.isfinite(hi_v)) or hi_v <= lo_v:
+                raise ValueError(f'speed_window_kph must be (lo, hi) with hi > lo, got {speed_window_kph!r}')
+            v_all = np.asarray(ttc.velocity_kph, float)
+            keep &= (v_all >= lo_v) & (v_all <= hi_v)
+            if keep.sum() < 500:
+                raise ValueError(f'tyre file has only {int(keep.sum())} samples inside the '
+                                 f'{lo_v:.1f}-{hi_v:.1f} km/h window at {pressure_psi} psi')
+            self.speed_window_kph = (lo_v, hi_v)
+        self.samples_selected = int(keep.sum())
         sl = keep
 
         sa = ttc.slip_angle_deg[sl]
@@ -464,6 +487,7 @@ class TireModel:
         # Filter to positive velocity (exclude stationary data)
         mask_v = ttc.velocity_kph[sl] > 5.0
         sa, fz, fy, mz, ia = sa[mask_v], fz[mask_v], fy[mask_v], mz[mask_v], ia[mask_v]
+        self.samples_after_velocity_filter = int(mask_v.sum())
 
         # ── Determine grid axes ──────────────────────────────────────────
         # Camber levels (round to nearest integer).  KEEP ONLY levels with
@@ -1145,10 +1169,24 @@ class TireModel:
             'pressure_psi': round(float(self.pressure_psi), 2),
             'pressure_blended': bool(self.pressure_blended),
             'pressures_available_psi': list(self.available_pressures_psi),
+            'selection': {
+                'warmup_samples_excluded': int(self.warmup_samples_excluded),
+                'speed_window_kph': (list(self.speed_window_kph)
+                                     if self.speed_window_kph is not None else None),
+                'samples_selected_before_velocity_filter': int(self.samples_selected),
+                'samples_after_velocity_filter': int(self.samples_after_velocity_filter),
+            },
             'fz_binning': str(getattr(self, 'fz_binning', '?')),
             'fz_setpoints_N': [round(float(v)) for v in self._fz_axis],
             'sa_sweep_deg': [float(self._sa_axis[0]), float(self._sa_axis[-1])],
             'camber_levels_deg': [float(v) for v in self._camber_levels],
+            'coverage': {
+                'fz_interpolation_range_N': [round(float(self._fz_lo), 1),
+                                               round(float(self._fz_hi), 1)],
+                'measured_positive_ia_rows_deg': [float(v) for v in self._camber_levels],
+                'negative_ia_is_inferred_by_mirror_extension': True,
+                'intermediate_ia_is_interpolated_between_rows': True,
+            },
             'per_load': rows,
             'zero_slip_offset_removed_max_N': round(float(np.max(np.abs(off))), 1),
             'mf_fit_r2': round(float(self.mf_r2), 4) if self.mf_r2 == self.mf_r2

@@ -53,7 +53,7 @@ from gui.panels import (
     VehicleConstantsPanel, AnalysisPlotsPanel, DirectEditPanel,
     FrameInterferencePanel, BTN_PRIMARY, BTN_SECONDARY,
 )
-from gui.plot_dialog import PlotDialog
+from gui.plot_dialog import PlotDialog, ReadableCanvas
 from vahan.optimizer import InverseSolver, DesignVar
 from vahan.dynamics import (VehicleParams, SteadyStateSolver, SteadyStateResult,
                             DynamicsSensitivity, AeroDownforceSolver, AeroResult)
@@ -593,15 +593,61 @@ def _all_metrics(state: SolvedState, side: str,
     return out
 
 
+def _validate_project_data(data) -> None:
+    """Schema check of a .vahan project dict BEFORE it touches live state or
+    replaces a file on disk (Astra F-01).  Raises ValueError with the reason.
+    Required: the four hardpoint blocks load() indexes directly; every point a
+    3-vector of numbers.  Optional blocks, when present, must have the right
+    container type (old files that simply lack them still load)."""
+    if not isinstance(data, dict):
+        raise ValueError(f'project file is not a JSON object ({type(data).__name__})')
+
+    def _pts(key, required):
+        if key not in data:
+            if required:
+                raise ValueError(f'project file has no "{key}" block')
+            return
+        blk = data[key]
+        if blk is None and not required:
+            return
+        if not isinstance(blk, dict):
+            raise ValueError(f'"{key}" must be an object of name -> [x, y, z]')
+        for nm, v in blk.items():
+            try:
+                a = np.asarray(v, dtype=float)
+            except (TypeError, ValueError):
+                raise ValueError(f'"{key}.{nm}" is not numeric: {v!r}')
+            if a.shape != (3,):
+                raise ValueError(f'"{key}.{nm}" must be 3 numbers, got shape {a.shape}')
+
+    for k in ('front_hp', 'rear_hp', 'front_arb', 'rear_arb'):
+        _pts(k, True)
+    for k in ('front_heave', 'rear_heave', 'front_decoupled', 'rear_decoupled'):
+        _pts(k, False)
+    for k in ('car', 'steer', 'alignment', 'motion', 'panels'):
+        if k in data and data[k] is not None and not isinstance(data[k], dict):
+            raise ValueError(f'"{k}" must be an object')
+    if data.get('topology') is not None and not isinstance(data['topology'], dict):
+        raise ValueError('"topology" must be an object')
+    if data.get('topology'):
+        from vahan.topology import SuspensionTopology
+        SuspensionTopology.from_dict(data['topology'])   # raises if unusable
+    if ('imported_parts' in data and data['imported_parts'] is not None
+            and not isinstance(data['imported_parts'], list)):
+        raise ValueError('"imported_parts" must be a list')
+
+
 def _ackermann_from_pair(toe_left_deg: float, toe_right_deg: float,
                          wheelbase_m: float, front_track_m: float,
-                         inner: str = 'FL') -> float:
+                         inner: str = None) -> float:
     """
     Ackermann % from a single (FL, FR) steer pair.
 
-    Inputs are the absolute steer angles of each front wheel (deg).
+    Inputs are signed toe-in angles of each front wheel (deg).
     `inner` names the wheel nearer the turn centre and MUST come from the
-    TURN DIRECTION (the sign of the rack travel the caller commanded).
+    TURN DIRECTION. By default infer it from physical yaw (FR toe - FL toe),
+    which also handles rear-facing steering arms and inverted pinion input.
+    An explicit inner may be supplied when the caller has magnitudes only.
 
     It used to be inferred as "whichever wheel steers more" — which is
     CIRCULAR: in reverse-Ackermann geometry the OUTER wheel steers more, so
@@ -615,6 +661,11 @@ def _ackermann_from_pair(toe_left_deg: float, toe_right_deg: float,
     """
     d_L = abs(float(toe_left_deg))
     d_R = abs(float(toe_right_deg))
+    if inner is None:
+        yaw = (float(toe_right_deg) - float(toe_left_deg)) / 2.
+        if abs(yaw) < 1e-9:
+            return float('nan')
+        inner = 'FL' if yaw > 0 else 'FR'
     if np.isnan(d_L) or np.isnan(d_R):
         return float('nan')
 
@@ -632,36 +683,24 @@ def _ackermann_from_pair(toe_left_deg: float, toe_right_deg: float,
     if max(d_L, d_R) < 0.2:
         return float('nan')
 
-    avg_rad = np.radians((d_inner + d_outer) / 2.0)
-    if abs(avg_rad) < 1e-6:
-        return float('nan')
-
-    R = wheelbase_m / np.tan(avg_rad)
-    denom_inner = R - front_track_m / 2.0
-    denom_outer = R + front_track_m / 2.0
-    if abs(denom_inner) < 1e-6 or denom_outer < 1e-6:
-        return float('nan')
-
-    ideal_inner = np.degrees(np.arctan(wheelbase_m / denom_inner))
-    ideal_outer = np.degrees(np.arctan(wheelbase_m / denom_outer))
-    ideal_diff  = ideal_inner - ideal_outer
-    if abs(ideal_diff) < 1e-9:
-        return float('nan')
-
-    return (d_inner - d_outer) / ideal_diff * 100.0
+    # CANONICAL definition (vahan.ackermann.ackermann_pct_from_pair, Astra
+    # F-08 2026-09-22): 100*(L/t)*(cot d_out - cot d_in) — exact at every steer
+    # angle and the SAME conversion YMD uses to build a pair from a %.  The old
+    # readout built a radius from the MEAN angle and took a linear angle ratio,
+    # which read an exact 100 % pair as 94.8 % at 30 deg of steer.
+    from vahan.ackermann import ackermann_pct_from_pair
+    return ackermann_pct_from_pair(d_inner, d_outer, front_track_m, wheelbase_m)
 
 
 def _rack_travel_from_angle(steer_wheel_deg: float, steer_params: dict) -> float:
     """
     Rack translation in metres from steering wheel angle.
-    Clamped symmetrically by total_rack_travel_mm.
+    Clamped symmetrically by total_rack_travel_mm.  Thin wrapper over the ONE
+    conversion in vahan.steering (the IK optimiser's steer mode uses the same
+    function), fed from the project steer block — no fallback rack numbers.
     """
-    ratio    = steer_params.get('rack_travel_per_rev_mm', 60.0)
-    total    = steer_params.get('total_rack_travel_mm', 120.0)
-    half     = total / 2.0
-    travel_mm = steer_wheel_deg * ratio / 360.0
-    travel_mm = float(np.clip(travel_mm, -half, half))
-    return travel_mm / 1000.0   # -> metres
+    from vahan.steering import rack_travel_from_handwheel_deg
+    return rack_travel_from_handwheel_deg(steer_wheel_deg, steer_params)
 
 
 # ==============================================================================
@@ -847,7 +886,9 @@ class CurvesCanvas(FigureCanvas):
             ax.tick_params(colors='#777777', labelsize=8)
             for sp in ax.spines.values():
                 sp.set_edgecolor('#222222')
-            ax.set_ylabel(f'{entry["label"]}\n({entry["unit"]})',
+            metric_label = ("Camber to chassis + static alignment"
+                            if key == 'camber' else entry['label'])
+            ax.set_ylabel(f'{metric_label}\n({entry["unit"]})',
                           color='#888888', fontsize=8, labelpad=2)
             ax.set_xlabel(x_label, color='#888888', fontsize=8, labelpad=2)
             ax.grid(True, color='#1a1a1a', lw=0.5)
@@ -1125,8 +1166,24 @@ class CurvesCanvas(FigureCanvas):
             plots.append(('Suspension Travel', 'Travel (mm)', series))
 
         if 'camber' in graphs:
-            series = [(c, sweep[f'camber_{c}'], _C[c], _LS[c]) for c in corners]
-            plots.append(('Camber', 'Camber (deg)', series))
+            # Dynamics needs inclination relative to the road.  The legacy
+            # camber_{corner} arrays are chassis-relative kinematic changes.
+            # Missing road-referenced samples stay gaps rather than silently
+            # drawing the different metric as if it were ground camber.
+            series = [(c, sweep.get(f'camber_ground_{c}',
+                                   np.full_like(g_arr, np.nan, dtype=float)),
+                       _C[c], _LS[c]) for c in corners]
+            plots.append(('Camber to road', 'Camber to road (deg)', series))
+            # Camber GAIN from 0 (user 2026-09-23: "i want to see camber gain from
+            # 0, regardless of static camber"): the chassis-relative kinematic
+            # camber change the suspension produces, starting at 0 at 0 g.
+            # Negative on the outer (loaded) wheel = gaining negative camber.
+            gain = []
+            for c in corners:
+                arr = np.asarray(sweep.get(f'camber_{c}', np.full_like(g_arr, np.nan, dtype=float)), float)
+                i0 = int(np.nanargmin(np.abs(np.asarray(g_arr, float)))) if len(arr) else 0
+                gain.append((c, arr - (arr[i0] if len(arr) and np.isfinite(arr[i0]) else 0.0), _C[c], _LS[c]))
+            plots.append(('Camber gain from 0 (relative to body)', 'Camber gain (deg)', gain))
 
         # Colour-blind-safe series palettes (user confuses purple/blue and
         # red/green/orange): stick to yellow / red / white / blue + lightness.
@@ -1142,6 +1199,14 @@ class CurvesCanvas(FigureCanvas):
             plots.append(('Roll Centre Height', 'RC (mm)', [
                 ('Front', sweep['rc_height_front_mm'], '#42A5F5', '-'),
                 ('Rear', sweep['rc_height_rear_mm'], '#FFD600', '--'),
+            ]))
+
+        if 'jacking' in graphs and 'jacking_heave_front_mm' in sweep:
+            # Body rise from the side forces' vertical push through the links
+            # (+ = body UP), per axle.  Force (N) is in the result table.
+            plots.append(('Jacking: body rise from side force', 'Body rise (mm)', [
+                ('Front', sweep['jacking_heave_front_mm'], '#42A5F5', '-'),
+                ('Rear', sweep['jacking_heave_rear_mm'], '#FFD600', '--'),
             ]))
 
         if 'utilization' in graphs:
@@ -1951,8 +2016,11 @@ class _DynamicsSweepWorker(QThread):
                 'rc_height_front_mm', 'rc_height_rear_mm',
                 'elastic_lt_front_N', 'elastic_lt_rear_N',
                 'geometric_lt_front_N', 'geometric_lt_rear_N',
-                'understeer_gradient_deg']
+                'understeer_gradient_deg',
+                'jacking_force_front_N', 'jacking_force_rear_N',
+                'jacking_heave_front_mm', 'jacking_heave_rear_mm']
         corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+        road_keys = ['camber_ground', 'inclination']
 
         out = {x_key: g_arr}
         for k in keys:
@@ -1960,6 +2028,9 @@ class _DynamicsSweepWorker(QThread):
         for ck in corner_keys:
             for lbl in ['FL', 'FR', 'RL', 'RR']:
                 out[f'{ck}_{lbl}'] = _np.zeros(self._n)
+        for ck in road_keys:
+            for lbl in ['FL', 'FR', 'RL', 'RR']:
+                out[f'{ck}_{lbl}'] = _np.full(self._n, _np.nan)
 
         self._solver._warm = {}
         for i, gv in enumerate(g_arr):
@@ -1983,10 +2054,16 @@ class _DynamicsSweepWorker(QThread):
             out['geometric_lt_front_N'][i] = r.geometric_lt_front_N
             out['geometric_lt_rear_N'][i] = r.geometric_lt_rear_N
             out['understeer_gradient_deg'][i] = r.understeer_gradient_deg
+            out['jacking_force_front_N'][i] = r.jacking_force_front_N
+            out['jacking_force_rear_N'][i] = r.jacking_force_rear_N
+            out['jacking_heave_front_mm'][i] = r.jacking_heave_front_mm
+            out['jacking_heave_rear_mm'][i] = r.jacking_heave_rear_mm
             for lbl in ['FL', 'FR', 'RL', 'RR']:
                 out[f'Fz_{lbl}'][i] = r.Fz.get(lbl, 0)
                 out[f'travel_{lbl}'][i] = r.travel.get(lbl, 0)
                 out[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
+                out[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, _np.nan)
+                out[f'inclination_{lbl}'][i] = r.inclination.get(lbl, _np.nan)
                 out[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
 
         # Smooth
@@ -2135,12 +2212,16 @@ class _ReportWorker(QThread):
                         'geometric_lt_front_N', 'geometric_lt_rear_N',
                         'understeer_gradient_deg']
                 corner_keys = ['Fz', 'travel', 'camber', 'utilization']
+                road_keys = ['camber_ground', 'inclination']
                 dyn_corn = {'lateral_g': g_arr}
                 for k in keys:
                     dyn_corn[k] = _np.zeros(n_pts)
                 for ck in corner_keys:
                     for lbl in ['FL', 'FR', 'RL', 'RR']:
                         dyn_corn[f'{ck}_{lbl}'] = _np.zeros(n_pts)
+                for ck in road_keys:
+                    for lbl in ['FL', 'FR', 'RL', 'RR']:
+                        dyn_corn[f'{ck}_{lbl}'] = _np.full(n_pts, _np.nan)
                 self._solver._warm = {}
                 for i, lg in enumerate(g_arr):
                     aero_at_g = {k: v * abs(lg) for k, v in aero_per_g.items()}
@@ -2158,6 +2239,8 @@ class _ReportWorker(QThread):
                         dyn_corn[f'Fz_{lbl}'][i] = r.Fz.get(lbl, 0)
                         dyn_corn[f'travel_{lbl}'][i] = r.travel.get(lbl, 0)
                         dyn_corn[f'camber_{lbl}'][i] = r.camber.get(lbl, 0)
+                        dyn_corn[f'camber_ground_{lbl}'][i] = r.camber_ground.get(lbl, _np.nan)
+                        dyn_corn[f'inclination_{lbl}'][i] = r.inclination.get(lbl, _np.nan)
                         dyn_corn[f'utilization_{lbl}'][i] = r.utilization.get(lbl, 0)
             else:
                 dyn_corn = self._solver.sweep_lateral_g(
@@ -2252,9 +2335,14 @@ class MainWindow(QMainWindow):
                            # Track-change behaviour: False (default) shifts
                            # only outboard pickups + wheel; True also shifts
                            # inboard chassis pickups so arms keep length.
-                           'track_pushes_inboard': False}
+                           'track_pushes_inboard': False,
+                           # FSAE chassis bays (vahan.chassis): ON for a NEW
+                           # project; a loaded file without the key is OFF.
+                           'fsae_chassis': {'enabled': True, 'node_offset_mm': 38.1,
+                                            'tube_od_mm': 25.4,
+                                            'diagonal_front': 'auto', 'diagonal_rear': 'auto'}}
         self._steer     = {'rack_travel_per_rev_mm': 60.,
-                           'total_rack_travel_mm': 100.}
+                           'total_rack_travel_mm': 100., 'rack_direction': 1}
         self._selected_keys    = list(DEFAULT_Y_KEYS)
         self._selected_corners = ['FL', 'FR', 'RL', 'RR']
         self._solvers: dict[str, SuspensionConstraints] = {}
@@ -2313,6 +2401,7 @@ class MainWindow(QMainWindow):
         self._update_3d()
         self._try_autoload_tire()
         self._update_min_turn_radius()
+        self._wire_grip_scale_mirrors()
         # (aero geom feeds solver only, no 3D visuals to push)
 
     # ==========================================================================
@@ -2341,6 +2430,11 @@ class MainWindow(QMainWindow):
             'Generate a Vehicle Dynamics Report (.docx) with all graphs and '
             'auto-analysis — opens and edits cleanly in Google Docs')
         export_rpt_act.triggered.connect(self._export_report)
+        review_act = fm.addAction('Engineering Review…')
+        review_act.setToolTip(
+            'Show a concise, presentation-ready review of the active redesign '
+            'and export it as Markdown for the binder.')
+        review_act.triggered.connect(self._show_engineering_review)
         export_csv_act = fm.addAction('Export Sweep Data (CSV)…')
         export_csv_act.setToolTip(
             'Write the current kinematic sweep (every metric, all 4 corners) '
@@ -2388,10 +2482,246 @@ class MainWindow(QMainWindow):
                            'validated (rates, geometric laws, full-travel '
                            'clash sweep).')
         pkg_act.triggered.connect(lambda: self._switch_page(6))
+        ride_act = pm.addAction('Ride')
+        ride_act.setShortcut('Ctrl+8')
+        ride_act.setToolTip('Ride: ISO 8608 road-model response of the solved car '
+                            '(7-DOF) and THE RIDE-RATE SOLVE — sweep front x rear '
+                            'ride rate, minimise worst-corner tire-load variation '
+                            'within travel + flat-ride limits, convert to springs.')
+        ride_act.triggered.connect(lambda: self._switch_page(7))
+        cs_act = pm.addAction('Corner Speed')
+        cs_act.setShortcut('Ctrl+9')
+        cs_act.setToolTip('Corner speed: the tightest corner the car can hold at '
+                          'each speed (trimmed yaw-moment engine, with and '
+                          'without aero, steering-lock radius marked) and the '
+                          'per-corner grip budget — the first g at which ANY '
+                          'tyre is out of budget.')
+        cs_act.triggered.connect(lambda: self._switch_page(8))
+        br_act = pm.addAction('Bearings')
+        br_act.setShortcut('Ctrl+0')
+        br_act.setToolTip('Control-arm spherical bearings: the SKF plain-bearing '
+                          'calculator inputs (radial/axial kN, oscillation time, '
+                          'half angle, load direction) per inboard pickup and load '
+                          'case, for the bore normal to the arm plane and along '
+                          'the pickup line.')
+        br_act.triggered.connect(lambda: self._switch_page(9))
+        bt_act = pm.addAction('Build Tolerance')
+        bt_act.setShortcut('Ctrl+Shift+1')
+        bt_act.setToolTip('Aero heave (heave, ride height and pitch vs speed) and the CG '
+                          'build tolerance: how far the built CG may sit from the design '
+                          'CG (height, front-rear) before the car stops behaving as designed.')
+        bt_act.triggered.connect(lambda: self._switch_page(10))
 
         vm = mb.addMenu('View')
         hp_act = vm.addAction('All Hardpoints…')
         hp_act.triggered.connect(self._show_all_hardpoints)
+        # Per-file show / hide for imported STEP solids + the keep-out zone
+        # (user 2026-09-19).  Rebuilt whenever the imported-part list changes.
+        self._step_parts_menu = vm.addMenu('STEP parts (show / hide)')
+        self._rebuild_step_parts_menu()
+        manage_act = vm.addAction('Manage STEP parts...')
+        manage_act.setToolTip('Show / hide, move, flip, recolour, rename or remove imported STEP solids')
+        manage_act.triggered.connect(self._import_step_dialog)
+        vm.addSeparator()
+        # FSAE chassis bays (user 2026-09-23): frame tubes around each corner's
+        # inboard pickups as clash bodies — drawn AND checked (one member set).
+        self._fsae_act = vm.addAction('FSAE chassis bays (frame tubes as clash bodies)')
+        self._fsae_act.setCheckable(True)
+        self._fsae_act.setToolTip(
+            'Frame tubes around each corner\'s inboard pickups, drawn and clash-checked.\n'
+            'Each chassis node = the arm leg (ball joint -> inboard pickup) continued\n'
+            '1.5 in (settable) past the pickup toward the car centre; that point is the\n'
+            'tube centre.  Tubes: UCA front-rear, LCA front-rear, front UCA-LCA, rear\n'
+            'UCA-LCA, plus one diagonal.  Replaces the pickup-to-pickup chassis stand-ins.')
+        self._fsae_act.toggled.connect(self._fsae_set_enabled)
+        fsae_set_act = vm.addAction('FSAE chassis settings...')
+        fsae_set_act.setToolTip('Node offset, tube OD and which diagonal the front and the rear '
+                                'bays use, chosen per axle (auto = the one with more clearance '
+                                'over full travel and steering)')
+        fsae_set_act.triggered.connect(self._fsae_settings_dialog)
+        self._fsae_sync_menu()
+
+        hm = mb.addMenu('Help')
+        tasks_act = hm.addAction('Task list...')
+        tasks_act.setToolTip('Open docs/GUI_TASKS.md: features promised for later, tick them off here')
+        tasks_act.triggered.connect(self._show_task_list)
+
+    # ── FSAE chassis bays (vahan.chassis) ────────────────────────────────────
+    def _fsae_sync_menu(self):
+        """Tick the View-menu toggle from the car dict (absent key = OFF)."""
+        act = getattr(self, '_fsae_act', None)
+        if act is None:
+            return
+        from vahan import chassis as _fsae
+        try:
+            on = _fsae.settings(self._car) is not None
+        except ValueError:
+            on = False
+        act.blockSignals(True); act.setChecked(on); act.blockSignals(False)
+
+    def _fsae_set_enabled(self, on: bool):
+        from vahan import chassis as _fsae
+        cur = dict(self._car.get('fsae_chassis') or _fsae.default_settings(False))
+        try:        # normalise (a legacy single 'diagonal' key becomes the per-axle keys)
+            cur = _fsae.normalise(cur)
+        except ValueError:
+            cur = _fsae.default_settings(False)
+        cur['enabled'] = bool(on)
+        self._car['fsae_chassis'] = cur
+        self._fsae_after_settings_change()
+
+    def _fsae_after_settings_change(self):
+        """Settings changed: drop the cached auto choice, resolve it now when
+        auto (so the view never shows an unresolved diagonal), redraw."""
+        from vahan import chassis as _fsae
+        from vahan import packaging as _pk
+        self._fsae_chassis_cache = None
+        self._fsae_sync_menu()
+        try:
+            s = _fsae.settings(self._car)
+        except ValueError as exc:
+            QMessageBox.warning(self, 'FSAE chassis', str(exc)); return
+        if _fsae.any_auto(s) and self._solvers:      # any axle on 'auto'
+            self._fsae_resolve_now()
+        self._update_3d()
+
+    def _fsae_resolve_now(self):
+        from vahan import packaging as _pk
+        from PyQt6.QtWidgets import QApplication as _QA
+        _QA.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            res = _pk.fsae_resolve_diagonals(self)
+        except Exception as exc:
+            self.statusBar().showMessage(f'FSAE chassis: auto diagonal not resolved ({exc})', 8000)
+            return None
+        finally:
+            _QA.restoreOverrideCursor()
+        self.statusBar().showMessage(self._fsae_summary_text(res), 10000)
+        return res
+
+    def _fsae_summary_text(self, res) -> str:
+        """One line per axle: the diagonal in use (auto pick with its tightest
+        gap, or the explicit per-axle choice)."""
+        from vahan import chassis as _fsae
+        try:
+            s = _fsae.settings(self._car)
+        except ValueError:
+            s = None
+        parts = []
+        for axle in ('front', 'rear'):
+            chosen = _fsae.diagonal_setting(s, axle) if s else 'auto'
+            if chosen in _fsae.EXPLICIT_DIAGONALS:
+                parts.append(f'{axle}: {_fsae.DIAGONAL_LABELS[chosen]} (set)')
+                continue
+            d = (res or {}).get(axle)
+            g = ((res or {}).get('gaps', {}).get(axle, {}).get(d) or {}).get('gap_mm')
+            parts.append(f'{axle}: auto = {_fsae.DIAGONAL_LABELS.get(d, d)}'
+                         + (f' (tightest {g:.1f} mm)' if g is not None else ''))
+        return 'FSAE chassis diagonal — ' + '; '.join(parts)
+
+    def _fsae_schedule_auto_resolve(self):
+        """Hardpoints changed with 'auto' on: re-pick the diagonal once edits
+        settle (1.5 s idle), never during a drag.  Audits always re-pick first."""
+        from vahan import packaging as _pk
+        if not _pk.fsae_auto_is_stale(self):
+            return
+        t = getattr(self, '_fsae_timer', None)
+        if t is None:
+            t = QTimer(self); t.setSingleShot(True); t.setInterval(1500)
+            t.timeout.connect(self._fsae_auto_resolve_timeout)
+            self._fsae_timer = t
+        t.start()
+
+    def _fsae_auto_resolve_timeout(self):
+        from vahan import packaging as _pk
+        if not self._solvers or not _pk.fsae_auto_is_stale(self):
+            return
+        old = dict(getattr(self, '_fsae_chassis_cache', None) or {})
+        res = self._fsae_resolve_now()
+        if res and (res.get('front'), res.get('rear')) != (old.get('front'), old.get('rear')):
+            self._update_3d()
+
+    def _fsae_settings_dialog(self):
+        from PyQt6.QtWidgets import (QDialog, QFormLayout, QDoubleSpinBox, QComboBox,
+                                     QCheckBox, QDialogButtonBox, QLabel, QVBoxLayout)
+        from vahan import chassis as _fsae
+        cur = dict(_fsae.DEFAULTS)
+        cur['enabled'] = False
+        cur.update(self._car.get('fsae_chassis') or {})
+        dlg = QDialog(self); dlg.setWindowTitle('FSAE chassis bays')
+        lay = QVBoxLayout(dlg); form = QFormLayout(); lay.addLayout(form)
+        en = QCheckBox('Frame tubes are clash bodies (and drawn)'); en.setChecked(bool(cur['enabled']))
+        en.setToolTip('OFF = the old pickup-to-pickup chassis stand-ins, exactly as before.')
+        off = QDoubleSpinBox(); off.setRange(0.0, 200.0); off.setDecimals(1); off.setSuffix(' mm')
+        off.setValue(float(cur['node_offset_mm']))
+        off.setToolTip('Where the chassis node (tube centre) sits: the arm leg line from the\n'
+                       'ball joint through the inboard pickup, continued this far PAST the\n'
+                       'pickup toward the car centre.  38.1 mm = 1.5 in.')
+        od = QDoubleSpinBox(); od.setRange(5.0, 80.0); od.setDecimals(1); od.setSuffix(' mm')
+        od.setValue(float(cur['tube_od_mm']))
+        od.setToolTip('Outside diameter of every chassis-bay tube.  25.4 mm = 1 in.')
+        # one diagonal combo PER AXLE (user 2026-09-23); a legacy single
+        # 'diagonal' key in the file seeds both (vahan.chassis.settings)
+        try:
+            seed = _fsae.normalise(cur)
+        except ValueError:
+            seed = dict(_fsae.DEFAULTS)
+        combos = {}
+        for axle in ('front', 'rear'):
+            dg = QComboBox()
+            for key in _fsae.DIAGONALS:
+                dg.addItem(_fsae.DIAGONAL_LABELS[key], key)
+            chosen = seed[_fsae.DIAGONAL_KEYS[axle]]
+            dg.setCurrentIndex(max(0, list(_fsae.DIAGONALS).index(chosen)
+                                    if chosen in _fsae.DIAGONALS else 0))
+            dg.setToolTip(f'The ONE diagonal of each {axle} bay (left and right are mirrored).\n'
+                          'Auto keeps the one whose tightest gap to every moving member\n'
+                          '(droop to bump, lock to lock) is larger.')
+            combos[axle] = dg
+        # transverse tubes (left node <-> mirrored right node, one per inboard
+        # pickup): rear ON by default (user/chassis 2026-09-23), front OFF
+        trans = {}
+        for axle in ('front', 'rear'):
+            cb = QCheckBox('Transverse tubes: each node to its mirrored node across the car')
+            cb.setChecked(bool(seed[_fsae.TRANSVERSE_KEYS[axle]]))
+            cb.setToolTip(f'{axle.capitalize()} bays: one tube per inboard control-arm point (UCA front,\n'
+                          'UCA rear, LCA front, LCA rear) from the left node straight across to the\n'
+                          'right node, same OD and node rule.  Checked once against the chassis-fixed\n'
+                          'sprocket disc (imported STEP) and the diff housing in the audits.')
+            trans[axle] = cb
+        form.addRow(en)
+        form.addRow('Node distance past the pickup', off)
+        form.addRow('Tube outside diameter', od)
+        form.addRow('Front bay diagonal', combos['front'])
+        form.addRow('Front bays', trans['front'])
+        form.addRow('Rear bay diagonal', combos['rear'])
+        form.addRow('Rear bays', trans['rear'])
+        cache = getattr(self, '_fsae_chassis_cache', None)
+        info = QLabel(self._fsae_summary_text(cache) if cache else
+                      'Auto diagonal: not evaluated yet (evaluated when you press OK).')
+        info.setWordWrap(True); lay.addWidget(info)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject); lay.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._car['fsae_chassis'] = {'enabled': en.isChecked(),
+                                     'node_offset_mm': float(off.value()),
+                                     'tube_od_mm': float(od.value()),
+                                     'diagonal_front': combos['front'].currentData(),
+                                     'diagonal_rear': combos['rear'].currentData(),
+                                     'transverse_front': trans['front'].isChecked(),
+                                     'transverse_rear': trans['rear'].isChecked()}
+        self._fsae_after_settings_change()
+
+    def _show_task_list(self):
+        """Help -> Task list: docs/GUI_TASKS.md as a checklist (ticks are written back)."""
+        from gui.task_list_dialog import TaskListDialog
+        dlg = getattr(self, '_task_dialog', None)
+        if dlg is None:
+            dlg = TaskListDialog(self)
+            self._task_dialog = dlg
+        dlg.reload(); dlg.show(); dlg.raise_(); dlg.activateWindow()
 
     def _change_topology_dialog(self):
         """Open a small dialog with just the per-axle topology pickers,
@@ -2488,12 +2818,47 @@ class MainWindow(QMainWindow):
             raise
 
     def _save_project_to_path(self, path: str):
-        """Serialise the whole project to `path`.
+        """Serialise the whole project to `path` ATOMICALLY.
 
         Split out of `_save_project` so the save path can be exercised
         headlessly by the regression net — it was welded to the file dialog,
         which is exactly why a crash in it went unnoticed.
+
+        ATOMIC (Astra F-01, 2026-09-22).  The old code opened `path` with 'w'
+        (truncating the user's accepted file) BEFORE json.dump, so any
+        serialisation error left a half-written, invalid project on disk.  Now:
+        serialise to a string, validate it, write + fsync a sibling temp file,
+        re-read and validate THAT, then os.replace() it over `path`.  Any
+        failure raises and leaves the previous file byte-for-byte intact (the
+        temp file is removed).
         """
+        import os as _os, tempfile as _tempfile
+        data = self._project_to_dict()
+        text = json.dumps(data, indent=2)          # raises before any file is touched
+        _validate_project_data(json.loads(text))
+        _dir = _os.path.dirname(_os.path.abspath(path)) or '.'
+        fd, tmp = _tempfile.mkstemp(prefix='.' + _os.path.basename(path) + '.',
+                                    suffix='.tmp', dir=_dir)
+        try:
+            with _os.fdopen(fd, 'w') as f:
+                f.write(text)
+                f.flush()
+                _os.fsync(f.fileno())
+            with open(tmp) as f:                   # what is on disk, not in memory
+                _validate_project_data(json.load(f))
+            _os.replace(tmp, path)
+        except BaseException:
+            try:
+                _os.remove(tmp)
+            except OSError:
+                pass
+            raise
+        self.statusBar().showMessage(
+            f'Saved all hardpoints (FL/RL + ARB) + vehicle params + panel state: {path}', 5000)
+
+    def _project_to_dict(self) -> dict:
+        """The whole project as one JSON-able dict (the .vahan schema).  The ONE
+        serialiser: save writes it, a load snapshots it for rollback."""
         mp = self._motion_panel
         # version 2: every panel input is captured under "panels" so the
         # full state of the dynamics / transient / loads / aero pages
@@ -2533,11 +2898,10 @@ class MainWindow(QMainWindow):
             # Imported STEP solids (diff / engine) — base64 mesh blobs so the
             # clearance geometry travels with the project.
             'imported_parts': self._imported_parts_to_json(),
+            # Drawn-hardpoint backup from the last "Apply Sag" (for "Reset sag")
+            'sag_backup': getattr(self, '_sag_backup', None),
         }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
-        self.statusBar().showMessage(
-            f'Saved all hardpoints (FL/RL + ARB) + vehicle params + panel state: {path}', 5000)
+        return data
 
     def _load_project(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -3153,9 +3517,17 @@ class MainWindow(QMainWindow):
                 wf_frac = (1.0 - out.get('cg_to_front_axle_m', 0.845)
                                   / out.get('wheelbase_m', 1.530))
                 if suffix == 'front':
-                    corner_load_N = m_total * 9.81 * wf_frac / 2.0
+                    supported_mass = (m_total * wf_frac
+                                      - out.get('unsprung_mass_front_kg', 0.0)) / 2.0
                 else:
-                    corner_load_N = m_total * 9.81 * (1 - wf_frac) / 2.0
+                    supported_mass = (m_total * (1 - wf_frac)
+                                      - out.get('unsprung_mass_rear_kg', 0.0)) / 2.0
+                # The spring supports sprung mass. The tyre supports the
+                # additional unsprung weight; including that in Fs inflates
+                # the geometric contribution to incremental wheel stiffness.
+                if supported_mass <= 0.0:
+                    continue
+                corner_load_N = supported_mass * 9.81
                 Fs = corner_load_N / mr_0
                 out[f'mr_slope_{suffix}_per_m'] = float(mr_slope)
                 out[f'static_spring_force_{suffix}_N'] = float(Fs)
@@ -3278,15 +3650,58 @@ class MainWindow(QMainWindow):
             pass
 
     def _load_project_from_path(self, path: str):
-        """Programmatic load (also used by the startup wizard).  Raises on error."""
+        """Programmatic load (also used by the startup wizard).  Raises on error.
+
+        TRANSACTIONAL (Astra F-01, 2026-09-22).  The old load mutated the motion
+        bounds and front hardpoints before it had even checked the rest of the
+        file, so a file missing `rear_hp` (or any exception part-way through)
+        left the live window half old / half new.  Now: parse and schema-check
+        the file into a candidate FIRST (nothing live is touched if that fails);
+        snapshot the live project with the same serialiser Save uses; apply; on
+        ANY exception restore the snapshot and re-raise.
+        """
+        import copy as _copy
         with open(path) as f:
             data = json.load(f)
+        _validate_project_data(data)               # candidate check — no mutation yet
+        try:
+            _snap = (_copy.deepcopy(self._project_to_dict()),
+                     _copy.deepcopy(dict(self._car)),
+                     set(getattr(self, '_car_file_keys', ()) or ()),
+                     getattr(self, '_project_loaded', False))
+        except Exception:
+            _snap = None                           # nothing coherent to roll back to yet
+        try:
+            self._apply_project_data(data, path)
+        except Exception:
+            if _snap is not None:
+                _pd, _car0, _keys0, _loaded0 = _snap
+                try:
+                    self._car.clear(); self._car.update(_copy.deepcopy(_car0))
+                    self._car_file_keys = set(_keys0)
+                    self._apply_project_data(_copy.deepcopy(_pd), '(previous project restored)')
+                    self._car.clear(); self._car.update(_copy.deepcopy(_car0))
+                    self._car_file_keys = set(_keys0)
+                    self._project_loaded = _loaded0
+                    self.statusBar().showMessage(
+                        f'Load FAILED — previous project restored: {path}', 0)
+                except Exception as _e2:
+                    print(f'[load] rollback after a failed load ALSO failed: '
+                          f'{type(_e2).__name__}: {_e2}', file=sys.stderr)
+            raise
+
+    def _apply_project_data(self, data: dict, path: str):
+        """Mutate the live window to the (already validated) project `data`."""
+        # Restore explicit motion bounds before any load-time sweep or sag
+        # refresh can replace them with an approximate MR-derived range.
+        self._motion_panel.restore_project_state(data.get('motion', {}))
 
         def _arr(d, key):
             return {k: np.array(v, float) for k, v in d[key].items()}
 
         self._front_hp  = _arr(data, 'front_hp')
         self._rear_hp   = _arr(data, 'rear_hp')
+        self._sag_backup = data.get('sag_backup') or None
         self._front_arb = _arr(data, 'front_arb')
         self._rear_arb  = _arr(data, 'rear_arb')
 
@@ -3331,11 +3746,54 @@ class MainWindow(QMainWindow):
         car_data.setdefault('driveshaft_dia_mm', 25.4)
         car_data.setdefault('rotor_dia_mm', 240.0)
         car_data.setdefault('show_driveshaft', True)
-        car_data.setdefault('show_diff_body', True)
+        car_data.setdefault('show_diff_body', False)
         car_data.setdefault('show_brakes', True)
         car_data.setdefault('show_shock_thickness', True)
+        # Per-project DECLARATIONS must never leak from the previously loaded
+        # project into this one (2026-09-14: a stale front_arb_drop_standoff_mm /
+        # front_arb_rule04_waiver carried across loads made the regression net
+        # judge v106 with v105's spacer).  Drop every key the last file declared
+        # and every known declaration key that this file does not define.
+        _declared = set(getattr(self, '_car_file_keys', ())) | {
+            'keepout_step', 'front_arb_drop_standoff_mm', 'rear_arb_drop_standoff_mm',
+            'front_arb_rule04_waiver', 'rear_arb_rule04_waiver', 'steering_stop_note',
+            'tire_speed_window_kph', 'tire_warmup_samples', 'fable_candidate_status', 'fable_candidate_note',
+            # FSAE chassis bays: a file WITHOUT the key is OFF (the new-project default is ON)
+            'fsae_chassis'}
+        for _k in _declared:
+            if _k not in car_data:
+                self._car.pop(_k, None)
+        self._car_file_keys = set(car_data.keys())
         self._car.update(car_data)
+        self._fsae_chassis_cache = None
+        self._fsae_sync_menu()
+        # A project-declared TTC speed window / warm-up count reaches the tyre
+        # model through _try_autoload_tire() below: it re-selects the project's
+        # own tire_file and _on_tire_file applies _tire_selection_kwargs().  Do
+        # NOT reload the panel's CURRENT tyre here — that overwrote
+        # car['tire_file'] with whatever sorted first before the project's
+        # choice was honoured (2026-09-15 round-trip test).
+        # The saved hardpoints are the geometry.  If the file's rack-length setting
+        # disagrees with its own tie_rod_inner X, the hardpoints win — otherwise the
+        # next car-panel signal re-places the rack end at the stale width and the
+        # front bump steer explodes (2026-09-11: v102 shown with a 1.5 deg toe swing).
+        try:
+            _tri = np.asarray(self._front_hp.get('tie_rod_inner'), float)
+            _w_hp = 2000.0 * abs(float(_tri[0]))
+            if abs(_w_hp - float(self._car.get('rack_length_mm', _w_hp))) > 0.05:
+                self._car['rack_length_mm'] = _w_hp
+        except Exception:
+            pass
+        # Chassis keep-out solid named by the project (Rule 18): draw it so the
+        # red zone is visible in the 3D view; the net gates members against it.
+        try:
+            from vahan.keepout import keepout_for_window as _kofw
+            _ko = _kofw(self)
+            self.view3d.set_keepout(_ko.faces if _ko is not None else None)
+        except Exception:
+            pass
         self._steer.update(data.get('steer', {}))
+        self._steer['rack_direction'] = data.get('steer', {}).get('rack_direction', 1)
         # Push the loaded rack numbers INTO the panel.  Without this the panel
         # showed its constructor defaults forever while the solver used the
         # saved values — and the first spinbox touch overwrote the saved ones.
@@ -3413,6 +3871,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._rebuild_solvers()
+        # Lock values (max steer angle, steering ratio, lock handwheel angle,
+        # min turn radius) come from THIS project's steer block + front
+        # geometry.  Loading used to skip this, so the Dynamics panel kept the
+        # startup car's 47.0 deg / 6.38 until a steering or car edit.
+        self._update_min_turn_radius()
+        # The Dynamics panel's set_state loaded the project grip scale with
+        # signals blocked — push it to every mirror box.
+        self._wire_grip_scale_mirrors()
         self._run_sweep()
         self._update_3d()
         # Sag now drives the travel-slider limits, so refresh it on load —
@@ -3485,10 +3951,61 @@ class MainWindow(QMainWindow):
         colourblind-safe grey/amber)."""
         payload = []
         for i, p in enumerate(self._imported_parts):
-            payload.append((p['verts'], p['faces'],
-                            self._IMPORTED_PART_COLOURS[i % len(self._IMPORTED_PART_COLOURS)]))
+            if not p.get('visible', True):          # hidden via View → STEP parts
+                continue
+            rgba = list(p.get('rgba') or self._IMPORTED_PART_COLOURS[i % len(self._IMPORTED_PART_COLOURS)])
+            rgba[3] = float(p.get('opacity', rgba[3]))
+            payload.append((p['verts'], p['faces'], tuple(rgba)))
         try:
             self.view3d.set_imported_parts(payload)
+        except Exception:
+            pass
+        self._rebuild_step_parts_menu()
+
+    def _rebuild_step_parts_menu(self):
+        """View → STEP parts: one checkable entry per imported STEP file plus the
+        bulkhead keep-out zone.  Toggling hides / shows that solid only; the
+        state is saved in the .vahan ('visible' per part)."""
+        menu = getattr(self, '_step_parts_menu', None)
+        if menu is None:
+            return
+        menu.clear()
+        parts = getattr(self, '_imported_parts', None) or []
+        if not parts:
+            a = menu.addAction('(no STEP parts imported — File → Import STEP)')
+            a.setEnabled(False)
+        for idx, p in enumerate(parts):
+            act = menu.addAction(str(p.get('name', f'part {idx + 1}')))
+            act.setCheckable(True)
+            act.setChecked(bool(p.get('visible', True)))
+            act.setToolTip('Show / hide this imported STEP solid in the 3-D view')
+            act.toggled.connect(lambda on, i=idx: self._set_step_part_visible(i, on))
+        menu.addSeparator()
+        ko = menu.addAction('Bulkhead keep-out zone (red)')
+        ko.setCheckable(True)
+        v3d = getattr(self, 'view3d', None)          # menu is built before the 3-D view
+        km = getattr(v3d, '_keepout_mesh', None) if v3d is not None else None
+        car = getattr(self, '_car', {}) or {}
+        ko.setChecked(bool(km.visible) if km is not None else bool(car.get('keepout_step')))
+        ko.setEnabled(bool(car.get('keepout_step')))
+        ko.toggled.connect(self._set_keepout_visible)
+
+    def _set_step_part_visible(self, idx: int, on: bool):
+        if 0 <= idx < len(self._imported_parts):
+            self._imported_parts[idx]['visible'] = bool(on)
+            self._push_imported_parts_to_view()
+            self.statusBar().showMessage(
+                f"{'Showing' if on else 'Hid'} STEP part "
+                f"'{self._imported_parts[idx].get('name', idx)}'", 3000)
+
+    def _set_keepout_visible(self, on: bool):
+        v = self.view3d
+        for attr in ('_keepout_mesh', '_keepout_edges'):
+            m = getattr(v, attr, None)
+            if m is not None:
+                m.visible = bool(on)
+        try:
+            v._canvas.update()
         except Exception:
             pass
 
@@ -3501,7 +4018,10 @@ class MainWindow(QMainWindow):
                    'source': p.get('source', 'onshape'),
                    'offset': list(p.get('offset', (0., 0., 0.))),
                    'flip': bool(p.get('flip', False)),
-                   'src_path': p.get('src_path', '')}
+                   'src_path': p.get('src_path', ''),
+                   'visible': bool(p.get('visible', True)),
+                   'rgba': [float(x) for x in p['rgba']] if p.get('rgba') else None,
+                   'opacity': float(p.get('opacity', 0.55))}
             rec.update(pack_mesh(p['verts'], p['faces']))
             out.append(rec)
         return out
@@ -3524,6 +4044,8 @@ class MainWindow(QMainWindow):
                           'offset': list(b.get('offset', (0., 0., 0.))),
                           'flip': bool(b.get('flip', False)),
                           'src_path': b.get('src_path', ''),
+                          'visible': bool(b.get('visible', True)),
+                          'rgba': b.get('rgba'), 'opacity': float(b.get('opacity', 0.55)),
                           'verts': v, 'faces': f, 'info': info})
         return parts
 
@@ -3751,6 +4273,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 return None
 
+        # Car CG (mm, car frame) — the same point the 3D view's CG sphere draws
+        # (car dict cg_x/y/z_mm, which the dynamics model also reads).
+        def _cg_mm():
+            return np.array([float(self._car.get('cg_x_mm', 0.)),
+                             float(self._car.get('cg_y_mm', 845.)),
+                             float(self._car.get('cg_z_mm', 280.))])
+
         # Copy CSV for FeatureScript paste (hardpoints + driveshaft points)
         onshape_btn = QPushButton('Copy for Onshape')
         onshape_btn.setStyleSheet(_btn_purple)
@@ -3758,6 +4287,10 @@ class MainWindow(QMainWindow):
                                'FeatureScript (now includes diff centre + tripods)')
         def _copy_onshape():
             csv_lines = []
+            # Assembly ORIGIN (0,0,0) as a fixed datum row so the CAD import has
+            # an explicit anchor point (user 2026-09-17).  Same (0,0,0) in every
+            # corner column — the global origin is corner-independent.
+            csv_lines.append('origin,' + ','.join(['0', '0', '0'] * len(corners)))
             for name in names:
                 vals = []
                 for label, hp_dict in corners:
@@ -3817,7 +4350,7 @@ class MainWindow(QMainWindow):
         # the SolidWorks axis system (Y UP).  Vahan is Z-up (X lateral, Y
         # forward, Z up); SolidWorks default is Y-up, so each point's Y and Z
         # are swapped -> SW gets (X, Z, Y) = (lateral, up, forward).
-        sw_btn = QPushButton('Copy for SW')
+        sw_btn = QPushButton('Copy for SW (X lateral)')
         sw_btn.setStyleSheet(_btn_purple)
         sw_btn.setToolTip('Copy as CSV in the SolidWorks axis system (Y up): '
                           'same format as Copy for Onshape, with each point\x27s '
@@ -3825,6 +4358,11 @@ class MainWindow(QMainWindow):
 
         def _copy_sw():
             csv_lines = []
+            # Assembly ORIGIN (0,0,0) datum row — SolidWorks has no external
+            # origin sketch the way the Onshape doc does, so the SW paste needs
+            # an explicit anchor point (user 2026-09-17).  (0,0,0) is the same
+            # in every axis convention, so no Y/Z swap is needed here.
+            csv_lines.append('origin,' + ','.join(['0', '0', '0'] * len(corners)))
             for name in names:
                 vals = []
                 for label, hp_dict in corners:
@@ -3847,10 +4385,60 @@ class MainWindow(QMainWindow):
                 csv_lines.append('tripod_inner,' + ','.join(z3 + z3 + f3(tL) + f3(tR)))
                 if oL is not None and oR is not None:
                     csv_lines.append('driveshaft_outer,' + ','.join(z3 + z3 + f3(oL) + f3(oR)))
+            # car CG (user 2026-09-26): same point in every corner column, like origin
+            _c = _cg_mm()
+            csv_lines.append('cg,' + ','.join([f'{_c[0]:.2f}', f'{_c[2]:.2f}', f'{_c[1]:.2f}'] * len(corners)))   # x, z, y (Y up)
             QApplication.clipboard().setText('|'.join(csv_lines))
             sw_btn.setText('Copied!')
         sw_btn.clicked.connect(_copy_sw)
         btn_row.addWidget(sw_btn)
+
+        # Second SW copy with the OTHER horizontal assignment (user 2026-09-18:
+        # "just make it two buttons if unsure").  X = fore/aft, Y = up,
+        # Z = lateral.  For a straight X,Y,Z paste this lands the FRONT plane
+        # on the car's side; the button above lands the RIGHT plane there.
+        # Keep whichever one comes out right in your SolidWorks import.
+        sw2_btn = QPushButton('Copy for SW (Front = front, head up)')
+        sw2_btn.setStyleSheet(_btn_purple)
+        sw2_btn.setToolTip('Same CSV as the other SW button but with X = fore/aft, '
+                           'Y = up, Z = lateral (origin row first).  If that one '
+                           'puts the FRONT plane on the side of the car in your '
+                           'import, this one puts the RIGHT plane there.')
+
+        def _copy_sw_alt():
+            csv_lines = ['origin,' + ','.join(['0', '0', '0'] * len(corners))]
+            for name in names:
+                vals = []
+                for label, hp_dict in corners:
+                    pt = hp_dict.get(name)
+                    if pt is not None:
+                        mm = pt * 1000.0
+                        # The user's SW import places col1 -> Z, col2 -> X,
+                        # col3 -> Y (inferred 2026-09-19 from two pastes).  For
+                        # Front plane = car front (nose toward the viewer, rear
+                        # behind the plane), Right plane = car side, head UP:
+                        # emit (-rearward, lateral, up).  Right-handed, no mirror.
+                        vals.extend([f'{-mm[1]:.2f}', f'{mm[0]:.2f}', f'{mm[2]:.2f}'])
+                    else:
+                        vals.extend(['0', '0', '0'])
+                csv_lines.append(f'{name},{",".join(vals)}')
+            ds = _ds_pts()
+            if ds is not None:
+                dc, tL, tR, oL, oR = ds
+                z3 = ['0', '0', '0']
+
+                def f3(p):
+                    return [f'{-p[1]:.2f}', f'{p[0]:.2f}', f'{p[2]:.2f}']   # -rearward, lateral, up
+                csv_lines.append('diff_center,' + ','.join(z3 + z3 + f3(dc) + f3(dc)))
+                csv_lines.append('tripod_inner,' + ','.join(z3 + z3 + f3(tL) + f3(tR)))
+                if oL is not None and oR is not None:
+                    csv_lines.append('driveshaft_outer,' + ','.join(z3 + z3 + f3(oL) + f3(oR)))
+            _c = _cg_mm()
+            csv_lines.append('cg,' + ','.join([f'{-_c[1]:.2f}', f'{_c[0]:.2f}', f'{_c[2]:.2f}'] * len(corners)))   # -rearward, lateral, up
+            QApplication.clipboard().setText('|'.join(csv_lines))
+            sw2_btn.setText('Copied!')
+        sw2_btn.clicked.connect(_copy_sw_alt)
+        btn_row.addWidget(sw2_btn)
 
         # PARAMETRIC route: SolidWorks equations file (global variables).  Link
         # the part's Equations to this file ONCE + dimension points to the
@@ -3860,15 +4448,24 @@ class MainWindow(QMainWindow):
             def vname(nm):
                 return nm.replace(' ', '_').replace('/', '_')
             lines = []   # pure "name"= value lines (SW Import chokes on comments)
+            # SolidWorks axis system (same as 'Copy for SW'): X = lateral,
+            # Y = UP, Z = fore/aft.  Vahan is Z-up (X lateral, Y fore/aft,
+            # Z up), so each point's Y and Z are swapped.  This puts the
+            # RIGHT plane on the car's side, TOP horizontal, FRONT transverse,
+            # and the assembly origin (0,0,0) at the intersection of all three
+            # (user 2026-09-18).  Origin variables come first.
+            lines.append('"origin_x"= 0mm')
+            lines.append('"origin_y"= 0mm')
+            lines.append('"origin_z"= 0mm')
             for name in names:
                 for label, hp_dict in corners:
                     pt = hp_dict.get(name)
                     if pt is not None:
                         mm = pt * 1000.0
                         v = vname(f'{name}_{label}')
-                        lines.append(f'"{v}_x"= {mm[0]:.3f}mm')
-                        lines.append(f'"{v}_y"= {mm[1]:.3f}mm')
-                        lines.append(f'"{v}_z"= {mm[2]:.3f}mm')
+                        lines.append(f'"{v}_x"= {mm[0]:.3f}mm')   # lateral
+                        lines.append(f'"{v}_y"= {mm[2]:.3f}mm')   # UP (Vahan Z)
+                        lines.append(f'"{v}_z"= {mm[1]:.3f}mm')   # fore/aft (Vahan Y)
             ds = _ds_pts()
             if ds is not None:
                 dc, tL, tR, oL, oR = ds
@@ -3876,9 +4473,13 @@ class MainWindow(QMainWindow):
                              ('tripod_inner_R', tR), ('hub_L', oL), ('hub_R', oR)):
                     if p is None:
                         continue
-                    lines.append(f'"{v}_x"= {p[0]:.3f}mm')
-                    lines.append(f'"{v}_y"= {p[1]:.3f}mm')
-                    lines.append(f'"{v}_z"= {p[2]:.3f}mm')
+                    lines.append(f'"{v}_x"= {p[0]:.3f}mm')   # lateral
+                    lines.append(f'"{v}_y"= {p[2]:.3f}mm')   # UP (Vahan Z)
+                    lines.append(f'"{v}_z"= {p[1]:.3f}mm')   # fore/aft (Vahan Y)
+            _c = _cg_mm()
+            lines.append(f'"cg_x"= {_c[0]:.3f}mm')   # lateral
+            lines.append(f'"cg_y"= {_c[2]:.3f}mm')   # UP (Vahan Z)
+            lines.append(f'"cg_z"= {_c[1]:.3f}mm')   # fore/aft (Vahan Y)
             return lines
 
         eq_btn = QPushButton('Export SW equations…')
@@ -3934,6 +4535,57 @@ class MainWindow(QMainWindow):
         lay.addLayout(btn_row)
 
         dlg.exec()
+
+    def _build_page_nav(self):
+        """Always-on horizontal page bar so every page (and the curves on it)
+        is one click away.  Buttons mirror the Page menu / Ctrl+1..9; the
+        checked button tracks the current page.  Colours use the app's yellow
+        accent (colourblind-safe)."""
+        from PyQt6.QtWidgets import QButtonGroup, QFrame
+        specs = [
+            ('Suspension',     'The 3-D model, kinematic curves and the hardpoint editor.'),
+            ('Lap Time',       'Track map + quasi-steady lap simulation of the current car.'),
+            ('Design City',    'Packaging enumerator — 0.1% swings of every parameter.'),
+            ('Loads',          'Member loads / free-body diagrams at each g case.'),
+            ('Ackermann + MMD','Ackermann (five methods, five graphs) AND the Milliken '
+                               'Moment Diagram (the FULL MMD SWEEP button) + the YMD grid.'),
+            ('Engine',         'Engine model + calibration — the torque curve the lap sim runs on.'),
+            ('Packaging',      'Move the inboard actuation with every gate validated '
+                               '(rates, geometric laws, full-travel clash sweep).'),
+            ('Ride',           'ISO 8608 road response (7-DOF) and the ride-rate solve.'),
+            ('Corner Speed',   'Tightest corner the car holds at each speed, lateral g vs '
+                               'radius (with/without aero), and the per-corner grip budget.'),
+            ('Bearings',       'Control-arm spherical bearings: SKF calculator inputs per '
+                               'pickup and load case, two bore orientations.'),
+            ('Build Tolerance', 'Aero heave vs speed and the CG build tolerance (height, '
+                                'front-rear).'),
+        ]
+        bar = QFrame(); bar.setObjectName('pageNav')
+        bar.setStyleSheet(
+            '#pageNav { background:#0e0e11; border-bottom:1px solid #2a2a31; } '
+            '#pageNav QPushButton { background:#1a1a1f; color:#c8c8cc; '
+            'border:1px solid #2a2a31; border-radius:4px; padding:5px 10px; '
+            'font-size:11px; font-weight:600; } '
+            '#pageNav QPushButton:hover { background:#26262e; color:#ffffff; } '
+            '#pageNav QPushButton:checked { background:#FFD600; color:#0a0a0a; '
+            'border:1px solid #FFD600; }')
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(6, 5, 6, 5); lay.setSpacing(4)
+        self._page_nav_group = QButtonGroup(self)
+        self._page_nav_group.setExclusive(True)
+        self._page_nav_btns = []
+        for idx, (label, tip) in enumerate(specs):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setToolTip(tip)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, i=idx: self._switch_page(i))
+            self._page_nav_group.addButton(b, idx)
+            self._page_nav_btns.append(b)
+            lay.addWidget(b)
+        lay.addStretch(1)
+        self._page_nav_btns[0].setChecked(True)
+        return bar
 
     def _switch_page(self, idx: int):
         """Page menu: 0 = Suspension, 1 = Laptime, 2 = Design City,
@@ -3993,11 +4645,58 @@ class MainWindow(QMainWindow):
                 import traceback; traceback.print_exc()
                 self.statusBar().showMessage(f'Packaging page failed: {e}', 8000)
                 return
+        if idx >= 7 and self._pages.count() < 8:
+            try:
+                from gui.ride_page import RidePage
+                self._ride_page = RidePage(self)
+                self._pages.addWidget(self._ride_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Ride page failed: {e}', 8000)
+                return
+        if idx >= 8 and self._pages.count() < 9:
+            try:
+                from gui.corner_speed_page import CornerSpeedPage
+                self._corner_speed_page = CornerSpeedPage(self)
+                self._pages.addWidget(self._corner_speed_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Corner Speed page failed: {e}', 8000)
+                return
+        if idx >= 9 and self._pages.count() < 10:
+            try:
+                from gui.bearings_page import BearingsPage
+                self._bearings_page = BearingsPage(self)
+                self._pages.addWidget(self._bearings_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Bearings page failed: {e}', 8000)
+                return
+        if idx >= 10 and self._pages.count() < 11:
+            try:
+                from gui.build_tolerance_page import BuildTolerancePage
+                self._build_tolerance_page = BuildTolerancePage(self)
+                self._pages.addWidget(self._build_tolerance_page)
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.statusBar().showMessage(f'Build Tolerance page failed: {e}', 8000)
+                return
+        try:
+            self._wire_grip_scale_mirrors()     # lazily built pages' grip boxes
+        except Exception:
+            pass
         if idx < self._pages.count():
             self._pages.setCurrentIndex(idx)
+            # keep the visible page bar in sync (menu / shortcut / code switch)
+            btns = getattr(self, '_page_nav_btns', None)
+            if btns and idx < len(btns):
+                btns[idx].blockSignals(True)
+                btns[idx].setChecked(True)
+                btns[idx].blockSignals(False)
             self.statusBar().showMessage(
                 ('Suspension', 'Laptime', 'Design City', 'Loads',
-                 'Ackermann', 'Engine', 'Packaging')[idx] + ' page', 2000)
+                 'Ackermann', 'Engine', 'Packaging', 'Ride',
+                 'Corner Speed', 'Bearings', 'Build Tolerance')[idx] + ' page', 2000)
 
     def _build_ui(self):
         self._build_menu()
@@ -4006,7 +4705,18 @@ class MainWindow(QMainWindow):
         # Laptime page (track + QSS sim of the CURRENT car) is page 1.
         from PyQt6.QtWidgets import QStackedWidget
         self._pages = QStackedWidget()
-        self.setCentralWidget(self._pages)
+        # Always-on page bar ABOVE the stack: every page (and its curves) is
+        # one visible click away.  The pages used to be reachable ONLY through
+        # the Page menu / Ctrl+1..9, which hid them (user 2026-09-17: "why am
+        # I missing features").  The bar mirrors the Page menu exactly.
+        _nav = self._build_page_nav()
+        _wrap = QWidget()
+        _wv = QVBoxLayout(_wrap)
+        _wv.setContentsMargins(0, 0, 0, 0)
+        _wv.setSpacing(0)
+        _wv.addWidget(_nav)
+        _wv.addWidget(self._pages, 1)
+        self.setCentralWidget(_wrap)
         central = QWidget()
         self._pages.addWidget(central)          # page 0 — Suspension
         root = QHBoxLayout(central)
@@ -4264,6 +4974,7 @@ class MainWindow(QMainWindow):
         self._analysis_plots_panel.llt_requested.connect(self._on_plot_llt)
         self._motion_panel.damper_params_changed.connect(self._on_damper_limits)
         self._motion_panel.apply_sag_requested.connect(self._on_apply_sag)
+        self._motion_panel.reset_sag_requested.connect(self._on_reset_sag)
         # Push initial damper limits to IK panel + sag display.
         # Deferred so the hardpoints/solvers finish initialising first
         # (needed for live MR lookup via _query_static_mr).
@@ -4308,6 +5019,33 @@ class MainWindow(QMainWindow):
     # ==========================================================================
     #  SOLVERS
     # ==========================================================================
+
+    def _wheel_profile_for_view(self):
+        """The real wheel profile the 3-D view draws: car['wheel_profile'] (the
+        vahan.wheel_profile JSON the clearance gate measures against, repo-
+        relative like keepout_step) loaded once per path; None = no profile,
+        the view falls back to the plain tyre cylinder."""
+        rel = self._car.get('wheel_profile') if hasattr(self, '_car') else None
+        if not rel:
+            return None
+        cache = getattr(self, '_wheel_profile_cache', None)
+        if cache is not None and cache[0] == rel:
+            return cache[1]
+        prof = None
+        try:
+            import os
+            from vahan.wheel_profile import load_profile
+            path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
+            if not os.path.exists(path):
+                path = os.path.join(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))), rel)
+            prof = load_profile(path)
+        except Exception as exc:
+            print(f'wheel profile for the 3-D view not loaded ({rel}): {exc}',
+                  file=sys.stderr)
+            prof = None
+        self._wheel_profile_cache = (rel, prof)
+        return prof
 
     def _spring_travel_range(self, solver, label) -> tuple[float, float]:
         """Travel range [t_lo, t_hi] (metres) over which this corner's spring
@@ -4378,8 +5116,9 @@ class MainWindow(QMainWindow):
     def _spring_limits_uncached(self, solver: SuspensionConstraints,
                        is_front: bool | None = None) -> tuple[float, float]:
         """
-        Return (spring_min_m, spring_max_m) based on stroke and computed
-        static sag.
+        Return physical damper eye-to-eye limits when fully-extended length
+        is configured. Preload and static sag cannot move hardware stops.
+        Otherwise retain the legacy stroke + computed-sag convention below.
 
         At design position (travel=0) the spring has length `spring_0`.
         At static the damper has compressed by `sag_mm` from full droop, so:
@@ -4390,9 +5129,13 @@ class MainWindow(QMainWindow):
         via VehicleParams.static_sag() — no longer a user input.
         """
         try:
+            stroke_m = self._motion_panel.stroke_mm / 1000.
+            extended_m = float(getattr(
+                self._motion_panel, 'fully_extended_mm', 0.0)) / 1000.
+            if extended_m > 0.0 and stroke_m > 0.0:
+                return extended_m - stroke_m, extended_m
             st0 = solver.solve(0.)
             spring_0  = st0.spring_length
-            stroke_m  = self._motion_panel.stroke_mm / 1000.
 
             # Determine which axle this corner belongs to.  Callers that hold
             # a FRESH (snapshot) solver pass is_front explicitly — the
@@ -4423,6 +5166,7 @@ class MainWindow(QMainWindow):
                 dyn_params.setdefault('cg_to_front_axle_m',
                                       self._car.get('cg_y_mm', 765) / 1000.)
             dyn_params = self._apply_topology_to_dyn_params(dyn_params)
+            dyn_params = self._steer_into_dyn_params(dyn_params)
 
             veh = VehicleParams(**dyn_params)
             sag = veh.static_sag(
@@ -4458,6 +5202,7 @@ class MainWindow(QMainWindow):
                 # FULL LOCK: half the total physical rack travel per side.
                 rt_m = float(self._steer.get('total_rack_travel_mm',
                                              120.0)) / 2.0 / 1000.0
+                rt_m *= self._steer.get('rack_direction', 1)
             else:
                 rt_m = _rack_travel_from_angle(ref_steer_wheel_deg,
                                                self._steer)
@@ -4479,7 +5224,7 @@ class MainWindow(QMainWindow):
 
             wb = self._car.get('wheelbase_mm', 1537.) / 1000.
             ft = self._car.get('track_f_mm', 1222.) / 1000.
-            return _ackermann_from_pair(toes['FL'], toes['FR'], wb, ft)
+            return _ackermann_from_pair(toes['FL'], toes['FR'], wb, ft, inner=None)
         except Exception:
             return float('nan')
 
@@ -4524,9 +5269,8 @@ class MainWindow(QMainWindow):
                 )
                 st = solver.solve(0.)
                 m  = KinematicMetrics(st, 'left' if side == 'FL' else 'right')
-                # KinematicMetrics.toe is in radians; sign convention
-                # there matches +rack → +toe for the rack-driven side.
-                return float(m.toe)
+                # Metrics are degrees; SteeringGeometry's factory is radians.
+                return float(np.radians(m.toe))
             except Exception:
                 return float('nan')
 
@@ -4537,6 +5281,7 @@ class MainWindow(QMainWindow):
                 front_hp_fr=corners.get('FR', {}),
                 rack_travel_per_rev_mm=rack_per_rev,
                 total_rack_travel_mm=total_rack,
+                rack_direction=rack_cfg.get('rack_direction', 1),
             )
         except Exception:
             return None
@@ -4561,6 +5306,8 @@ class MainWindow(QMainWindow):
             self._solvers = self._build_corner_solvers(
                 self._all_corner_hp(), self._steer, self._topology,
                 steer_angle_deg)
+            self._solver_rack_travel_m = _rack_travel_from_angle(
+                steer_angle_deg, self._steer)
 
             cp = self._car
             self.view3d.set_tire_params(
@@ -4568,6 +5315,7 @@ class MainWindow(QMainWindow):
                 rim_r   = cp['tire_rim_dia_mm']   / 2000.,
                 half_w  = cp['tire_width_mm']     / 2000.,
             )
+            self.view3d.set_wheel_profile(self._wheel_profile_for_view())
         except Exception as e:
             # Don't just swallow — print the traceback to stderr so
             # broken solver-init bugs (e.g. an extra HP key the dataclass
@@ -4811,11 +5559,72 @@ class MainWindow(QMainWindow):
         ae_world      = pv + _rodrigues(arm_vec, bc_axis, theta)
         drop_link_travel = float(np.linalg.norm(ae_world - arb_drop_top_world)
                                  - np.sqrt(dl_len2))
+        # A Newton iterate (including a clamped one) is not a physical pose.
+        # v84 could silently stretch a 55 mm drop link to 125 mm near bump.
+        if not np.isfinite(drop_link_travel) or abs(drop_link_travel) > 1e-7:
+            raise ValueError(
+                f'ARB linkage solve did not close at this position '
+                f'(drop-link length error {drop_link_travel * 1000:+.3f} mm)')
         return theta, ae_world, drop_link_travel
 
-    def _compute_arb_geometry_from_kinematics(self, axle: str = 'F') -> dict | None:
+    @staticmethod
+    def _routed_arb_arm_compliance_mm_per_N(polyline, load_direction,
+                                             diameter_mm: float,
+                                             E_Npmm2: float,
+                                             G_Npmm2: float) -> float:
+        """Unit-load tip compliance of a routed solid circular ARB arm.
+
+        Integrates bending, torsion and axial strain along each straight
+        segment using the actual load direction at the arm end.  Values are
+        returned in mm/N so DynamicsPanel can combine the arm and torsion bar
+        as springs in series.  Bend joints/stress concentrations are outside
+        this elastic rate calculation and remain strength-detail gates.
+        """
+        line = [np.asarray(p, float) for p in polyline]
+        fhat = np.asarray(load_direction, float)
+        lf = float(np.linalg.norm(fhat))
+        d = 0.001 * float(diameter_mm)
+        if len(line) < 2 or lf < 1e-12 or d <= 0.0:
+            return 0.0
+        fhat /= lf
+        E = float(E_Npmm2) * 1e6
+        G = float(G_Npmm2) * 1e6
+        area = np.pi * d*d / 4.0
+        I = np.pi * d**4 / 64.0
+        J = 2.0 * I
+        if min(E, G, area, I, J) <= 0.0:
+            return 0.0
+        tip = line[-1]
+        compliance_m_per_N = 0.0
+        # Midpoint integration is exact enough here because the energy
+        # density is quadratic along each straight segment.
+        samples = 64
+        for a, b in zip(line[:-1], line[1:]):
+            vec = b-a; length = float(np.linalg.norm(vec))
+            if length < 1e-12:
+                continue
+            tangent = vec/length
+            for i in range(samples):
+                s = (i+0.5)*length/samples
+                r = a + s*tangent
+                moment = np.cross(tip-r, fhat)
+                torsion = float(moment @ tangent)
+                bend2 = max(float(moment @ moment)-torsion*torsion, 0.0)
+                axial = float(fhat @ tangent)
+                compliance_m_per_N += (bend2/(E*I) + torsion*torsion/(G*J)
+                                       + axial*axial/(E*area))*length/samples
+        return compliance_m_per_N * 1000.0
+
+    def _compute_arb_geometry_from_kinematics(self, axle: str = 'F',
+                                              travel_m: float = 0.0) -> dict | None:
         """
         Derive ARB arm length, half-length and motion ratio from the kinematic model.
+
+        ``travel_m`` centres the +-1 mm MR perturbation on that wheel travel
+        (default static) so a caller can measure the bar's motion ratio across
+        the travel range — the Design City gate holds it at +-25 mm as well as
+        at static, because a drop link swung off its arc tangent keeps its
+        static rate and loses it in bump (the v74 rate-cliff lesson).
 
         These three numbers are uniquely determined by the geometry once the
         ARB hardpoints (`arb_pivot`, `arb_arm_end`, `arb_drop_top`) and the
@@ -4905,8 +5714,8 @@ class MainWindow(QMainWindow):
         # of perturbation magnitude.
         dt = 0.001
         try:
-            st_p = solver.solve(+dt)
-            st_m = solver.solve(-dt)
+            st_p = solver.solve(float(travel_m) + dt)
+            st_m = solver.solve(float(travel_m) - dt)
             dt_w_p = self._arb_drop_top_world(label, st_p)
             dt_w_m = self._arb_drop_top_world(label, st_m)
             if dt_w_p is None or dt_w_m is None:
@@ -4925,10 +5734,38 @@ class MainWindow(QMainWindow):
         if not np.isfinite(mr) or mr <= 0.0:
             return None
 
+        arm_compliance = 0.0
+        try:
+            from vahan.interference import (arb_blade_polyline,
+                                            arb_blade_dogleg_params_for)
+            dog = arb_blade_dogleg_params_for(self._car, axle)
+            blade_w = float(getattr(self._dynamics_panel,
+                                    '_arb_blade_w_f' if is_front else '_arb_blade_w_r').value())
+            blade_t = float(getattr(self._dynamics_panel,
+                                    '_arb_blade_t_f' if is_front else '_arb_blade_t_r').value())
+            # Declared rectangular blades retain the existing weak-axis
+            # cantilever model.  Only the project's zero-dimension default,
+            # rendered and collided as a solid 0.625-inch circular arm, uses
+            # the routed-arm compliance calculation.
+            if (abs(dog[0]) > 1e-12 or abs(dog[1]) > 1e-12) and not (
+                    blade_w > 0.0 and blade_t > 0.0):
+                st0 = solver.solve(0.0)
+                dt0 = self._arb_drop_top_world(label, st0)
+                pts0 = {'arb_arm_end_world': np.asarray(arm_end, float)}
+                line = arb_blade_polyline(
+                    pts0, pivot, 0.001*dog[0], dog[2], dog[3], 0.001*dog[1])
+                arm_compliance = self._routed_arb_arm_compliance_mm_per_N(
+                    line, np.asarray(dt0, float)-np.asarray(arm_end, float),
+                    15.875, float(self._dynamics_panel._arb_E.value()),
+                    float(self._dynamics_panel._arb_G.value()))
+        except Exception:
+            arm_compliance = 0.0
+
         return {
             'arm_length_mm':  arm_len_m  * 1000.0,
             'half_length_mm': half_len_m * 1000.0,
             'mr':             float(mr),
+            'arm_compliance_mm_per_N': float(arm_compliance),
         }
 
     def _decoupled_solver(self, is_front: bool):
@@ -5351,6 +6188,12 @@ class MainWindow(QMainWindow):
             'alignment': dict(self._alignment),
             'car':       dict(self._car),
         }
+        # Generation stamp: a background sweep started from an OLDER snapshot
+        # (e.g. a panel signal during project load) must never land on top of a
+        # newer one — it drew a 1.48 deg front toe swing on v141 that the
+        # geometry does not have (2026-09-21).
+        self._sweep_gen = int(getattr(self, '_sweep_gen', 0)) + 1
+        job['gen'] = self._sweep_gen
         job['solvers'] = self._build_corner_solvers(
             job['corners'], job['steer'], job['topology'], 0.0)
         job['spring_limits'] = {
@@ -5438,12 +6281,17 @@ class MainWindow(QMainWindow):
 
             elif motion == 'roll':
                 angles  = np.linspace(lo, hi, n)
-                th      = job['corners']['FL']['wheel_center'][0]
-                t_l     =  np.sin(np.radians(angles)) * th
-                t_r     = -t_l
                 x_arr   = angles
                 x_label = 'Roll Angle (deg)'
-                sweeps  = {'FL': t_l, 'FR': t_r, 'RL': t_l, 'RR': t_r}
+                # Wheel-centre X is signed (+ left, - right).  Use each
+                # corner's own arm about the centreline: rear track can
+                # differ from front track, and the static model can be
+                # asymmetric.
+                sin_roll = np.sin(np.radians(angles))
+                sweeps = {
+                    lbl: sin_roll * float(job['corners'][lbl]['wheel_center'][0])
+                    for lbl in ('FL', 'FR', 'RL', 'RR')
+                }
                 sweep_results = {
                     lbl: _sweep(lbl, t)
                     for lbl, t in sweeps.items() if lbl in job['solvers']
@@ -5503,21 +6351,10 @@ class MainWindow(QMainWindow):
                 for i in range(n):
                     fl_raw = res_fl['toe'][i] - toe_off
                     fr_raw = res_fr['toe'][i] - toe_off
-                    ang_i = steer_angles[i]   # steer branch only
-                    # TURN DIRECTION COMES FROM THE STEERING INPUT, full stop.
-                    # It cannot be inferred from the toe values: the toe sign
-                    # convention is MIRRORED between the left and right wheels,
-                    # so FL +12.5 deg and FR -13.7 deg describe the SAME
-                    # physical turn.  Summing them was therefore negative in
-                    # BOTH directions, the inner wheel was misidentified on one
-                    # side, and the swept Ackermann curve FLIPPED SIGN about
-                    # zero steer — +53.6% at -60 deg handwheel and -53.6% at
-                    # +60 deg on a symmetric car.  Ackermann is a property of
-                    # the linkage; steering the other way cannot change it.
-                    # Positive handwheel = left turn = the LEFT wheel is inner.
-                    _inn = 'FL' if float(ang_i) >= 0 else 'FR'
+                    # Signed physical yaw is FR toe minus FL toe, not their
+                    # sum or the rack sign; rear-facing arms reverse the latter.
                     ack[i] = _ackermann_from_pair(fl_raw, fr_raw, wb, ft,
-                                                  inner=_inn)
+                                                  inner=None)
                 res_fl['ackermann'] = ack
                 res_fr['ackermann'] = ack.copy()
 
@@ -5603,7 +6440,8 @@ class MainWindow(QMainWindow):
                     if lbl in sweep_results:
                         sweep_results[lbl]['roll_axis_incl'] = incl_deg.copy()
 
-        return {'motion': motion, 'sweep_results': sweep_results,
+        return {'gen': job.get('gen'),
+                'motion': motion, 'sweep_results': sweep_results,
                 'x_arr': x_arr, 'x_label': x_label}
 
     def _apply_sweep_results(self, res: dict):
@@ -5611,6 +6449,8 @@ class MainWindow(QMainWindow):
         (live-state) MR injections, surface the solvable range and replot.
         Called directly by _run_sweep and via queued signal by the worker."""
         motion = res['motion']
+        if res.get('gen') is not None and res['gen'] != getattr(self, '_sweep_gen', res['gen']):
+            return          # stale snapshot (an older generation) — drop it
         try:
             self._sweep_results = res['sweep_results']
             self._x_arr   = res['x_arr']
@@ -5738,6 +6578,7 @@ class MainWindow(QMainWindow):
         spring_lens  = np.full(len(travels), float('nan'))
         travels_arr  = np.array([float(t) for t in travels])
         out['_travel_in'] = travels_arr   # input travel (m) — for cross-car cradle/tbar MR
+        states = [None] * len(travels)   # in-stroke SolvedState per station (tangent-MR seed)
 
         # Find index closest to t=0 (design position) to use as the warm-start seed
         mid_idx = int(np.argmin(np.abs(travels_arr)))
@@ -5776,6 +6617,7 @@ class MainWindow(QMainWindow):
                     spring_ok = spring_min <= st.spring_length <= spring_max
                     if spring_ok:
                         spring_lens[i] = st.spring_length
+                        states[i] = st
 
                 # Outside stroke limits: leave ALL metrics as NaN (trim the curve).
                 # Warm-start variables still update so the solver stays on-track.
@@ -5813,7 +6655,7 @@ class MainWindow(QMainWindow):
                     'front_drive_bias': 0.0,   # RWD = no front drive
                 }
                 vals = _all_metrics(st, side, spring_prev, travel_prev,
-                                    state_prev=state_prev,
+                                    state_prev=state_prev, car=car,
                                     **arb_kwargs, **anti_kwargs)
                 for key in out:
                     if key.startswith('_'):
@@ -5827,15 +6669,15 @@ class MainWindow(QMainWindow):
                 state_prev = st   # for the IC finite difference next step
 
                 # Store front-view IC for axle-level roll-centre post-processing.
-                # Computed directly from SolvedState (same formula as roll_center_height).
-                uca_in_xz = np.array([(st.uca_front[0]+st.uca_rear[0])/2,
-                                       (st.uca_front[2]+st.uca_rear[2])/2])
-                lca_in_xz = np.array([(st.lca_front[0]+st.lca_rear[0])/2,
-                                       (st.lca_front[2]+st.lca_rear[2])/2])
-                ic_fv = _intersect_2d(uca_in_xz,
-                                      np.array([st.uca_outer[0], st.uca_outer[2]]),
-                                      lca_in_xz,
-                                      np.array([st.lca_outer[0], st.lca_outer[2]]))
+                # ONE MODEL: the SAME construction the solver's roll_center_height
+                # uses (KinematicMetrics.ic_front_view: pins and ball joint projected
+                # along the pivot axis to the wheel-centre plane).  The old inline
+                # pickup-MIDPOINT intersection here drew a rear roll centre 7.7 mm
+                # lower on the Kinematics graph than the binder (2026-09-21).
+                try:
+                    ic_fv = KinematicMetrics(st, side).ic_front_view
+                except Exception:
+                    ic_fv = None
                 if ic_fv is not None:
                     out['_ic_fv_x'][i] = float(ic_fv[0])
                     out['_ic_fv_z'][i] = float(ic_fv[1])
@@ -5850,23 +6692,44 @@ class MainWindow(QMainWindow):
         _sweep_pass(range(mid_idx, -1, -1))
 
         # ── Post-process MR ───────────────────────────────────────────────────
-        # Cumulative MR = |Δdamper_length / Δwheel_travel| from design (t=0).
-        # Using the cumulative ratio is far more stable than np.gradient:
-        # no numerical differentiation noise, no branch-flip spikes, and gives
-        # directly the "how many mm of damper per mm of wheel" value the user wants.
-        valid = ~np.isnan(spring_lens)
-        if valid.sum() >= 2:
-            # Spring length at design position (t≈0)
-            spring_0 = (spring_lens[mid_idx]
-                        if not np.isnan(spring_lens[mid_idx])
-                        else np.nanmedian(spring_lens))
-
-            mr_full = np.full(len(travels_arr), float('nan'))
-            nz = np.abs(travels_arr) > 1e-6   # avoid division by zero at t=0
-            mr_full[valid & nz] = np.abs(
-                (spring_lens[valid & nz] - spring_0) / travels_arr[valid & nz]
-            )
-            out['motion_ratio'] = mr_full
+        # TANGENT MR at every station: |d spring_length / d travel| by the
+        # same +-1 mm central difference the dynamics build, solver_mr and
+        # packaging._tangent_mr use (ONE MODEL — the graph shows the MR the
+        # dynamics runs on).  The old curve was the CUMULATIVE secant from the
+        # station nearest t=0, which (a) is 0/0 at t=0 exactly (NaN hole), (b)
+        # on a grid that misses 0 divided the secant from the NEAREST station
+        # by the travel from ZERO (0.0 at that station, 0.82 / 0.37 spikes
+        # beside it on v150), and (c) drifted 0.011 off the tangent at +-30 mm.
+        # Where both grid neighbours are in-stroke and symmetric about the
+        # station (step <= 2.5 mm) the grid central difference IS that tangent
+        # (differs by (h^2 - dt^2) f'''/6 ~ 1e-6); at the ends of the valid
+        # range, beside a trimmed gap, or on a coarse / uneven grid, solve
+        # t +- 1 mm warm-started from the station's own solution instead.
+        _dt = 0.001
+        mr_full = np.full(len(travels_arr), float('nan'))
+        n_st = len(travels_arr)
+        for i, st in enumerate(states):
+            if st is None or np.isnan(spring_lens[i]):
+                continue
+            t_i = travels_arr[i]
+            if 0 < i < n_st - 1 and not np.isnan(spring_lens[i - 1]) \
+                    and not np.isnan(spring_lens[i + 1]):
+                h_lo = t_i - travels_arr[i - 1]
+                h_hi = travels_arr[i + 1] - t_i
+                if (h_lo > 1e-9 and h_hi > 1e-9 and abs(h_hi - h_lo) < 1e-6
+                        and max(h_lo, h_hi) <= 0.0025):
+                    mr_full[i] = abs(spring_lens[i + 1] - spring_lens[i - 1]) / (h_lo + h_hi)
+                    continue
+            try:
+                x_i = st.x_vec()
+                sp = solver.solve(t_i + _dt, x0=x_i, rocker_theta0=st.rocker_angle,
+                                  rocker_spring_prev=st.spring_length)
+                sm = solver.solve(t_i - _dt, x0=x_i, rocker_theta0=st.rocker_angle,
+                                  rocker_spring_prev=st.spring_length)
+                mr_full[i] = abs(sp.spring_length - sm.spring_length) / (2 * _dt)
+            except Exception:
+                pass
+        out['motion_ratio'] = mr_full
 
         return out
 
@@ -5882,6 +6745,7 @@ class MainWindow(QMainWindow):
         flip_x       = np.array([-1., 1., 1.])
 
         for label in ('FL', 'FR', 'RL', 'RR'):
+            geometry_errors = []
             solver = self._solvers.get(label)
             if not solver:
                 continue
@@ -5937,6 +6801,20 @@ class MainWindow(QMainWindow):
             elif 'damper_chassis_pt' in hp_d:
                 pts['rocker_pivot'] = hp_d['damper_chassis_pt']
 
+            # ── FSAE chassis bays (car['fsae_chassis'], vahan.chassis) ──────
+            # Chassis-fixed frame nodes from the DESIGN hardpoints (static ball
+            # joints), plus the diagonal this corner uses — every consumer of
+            # these pts (3D view, interference view, audits) reads the same.
+            try:
+                from vahan import chassis as _fsae
+                _fs = _fsae.settings(self._car)
+                if _fs is not None:
+                    pts.update(_fsae.node_pts(hp_d, _fs))
+                    pts[_fsae.DIAG_PTS_KEY] = _fsae.diagonal_for(self, label)
+                    pts[_fsae.TRANSVERSE_PTS_KEY] = _fsae.transverse_setting(_fs, label)
+            except ValueError as exc:
+                geometry_errors.append(f'FSAE chassis settings: {exc}')
+
             # ── arb_drop_top: route via the topology-aware helper ───────
             # Bellcrank: drop top is on the rocker (rotates with state.rocker_angle)
             # Control-arm: drop top is on the LCA (sweeps with LCA pose)
@@ -5951,23 +6829,29 @@ class MainWindow(QMainWindow):
                     _, ae_world, _ = self._solve_arb_bellcrank(
                         dt_world, arb_hp_vis)
                     pts['arb_arm_end_world'] = ae_world
+            except ValueError as exc:
+                geometry_errors.append(str(exc))
+                # Do not replace an impossible moving linkage with its static
+                # design triangle. Non-finite endpoints suppress its drawing.
+                pts['arb_arm_end_world'] = np.full(3, np.nan)
             except Exception:
-                pass   # if geometry invalid, rocker quad falls back to triangle
+                pass   # other topologies may have no corner ARB mechanism
 
             # ── camber visual: rotate spin axis by alignment offset ────────
-            # Equivalent to adding a shim between hub and upright.
-            # Left corners: rotate spin axis around Y by -camber_off_rad
-            # Right corners: rotate by +camber_off_rad
-            # (derived from camber = -arctan2(spin[2], |spin[0]|) * sign)
+            # Preserve the current global-Y post-solve alignment convention.
+            # At neutral, both solver spin axes point +X: Rodrigues around
+            # +Y lowers spin Z, so left uses +camber, right uses -camber.
+            # At steer this is not yet a fixed shim transported with upright.
             camber_vis = self._alignment.get(
                 'front_camber_deg' if is_front else 'rear_camber_deg', 0.)
             is_left = label in ('FL', 'RL')
-            rot_rad = np.radians(camber_vis) * (-1. if is_left else 1.)
+            rot_rad = np.radians(camber_vis) * (1. if is_left else -1.)
             spin_vis = (_rodrigues(st.spin_axis, np.array([0., 1., 0.]), rot_rad)
                         if abs(rot_rad) > 1e-9 else st.spin_axis)
 
             corners_draw.append({
                 'pts': pts, 'spin_axis': spin_vis, 'label': label,
+                'geometry_errors': geometry_errors,
                 # Only the keys actually present in this corner's hardpoint
                 # dict are real, editable points.  _state_to_pts injects
                 # derived render points (direct-damper reports pushrod_inner
@@ -6068,6 +6952,7 @@ class MainWindow(QMainWindow):
                 rim_r=cp['tire_rim_dia_mm'] / 2000.,
                 half_w=cp['tire_width_mm'] / 2000.,
             )
+            view3d.set_wheel_profile(self._wheel_profile_for_view())
         except Exception:
             pass
         travels = {lbl: 0.0 for lbl in ('FL', 'FR', 'RL', 'RR')}
@@ -6127,8 +7012,10 @@ class MainWindow(QMainWindow):
             _only = corner_label if corner_label in ('RL', 'RR') else None
             _show_ds = (cp.get('show_driveshaft', True)
                         and (corner_label is None or corner_label in ('RL', 'RR')))
+            _step_diff = any('diff' in str(_p.get('name', '')).lower()
+                             for _p in (getattr(self, '_imported_parts', None) or []))
             view3d.set_driveshaft_package(_pkg, show=_show_ds, only=_only,
-                                          show_diff=cp.get('show_diff_body', True))
+                                          show_diff=cp.get('show_diff_body', False) and not _step_diff)
         except Exception:
             pass
         # force-vector arrows (feed hover) — from the SAME solved model
@@ -6192,6 +7079,19 @@ class MainWindow(QMainWindow):
                 continue
             if 'arb_pivot' in arb_hp and 'arb_arm_end' in arb_hp:
                 # ── Bellcrank ARB rendering ──────────────────────────
+                _front = axle_l == 'FL'
+                _blade_w = float(getattr(self._dynamics_panel,
+                    '_arb_blade_w_f' if _front else '_arb_blade_w_r').value())
+                _blade_t = float(getattr(self._dynamics_panel,
+                    '_arb_blade_t_f' if _front else '_arb_blade_t_r').value())
+                from vahan.interference import (arb_blade_envelope_radius,
+                                                arb_blade_polyline,
+                                                arb_blade_dogleg_params_for)
+                _blade_r = (arb_blade_envelope_radius(_blade_w, _blade_t)
+                            or (0.5 * 0.625 * 25.4 / 1000.0))
+                _bar_r = 0.0005 * float(getattr(self._dynamics_panel,
+                    '_arb_OD_f' if _front else '_arb_OD_r').value())
+                _dog = arb_blade_dogleg_params_for(self._car, 'front' if _front else 'rear')
                 pv_l = arb_hp['arb_pivot'].copy()
                 pv_r = pv_l * flip_x
                 ae_l_design = arb_hp['arb_arm_end'].copy()
@@ -6201,11 +7101,17 @@ class MainWindow(QMainWindow):
                     ae_w = c['pts'].get('arb_arm_end_world')
                     if c['label'] == axle_l and dt is not None:
                         ae = ae_w if ae_w is not None else ae_l_design
-                        arb_segs += [(dt, ae), (ae, pv_l)]
+                        arb_segs += [(dt, ae, 0.006)]
+                        _bp = arb_blade_polyline(c['pts'], pv_l, .001*_dog[0], _dog[2], _dog[3], .001*_dog[1])
+                        arb_segs += [(a, b, _blade_r) for a, b in zip(_bp[:-1], _bp[1:])]
+                        arb_segs.append((np.asarray(ae), np.asarray(ae), 0.315*25.4/1000.0))
                     if c['label'] == axle_r and dt is not None:
                         ae = ae_w if ae_w is not None else ae_r_design
-                        arb_segs += [(dt, ae), (ae, pv_r)]
-                arb_segs += [(pv_l, pv_r)]   # torsion bar
+                        arb_segs += [(dt, ae, 0.006)]
+                        _bp = arb_blade_polyline(c['pts'], pv_r, .001*_dog[0], _dog[2], _dog[3], .001*_dog[1])
+                        arb_segs += [(a, b, _blade_r) for a, b in zip(_bp[:-1], _bp[1:])]
+                        arb_segs.append((np.asarray(ae), np.asarray(ae), 0.315*25.4/1000.0))
+                arb_segs += [(pv_l, pv_r, _bar_r)]   # torsion bar
             elif 'arb_pivot' in arb_hp and 'arb_lca_attach' in arb_hp:
                 # ── Control-arm ARB rendering (NO drop link) ─────────
                 pv_l = arb_hp['arb_pivot'].copy()
@@ -6266,6 +7172,36 @@ class MainWindow(QMainWindow):
             # settle frame restores it.
             try:
                 self.view3d.set_motion_lod(bool(light))
+                self.view3d._rocker_plate_style = self._car.get('rocker_plate_style', 'legacy')
+                from vahan.interference import (rocker_plate_style_for,
+                                                rocker_pr_full_length_fork_for,
+                                                rocker_pr_full_length_fork_clear_gap_for)
+                from vahan.interference import rocker_pr_full_length_fork_jog_for
+                self.view3d._front_rocker_plate_style = rocker_plate_style_for(self._car, 'front')
+                self.view3d._rear_rocker_plate_style = rocker_plate_style_for(self._car, 'rear')
+                self.view3d._front_rocker_pr_full_length_fork = rocker_pr_full_length_fork_for(self._car, 'front')
+                self.view3d._rear_rocker_pr_full_length_fork = rocker_pr_full_length_fork_for(self._car, 'rear')
+                self.view3d._front_rocker_pr_full_length_fork_clear_gap_m = rocker_pr_full_length_fork_clear_gap_for(self._car, 'front')
+                self.view3d._rear_rocker_pr_full_length_fork_clear_gap_m = rocker_pr_full_length_fork_clear_gap_for(self._car, 'rear')
+                self.view3d._front_rocker_pr_full_length_fork_jog = rocker_pr_full_length_fork_jog_for(self._car, 'front')
+                self.view3d._rear_rocker_pr_full_length_fork_jog = rocker_pr_full_length_fork_jog_for(self._car, 'rear')
+                self.view3d._rocker_plate_clear_gap_m = float(
+                    self._car.get('rocker_plate_clear_gap_mm', 24.0)) / 1000.0
+                self.view3d._rocker_spring_clevis_clear_gap_m = float(
+                    self._car.get('rocker_spring_clevis_clear_gap_mm',
+                                  float(self._car.get('spring_od_mm', 63.0)) + 6.0)) / 1000.0
+                self.view3d._front_rocker_spring_clevis_setback_m = (
+                    float(self._car['front_rocker_spring_clevis_setback_mm'])/1000.0
+                    if 'front_rocker_spring_clevis_setback_mm' in self._car else None)
+                self.view3d._rear_rocker_spring_clevis_setback_m = (
+                    float(self._car['rear_rocker_spring_clevis_setback_mm'])/1000.0
+                    if 'rear_rocker_spring_clevis_setback_mm' in self._car else None)
+                self.view3d._rocker_plate_t_m = float(
+                    self._car.get('rocker_plate_thickness_mm', 6.0)) / 1000.0
+                self.view3d._rocker_main_arm_width_m = float(
+                    self._car.get('rocker_plate_main_arm_width_mm', 38.1)) / 1000.0
+                self.view3d._rocker_arb_arm_width_m = float(
+                    self._car.get('rocker_plate_arb_arm_width_mm', 25.4)) / 1000.0
             except Exception:
                 pass
 
@@ -6535,11 +7471,32 @@ class MainWindow(QMainWindow):
                 _only = _iso if _iso in ('RL', 'RR') else None
                 _show_ds = (self._car.get('show_driveshaft', True)
                             and (_iso is None or _iso in ('RL', 'RR')))
+                # The native stand-in diff body + yellow tripods are never drawn
+                # when a real diff STEP is imported (user 2026-09-23: "delete that
+                # yellow thing from the native diff hub, it's obstructive").
+                _step_diff = any('diff' in str(_p.get('name', '')).lower()
+                                 for _p in (getattr(self, '_imported_parts', None) or []))
                 self.view3d.set_driveshaft_package(
                     _pkg, show=_show_ds, only=_only,
-                    show_diff=self._car.get('show_diff_body', True))
+                    show_diff=self._car.get('show_diff_body', False) and not _step_diff)
             except Exception:
                 pass
+
+            # ── FSAE chassis bays (View > FSAE chassis bays) ─────────────────
+            # Drawn from the SAME bay_members() capsules full_members() adds to
+            # the clash set, so what is shown is exactly what is checked.
+            try:
+                from vahan import chassis as _fsae
+                _fs = _fsae.settings(self._car)
+                _tubes = []
+                if _fs is not None:
+                    for c in corners_draw:
+                        _tubes.extend(_fsae.bay_members(c['pts'], _fs))
+                self.view3d.set_chassis_tubes(_tubes)
+                if _fs is not None and not light:
+                    self._fsae_schedule_auto_resolve()
+            except Exception as _e:
+                print(f'[fsae chassis] draw failed: {type(_e).__name__}: {_e}', file=sys.stderr)
 
             # ── View mode (normal / load / interference) + clash highlight ───
             try:
@@ -6556,8 +7513,9 @@ class MainWindow(QMainWindow):
                     # passing THROUGH one (v31's bug) is caught.  The upright
                     # body is drawn as a solid volume for the eye but is NOT a
                     # clash body — its corners ARE the members' own pickups.
-                    from vahan.interference import full_members as _fullmem, \
-                        connected_for as _connfor
+                    from vahan.interference import full_members as _fullmem, arb_member_kwargs as _arbkw, \
+                        connected_for as _connfor, cross_corner_clashes as _crossclashes
+                    _members_by_corner = {}
                     for c in corners_draw:
                         _seg = _pkg.get(c['label']) if (_pkg is not None and c['label'] in ('RL', 'RR')) else None
                         _ds = ((np.asarray(_seg['inner'], float),
@@ -6573,14 +7531,65 @@ class MainWindow(QMainWindow):
                                                      else '_arb_OD_r').value())
                         except Exception:
                             pass
+                        _akw = _arbkw(self._car, c['label'], float(getattr(
+                            self._dynamics_panel, '_arb_blade_w_f' if c['label'][0] == 'F' else '_arb_blade_w_r').value()),
+                            float(getattr(self._dynamics_panel, '_arb_blade_t_f' if c['label'][0] == 'F' else '_arb_blade_t_r').value()))
                         mem = _fullmem(c['pts'], self._car, arb_pivot=_apv,
-                                       arb_od_mm=_aod, driveshaft_seg=_ds)
+                                       arb_od_mm=_aod, driveshaft_seg=_ds,
+                                       **_akw)
+                        _members_by_corner[c['label']] = mem
                         if len(mem) < 2:
                             continue
-                        _byn = {m['name']: (m['a'], m['b']) for m in mem}
+                        _byn = {}
+                        for _m in mem:
+                            _byn.setdefault(_m['name'], []).append((_m['a'], _m['b']))
+                        # The rocker PLATE (the 6 mm prism this view draws) is a clash
+                        # body too: a drop link or pushrod running through it lights up
+                        # red here exactly as the packaging audit and the net report it
+                        # (2026-09-14: v106's out-of-plane drop link crossed the plate).
+                        try:
+                            from vahan.interference import (rocker_plate_gaps as _plategaps,
+                                                            rocker_plate_style_for as _plate_style,
+                                                            rocker_pr_full_length_fork_for as _pr_fork,
+                                                            rocker_pr_full_length_fork_clear_gap_for as _pr_fork_gap)
+                            from vahan.interference import rocker_pr_full_length_fork_jog_for as _pr_fork_jog
+                            _jog = _pr_fork_jog(self._car, c['label'])
+                            for _pn, _pg in _plategaps(
+                                    c['pts'], mem,
+                                    half_t=float(self._car.get(
+                                        'rocker_plate_thickness_mm', 6.0))/2000.0,
+                                    style=_plate_style(self._car, c['label']),
+                                    clear_gap_m=float(self._car.get(
+                                        'rocker_plate_clear_gap_mm', 24.0))/1000.0,
+                                    spring_clevis_clear_gap_m=float(self._car.get(
+                                        'rocker_spring_clevis_clear_gap_mm',
+                                        float(self._car.get('spring_od_mm', 63.0)) + 6.0))/1000.0,
+                                    spring_clevis_setback_m=(float(self._car[
+                                        ('front_' if c['label'].startswith('F') else 'rear_') +
+                                        'rocker_spring_clevis_setback_mm'])/1000.0
+                                        if (('front_' if c['label'].startswith('F') else 'rear_') +
+                                            'rocker_spring_clevis_setback_mm') in self._car else None),
+                                    main_arm_width_m=float(self._car.get(
+                                        'rocker_plate_main_arm_width_mm', 38.1))/1000.0,
+                                    arb_arm_width_m=float(self._car.get(
+                                        'rocker_plate_arb_arm_width_mm', 25.4))/1000.0,
+                                    pr_full_length_fork=_pr_fork(self._car, c['label']),
+                                    pr_full_length_fork_clear_gap_m=_pr_fork_gap(
+                                        self._car, c['label']),
+                                    pr_full_length_fork_negative_cheek_jog_m=_jog[0],
+                                    pr_full_length_fork_jog_fractions=_jog[1:]):
+                                if _pg < 0.0 and _pn in _byn:
+                                    _clash_segs.extend(_byn[_pn])
+                        except Exception:
+                            pass
                         for cl in _clashfn(mem, connected=_connfor(c['label'])):
-                            _clash_segs.append(_byn[cl['a']])
-                            _clash_segs.append(_byn[cl['b']])
+                            _clash_segs.extend(_byn[cl['a']])
+                            _clash_segs.extend(_byn[cl['b']])
+                    for cl in _crossclashes(_members_by_corner):
+                        for side in ('a', 'b'):
+                            _matches = [m for m in _members_by_corner[cl[side+'_corner']]
+                                        if m['name'] == cl[side]]
+                            _clash_segs.extend((m['a'], m['b']) for m in _matches)
                 self.view3d.set_clashes(_clash_segs)
             except Exception:
                 pass
@@ -6611,15 +7620,17 @@ class MainWindow(QMainWindow):
                     return None
 
                 def _ic_from_pts(pts):
-                    """Front-view (XZ) IC + contact-patch X from a pts dict."""
-                    uca_in = np.array([(pts['uca_front'][0]+pts['uca_rear'][0])/2,
-                                       (pts['uca_front'][2]+pts['uca_rear'][2])/2])
-                    lca_in = np.array([(pts['lca_front'][0]+pts['lca_rear'][0])/2,
-                                       (pts['lca_front'][2]+pts['lca_rear'][2])/2])
-                    ic = _intersect_2d(uca_in,
-                                       np.array([pts['uca_outer'][0], pts['uca_outer'][2]]),
-                                       lca_in,
-                                       np.array([pts['lca_outer'][0], pts['lca_outer'][2]]))
+                    """Front-view (XZ) IC + contact-patch X from a pts dict —
+                    the SAME instant-axis construction as the graphs (Rule 17,
+                    KinematicMetrics._arm_trace_xz): each arm plane traced on
+                    the transverse plane through the wheel centre from its
+                    pivot AXIS, not the pickup midpoint.  Until 2026-10-01 the
+                    3-D sphere used the midpoint and disagreed with the graph."""
+                    from vahan.kinematics import KinematicMetrics as _KMrc
+                    y_ref = float(pts['wheel_center'][1])
+                    u_in, u_out = _KMrc._arm_trace_xz(pts['uca_front'], pts['uca_rear'], pts['uca_outer'], y_ref)
+                    l_in, l_out = _KMrc._arm_trace_xz(pts['lca_front'], pts['lca_rear'], pts['lca_outer'], y_ref)
+                    ic = _intersect_2d(u_in, u_out, l_in, l_out)
                     return ic, float(pts['wheel_center'][0])
 
                 l_ic, l_cpx = _ic_from_pts(l_c['pts'])
@@ -6729,21 +7740,9 @@ class MainWindow(QMainWindow):
                 toe_off = self._alignment.get('front_toe_deg', 0.)
                 fl_toe_raw = fl_vals.get('toe', float('nan')) - toe_off
                 fr_toe_raw = fr_vals.get('toe', float('nan')) - toe_off
-                # Direction from the STEERING INPUT, not the toe sum — the toe
-                # sign convention is mirrored left/right, so the sum is not a
-                # direction (see the sweep site: it flipped the swept curve's
-                # sign about zero steer).  In heave/roll/pitch the live rack is
-                # centred, so use the current motion value when steering and
-                # otherwise assume the positive reference steer the fallback
-                # probe uses (FL inner).
-                try:
-                    _sv = (float(self._motion_panel.position)
-                           if str(self._motion_panel.motion) == 'steer' else 1.0)
-                except Exception:
-                    _sv = 1.0
-                _inn = 'FL' if _sv >= 0 else 'FR'
+                # Infer actual turn from the signed wheel-yaw difference.
                 ack = _ackermann_from_pair(fl_toe_raw, fr_toe_raw, wb, ft,
-                                           inner=_inn)
+                                           inner=None)
                 if np.isnan(ack):
                     # Live state at/near zero steer → probe the geometry
                     ack = self._probe_static_ackermann()
@@ -6762,7 +7761,12 @@ class MainWindow(QMainWindow):
             if all_corner_values:
                 self._values_panel.update_values(all_corner_values)
 
-            if not light:
+            geometry_errors = [f"{c['label']}: {error}"
+                               for c in corners_draw
+                               for error in c.get('geometry_errors', [])]
+            if geometry_errors:
+                self.statusBar().showMessage('Invalid geometry — ' + '; '.join(geometry_errors))
+            elif not light:
                 unit = 'deg' if motion in ('roll', 'steer') else ' mm'
                 self.statusBar().showMessage(
                     f'{motion.title()} = {pos:+.2f}{unit}', 2000)
@@ -6880,11 +7884,21 @@ class MainWindow(QMainWindow):
         self._update_3d()
         self._update_min_turn_radius()
 
+    def _steer_into_dyn_params(self, dyn_params: dict) -> dict:
+        """THE project steer block -> the VehicleParams rack fields.  Every
+        VehicleParams the app builds goes through here, so the dynamics model,
+        the steering-geometry map and the optimiser all see the same rack as
+        the project file (VehicleParams' own 60 / 120 are only dataclass
+        defaults for scripts that build a car without a project)."""
+        for k in ('rack_travel_per_rev_mm', 'total_rack_travel_mm'):
+            dyn_params[k] = float(self._steer[k])
+        return dyn_params
+
     def _update_min_turn_radius(self):
         """Compute min turn radius from steering geometry and update readout."""
         try:
             steer_params = self._steer
-            total_mm = steer_params.get('total_rack_travel_mm', 120.0)
+            total_mm = float(steer_params['total_rack_travel_mm'])
             half_mm  = total_mm / 2.0
             rack_m   = half_mm / 1000.0
 
@@ -6908,7 +7922,7 @@ class MainWindow(QMainWindow):
                 self._dynamics_panel._cached_r_min = r_min
                 self._dynamics_panel._cached_max_steer = max_steer_deg
                 # Steering ratio: handwheel degrees / front wheel degrees
-                rack_per_rev = steer_params.get('rack_travel_per_rev_mm', 60.0)
+                rack_per_rev = float(steer_params['rack_travel_per_rev_mm'])
                 if rack_per_rev > 0:
                     hw_deg = (half_mm / rack_per_rev) * 360.0
                     self._dynamics_panel._cached_steer_ratio = hw_deg / max_steer_deg
@@ -6992,6 +8006,19 @@ class MainWindow(QMainWindow):
         # otherwise every car-param edit silently dropped car['tire_file'] and
         # the next save lost the tyre reference (net then loaded a wrong tyre).
         params['tire_file'] = old.get('tire_file', params.get('tire_file', ''))
+        # Saved packaging allowances are not controls in this panel. An
+        # unrelated car edit must not discard the accepted design envelope.
+        for key in ('rim_joint_clearance_mm', 'rim_housing_allowance_mm',
+                    'rim_barrel_width_mm', 'front_bump_steer_limit_deg'):
+            if key in old:
+                params.setdefault(key, old[key])
+        # Every other saved key the car panel does not manage (keep-out solid,
+        # rack housing/bar hardware, ride-page inputs, ...) carries forward too:
+        # a car-param edit must never silently drop project state before a save
+        # (2026-09-10: the net's _on_car call dropped car['keepout_step'] and the
+        # Rule 18 gate skipped itself).
+        for key, val in old.items():
+            params.setdefault(key, val)
         self._car = params
 
         # Refresh the hardpoint table UIs so the user sees the shifted values
@@ -7294,8 +8321,9 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             {'free': 'Nudge: FREE (world axes)',
              'link': 'Nudge: LINK-constrained — point slides along its member',
-             'plane': 'Nudge: PLANE-constrained — point stays in the rocker/'
-                      'bellcrank plane'}.get(mode, mode), 4000)
+             'plane': 'Nudge: PLANE-constrained — point stays in ITS OWN plane '
+                      '(control-arm plane for arm / tie-rod points, rocker '
+                      'plane for actuation points)'}.get(mode, mode), 4000)
 
     def _edit_plane_normal(self, is_front: bool):
         """Unit normal of the actuation plane for constraint mode 'plane':
@@ -7318,6 +8346,38 @@ class MainWindow(QMainWindow):
                     return n / nn
         return None
 
+    # Which plane a point is held in under 'plane' nudge mode.  A point stays in
+    # ITS OWN plane: lower-arm points and the tie / toe rod use the LCA plane
+    # (on the rear the toe link is one welded part with the LCA and shares its
+    # inner pivot); upper-arm points use the UCA plane; everything else
+    # (rocker / pushrod-inner / spring / ARB) keeps the actuation plane.
+    # (user 2026-09-18: plane mode let the rear toe-link outer drift 2.4 mm
+    # off the control-arm plane because it only ever used the rocker plane.)
+    _LCA_PLANE_PTS = ('lca_front', 'lca_rear', 'lca_outer')
+    _UCA_PLANE_PTS = ('uca_front', 'uca_rear', 'uca_outer')
+    _LCA_PLANE_MEMBERS = frozenset({'lca_front', 'lca_rear', 'lca_outer',
+                                    'tie_rod_outer', 'tie_rod_inner'})
+    _UCA_PLANE_MEMBERS = frozenset({'uca_front', 'uca_rear', 'uca_outer'})
+
+    def _edit_point_plane_normal(self, hp_name: str, is_front: bool):
+        """Unit normal of the plane `hp_name` is constrained to in 'plane'
+        mode (see the class comment above); falls back to the actuation
+        plane for every non-arm point."""
+        hp = self._front_hp if is_front else self._rear_hp
+        trio = None
+        if hp_name in self._LCA_PLANE_MEMBERS:
+            trio = self._LCA_PLANE_PTS
+        elif hp_name in self._UCA_PLANE_MEMBERS:
+            trio = self._UCA_PLANE_PTS
+        if trio is not None and hp and all(k in hp for k in trio):
+            p0 = np.asarray(hp[trio[0]], float)
+            n = np.cross(np.asarray(hp[trio[1]], float) - p0,
+                         np.asarray(hp[trio[2]], float) - p0)
+            nn = float(np.linalg.norm(n))
+            if nn > 1e-12:
+                return n / nn
+        return self._edit_plane_normal(is_front)
+
     def _constrain_delta(self, hp_name: str, corner: str,
                          delta: np.ndarray) -> np.ndarray:
         """Project a WASD nudge delta per the active constraint mode."""
@@ -7339,11 +8399,11 @@ class MainWindow(QMainWindow):
                 'moved free', 3000)
         elif self._edit_constraint == 'plane':
             is_front = corner in ('FL', 'FR')
-            n = self._edit_plane_normal(is_front)
+            n = self._edit_point_plane_normal(hp_name, is_front)
             if n is not None:
                 return delta - float(np.dot(delta, n)) * n
             self.statusBar().showMessage(
-                'PLANE constraint: no actuation plane on this axle — '
+                f'PLANE constraint: no plane for "{hp_name}" on this axle — '
                 'moved free', 3000)
         return delta
 
@@ -8503,12 +9563,28 @@ class MainWindow(QMainWindow):
     _ik_thread: _IKWorker | None = None
     _ik_explore_thread: _IKExploreWorker | None = None
 
+    def _ik_live_geometry(self, axle: str) -> dict:
+        """The live hardpoint dict the IK solves on for ``axle``: the axle's
+        suspension points with its ARB points merged in.  ONE builder for the
+        solve input AND the Apply-time staleness stamp."""
+        hp = dict(self._front_hp if axle == 'front' else self._rear_hp)
+        arb = self._front_arb if axle == 'front' else self._rear_arb
+        for k, v in arb.items():
+            hp[k] = v.copy()
+        return hp
+
+    def _ik_drop_link_in_plane(self, axle: str) -> bool:
+        """Rule 04 applies to bellcrank ARBs; control-arm bars are exempt."""
+        axle_top = self._topology.front if axle == 'front' else self._topology.rear
+        arb_type = getattr(getattr(axle_top, 'arb_type', None), 'value', None)
+        return arb_type != 'control_arm'
+
     def _build_ik_solver(self, spec: dict, bound_mm: float) -> InverseSolver:
         """Create a configured InverseSolver from a UI spec dict."""
         from vahan.optimizer import _evaluate_sweep
 
         axle = spec['axle']
-        hp = dict(self._front_hp if axle == 'front' else self._rear_hp)
+        hp = self._ik_live_geometry(axle)
         side = 'left'
         # Mirror the live solver build (_rebuild_solvers): pushrod_body is the
         # user-configured damper mount, NOT a hardcoded front=uca/rear=lca guess.
@@ -8519,11 +9595,8 @@ class MainWindow(QMainWindow):
         axle_top = self._topology.front if axle == 'front' else self._topology.rear
         pushrod_body = axle_top.damper_mount.value  # 'uca' / 'lca' / 'upright'
 
-        # Merge ARB points into hp dict so optimizer can adjust them
-        arb = self._front_arb if axle == 'front' else self._rear_arb
-        for k, v in arb.items():
-            hp[k] = v.copy()
-
+        # (ARB points are merged into hp by _ik_live_geometry so the
+        # optimizer can adjust them.)
         variables = []
         for hp_name in spec['hp_names']:
             for coord in spec['coords']:
@@ -8548,6 +9621,9 @@ class MainWindow(QMainWindow):
             travel_mm=(lo_mm, hi_mm), n_points=n_pts,
             anti_kwargs=anti_kwargs,
             motion=motion,
+            axle=axle,                 # bound into every result (Apply uses it)
+            drop_link_in_plane=self._ik_drop_link_in_plane(axle),
+            steer_params=dict(self._steer),   # THE project steer block
         )
 
         # Primary target curve: lo (at min travel/droop) -> hi (at max/bump),
@@ -8580,6 +9656,7 @@ class MainWindow(QMainWindow):
                 metric_keys=lock_metrics,
                 anti_kwargs=anti_kwargs,
                 motion=motion,
+                steer_params=dict(self._steer),
             )
             for lk in lock_metrics:
                 curve = current_curves.get(lk)
@@ -8612,10 +9689,12 @@ class MainWindow(QMainWindow):
 
                 warm_x_raw = np.array(last['x'])
                 axle = spec['axle']
-                hp = dict(self._front_hp if axle == 'front' else self._rear_hp)
-                arb = self._front_arb if axle == 'front' else self._rear_arb
-                for k, v in arb.items():
-                    hp[k] = v.copy()
+                if last.get('axle') not in (None, axle):
+                    self._ik_panel.show_result(None,
+                        f"Last solve was for the {last['axle']} axle; the "
+                        f'selector is now {axle}. Run Solve again first.')
+                    return
+                hp = self._ik_live_geometry(axle)
                 side = 'left'
                 # Mirror the live solver build: pushrod_body = configured mount.
                 axle_top = (self._topology.front if axle == 'front'
@@ -8665,6 +9744,7 @@ class MainWindow(QMainWindow):
                         hp, travel_arr, side, pushrod_body,
                         metric_keys=lock_metrics,
                         anti_kwargs=anti_kwargs, motion=motion,
+                        steer_params=dict(self._steer),
                     )
                     for lk in lock_metrics:
                         curve = current_curves.get(lk)
@@ -8698,6 +9778,9 @@ class MainWindow(QMainWindow):
                     'targets':      targets_spec,
                     'var_specs':    var_specs,
                     'tube_od':      spec.get('tube_od', {}),
+                    'axle':         axle,
+                    'drop_link_in_plane': self._ik_drop_link_in_plane(axle),
+                    'steer_params': dict(self._steer),
                 }
 
                 base = spec['bound_mm']
@@ -8764,6 +9847,14 @@ class MainWindow(QMainWindow):
         preload_r    = params.get('preload_rear_mm',   0.0)
         L_full       = float(params.get('fully_extended_mm', 0.0))
 
+        # Hardware edits change both the eye-to-eye stops and their solved
+        # wheel-travel roots, even when the hardpoints/solver are unchanged.
+        hardware_limits = (float(stroke), L_full)
+        if getattr(self, '_damper_hardware_limits', None) != hardware_limits:
+            self._static_limit_cache = {}
+            self._spring_travel_cache = {}
+            self._damper_hardware_limits = hardware_limits
+
         # Build a VehicleParams from the dynamics panel to get spring/MR/mass.
         sag_info = None
         try:
@@ -8782,7 +9873,7 @@ class MainWindow(QMainWindow):
                                       self._car.get('cg_y_mm', 765) / 1000.0)
 
             dyn_params = self._apply_topology_to_dyn_params(dyn_params)
-
+            dyn_params = self._steer_into_dyn_params(dyn_params)
 
             veh = VehicleParams(**dyn_params)
 
@@ -9004,6 +10095,8 @@ class MainWindow(QMainWindow):
                     touched += 1
             return touched
 
+        # Backup of the DRAWN points so "Reset sag" can undo this (persisted).
+        self._sag_backup = self._sag_snapshot()
         try:
             nf = _commit('FL', self._front_hp, shift_f)
             nr = _commit('RL', self._rear_hp,  shift_r)
@@ -9074,6 +10167,50 @@ class MainWindow(QMainWindow):
             f'F {-gap_f*1000:+.1f} mm / R {-gap_r*1000:+.1f} mm so the tires '
             f'sit on z=0', 6000)
 
+    def _sag_snapshot(self) -> dict:
+        """Every dict 'Apply Sag' can move, as plain lists (JSON-safe), plus diff_vert_mm."""
+        def _d(d):
+            return {k: [float(x) for x in np.asarray(v, float)] for k, v in (d or {}).items() if v is not None}
+        return {'front_hp': _d(self._front_hp), 'rear_hp': _d(self._rear_hp),
+                'front_arb': _d(self._front_arb), 'rear_arb': _d(self._rear_arb),
+                'front_heave': _d(self._front_heave), 'rear_heave': _d(self._rear_heave),
+                'front_decoupled': _d(self._front_decoupled), 'rear_decoupled': _d(self._rear_decoupled),
+                'diff_vert_mm': float(self._car.get('diff_vert_mm', 150.0))}
+
+    def _on_reset_sag(self):
+        """Motion panel "Reset sag": put every hardpoint back to the drawn (pre-apply)
+        positions saved by the last "Apply Sag to Hardpoints" (survives save/load)."""
+        bk = getattr(self, '_sag_backup', None)
+        if not bk:
+            self.statusBar().showMessage('Reset sag: nothing to undo — no sag has been applied to these hardpoints', 5000)
+            return
+        for key, target in (('front_hp', self._front_hp), ('rear_hp', self._rear_hp),
+                            ('front_arb', self._front_arb), ('rear_arb', self._rear_arb),
+                            ('front_heave', self._front_heave), ('rear_heave', self._rear_heave),
+                            ('front_decoupled', self._front_decoupled), ('rear_decoupled', self._rear_decoupled)):
+            if target is None:
+                continue
+            for k, v in bk.get(key, {}).items():
+                target[k] = np.array(v, float)
+        if 'diff_vert_mm' in bk:
+            self._car['diff_vert_mm'] = float(bk['diff_vert_mm'])
+        self._sag_backup = None
+        self._pending_sag_shift_m = {}
+        try:
+            self._rebuild_solvers()
+            if hasattr(self, '_front_hp_panel'):
+                self._front_hp_panel.refresh(self._front_hp, self._front_arb, self._front_heave, self._front_decoupled)
+            if hasattr(self, '_rear_hp_panel'):
+                self._rear_hp_panel.refresh(self._rear_hp,  self._rear_arb,  self._rear_heave,  self._rear_decoupled)
+            self._run_sweep()
+            self._update_3d()
+            self._refresh_sag()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.statusBar().showMessage(f'Reset sag rebuild: {e}', 6000)
+            return
+        self.statusBar().showMessage('Sag reset: hardpoints restored to the drawn positions (travel = 0 is the CAD pose again)', 6000)
+
     def _refresh_sag(self):
         # Sag inputs may have changed -> cached spring limits / MR are stale.
         self._static_limit_cache = {}
@@ -9140,7 +10277,10 @@ class MainWindow(QMainWindow):
 
     def _on_ik_done(self, result: dict):
         self._ik_panel.show_result(result)
-        self.statusBar().showMessage(f'IK done — cost {result["cost"]:.4f}', 5000)
+        ok = result.get('applicable', False)
+        self.statusBar().showMessage(
+            f'IK done ({result.get("axle")}) — cost {result["cost"]:.4f}'
+            + ('' if ok else ' — NOT applicable, see IK panel'), 5000)
 
     def _on_ik_explore_done(self, solutions: list[dict]):
         # Filter out solutions with tube collisions
@@ -9158,9 +10298,29 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f'IK failed: {msg}', 5000)
 
     def _on_ik_apply(self, data: dict):
-        """Apply IK-optimised hardpoints to the model."""
-        axle = data['axle']
+        """Apply IK-optimised hardpoints to the model.
+
+        The axle and geometry stamp were bound to the result at SOLVE time.
+        Refuse (and say why) when either is missing or the live geometry of
+        that axle has changed since the solve -- the solution was computed
+        for a different car."""
+        from vahan.optimizer import geometry_fingerprint
+        axle = data.get('axle')
         new_hp = data['hp']
+        stamp = data.get('geometry_stamp')
+        refuse = None
+        if axle not in ('front', 'rear'):
+            refuse = 'the IK result is not bound to an axle - solve again.'
+        elif not stamp:
+            refuse = 'the IK result has no geometry stamp - solve again.'
+        elif geometry_fingerprint(self._ik_live_geometry(axle)) != stamp:
+            refuse = (f'the {axle} geometry changed after this IK solve '
+                      f'(hardpoints were edited, loaded or applied). The '
+                      f'result is stale - solve again.')
+        if refuse:
+            self._ik_panel.show_apply_refused(refuse)
+            self.statusBar().showMessage(f'IK Apply refused: {refuse}', 8000)
+            return
 
         # Separate ARB points from suspension hardpoints
         _ARB_KEYS = {'arb_drop_top', 'arb_arm_end', 'arb_pivot'}
@@ -9188,6 +10348,22 @@ class MainWindow(QMainWindow):
         title = (f'{self._motion_panel.motion.title()}  '
                  f'[{self._motion_panel.min_val:+.0f} -> '
                  f'{self._motion_panel.max_val:+.0f}]')
+        # Bump steer as a NUMBER on the graph (2026-09-14): the toe swing of the
+        # front / rear over the plotted window, from the same sweep the curves
+        # draw, so a curve that looks wrong can be compared with the file's
+        # value in the regression net without reading it off the axis.
+        try:
+            if self._motion_panel.motion == 'heave' and 'toe' in (self._selected_keys or []):
+                _sp = []
+                for _lbl in ('FL', 'RL'):
+                    _r = (self._sweep_results or {}).get(_lbl) or {}
+                    _t = np.asarray(_r.get('toe', []), float)
+                    if _t.size and np.isfinite(_t).any():
+                        _sp.append(f'{"front" if _lbl == "FL" else "rear"} {np.nanmax(_t) - np.nanmin(_t):.2f}°')
+                if _sp:
+                    title += '   toe swing over the window: ' + ', '.join(_sp)
+        except Exception:
+            pass
         self.curves.plot(self._x_arr, self._x_label,
                          self._sweep_results, self._selected_keys, title,
                          corners=self._selected_corners)
@@ -9225,6 +10401,71 @@ class MainWindow(QMainWindow):
         if arb_F is not None and arb_R is not None:
             self._dynamics_panel.set_derived_arb_geometry(arb_F, arb_R)
 
+    # ── THE project grip scale ───────────────────────────────────────────
+    # ONE belt->road grip scale for every consumer: the steady-state solver
+    # (utilization, per-corner / axle limits, diff cap, traction, braking),
+    # the lap sim, the Ackermann / MMD / YMD analyses, the Corner Speed page
+    # and the acceleration model.  Stored on the Dynamics panel ('Grip
+    # multiplier'), saved in the project as panels.dynamics.grip_multiplier.
+    # The other pages' grip boxes are MIRRORS of it: editing any of them sets
+    # the project value and every box follows.  Code must read grip_scale(),
+    # never a page spinbox.
+    def grip_scale(self) -> float:
+        return float(self._dynamics_panel._grip_mult.value())
+
+    def grip_scale_list(self) -> list:
+        """The user's list of grip scales to show limits at (Dynamics panel
+        'Limits at grip ×'), e.g. [0.70, 1.00].  Always contains the
+        project scale."""
+        return self._dynamics_panel.grip_scale_list()
+
+    def _grip_scale_mirrors(self) -> list:
+        out = [self._dynamics_panel._grip_mult]
+        for owner, attr in ((getattr(self, '_laptime_page', None), '_grip'),
+                            (getattr(self, '_ackermann_page', None), '_grip'),
+                            (getattr(self, '_ackermann_page', None), '_lap_grip'),
+                            (getattr(self, '_analysis_plots_panel', None), '_ack_grip'),
+                            (getattr(self, '_corner_speed_page', None), '_grip'),
+                            (getattr(self, '_build_tolerance_page', None), '_grip')):
+            sb = getattr(owner, attr, None) if owner is not None else None
+            if sb is not None:
+                out.append(sb)
+        return out
+
+    def set_grip_scale(self, value: float, source=None) -> None:
+        """Set THE project grip scale and make every grip box show it."""
+        v = float(value)
+        for sb in self._grip_scale_mirrors():
+            if sb is source:
+                continue
+            if abs(float(sb.value()) - v) > 1e-9:
+                sb.blockSignals(True)
+                sb.setValue(v)
+                sb.blockSignals(False)
+        if source is not self._dynamics_panel._grip_mult:
+            # the Dynamics box changed silently: refresh what depends on it
+            try:
+                self._dynamics_panel.params_changed.emit(
+                    self._dynamics_panel.get_params())
+            except Exception:
+                pass
+
+    def _wire_grip_scale_mirrors(self) -> None:
+        """Give every grip box the same range, show the project value and
+        route its edits to set_grip_scale.  Idempotent (pages are lazy)."""
+        v = self.grip_scale()
+        for sb in self._grip_scale_mirrors():
+            if sb.property('vahan_grip_mirror'):
+                continue
+            sb.blockSignals(True)
+            sb.setRange(0.10, 1.50)
+            sb.setValue(v)
+            sb.blockSignals(False)
+            sb.setProperty('vahan_grip_mirror', True)
+            sb.valueChanged.connect(
+                lambda val, _sb=sb: self.set_grip_scale(val, source=_sb))
+        self.set_grip_scale(v, source=self._dynamics_panel._grip_mult)
+
     def _build_dynamics_solver(self) -> SteadyStateSolver:
         """Build a SteadyStateSolver from current GUI state.
 
@@ -9236,6 +10477,9 @@ class MainWindow(QMainWindow):
           model (hardpoints + bell-crank solver) and pushed to the panel
           before reading parameters, so the panel only owns D / G / E.
         """
+        selection_error = getattr(self, '_tire_selection_error', None)
+        if selection_error:
+            raise RuntimeError(f'Tire selection blocked: {selection_error}')
         # ── Push kinematically-derived ARB geometry into the panel ───────
         # Done BEFORE get_params() so the panel's wheel-rate calculation
         # uses fresh arm length / half-length / MR values straight from the
@@ -9297,10 +10541,12 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-        # Max steer angle from geometry (cached by _update_min_turn_radius)
+        # Max steer angle from geometry (cached by _update_min_turn_radius,
+        # which project load now re-runs) + the project steer block's rack.
         cached_steer = getattr(self._dynamics_panel, '_cached_max_steer', None)
         if cached_steer and cached_steer > 1.0:
             dyn_params['max_steer_angle_deg'] = cached_steer
+        dyn_params = self._steer_into_dyn_params(dyn_params)
 
         dyn_params = self._apply_topology_to_dyn_params(dyn_params)
 
@@ -9343,17 +10589,14 @@ class MainWindow(QMainWindow):
         tire_rear = self._tire_model_rear
         ss = SteadyStateSolver(veh, self._solvers, tire,
                                tire_model_rear=tire_rear)
-        # Grip multiplier (belt→road) is a PANEL INPUT: it scales the tyre μ
-        # used for the friction-circle utilization.  Default 1.0 = raw belt μ;
-        # set <1 (≈0.70 asphalt) for honest utilization.  The lap-time sim
-        # overrides _mu_scale locally and restores it, so this is only the
-        # dynamics-page value.
-        try:
-            gm = getattr(self._dynamics_panel, '_grip_mult', None)
-            if gm is not None:
-                ss._mu_scale = float(gm.value())
-        except Exception:
-            pass
+        # THE project grip scale (belt -> road) — every limit this solver
+        # reports uses it (see SteadyStateSolver._mu_scale).
+        ss._mu_scale = self.grip_scale()
+        # Jacking heave feedback into the kinematics: OFF unless the project
+        # asks for it (user 2026-09-23 — it wrecked the camber-vs-g curve).
+        ss.jacking_feedback = bool(self._car.get('jacking_feedback', False))
+        ss.aero_heave = bool(self._car.get('aero_heave', True))   # aero sink in the corner travel (ONE MODEL)
+        ss.pitch_travel = bool(self._car.get('pitch_travel', True))   # braking dive / accel squat in the corner travel
         return ss
 
     def _refresh_vehicle_constants(self):
@@ -9383,61 +10626,95 @@ class MainWindow(QMainWindow):
             os.path.abspath(__file__))), 'tire_data')
         files = sorted(glob.glob(os.path.join(base, '*.mat')) +
                        glob.glob(os.path.join(base, '*.csv')))
+        # Read the declared choice before considering an exploratory default.
+        # A project that names a tyre has a reproducibility contract even when
+        # this checkout contains no TTC files at all.
+        want = str(self._car.get('tire_file', '') or '').strip()
         if not files:
+            if want:
+                self._tire_model = None
+                self._tire_model_rear = None
+                self._dynamics_panel._tire_path = ''
+                err = (f'configured project tyre {want!r} cannot be loaded because '
+                       'tire_data contains no usable tyre files; analysis is blocked '
+                       'until a valid tyre is selected')
+                self._tire_selection_error = err
+                self._dynamics_panel._tire_label.setText(f'REFUSED: {err}')
+                self._dynamics_panel.set_status(f'REFUSED: {err}')
+                print(f'[tire] {err}')
+                try:
+                    self.statusBar().showMessage(f'Tyre selection refused: {err}', 15000)
+                except Exception:
+                    pass
             return
         # The PROJECT chooses its tire; the source still names no dataset, so the
         # public repo implies nothing (the filename lives in the gitignored
         # config).  Falling back to files[0] picked purely by ALPHABETICAL order
         # silently ran the car on the wrong compound for months — one dataset
         # sorts ahead of another alphabetically, and nothing ever said so.
-        want = str(self._car.get('tire_file', '') or '').strip()
         if want:
             for f in files:
                 if os.path.basename(f).lower() == want.lower():
                     self._on_tire_file(f)
                     return
-        # NEVER fall back SILENTLY.  Alphabetical order is not a tyre choice,
-        # and it is how the car ran months of analysis on the wrong compound.
-        # But do not cry wolf either: at STARTUP no project has been opened yet,
-        # so "this project names no tyre" is meaningless then.  Warning
-        # unconditionally made the message fire on every launch INCLUDING for
-        # configs that name their tyre correctly, and it misled a reviewer into
-        # running a whole analysis believing the wrong compound was loaded.
-        # Only warn once a project is actually open.
-        msg = (f'config asks for {want!r} but it is not in tire_data/'
-               if want else 'this project names NO tyre file')
-        self._on_tire_file(files[0])
+            # A named project tyre is a safety contract.  Do not replace it
+            # with the alphabetically first file: that creates a plausible
+            # looking but untraceable analysis on another compound.
+            self._tire_model = None
+            self._tire_model_rear = None
+            self._dynamics_panel._tire_path = ''
+            err = (f'configured project tyre {want!r} is missing from tire_data; '
+                   'analysis is blocked until a valid tyre is selected')
+            self._tire_selection_error = err
+            self._dynamics_panel._tire_label.setText(f'REFUSED: {err}')
+            self._dynamics_panel.set_status(f'REFUSED: {err}')
+            print(f'[tire] {err}')
+            try:
+                self.statusBar().showMessage(f'Tyre selection refused: {err}', 15000)
+            except Exception:
+                pass
+            return
+        # No project is open or no tyre was named.  An exploratory startup
+        # default may be useful, but it must neither mutate car['tire_file']
+        # nor be presented as the project's selected dataset.
+        self._on_tire_file(files[0], persist_choice=False)
         if getattr(self, '_project_loaded', False):
-            warn = (f'TYRE NOT CHOSEN BY THE PROJECT — {msg}; loaded '
-                    f'{os.path.basename(files[0])} by filename order. '
-                    f'Set the tyre explicitly before trusting any number.')
+            warn = (f'NO PROJECT TYRE DECLARED — exploratory default '
+                    f'{os.path.basename(files[0])} loaded by filename order; '
+                    f'select a tyre before trusting analysis.')
             print(f'[tire] {warn}')
             try:
                 self.statusBar().showMessage(warn, 15000)
             except Exception:
                 pass
 
-    def _on_tire_file(self, path: str):
+    def _on_tire_file(self, path: str, *, persist_choice: bool = True):
         """Load tire data from .mat, .csv, or .xlsx, at the chosen pressure."""
         try:
             from vahan.tire_model import TireModel
             psi = self._dynamics_panel.get_tire_pressure_psi()
             try:
-                self._tire_model = TireModel.from_file(path, pressure_psi=psi)
+                self._tire_model = TireModel.from_file(path, pressure_psi=psi, **self._tire_selection_kwargs())
             except ValueError as pe:
                 # asked for a pressure this file does not hold (or none at
                 # all) — REFUSE.  Blended data is banned; there is no
                 # fallback tyre.
                 self._tire_model = None
+                self._tire_model_rear = None
+                self._tire_selection_error = str(pe)
                 self._dynamics_panel._tire_label.setText(
                     f'REFUSED: {pe}')
-                self.statusBar().showMessage(f'Tyre pressure: {pe}', 12000)
+                self._dynamics_panel.set_status(f'REFUSED: {pe}')
+                self.statusBar().showMessage(f'Tyre selection: {pe}', 12000)
                 return
             tm = self._tire_model
             name = path.split('/')[-1].split('\\')[-1]
-            self._car['tire_file'] = name       # persist so save keeps the tyre
+            if persist_choice:
+                self._car['tire_file'] = name   # persist an explicit selection
+            self._tire_selection_error = None
             self._dynamics_panel._tire_path = path
-            self._dynamics_panel._tire_label.setText(name)
+            self._dynamics_panel._tire_label.setText(
+                name if persist_choice else f'{name} (EXPLORATORY DEFAULT)')
             self._dynamics_panel._tire_label.setStyleSheet(
                 'color: #e0e0e0; font-size: 11px;')
             self._dynamics_panel.set_tire_pressures_available(
@@ -9453,8 +10730,14 @@ class MainWindow(QMainWindow):
                 f'Fz: {tm.fz_range[0]:.0f}-{tm.fz_range[1]:.0f} N '
                 f'({tm.fz_binning})'
                 f'{psi_str}')
+            if not persist_choice:
+                self._dynamics_panel.set_status(
+                    f'EXPLORATORY DEFAULT ONLY — {name}; no project tyre is selected')
             self.statusBar().showMessage(f'Tire model loaded: {path}', 4000)
         except Exception as e:
+            self._tire_model = None
+            self._tire_model_rear = None
+            self._tire_selection_error = str(e)
             self._dynamics_panel.set_status(f'Error: {e}')
             self.statusBar().showMessage(f'Tire load error: {e}', 6000)
 
@@ -9476,8 +10759,31 @@ class MainWindow(QMainWindow):
             return None
         from vahan.tire_model import TireModel
         self._tire_model_rear = TireModel.from_file(
-            path, pressure_psi=self._dynamics_panel.get_tire_pressure_psi())
+            path, pressure_psi=self._dynamics_panel.get_tire_pressure_psi(),
+            **self._tire_selection_kwargs())
         return self._tire_model_rear
+
+    def _tire_selection_kwargs(self) -> dict:
+        """Project-declared TTC sample selection for the tyre fit (2026-09-15,
+        rim-matched surface): car['tire_speed_window_kph'] = [lo, hi] keeps one
+        test-speed / conditioning block (run 6 holds 15/25/45 mph); optional
+        car['tire_warmup_samples'] overrides the 1500-sample warm-up discard.
+        Absent keys = the historical behaviour (all speeds above 5 km/h)."""
+        kw = {}
+        win = self._car.get('tire_speed_window_kph')
+        if win is not None:
+            if not isinstance(win, (list, tuple)) or len(win) != 2:
+                raise ValueError('project tire_speed_window_kph must be a [low, high] km/h pair')
+            lo, hi = float(win[0]), float(win[1])
+            if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+                raise ValueError('project tire_speed_window_kph must be finite with high > low')
+            kw['speed_window_kph'] = (lo, hi)
+        wp = self._car.get('tire_warmup_samples')
+        if wp is not None:
+            if isinstance(wp, bool) or int(wp) != float(wp) or int(wp) < 0:
+                raise ValueError('project tire_warmup_samples must be a non-negative integer')
+            kw['warmup_pts'] = int(wp)
+        return kw
 
     def _on_tire_plots(self):
         """Render the tire / grip characterization plots (Fy vs slip angle,
@@ -9538,10 +10844,15 @@ class MainWindow(QMainWindow):
             ss = self._build_dynamics_solver()
             veh = ss._veh
             max_g_info = ss.max_accel_g(speed_kph=veh.speed_kph)
-            if max_g_info.get('traction_g', 0) > 0:
-                self._dynamics_panel.show_max_g(max_g_info)
+            # the same limits at every grip scale in the user's list
+            max_g_info['by_grip_scale'] = ss.limits_at_grip_scales(
+                self.grip_scale_list(), speed_kph=veh.speed_kph)
             if veh.min_turn_radius_m < 100:
                 max_g_info['min_turn_radius_m'] = veh.min_turn_radius_m
+            # ONE call (it appends to the summary; two calls printed the
+            # traction line twice)
+            if (max_g_info.get('traction_g', 0) > 0
+                    or 'min_turn_radius_m' in max_g_info):
                 self._dynamics_panel.show_max_g(max_g_info)
         except Exception:
             pass
@@ -9651,11 +10962,19 @@ class MainWindow(QMainWindow):
             result.geometric_lt_front_N = sweep['geometric_lt_front_N'][idx_ref]
             result.geometric_lt_rear_N = sweep['geometric_lt_rear_N'][idx_ref]
             result.understeer_gradient_deg = sweep.get('understeer_gradient_deg', np.zeros(1))[min(idx_ref, len(sweep.get('understeer_gradient_deg', [0]))-1)]
+            for _jk in ('jacking_force_front_N', 'jacking_force_rear_N',
+                        'jacking_heave_front_mm', 'jacking_heave_rear_mm'):
+                if _jk in sweep:
+                    setattr(result, _jk, float(sweep[_jk][idx_ref]))
             result.iterations = 0
             for lbl in ['FL', 'FR', 'RL', 'RR']:
                 result.Fz[lbl] = sweep[f'Fz_{lbl}'][idx_ref]
                 result.travel[lbl] = sweep[f'travel_{lbl}'][idx_ref]
                 result.camber[lbl] = sweep[f'camber_{lbl}'][idx_ref]
+                for key in ('camber_ground', 'inclination'):
+                    values = sweep.get(f'{key}_{lbl}')
+                    if values is not None:
+                        getattr(result, key)[lbl] = float(values[idx_ref])
                 result.utilization[lbl] = sweep.get(f'utilization_{lbl}', np.zeros(1))[idx_ref]
             self._dynamics_panel.show_result(result)
 
@@ -9708,11 +11027,8 @@ class MainWindow(QMainWindow):
         """Run sensitivity analysis in a background thread."""
         try:
             solver = self._build_dynamics_solver()
-            tire = self._tire_model
-            if tire is None:
-                from vahan.tire_model import LinearTireModel
-                tire = LinearTireModel()
-            sens = DynamicsSensitivity(solver._veh, self._solvers, tire)
+            # Same car, same tyres, same grip scale as the Dynamics page.
+            sens = DynamicsSensitivity.from_solver(solver)
 
             self._sens_worker = _SensitivityWorker(
                 sens, spec['lateral_g'], spec['longitudinal_g'],
@@ -9787,9 +11103,6 @@ class MainWindow(QMainWindow):
     def _on_compute_loads(self):
         """Compute component forces for all 4 corners at current dynamics state."""
         try:
-            from vahan.loads import compute_all_corners
-
-            solver = self._build_dynamics_solver()
             dyn_params = self._dynamics_panel.get_params()
             lat_g = dyn_params.get('_lat_g', 1.2)
             lon_g = dyn_params.get('_lon_g', 0.0)
@@ -9801,46 +11114,25 @@ class MainWindow(QMainWindow):
             except AttributeError:
                 pass
 
-            result = solver.solve(lat_g, lon_g)
-
-            # Separate front/rear brake params + shared upright params
-            bp_f = self._loads_panel.get_brake_params_front()
-            bp_r = self._loads_panel.get_brake_params_rear()
-            up = self._loads_panel.get_upright_params()
-
-            veh = solver._veh
-            wheel_r = veh.tire_radius_m
-
-            # DECOUPLED corners keep their pushrod inner end on the central
-            # twin-rocker cradle; hand the live cradle solvers to the load path
-            # so it can recover the true pushrod_inner instead of seeing NaN.
-            # FRESH cradle solvers (the cached ones go stale on any edit) so the
-            # load path sees the SAME decoupled model as the 3D view / graph.
-            cradle_solvers = {
-                'front': self._decoupled_solver(True),
-                'rear':  self._decoupled_solver(False),
-            }
-            # HEAVE_TBAR corners are likewise cradle_link — recover their
-            # pushrod_inner from the heave-T-bar rocker (FRESH, never cached).
-            heave_tbar_solvers = {
-                'front': self._heave_tbar_solver(True),
-                'rear':  self._heave_tbar_solver(False),
-            }
-
-            loads = compute_all_corners(
-                self._solvers, result,
-                brake_params_f=bp_f, brake_params_r=bp_r,
-                upright_params_f=up, upright_params_r=up,
-                wheel_radius_m=wheel_r,
-                motion_ratio_f=veh.motion_ratio_front,
-                motion_ratio_r=veh.motion_ratio_rear,
-                cradle_solvers=cradle_solvers,
-                heave_tbar_solvers=heave_tbar_solvers,
-            )
+            # ONE load path (gui.wheel_package.compute_case): the same solve,
+            # cradle / heave-T-bar / ARB geometry AND the same aero load at the
+            # case speed as the Loads page, the Bearings page and the report.
+            # (This used to re-solve here WITHOUT aero while the report passed
+            # aero — the app disagreed with itself; user 2026-09-29.)
+            from gui.wheel_package import compute_case, case_aero, case_aero_text
+            loads = compute_case(self, lat_g, lon_g)[0]
+            _ca = case_aero(self, lat_g, lon_g)
 
             self._loads_panel.show_loads(loads, lat_g=lat_g, lon_g=lon_g)
+            try:
+                self._loads_panel._loads_status.setText(
+                    f'Computed at {lat_g:.2f}g lateral, {lon_g:.2f}g longitudinal, '
+                    + case_aero_text(_ca))
+            except Exception:
+                pass
             self.statusBar().showMessage(
-                f'Component loads computed at {lat_g:.1f}g lat, {lon_g:.1f}g lon', 4000)
+                f'Component loads computed at {lat_g:.1f}g lat, {lon_g:.1f}g lon, '
+                f'{_ca["speed_kph"]:.0f} km/h, aero {_ca["total_N"]:.0f} N', 4000)
 
         except Exception as e:
             import traceback; traceback.print_exc()
@@ -9886,6 +11178,7 @@ class MainWindow(QMainWindow):
                 system=system,
                 tire_model=tire,
                 cambers=getattr(result, 'inclination', None) or {},
+                grip_scale=self.grip_scale(),        # THE project scale
             )
 
             # Rotor thermal — single braking event
@@ -9914,6 +11207,115 @@ class MainWindow(QMainWindow):
     # ==========================================================================
     #  ANALYSIS & VALIDATION PLOTS  (separate from main graph viewport)
     # ==========================================================================
+
+    def _engineering_review_text(self):
+        """Build the presentation summary from the live ONE-MODEL state."""
+        from vahan.redesign_review import build_review_text
+        kin = {}
+        try:
+            kin['ackermann_pct'] = float(self._probe_static_ackermann())
+        except Exception:
+            pass
+        try:
+            if self._x_label == 'Wheel Travel (mm)':
+                vals = []
+                for lbl in ('FL', 'FR'):
+                    arr = self._sweep_results.get(lbl, {}).get('toe', [])
+                    vals.extend(float(x) for x in np.asarray(arr, float)
+                                if np.isfinite(x))
+                if vals:
+                    kin['bump_steer_span_deg'] = max(vals) - min(vals)
+        except Exception:
+            pass
+        kin['steering_effort_status'] = 'available in Steering Torque analysis'
+        veh = {}
+        try:
+            solved = self._build_dynamics_solver()._veh
+            for key in ('spring_rate_front_Npm', 'spring_rate_rear_Npm',
+                        'wheel_rate_front_Npm', 'wheel_rate_rear_Npm',
+                        'motion_ratio_front', 'motion_ratio_rear'):
+                if hasattr(solved, key):
+                    veh[key] = getattr(solved, key)
+        except Exception:
+            try:
+                veh.update(self._dynamics_panel.get_params())
+            except Exception:
+                pass
+        ride = {}
+        try:
+            # Compute the small-oscillation sprung-mass frequencies from the
+            # same solved wheel rates and mass split shown in the dynamics
+            # panel.  This keeps the review tied to the live model.
+            wb = float(getattr(self._build_dynamics_solver()._veh, 'wheelbase_m',
+                               self._car.get('wheelbase_mm', 1537.0) / 1000.0))
+            a_front = float(getattr(self._build_dynamics_solver()._veh,
+                                    'cg_to_front_axle_m', wb * 0.55))
+            sm = float(getattr(self._build_dynamics_solver()._veh,
+                               'sprung_mass_kg', 0.0))
+            front_frac = max(0.05, min(0.95, (wb - a_front) / max(wb, 1e-9)))
+            for axle, rate, frac in (
+                    ('front', veh.get('wheel_rate_front_Npm'), front_frac),
+                    ('rear', veh.get('wheel_rate_rear_Npm'), 1.0-front_frac)):
+                if rate and sm > 0:
+                    import math
+                    ride[f'{axle}_frequency_hz'] = math.sqrt(
+                        float(rate) / (sm * frac / 2.0)) / (2.0 * math.pi)
+            for axle, labels in (('front', ('FL', 'FR')), ('rear', ('RL', 'RR'))):
+                arrs = []
+                for lbl in labels:
+                    arr = np.asarray(self._sweep_results.get(lbl, {}).get('motion_ratio', []), float)
+                    arrs.extend(arr[np.isfinite(arr)])
+                if arrs:
+                    a = np.asarray(arrs, float)
+                    ride[f'{axle}_mr_variation_pct'] = 100.0 * (np.max(a)-np.min(a)) / max(abs(np.mean(a)), 1e-9)
+        except Exception:
+            pass
+        topology = 'standard'
+        try:
+            topology = self._topology.describe()
+        except Exception:
+            pass
+        return build_review_text(
+            config_name='active Vahan project', version='active redesign',
+            car=self._car, steer=self._steer, alignment=self._alignment,
+            vehicle=veh, topology=topology, kinematic=kin, ride=ride)
+
+    def _show_engineering_review(self):
+        """Open the review and offer a one-click Markdown export."""
+        from PyQt6.QtWidgets import QFileDialog, QPushButton, QHBoxLayout
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit
+        from PyQt6.QtGui import QFont
+        text = self._engineering_review_text()
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Engineering Review — active redesign')
+        dlg.resize(980, 720)
+        lay = QVBoxLayout(dlg)
+        box = QPlainTextEdit(); box.setPlainText(text); box.setReadOnly(True)
+        box.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        f = QFont('Segoe UI'); f.setPointSize(10); box.setFont(f)
+        lay.addWidget(box)
+        row = QHBoxLayout()
+        copy = QPushButton('Copy review')
+        copy.clicked.connect(lambda: QApplication.clipboard().setText(text))
+        export = QPushButton('Export Markdown…')
+        def _save():
+            path, _ = QFileDialog.getSaveFileName(
+                dlg, 'Export Engineering Review',
+                'engineering_review.md', 'Markdown (*.md)')
+            if path:
+                try:
+                    with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+                        fh.write(text)
+                    self.statusBar().showMessage(f'Engineering review exported: {path}', 6000)
+                except OSError as exc:
+                    QMessageBox.warning(dlg, 'Export review', str(exc))
+        export.clicked.connect(_save)
+        row.addWidget(copy); row.addWidget(export); row.addStretch()
+        lay.addLayout(row)
+        dlg.show()
+        if not hasattr(self, '_open_plot_dialogs'):
+            self._open_plot_dialogs = []
+        self._open_plot_dialogs.append(dlg)
 
     def _show_text_popup(self, title, text):
         """Monospaced, selectable, resizable text report window."""
@@ -9946,7 +11348,7 @@ class MainWindow(QMainWindow):
         """Open fig in a PlotDialog popup."""
         dlg = PlotDialog(self, fig, title=title)
         # Value-readout on hover, same machinery as the kinematics canvas.
-        dlg.hover = HoverAnnotator(dlg.canvas)
+        dlg.hover = getattr(dlg.canvas, 'hover', None) or HoverAnnotator(dlg.canvas)
         dlg.show()
         # Keep a reference so Qt doesn't gc it
         if not hasattr(self, '_open_plot_dialogs'):
@@ -9968,6 +11370,7 @@ class MainWindow(QMainWindow):
                 tire_radius_m=veh.tire_radius_m,
                 brake_bias_front=veh.front_brake_bias,
                 tire_model=self._tire_model,     # None if no TTC loaded
+                grip_scale=self.grip_scale(),    # THE project scale
                 **inp,
             )
             self._show_plot(fig, 'Brake-Torque Capacity vs Deceleration')
@@ -10480,12 +11883,7 @@ class MainWindow(QMainWindow):
                     'Slip/load/force plot needs TTC data loaded', 5000)
                 return
             solver = self._build_dynamics_solver()
-            gm = 1.0
-            try:
-                gm = float(self._analysis_plots_panel
-                           .ackermann_solver_inputs().get('grip_multiplier', 1.0))
-            except Exception:
-                pass
+            gm = self.grip_scale()                       # THE project scale
             fig = plot_slip_load_force(tire_model=self._tire_model,
                                        solver=solver, grip_multiplier=gm)
             self._show_plot(fig, 'Slip angle / load / lateral force')
@@ -10672,12 +12070,7 @@ class MainWindow(QMainWindow):
         # every other Ackermann answer -- retracted 2026-08-02.  Source of
         # truth is the Ackermann page's grip spin when that page exists.
         if 'grip_multiplier' not in inp:
-            _gm = 0.70
-            try:
-                _gm = float(self._ackermann_page._grip.value())
-            except Exception:
-                pass
-            inp['grip_multiplier'] = _gm
+            inp['grip_multiplier'] = self.grip_scale()   # THE project scale
 
         return dict(
             tire_model=self._tire_model,
@@ -10745,11 +12138,11 @@ class MainWindow(QMainWindow):
                     pass
                 if getattr(fig, '_mmd_numbers', None):
                     numbers.append(fig._mmd_numbers)
-                _mc = _Canvas(fig)
+                _mc = ReadableCanvas(fig)
                 # hover-to-read on every MMD tab (item 7)
                 if not hasattr(self, '_mmd_hovers'):
                     self._mmd_hovers = []
-                self._mmd_hovers.append(HoverAnnotator(_mc))
+                self._mmd_hovers.append(_mc.hover)
                 tabs.addTab(_mc, f'{pct:+.0f}%')
             # NUMBERS tab first: every important value, side by side.
             if numbers:
@@ -10783,10 +12176,11 @@ class MainWindow(QMainWindow):
                     _ss = self._build_dynamics_solver()
                     _rows2 = _tsa(self._tire_model, _ss, 8.0,
                                   [n['ackermann_pct'] for n in numbers],
-                                  grip_multiplier=0.70)
+                                  grip_multiplier=self.grip_scale())
                     rows.append('')
                     rows.append('  ROAD FRAME - constant radius 8 m, '
-                                'asphalt 0.70x rig grip (trimmed limit):')
+                                f'asphalt {self.grip_scale():.2f}x rig grip '
+                                '(trimmed limit):')
                     _ay2 = [r.get('Ay_trim_max', float('nan'))
                             for r in _rows2]
                     for r in _rows2:
@@ -11011,10 +12405,7 @@ class MainWindow(QMainWindow):
             # Steering-rack geometry — so VehicleParams can supply it to
             # the steering-geometry probe below AND so saving/loading the
             # project reflects the current rack.
-            steer_cfg = self._steer or {}
-            for k in ('rack_travel_per_rev_mm', 'total_rack_travel_mm'):
-                if k in steer_cfg:
-                    dyn_params[k] = steer_cfg[k]
+            dyn_params = self._steer_into_dyn_params(dyn_params)
             # Motion ratios from kinematics at design position
             dt = 0.001
             for label, key in [('FL', 'motion_ratio_front'), ('RL', 'motion_ratio_rear')]:
@@ -11111,6 +12502,7 @@ class MainWindow(QMainWindow):
                 params=tparams,
                 steering_geometry=steering_geom,
                 shock_stroke_mm=getattr(self._motion_panel, 'stroke_mm', 50.0),
+                grip_scale=self.grip_scale(),        # THE project scale
             )
 
             # ── Build steering profile ─────────────────────────────────────
@@ -11370,7 +12762,7 @@ class MainWindow(QMainWindow):
 
         # ── Right: matplotlib canvas ────────────────────────────────────
         fig = Figure(facecolor='#000000')
-        canvas = FigureCanvas(fig)
+        canvas = ReadableCanvas(fig)
         canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root.addWidget(canvas, stretch=1)
 
@@ -11381,7 +12773,7 @@ class MainWindow(QMainWindow):
         self._transient_canvas = canvas
 
         # Hover value readouts — works for every signal including path (X-Y).
-        self._transient_hover = HoverAnnotator(canvas)
+        self._transient_hover = canvas.hover
 
         # Selecting signals inside the dialog re-renders.
         sig_list.itemSelectionChanged.connect(self._render_transient_canvas)
@@ -11829,15 +13221,14 @@ class MainWindow(QMainWindow):
                 )
 
         # Roll sweep — ±3 ° about the longitudinal axis.
-        # Use the same track-halfwidth convention as _run_sweep (front WC X).
+        # Same per-corner approximation as the interactive roll sweep.
         roll_degs = np.linspace(-3., 3., n)
-        th = self._front_hp['wheel_center'][0]
-        t_l = np.sin(np.radians(roll_degs)) * th
-        t_r = -t_l
+        report_corners = self._all_corner_hp()
         roll_results = {}
         for lbl in ('FL', 'FR', 'RL', 'RR'):
             if lbl in self._solvers:
-                t = t_l if lbl in ('FL', 'RL') else t_r
+                t = (np.sin(np.radians(roll_degs))
+                     * float(report_corners[lbl]['wheel_center'][0]))
                 roll_results[lbl] = self._do_sweep(
                     self._solvers[lbl], t,
                     'left' if lbl in ('FL', 'RL') else 'right',
@@ -11876,8 +13267,11 @@ class MainWindow(QMainWindow):
                 if hasattr(_veh_solved, _k):
                     veh_params[_k] = getattr(_veh_solved, _k)
             try:
-                veh_params['peak_mu'] = float(
-                    self._tire_model.peak_mu(700.0, 0.0)) if self._tire_model else 1.5
+                # road mu of the loaded tyre on THE project grip scale (no
+                # 1.5 literal; omitted when no tyre is loaded)
+                if self._tire_model is not None:
+                    veh_params['peak_mu'] = float(
+                        self._tire_model.peak_mu(700.0, 0.0)) * self.grip_scale()
             except Exception:
                 pass
         except Exception:
@@ -11927,25 +13321,18 @@ class MainWindow(QMainWindow):
         # ── Component loads (computed at the panel's current g point) ─────
         loads_data = None
         try:
-            from vahan.loads import compute_all_corners
-            result = ss_solver.solve(lat_g, lon_g,
-                                     aero_Fz=self._get_active_aero_Fz(at_g=lat_g)
-                                     if self._aero_active else None)
-            bp_f = self._loads_panel.get_brake_params_front()
-            bp_r = self._loads_panel.get_brake_params_rear()
-            up   = self._loads_panel.get_upright_params()
-            veh  = ss_solver._veh
+            # ONE load path (gui.wheel_package.compute_case) — the same solve
+            # and the same aero load at the case speed as the Loads page /
+            # Loads panel / Bearings page, so the report cannot disagree with
+            # the screen (user 2026-09-29).
+            from gui.wheel_package import compute_case as _wp_case, case_aero as _wp_aero
+            _ca = _wp_aero(self, lat_g, lon_g)
             loads_data = {
                 'lat_g': lat_g,
                 'lon_g': lon_g,
-                'corners': compute_all_corners(
-                    self._solvers, result,
-                    brake_params_f=bp_f, brake_params_r=bp_r,
-                    upright_params_f=up, upright_params_r=up,
-                    wheel_radius_m=veh.tire_radius_m,
-                    motion_ratio_f=veh.motion_ratio_front,
-                    motion_ratio_r=veh.motion_ratio_rear,
-                ),
+                'speed_kph': _ca['speed_kph'],
+                'aero_Fz': _ca['aero_Fz'],
+                'corners': _wp_case(self, lat_g, lon_g)[0],
             }
         except Exception:
             pass  # loads section optional — skip if solver fails

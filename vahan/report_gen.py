@@ -655,16 +655,19 @@ def generate_report(output_path: str, data: dict,
         _heading(doc, '3 — Suspension Kinematics: Roll', 1)
         _body(doc, (
             f'Body roll sweep {roll_x[0]:.1f} ° to {roll_x[-1]:.1f} °. '
-            'Shows camber recovery — how well the outer tire stays upright as the body rolls.'
+            'Shows front-view camber relative to the chassis, including static alignment. '
+            'Body orientation is not included in this kinematic curve; it does not '
+            'by itself establish tire inclination relative to the road.'
         ), size_pt=10)
         _hr(doc)
 
         _heading(doc, '3.1 — Camber vs Roll Angle', 2)
         fig = _fig_kinem_corners(roll_x, roll_res, 'camber',
-                                  'Camber (°)', 'Camber vs Body Roll',
+                                  'Chassis camber + alignment (°)', 'Chassis Camber vs Body Roll',
                                   xlabel='Body Roll Angle (°)')
         _embed_figure(doc, fig,
-                      caption='Ideal: outer tire (FL at positive roll) gains negative camber — stays flat on road.')
+                      caption='Negative = top leans inboard relative to the chassis. '
+                              'Use road-referenced inclination and tire data to assess grip.')
         # Analysis: check outer tire camber at max roll
         fl_camber = roll_res.get('FL', {}).get('camber')
         if fl_camber is not None and np.any(np.isfinite(fl_camber)):
@@ -672,15 +675,10 @@ def generate_report(output_path: str, data: dict,
             if max_roll_idx >= 0 and max_roll_idx < len(fl_camber):
                 fl_c = float(fl_camber[max_roll_idx])
                 roll_at = float(roll_x[max_roll_idx])
-                if fl_c < -0.5:
-                    roll_txt = (f'FL (outside) camber: {fl_c:.2f} ° at {roll_at:.1f} ° body roll — '
-                                f'good negative recovery.')
-                elif fl_c < 0:
-                    roll_txt = (f'FL camber: {fl_c:.2f} ° at {roll_at:.1f} ° body roll — '
-                                f'slight negative gain. Consider geometry tuning.')
-                else:
-                    roll_txt = (f'FL camber: {fl_c:.2f} ° at {roll_at:.1f} ° body roll — '
-                                f'going positive on the outer tire. Review UCA geometry.')
+                roll_txt = (f'FL chassis-referenced camber including alignment: '
+                            f'{fl_c:.2f} ° at {roll_at:.1f} ° body roll. '
+                            'No grip or geometry recommendation follows from this '
+                            'value without the road-frame orientation and tire operating state.')
             else:
                 roll_txt = 'Insufficient roll range data.'
         else:

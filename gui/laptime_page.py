@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 
 import numpy as np
+from gui.plot_dialog import ReadableCanvas
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
@@ -539,7 +540,7 @@ class LaptimePage(QWidget):
         # constrained_layout cohabits the equal-aspect track map, the colorbar
         # and the stacked graphs without the collapse tight_layout caused.
         self._fig = Figure(facecolor='#000000', layout='constrained')
-        self._canvas = FigureCanvas(self._fig)
+        self._canvas = ReadableCanvas(self._fig)
         right.addWidget(self._canvas, 1)
         root.addLayout(right, 1)
 
@@ -555,7 +556,7 @@ class LaptimePage(QWidget):
         # Hover value-readout — same machinery as the kinematics canvas.
         try:
             from gui.main_window import HoverAnnotator
-            self._hover = HoverAnnotator(self._canvas)
+            self._hover = self._canvas.hover
         except Exception:
             pass
 
@@ -791,16 +792,12 @@ class LaptimePage(QWidget):
         self._diff_engbrake.setEnabled(is_lsd)
         # readout: locking % + a representative exit-understeer yaw moment
         try:
-            veh = self._main._build_dynamics_solver()._veh
+            _ss = self._main._build_dynamics_solver()
+            veh = _ss._veh
             r_t = max(veh.tire_radius_m, 1e-3)
             track = float(getattr(veh, 'rear_track_m', 1.2))
-            mu0 = 1.5
-            try:
-                tm = getattr(self._main, '_tire_model', None)
-                if tm is not None:
-                    mu0 = float(tm.peak_mu(700.0, 0.0))
-            except Exception:
-                pass
+            # the car's own rear tyre on THE project grip scale (no 1.5 literal)
+            mu0 = float(_ss._tire_rear.peak_mu(700.0, 0.0)) * float(_ss._mu_scale)
             cap = mu0 * veh.total_mass_kg * 9.80665 * (1.0 - veh.front_weight_fraction)
             # ~200 Nm axle drive torque is a typical FSAE corner-exit value
             mz_exit = d.yaw_moment_Nm(200.0, track, r_t, True, max_bias_N=cap)
@@ -869,17 +866,32 @@ class LaptimePage(QWidget):
             self._status.setText('No track loaded.')
             return
         try:
-            ss = self._main._build_dynamics_solver()
+            sim = self.build_sim()
         except Exception as e:
             self._status.setText(f'Could not build the car: {e}')
             return
+        self._btn.setEnabled(False)
+        self._status.setText('Simulating…')
+        self._worker = _SimWorker(sim, self._track,
+                                  int(self._ndetail.value()))
+        self._worker.progress.connect(
+            lambda m, p: self._status.setText(f'{m}  ({p}%)'))
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.failed.connect(self._on_fail)
+        self._worker.start()
+
+    def build_sim(self) -> LapSimulator:
+        """The LapSimulator exactly as the Simulate button configures it
+        (live car + every box on this page).  Split out of _on_sim so a
+        headless caller runs the SAME configuration the user sees."""
+        ss = self._main._build_dynamics_solver()
         sim = LapSimulator(
             ss,
             cla_m2=float(self._cla.value()),
             cda_m2=float(self._cda.value()),
             air_density=float(self._rho.value()),
             aero_cop_rear_frac=float(self._cop.value()) / 100.0,
-            grip_scale=float(self._grip.value()),
+            grip_scale=float(self._main.grip_scale()),   # THE project scale
             static_rh_front_mm=float(self._rh_f.value()),
             static_rh_rear_mm=float(self._rh_r.value()),
         )
@@ -905,15 +917,7 @@ class LaptimePage(QWidget):
             sim.set_torque_curve(curve[0], curve[1], curve[2])
         else:
             sim.set_torque_curve(None, None)
-        self._btn.setEnabled(False)
-        self._status.setText('Simulating…')
-        self._worker = _SimWorker(sim, self._track,
-                                  int(self._ndetail.value()))
-        self._worker.progress.connect(
-            lambda m, p: self._status.setText(f'{m}  ({p}%)'))
-        self._worker.finished_ok.connect(self._on_done)
-        self._worker.failed.connect(self._on_fail)
-        self._worker.start()
+        return sim
 
     # ── powertrain-realism helpers (1a / 1b / 1c) ────────────────────────
     def _total_ratio_1st(self) -> float:
@@ -965,12 +969,14 @@ class LaptimePage(QWidget):
         # fall back to the ASSUMED generic shape scaled to peak power.
         import vahan.engine as _VE
         car = getattr(self._main, '_car', {})
-        _VE.VE_FALL_START_RPM = float(car.get('engine_ve_fall_rpm',
-                                              _VE.VE_FALL_START_RPM))
-        _VE.VE_AT_13K = float(car.get('engine_ve_13k', _VE.VE_AT_13K))
+        # every knob passed EXPLICITLY (no module-global mutation — the old
+        # global writes never reached ve_target_curve; audit item 21)
         c = _VE.engine_curve(
             car.get('engine_method', _VE.DEFAULT_METHOD),
             ve_target=float(car.get('engine_ve_target', _VE.VE_TARGET)),
+            ve_fall_rpm=float(car.get('engine_ve_fall_rpm',
+                                      _VE.VE_FALL_START_RPM)),
+            ve_13k=float(car.get('engine_ve_13k', _VE.VE_AT_13K)),
             fmep_a=float(car.get('engine_fmep_a', _VE.FMEP_A_BAR)),
             fmep_b=float(car.get('engine_fmep_b', _VE.FMEP_B_BAR)),
             anchor_hp=float(car.get('engine_anchor_hp', _VE.ANCHOR_HP)))

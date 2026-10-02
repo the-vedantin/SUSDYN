@@ -1,5 +1,12 @@
 # Rule 12 — Over-the-arm plate
 
+## Current dimensional instruction
+
+The user specified 1.25 inches (31.75 mm) above the respective arm plane along
+its upward normal, with a 1 inch (25.4 mm) in-plane inboard offset. This
+supersedes the earlier approximate one-inch height used below. Front is UCA;
+rear is LCA. Measure the actual saved geometry, not only the declared topology.
+
 ## The rule
 When the pushrod picks up "over the arm," the pushrod rod end loads onto a plate
 welded on top of the control arm. The one-inch spherical rod end (its centre is
@@ -20,5 +27,5 @@ the arm plane by roughly the rod-end offset (about one inch), not below it and n
 far off it.
 
 ## Tolerance
-About one inch (25 mm) above the arm plane; a small band around that, always
-positive (above the arm).
+Current target: 31.75 mm above the arm plane, always positive. Report deviation
+from that target; do not substitute the obsolete approximately 25 mm target.

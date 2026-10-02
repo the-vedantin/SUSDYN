@@ -72,6 +72,7 @@ def plot_brake_capacity(
     rotor_outer_dia_in: float, pad_height_in: float = 0.85,
     typical_max_line_psi: float = 1500,
     tire_model=None,
+    grip_scale: float = None,
 ) -> Figure:
     """Required line pressure vs deceleration g, both axles, compared to typical max.
 
@@ -113,6 +114,10 @@ def plot_brake_capacity(
     lock_axle = ''
     ideal_peak_g = None
     if tire_model is not None and hasattr(tire_model, 'peak_Fy'):
+        if grip_scale is None:
+            raise ValueError('plot_brake_capacity needs grip_scale (the '
+                             'project grip scale) with a tyre model')
+        _gs = float(grip_scale)
         ax_sweep = np.linspace(0.05, 3.0, 300)
         for ax in ax_sweep:
             h_wb = cg_height_m / wheelbase_m
@@ -122,8 +127,8 @@ def plot_brake_capacity(
                 peak_g = peak_g or ax
                 lock_axle = lock_axle or 'rear (unloads)'
                 break
-            grip_f = abs(float(tire_model.peak_Fy(max(Fz_f, 10.0))))
-            grip_r = abs(float(tire_model.peak_Fy(max(Fz_r, 10.0))))
+            grip_f = abs(float(tire_model.peak_Fy(max(Fz_f, 10.0)))) * _gs
+            grip_r = abs(float(tire_model.peak_Fy(max(Fz_r, 10.0)))) * _gs
             demand_f = brake_bias_front * m * ax * g_acc / 2.0
             demand_r = (1.0 - brake_bias_front) * m * ax * g_acc / 2.0
             if peak_g is None:
@@ -646,7 +651,7 @@ def plot_ackermann_demand(
 # ═════════════════════════════════════════════════════════════════════════════
 def ackermann_fz_fy_data(
     tire_model, solver, radius_m: float = 8.0,
-    ackermann_pct: float = 45.0, grip_multiplier: float = 1.0,
+    ackermann_pct: float = 45.0, grip_multiplier: float | None = None,
     lat_g_list=None,
 ) -> dict:
     """THE COMPUTE HALF of the Fz-Fy map — arrays only, no plotting.
@@ -674,6 +679,8 @@ def ackermann_fz_fy_data(
     L = float(veh.wheelbase_m)
     t = float(veh.front_track_m)
     R = float(radius_m)
+    from vahan.dynamics import resolve_grip_scale   # None = project scale
+    grip_multiplier = resolve_grip_scale(grip_multiplier, solver)
 
     # ── Kinematic steer at this radius, ZERO-CRAB approximation ─────────────
     # Chassis slip angle taken as 0: each wheel's zero-slip heading is the
@@ -788,7 +795,7 @@ def ackermann_fz_fy_data(
 
 def plot_ackermann_fz_fy(
     tire_model, solver, radius_m: float = 8.0,
-    ackermann_pct: float = 45.0, grip_multiplier: float = 1.0,
+    ackermann_pct: float = 45.0, grip_multiplier: float | None = None,
     lat_g_list=None,
 ) -> Figure:
     """Fz–Fy operating map: DEMAND vs DELIVERED per front wheel vs lateral g.
@@ -816,6 +823,8 @@ def plot_ackermann_fz_fy(
     its own palette without a second copy of the physics.
     """
     R = float(radius_m)
+    from vahan.dynamics import resolve_grip_scale   # None = project scale
+    grip_multiplier = resolve_grip_scale(grip_multiplier, solver)
     _d = ackermann_fz_fy_data(tire_model, solver, radius_m=R,
                               ackermann_pct=ackermann_pct,
                               grip_multiplier=grip_multiplier,
@@ -1164,7 +1173,7 @@ def plot_mmd(
     toe_rear_deg: float = 0.0,
     velocity_mps: float = 13.4,
     ackermann_pct: float = 0.0,
-    grip_multiplier: float = 1.0,
+    grip_multiplier: float | None = None,
     beta_range_deg: tuple = (-8, 8), beta_n: int = 9,
     delta_range_deg: tuple = (-20, 20), delta_n: int = 11,
 ) -> Figure:
@@ -1203,6 +1212,10 @@ def plot_mmd(
     # let states at the extreme corners (big beta against big opposite
     # delta) hop hands mid-line, scribbling the diagram tips.  Continuation
     # keeps each isoline on its own branch (and converges faster).
+    if grip_multiplier is None:
+        # this diagram builds its own reduced car, which carries no project
+        # grip scale — the caller must pass MainWindow.grip_scale()
+        raise ValueError('plot_mmd needs grip_multiplier (the project grip scale)')
     _prev_ay = {'ay': 0.0}
 
     def compute_state(beta_deg, delta_deg):
@@ -1739,7 +1752,9 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
     ay_arr = np.linspace(-max_ay_g, max_ay_g, n_pts)
     ax_max = np.full_like(ay_arr, float("nan"))
     ax_min = np.full_like(ay_arr, float("nan"))
-    mu_default = 1.6
+    # reference circle = the solver's own vehicle mu on THE grip scale
+    # (was a 1.6 literal that also served as a silent fallback)
+    mu_ref = float(steady_solver._effective_mu())
 
     def _mu_at(k, Fz_k):
         """Per-tyre mu from the solver's ACTUAL tire (split-tire aware, camber-0
@@ -1747,11 +1762,8 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
         `tire_model` attribute (the solver stores `_tire`) and called
         peak_mu with one argument (it takes fz, camber) — both silently fell
         back to mu_default=1.6, so the whole figure ignored the TTC data."""
-        try:
-            t = steady_solver._tire_for(k)
-            return float(t.peak_mu(Fz_k, 0.0)) * getattr(steady_solver, '_mu_scale', 1.0)
-        except Exception:
-            return mu_default
+        t = steady_solver._tire_for(k)
+        return float(t.peak_mu(Fz_k, 0.0)) * float(steady_solver._mu_scale)
 
     def tyre_util_max(result):
         umax = 0.0
@@ -1798,9 +1810,9 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
                     label="Max brake @ ay")
 
     theta = np.linspace(0, 2*np.pi, 200)
-    ax_gg.plot(mu_default * np.cos(theta), mu_default * np.sin(theta),
+    ax_gg.plot(mu_ref * np.cos(theta), mu_ref * np.sin(theta),
                 color=_YELLOW, lw=1.0, alpha=0.5, linestyle="--",
-                label=f"Reference circle (mu={mu_default})")
+                label=f"Reference circle (road mu={mu_ref:.2f})")
 
     ax_gg.axhline(0, color=_TICK, lw=0.5, alpha=0.5)
     ax_gg.axvline(0, color=_TICK, lw=0.5, alpha=0.5)
@@ -1889,7 +1901,7 @@ def plot_friction_circle(steady_solver, max_ay_g=1.8, n_pts=21):
 # ═════════════════════════════════════════════════════════════════════════════
 # 12. Slip angle vs vertical load vs lateral force  (the tyre, seen directly)
 # ═════════════════════════════════════════════════════════════════════════════
-def plot_slip_load_force(tire_model, solver=None, grip_multiplier: float = 1.0,
+def plot_slip_load_force(tire_model, solver=None, grip_multiplier: float | None = None,
                          lat_g_list=(0.5, 1.0, 1.5, 2.0)) -> Figure:
     """Slip angle against lateral force, one curve per vertical load — plus
     where the CAR's four wheels actually sit on that family.
@@ -1906,7 +1918,8 @@ def plot_slip_load_force(tire_model, solver=None, grip_multiplier: float = 1.0,
     top, so an impossible demand is visible instead of implied.
     """
     fig, (ax1, ax2) = _styled_fig(figsize=(13, 5.6), n=1, m=2)
-    gm = max(float(grip_multiplier), 1e-6)
+    from vahan.dynamics import resolve_grip_scale   # None = project scale
+    gm = max(resolve_grip_scale(grip_multiplier, solver), 1e-6)
     fz_lo, fz_hi = (float(tire_model.fz_range[0]),
                     float(tire_model.fz_range[1]))
     loads = np.linspace(max(fz_lo * 0.5, 50.0), fz_hi, 6)
@@ -1975,7 +1988,7 @@ def plot_slip_load_force(tire_model, solver=None, grip_multiplier: float = 1.0,
 
 def plot_ymd_ackermann_grid(tire_model, solver, radius_m=8.0,
                             pct_list=(100, 70, 50, 30, 0, -30, -70),
-                            grip_multiplier=0.70, aero_Fz_per_g=None,
+                            grip_multiplier=None, aero_Fz_per_g=None,
                             fig=None):
     """Ackermann vs stability/control — READABLE version.
 

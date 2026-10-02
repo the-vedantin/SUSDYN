@@ -183,9 +183,10 @@ def _ic_z(m, state_prev=None, **_):
     ic = _kinematic_ic(m._s, state_prev)
     return float(ic[1]) * 1000 if ic is not None else float('nan')
 
-def _sv_ic_coeff(s):
+def _sv_ic_coeff(s, ref='contact_patch'):
     """
     Shared helper: side-view (YZ-plane) IC geometric anti coefficient.
+    (The IC point itself comes from _sv_ic_point.)
 
     Uses the 3D virtual-arm method:
       1. Find the foot-of-perpendicular from the outer BJ to the pivot axis.
@@ -225,17 +226,107 @@ def _sv_ic_coeff(s):
     uca_pt, uca_dir = _sv_arm_line(s.uca_front, s.uca_rear, s.uca_outer)
     lca_pt, lca_dir = _sv_arm_line(s.lca_front, s.lca_rear, s.lca_outer)
     if uca_pt is None or lca_pt is None:
-        return float('nan')
+        return None if ref == 'point' else float('nan')
 
     ic = _intersect_2d(uca_pt, uca_pt + uca_dir, lca_pt, lca_pt + lca_dir)
     if ic is None:
-        return float('nan')
+        return None if ref == 'point' else float('nan')
+    if ref == 'point':
+        return np.array([float(ic[0]), float(ic[1])])
 
     dy = ic[0] - s.wheel_center[1]   # Y_ic − wc_y  (negative when IC is forward)
-    dz = ic[1]                        # IC height above ground
+    # Reference point of the side-view line (RCVD fig 17.12-17.15):
+    #   'contact_patch' - torque reacted by the UPRIGHT (outboard brakes): IC height
+    #                     above the ground.
+    #   'wheel_centre'  - torque reacted by the CHASSIS (inboard diff + half-shafts,
+    #                     this car's drive): IC height relative to the wheel centre.
+    dz = ic[1] - (float(s.wheel_center[2]) if ref == 'wheel_centre' else 0.0)
     if abs(dy) < 1e-3:
         return float('nan')
     return dz / dy
+
+
+def _sv_ic_point(s):
+    """Side-view instant centre (Y, Z) in metres, or None."""
+    return _sv_ic_coeff(s, ref='point')
+
+
+def anti_squat_breakdown(s, *, cg_height_m, wheelbase_m, total_mass_kg,
+                         rear_ride_rate_Npm, accel_g=1.0):
+    """The numbers behind the rear anti-squat figure (RCVD p.617-619, fig 17.12a / 17.15).
+
+    load transfer (N, whole axle) = m * a * h / L   - no suspension term: anti-squat
+                                                      cannot change tyre load.
+    % anti-squat = tan(side-view line) / (h / L) * 100, the line drawn from the
+      WHEEL CENTRE when the chassis reacts the drive torque (inboard diff + half-shafts,
+      fig 17.15b) and from the CONTACT PATCH when the axle/upright reacts it (fig 17.15a).
+    squat (m) = per-wheel transfer * (1 - anti) / ride rate.
+    """
+    ic = _sv_ic_point(s)
+    if ic is None:
+        return None
+    ratio = float(wheelbase_m) / float(cg_height_m)
+    tan_wc = -_sv_ic_coeff(s, ref='wheel_centre')
+    tan_cp = -_sv_ic_coeff(s, ref='contact_patch')
+    transfer = float(total_mass_kg) * float(accel_g) * 9.81 / ratio
+    out = {
+        'accel_g': float(accel_g), 'cg_height_m': float(cg_height_m), 'wheelbase_m': float(wheelbase_m),
+        'total_mass_kg': float(total_mass_kg), 'rear_ride_rate_Npm': float(rear_ride_rate_Npm),
+        'ic_ahead_of_axle_m': float(s.wheel_center[1] - ic[0]), 'ic_height_m': float(ic[1]),
+        'wheel_centre_height_m': float(s.wheel_center[2]),
+        'tan_from_wheel_centre': tan_wc, 'tan_from_contact_patch': tan_cp,
+        'anti_squat_pct_wheel_centre': tan_wc * ratio * 100.0,
+        'anti_squat_pct_contact_patch': tan_cp * ratio * 100.0,
+        'load_transfer_axle_N': transfer, 'load_transfer_per_wheel_N': transfer / 2.0,
+    }
+    squat = lambda pct: transfer / 2.0 * (1.0 - pct / 100.0) / float(rear_ride_rate_Npm)
+    out['squat_m_as_designed'] = squat(out['anti_squat_pct_wheel_centre'])
+    out['squat_m_by_anti_pct'] = {str(p): squat(p) for p in (0, 30, 60, 100)}
+    # IC height above the WHEEL CENTRE needed for a target %, at the present swing-arm length
+    out['ic_rise_above_wheel_centre_m_for_pct'] = {
+        str(p): p / 100.0 / ratio * out['ic_ahead_of_axle_m'] for p in (30, 60)}
+    return out
+
+
+# ── Half-shaft (rear, chassis-mounted differential) ─────────────────────────
+def _halfshaft_geometry(m, car=None):
+    """(tripod centre at the diff, hub centre, shaft vector) in metres for this corner,
+    or None when no car dict / not a driven corner. Uses vahan.driveshaft (ONE MODEL)."""
+    if not car:
+        return None
+    from vahan.driveshaft import tripod_inners_m
+    wc = np.asarray(m._s.wheel_center, float)
+    if abs(wc[1] - float(car.get('wheelbase_mm', 1537.)) / 1000.) > 0.25:
+        return None                                   # front corner: no half-shaft
+    inner = tripod_inners_m(car)['L' if wc[0] >= 0 else 'R']
+    return inner, wc, wc - inner
+
+
+def _halfshaft_len(m, car=None, **_):
+    """Half-shaft length, tripod centre at the differential to the hub centre (mm).
+    Its change through travel is the plunge the inboard joint must absorb."""
+    g = _halfshaft_geometry(m, car)
+    return float('nan') if g is None else float(np.linalg.norm(g[2])) * 1000
+
+
+def _halfshaft_angle(m, car=None, **_):
+    """Angle between the half-shaft and the wheel spin axis (deg): the CV / tripod articulation."""
+    g = _halfshaft_geometry(m, car)
+    if g is None:
+        return float('nan')
+    spin = np.asarray(m._s.spin_axis, float); spin = spin / max(np.linalg.norm(spin), 1e-12)
+    axis = g[2] / max(np.linalg.norm(g[2]), 1e-12)
+    return float(np.degrees(np.arccos(np.clip(abs(float(np.dot(axis, spin))), 0., 1.))))
+
+
+def _halfshaft_lateral(m, car=None, **_):
+    """Hub centre minus tripod centre along the wheel spin axis (mm): the straight-line
+    separation of the upright from the diff output. Shrinks in bump, grows in droop."""
+    g = _halfshaft_geometry(m, car)
+    if g is None:
+        return float('nan')
+    spin = np.asarray(m._s.spin_axis, float); spin = spin / max(np.linalg.norm(spin), 1e-12)
+    return abs(float(np.dot(g[2], spin))) * 1000
 
 
 def _anti_dive(m, cg_height_m=0.28, wheelbase_m=1.524,
@@ -262,7 +353,13 @@ def _anti_squat(m, cg_height_m=0.28, wheelbase_m=1.524,
     anti position has IC *ahead* of the axle (Y_ic < wc_y → coeff < 0), so
     we negate to get a positive anti-squat percentage.
     """
-    coeff = _sv_ic_coeff(m._s)
+    # FIXED 2026-09-19 (validated three ways against RCVD p.617-620): the diff is
+    # on the CHASSIS and drives through half-shafts, so the drive torque is NOT
+    # reacted by the upright and the line runs from the WHEEL CENTRE.  The old
+    # contact-patch form reported 73 % on v137 where the true value is ~0 %.
+    # Pass chassis_mounted_diff=False only for a live axle / upright-reacted drive.
+    coeff = _sv_ic_coeff(m._s, ref='wheel_centre' if _.get('chassis_mounted_diff', True)
+                         else 'contact_patch')
     if np.isnan(coeff):
         return float('nan')
     return -coeff * (wheelbase_m / cg_height_m) * rear_drive_bias * 100.0
@@ -275,10 +372,15 @@ def _anti_lift(m, cg_height_m=0.28, wheelbase_m=1.524,
     = (Z_ic / (wc_y − Y_ic)) × (wheelbase / h_cg) × front_drive_bias × 100
     Zero for RWD (front_drive_bias = 0).  Non-zero for AWD or FWD.
     """
+    # FIXED 2026-09-19: this entry is registered on the REAR axle, where the
+    # meaningful quantity is anti-LIFT UNDER BRAKING (outboard rear brakes ->
+    # contact-patch line, rear brake fraction).  The old front-drive formula
+    # always returned 0 on this RWD car.  ASSUMES outboard rear brakes.
     coeff = _sv_ic_coeff(m._s)
     if np.isnan(coeff):
         return float('nan')
-    return coeff * (wheelbase_m / cg_height_m) * front_drive_bias * 100.0
+    fbb = float(_.get('front_brake_bias', 0.65))
+    return -coeff * (wheelbase_m / cg_height_m) * (1.0 - fbb) * 100.0
 
 
 def _kingpin_len(m, **_):
@@ -329,12 +431,22 @@ def compute_turn_radius_post(toe_left_deg: np.ndarray,
     steer angles (toe curves with static toe offset removed).
 
     Bicycle-model equivalence: the radius the car would trace if there
-    were zero tire slip, found by averaging the two wheel steer angles:
+    were zero tire slip, found from the MEAN steer angle of the two
+    front wheels.  The inputs are per-wheel TOE angles (toe-in positive
+    on BOTH sides), so a steered pair has OPPOSITE toe signs: steering
+    left puts the FL wheel toe-out (negative) and the FR wheel toe-in
+    (positive).  The physical yaw of the axle is therefore
+    (toe_R - toe_L) / 2 — the same convention _ackermann_from_pair uses —
+    never (toe_L + toe_R) / 2, which nearly cancels a steered pair and
+    left only the Ackermann DIFFERENCE (~3.5 deg at full lock on v150
+    -> 25 m instead of the true 2.25 m, 2026-09-29):
 
-        delta_bicycle = (delta_L + delta_R) / 2              [signed, deg]
+        delta_bicycle = (delta_R - delta_L) / 2              [signed, deg]
         R             = L / tan(delta_bicycle)               [signed, m]
 
-    Sign of R carries the turn direction (left/right).  At near-zero
+    R > 0 is a LEFT turn (FL inner), R < 0 a right turn.  |R| at full
+    lock equals vahan.corner_speed.lock_radius_m (mean of the two
+    magnitudes) whenever both wheels steer the same way.  At near-zero
     steer the radius blows up to infinity, so values are clipped to
     ±max_abs_radius_m and any |delta_bicycle| < 0.05° returns NaN.
 
@@ -356,7 +468,8 @@ def compute_turn_radius_post(toe_left_deg: np.ndarray,
     """
     dL = np.asarray(toe_left_deg,  dtype=float)
     dR = np.asarray(toe_right_deg, dtype=float)
-    delta_bike = 0.5 * (dL + dR)
+    # Mean steer with the per-side toe signs resolved (FR toe minus FL toe).
+    delta_bike = 0.5 * (dR - dL)
     out = np.full_like(delta_bike, np.nan)
     mask = np.abs(delta_bike) > 0.05
     out[mask] = wheelbase_m / np.tan(np.radians(delta_bike[mask]))
@@ -441,28 +554,13 @@ def compute_ackermann_post(toe_curve: np.ndarray,
         delta_inner = max(delta_near, delta_far)
         delta_outer = min(delta_near, delta_far)
 
-        # Actual toe-difference (steer angle spread)
-        actual_diff = delta_inner - delta_outer
-
-        # Average steer angle → bicycle-model turn radius
-        delta_avg_rad = np.radians((delta_inner + delta_outer) / 2.0)
-        if abs(delta_avg_rad) < 1e-6:
-            continue
-        R = L / np.tan(delta_avg_rad)
-
-        # Ideal Ackermann angles
-        denom_inner = R - t / 2.0
-        denom_outer = R + t / 2.0
-        if abs(denom_inner) < 1e-6 or denom_outer < 1e-6:
-            continue
-        ideal_inner = np.degrees(np.arctan(L / denom_inner))
-        ideal_outer = np.degrees(np.arctan(L / denom_outer))
-        ideal_diff = ideal_inner - ideal_outer
-
-        if abs(ideal_diff) < 1e-9:
-            continue
-
-        ack[i] = (actual_diff / ideal_diff) * 100.0
+        # CANONICAL Ackermann % (vahan.ackermann.ackermann_pct_from_pair,
+        # Astra F-08 2026-09-22): 100*(L/t)*(cot d_out - cot d_in), exact at
+        # every steer angle and the same conversion the GUI readout and YMD use.
+        # (Was a mean-angle radius + linear angle ratio: an exact 100 % pair
+        # read 94.8 % at 30 deg of steer.)
+        from vahan.ackermann import ackermann_pct_from_pair
+        ack[i] = ackermann_pct_from_pair(delta_inner, delta_outer, t, L)
 
     return ack
 
@@ -526,6 +624,11 @@ CATALOG = [
     dict(key='anti_dive',  label='Anti-Dive',  unit='%', category='Anti', fn=_anti_dive,  scope='front'),
     dict(key='anti_squat', label='Anti-Squat', unit='%', category='Anti', fn=_anti_squat, scope='rear'),
     dict(key='anti_lift',  label='Anti-Lift',  unit='%', category='Anti', fn=_anti_lift,  scope='rear'),
+
+    # ── Half-shaft (rear only; front reads NaN) ──────────────────────────────
+    dict(key='halfshaft_len',     label='Half-shaft length (tripod to hub)',        unit='mm', category='Half-shaft', fn=_halfshaft_len,     scope='rear'),
+    dict(key='halfshaft_lateral', label='Diff-to-upright separation (along axle)', unit='mm', category='Half-shaft', fn=_halfshaft_lateral, scope='rear'),
+    dict(key='halfshaft_angle',   label='Half-shaft joint angle',                  unit='°',  category='Half-shaft', fn=_halfshaft_angle,   scope='rear'),
 
     # ── Wheel Centre ──────────────────────────────────────────────────────────
     dict(key='wc_x',         label='Wheel Centre X',       unit='mm',   category='Wheel Ctr', fn=_wc_x,        scope='corner'),

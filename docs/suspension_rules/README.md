@@ -14,7 +14,7 @@ Units: millimetres and degrees. Frame: X lateral (outboard +), Y longitudinal
 | # | Rule | One line |
 |---|------|----------|
 | [00](00_one_model.md) | One Model | Every number comes from the single solved model; no duplicated physics. |
-| [01](01_coplanarity_no_bending.md) | Coplanarity / nothing in bending | The whole actuation chain stays in one plane across travel. |
+| [01](01_coplanarity_no_bending.md) | Coplanarity / nothing in bending | Each corner’s complete actuation chain is coplanar at static; each corner has its own plane. |
 | [02](02_rocker_pivot_axis.md) | Rocker pivot axis | The rocker turns about the actuation-plane normal. |
 | [03](03_arb_triad.md) | Anti-roll-bar triad | Torsion bar, blade, and drop link are mutually perpendicular. |
 | [04](04_arb_drop_link_in_plane.md) | Drop link in plane at static | A bellcrank ARB's drop link lies in the rocker plane at static. |
@@ -27,6 +27,11 @@ Units: millimetres and degrees. Frame: X lateral (outboard +), Y longitudinal
 | [11](11_pushrod_lca_mount.md) | Pushrod-on-arm mount | Mount near the ball joint, never mid-arm. |
 | [12](12_over_the_arm_plate.md) | Over-the-arm plate | The rod end sits about an inch above the arm plane. |
 | [13](13_pushrod_alignment.md) | Pushrod alignment | Keep the pushrod near the X-Z plane, little Y lean. |
-| [14](14_same_shocks_preload.md) | Same shocks, tune with preload | Respect shock stroke and length; set wheel rate with preload. |
+| [14](14_same_shocks_preload.md) | Same shocks: rate with spring/MR, sag with preload | Respect shock stroke and length; spring stiffness and motion ratio set wheel rate; preload sets installed force and sag. |
 | [15](15_tie_rod_inline.md) | Tie rods inline | Tie-rod ends share the same X, not the same Y. |
 | [16](16_rim_fit.md) | Fits inside the REAL rim, all four corners | Joint BODIES + member TUBES stay ≥3 mm inside the barrel at droop/static/bump (and front steer), FL and RL — `rim_fit()` checks centres only and is not the answer. |
+| [17](17_roll_centre_instant_axis.md) | Roll centre from the instant axis | Arms are traced from their pivot AXIS on the wheel-centre plane, never from the pickup midpoint — a pickup slid along its own axis must not move the roll centre. |
+| [18](18_chassis_keepout.md) | Chassis keep-out (red zone) | A STEP keep-out named by the project is a hard volume: no member inside it at droop/static/bump × lock/centre/lock — rack housing under the floor, torsion bar above the roof. |
+| [19](19_front_hoop_line.md) | Front ARB ahead of the front-hoop line | Bar, blades, links and rod ends of the front ARB stay ≥ 3 mm ahead of the line through the LCA-aft / UCA-aft pickups extended upward, at droop/static/bump (user rule 2026-09-14). |
+
+Tyre evidence note (2026-09-15): the tyre model can be pinned to one test-speed block (`car['tire_speed_window_kph']`), used for the rim-matched 7-in run-6 surface; see the top-level README.

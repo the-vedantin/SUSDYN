@@ -691,7 +691,8 @@ class TransientSolver:
                  corner_solvers: Optional[dict] = None,
                  params: Optional[TransientParams] = None,
                  steering_geometry: Optional[SteeringGeometry] = None,
-                 shock_stroke_mm: Optional[float] = None):
+                 shock_stroke_mm: Optional[float] = None,
+                 grip_scale: float = 1.0):
         """
         Parameters
         ----------
@@ -719,6 +720,10 @@ class TransientSolver:
             raise ValueError('TransientSolver requires a tire_model')
         self._veh = vehicle
         self._tire = tire_model
+        # THE project grip scale (belt -> road), applied to every tyre force
+        # this solver evaluates — the app passes MainWindow.grip_scale();
+        # 1.0 = the raw tyre data (bare-library default only).
+        self._grip_scale = float(grip_scale)
         self._params = params if params is not None else TransientParams()
         self._steering_geom = steering_geometry
         # Resolve speed-hold PI gains: per-kg values win when the raw
@@ -1005,7 +1010,7 @@ class TransientSolver:
 
             # One batched tire call for all 4 wheels
             fy_tire = np.asarray(self._tire.Fy(alpha_deg, fz_arr, cam_arr),
-                                 dtype=float)
+                                 dtype=float) * self._grip_scale
             if fy_tire.ndim == 0:
                 fy_tire = np.array([float(fy_tire)] * 4)
             # SAE -> ISO: the table's Y points RIGHT, this model's Y points

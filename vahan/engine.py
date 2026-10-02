@@ -84,7 +84,13 @@ def ve_target_curve(rpm, ve_peak: float = VE_TARGET,
                     fall_start: float = VE_FALL_START_RPM,
                     ve_13k: float = VE_AT_13K):
     """Target breathing vs rpm: flat ve_peak to fall_start, then linear to
-    ve_13k at 13,000 (restrictor starvation).  All three knobs explicit."""
+    ve_13k at 13,000 (restrictor starvation).  All three knobs explicit.
+
+    The defaults are the module constants AS DEFINED (Python binds them at
+    import); callers with a different calibration MUST pass fall_start /
+    ve_13k explicitly.  Mutating VE_FALL_START_RPM / VE_AT_13K at run time
+    does nothing here — that was the dead Engine-page taper controls bug
+    (audit 2026-09-22 item 21)."""
     import numpy as np
     r = np.asarray(rpm, float)
     frac = np.clip((r - fall_start) / max(13000.0 - fall_start, 1.0), 0.0, 1.0)
@@ -93,8 +99,14 @@ def ve_target_curve(rpm, ve_peak: float = VE_TARGET,
 
 def engine_curve(method: str = DEFAULT_METHOD, ve_target: float = VE_TARGET,
                  fmep_a: float = FMEP_A_BAR, fmep_b: float = FMEP_B_BAR,
-                 anchor_hp: float = ANCHOR_HP):
+                 anchor_hp: float = ANCHOR_HP,
+                 ve_fall_rpm: float = VE_FALL_START_RPM,
+                 ve_13k: float = VE_AT_13K):
     """(rpm[], crank torque N·m[], label) for the chosen calibration method.
+
+    ALL SIX calibration knobs are explicit arguments (ve_target, ve_fall_rpm,
+    ve_13k, fmep_a, fmep_b, anchor_hp) — no module globals are read at call
+    time, so two windows / cars can never leak a calibration into each other.
 
     'corrected': per-rpm — IMEP scaled by (ve_target / VE_sim(rpm)), then a
                  realistic friction line subtracted.  torque = BMEP·Vd/(4π).
@@ -111,7 +123,9 @@ def engine_curve(method: str = DEFAULT_METHOD, ve_target: float = VE_TARGET,
             return list(rpm), list(tq), METHOD_LABELS["raw"]
         imep = np.array([p["imep_bar"] for p in sw["curve"]], float)
         ve = np.array([p["ve_atm"] for p in sw["curve"]], float)
-        ve_t = ve_target_curve(rpm, ve_peak=float(ve_target))
+        ve_t = ve_target_curve(rpm, ve_peak=float(ve_target),
+                               fall_start=float(ve_fall_rpm),
+                               ve_13k=float(ve_13k))
         imep_c = imep * (ve_t / np.maximum(ve, 1e-3))
         bmep_c = imep_c - (float(fmep_a) + float(fmep_b) * rpm / 1000.0)
         bmep_c = np.maximum(bmep_c, 0.0)

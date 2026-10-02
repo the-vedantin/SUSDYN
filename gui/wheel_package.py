@@ -11,19 +11,134 @@ Load mode with a chosen corner isolated.
 import numpy as np
 from vahan import loads as _loads
 
-# (label, lat g, lon g)   +lon = accel, -lon = braking
-CASES = [('Max cornering 2.0 g', 2.0, 0.0),
-         ('Full braking 1.6 g', 0.0, -1.6),
-         ('Full acceleration 1.0 g', 0.0, 1.0),
-         ('Cornering 1.4 g + braking 1.0 g', 1.4, -1.0)]
+_G_EARTH = 9.80665
+
+# (label, lat g, lon g, speed rule)   +lon = accel, -lon = braking
+# Every load case has a SPEED (user 2026-09-29): the aero downforce on the
+# corners is Cl·A·½ρv², so a case without a speed silently had no aero.  The
+# speed rule is explicit per case and resolved by case_speed_kph():
+#   'corner_radius' : the speed that gives this lateral g on the Dynamics-panel
+#                     turn radius,  v = sqrt(|lat g| · g · R)
+#   'aero_V_ref'    : the aero package's reference speed (Dynamics panel
+#                     V_ref) — a straight-line case has no radius to imply one
+#   'static'        : 0 g lateral AND 0 g longitudinal = the car at rest,
+#                     0 km/h, no aero (the static reference of every cycle)
+SPEED_CORNER, SPEED_VREF, SPEED_STATIC = 'corner_radius', 'aero_V_ref', 'static'
+CASES = [('Max cornering 2.0 g', 2.0, 0.0, SPEED_CORNER),
+         ('Full braking 1.6 g', 0.0, -1.6, SPEED_VREF),
+         ('Full acceleration 1.0 g', 0.0, 1.0, SPEED_VREF),
+         ('Cornering 1.4 g + braking 1.0 g', 1.4, -1.0, SPEED_CORNER)]
 
 
-def compute_case(win, lat_g, lon_g):
-    """Return (loads_dict, veh, upright_params) for one case, exactly as the
-    Loads panel does (ONE MODEL)."""
+def case_speed_rule(lat_g, lon_g=0.0) -> str:
+    """The speed rule a (lat g, lon g) case falls under: cornering cases sit on
+    the panel's turn radius, braking / acceleration at the aero reference
+    speed, 0 g / 0 g is the car at rest (static, no aero)."""
+    if abs(float(lat_g)) > 1e-9:
+        return SPEED_CORNER
+    return SPEED_VREF if abs(float(lon_g)) > 1e-9 else SPEED_STATIC
+
+
+def case_speed_kph(win, lat_g, lon_g=0.0, rule=None) -> float:
+    """Speed (km/h) of one load case under its rule (see CASES)."""
+    rule = rule or case_speed_rule(lat_g, lon_g)
+    dp = win._dynamics_panel
+    if rule == SPEED_CORNER:
+        R = float(dp._turn_radius.value())
+        return float(np.sqrt(abs(float(lat_g)) * _G_EARTH * max(R, 0.0))) * 3.6
+    if rule == SPEED_STATIC:
+        return 0.0
+    return float(dp.get_custom_aero_params()['V_ref_kph'])
+
+
+def aero_package(win) -> dict | None:
+    """The aero package the load cases use, as Cl·A (m²) + CoP + ρ, or None
+    when Apply Aero is OFF on the Dynamics panel or the package is empty.
+    ONE path with the rest of the app: source 'custom' (and 'solved' before
+    the aero-target solver has run) = the panel's F_ref at V_ref split by CoP
+    (gui.build_tolerance_page.aero_package); source 'solved' with a result =
+    that solver's axle needs at its g on the panel radius, i.e. the same
+    downforce the sweep applies at that g, expressed as a Cl·A."""
+    if not getattr(win, '_aero_active', False):
+        return None
+    dp = win._dynamics_panel
+    source = dp.get_aero_source() if hasattr(dp, 'get_aero_source') else 'solved'
+    r = getattr(win, '_last_aero_result', None)
+    if source == 'solved' and r is not None:
+        fn, rn = float(r.front_axle_need_N), float(r.rear_axle_need_N)
+        g_ref = float(r.lateral_g)
+        if fn + rn < 0.1 or g_ref < 0.01:
+            return None
+        R = float(dp._turn_radius.value())
+        rho = float(dp.get_custom_aero_params()['air_density'])
+        v2 = g_ref * _G_EARTH * R
+        if R <= 0.0 or rho <= 0.0:
+            return None
+        return dict(cla_m2=2.0 * (fn + rn) / (rho * v2), cop_rear=rn / (fn + rn), rho=rho,
+                    label=f'solved aero need {fn + rn:.0f} N at {g_ref:.2f} g on {R:.1f} m '
+                          f'({np.sqrt(v2) * 3.6:.1f} km/h), {100.0 * rn / (fn + rn):.0f} % rear')
+    from gui.build_tolerance_page import aero_package as _pkg
+    pk = _pkg(win)
+    if pk['cla_m2'] <= 0.0:
+        return None
+    return pk
+
+
+def case_aero(win, lat_g, lon_g=0.0, speed_kph=None) -> dict:
+    """The aero load of one case: {'speed_kph', 'rule', 'aero_Fz' (per-corner N
+    or None), 'package' (label or None), 'total_N'}.  speed_kph None = the
+    case rule.  Respects the panel's Apply Aero toggle (off -> aero_Fz None)."""
+    from vahan.aero_ride import aero_per_corner_N
+    rule = case_speed_rule(lat_g, lon_g)
+    v = float(speed_kph) if speed_kph is not None else case_speed_kph(win, lat_g, lon_g, rule)
+    pk = aero_package(win)
+    af = aero_per_corner_N(pk['cla_m2'], pk['cop_rear'], pk['rho'], v / 3.6) if (pk and v > 0.0) else None
+    return dict(speed_kph=v, rule=rule, aero_Fz=af, package=pk['label'] if pk else None,
+                total_N=float(sum(af.values())) if af else 0.0)
+
+
+def case_aero_text(ca: dict) -> str:
+    """One-line human readout of case_aero()."""
+    why = {SPEED_CORNER: 'on the Dynamics-panel turn radius', SPEED_VREF: 'the aero reference speed',
+           SPEED_STATIC: 'at rest'}.get(ca['rule'], ca['rule'])
+    if ca['rule'] == SPEED_STATIC and ca['speed_kph'] <= 0.0:
+        return '0 km/h (0 g / 0 g = at rest), no aero'
+    if not ca['aero_Fz']:
+        return f"{ca['speed_kph']:.1f} km/h ({why}), aero OFF (Apply Aero on the Dynamics panel)"
+    a = ca['aero_Fz']
+    return (f"{ca['speed_kph']:.1f} km/h ({why}), aero {ca['total_N']:.0f} N = "
+            f"{a['FL'] + a['FR']:.0f} N front / {a['RL'] + a['RR']:.0f} N rear "
+            f"[{ca['package']}]")
+
+
+def arb_geometry_fn(win):
+    """callable(label, state) -> bellcrank-ARB points in WORLD at that pose
+    (drop-link top on the rocker via MainWindow._arb_drop_top_world, arm end and
+    bar pivot mirrored for the right side) — what compute_all_corners needs to
+    solve the drop-link forces and the bar torque exactly.  None if no ARB data."""
+    def _geo(lbl, st):
+        arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
+        if not arb or arb.get('arb_pivot') is None:
+            raise KeyError('no ARB pivot')
+        mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else np.ones(3)
+        dt = win._arb_drop_top_world(lbl, st)
+        if dt is None:
+            raise KeyError('no ARB drop top')
+        return {'drop_top': np.asarray(dt, float),
+                'arm_end': np.asarray(arb['arb_arm_end'], float) * mir,
+                'pivot': np.asarray(arb['arb_pivot'], float) * mir}
+    return _geo
+
+
+def compute_case(win, lat_g, lon_g, speed_kph=None):
+    """Return (loads, veh, upright_params, result, bp_f, bp_r, solver) for one
+    case — THE load path (the Loads page, the Loads panel, the Bearings page
+    and the report all call this; ONE MODEL).  The case is solved WITH the
+    aero load at the case speed (case_aero: speed_kph None = the case rule,
+    Apply Aero off = no aero)."""
     from vahan.loads import compute_all_corners
     solver = win._build_dynamics_solver()
-    result = solver.solve(lat_g, lon_g)
+    result = solver.solve(lat_g, lon_g, aero_Fz=case_aero(win, lat_g, lon_g, speed_kph)['aero_Fz'])
     veh = solver._veh
     up = win._loads_panel.get_upright_params()
     bp_f = win._loads_panel.get_brake_params_front()
@@ -33,8 +148,9 @@ def compute_case(win, lat_g, lon_g):
     loads = compute_all_corners(
         win._solvers, result, brake_params_f=bp_f, brake_params_r=bp_r,
         upright_params_f=up, upright_params_r=up, wheel_radius_m=veh.tire_radius_m,
-        motion_ratio_f=veh.motion_ratio_front, motion_ratio_r=veh.motion_ratio_rear,
-        cradle_solvers=cradle, heave_tbar_solvers=htb)
+        cradle_solvers=cradle, heave_tbar_solvers=htb,
+        veh=veh, topology=getattr(win, '_topology', None),
+        arb_geometry=arb_geometry_fn(win))
     # bp_f/bp_r carry the Seward caliper geometry (pad radius R_pad, bolt spacing
     # l5, pad offset l4); `solver` carries the tyre models for the aligning
     # moment Mz.  Returned so the load view uses the SAME objects (one model).
@@ -57,8 +173,9 @@ _C_CAL = (0.35, 0.90, 0.95, 1.0)   # brake CALIPER mount (cyan — distinct from
 _C_MOM = (1.00, 0.55, 0.00, 1.0)   # MOMENTS (N·m) — orange, drawn double-headed
 
 
-def _load_items(win, lat_g, lon_g, only_corner=None):
+def _load_items(win, lat_g, lon_g, only_corner=None, speed_kph=None):
     """Every load in the wheel package, as (point, force_vec, rgba, label).
+    speed_kph: the case speed for the aero load (None = the case rule).
 
     Categories the user asked to keep separate:
       CHASSIS  = the reaction each control-arm/tie/pushrod pushes into its
@@ -69,79 +186,68 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
       ROCKER/ARB = the bellcrank free body (pushrod, spring, ARB drop-link -
                  all AXIAL - and the only moment reaction, at the rocker PIVOT).
     """
-    loads, veh, up, res, bp_f, bp_r, dyn = compute_case(win, lat_g, lon_g)
+    loads, veh, up, res, bp_f, bp_r, dyn = compute_case(win, lat_g, lon_g, speed_kph)
     corners = [only_corner] if only_corner else ['FL', 'FR', 'RL', 'RR']
     items = []
-    # The ARB drop-link force is the ANTISYMMETRIC (left-right) part of the two
-    # rockers' moment about the rocker axis — the bar is one torsion element, so
-    # it reacts only ROLL (the difference), never a symmetric brake/squat/bump.
-    # Precompute each corner's rocker moment m0 and pair the sides so the free
-    # body below reacts m0 - m0_opposite (zero when both sides match).
-    _OPP = {'FL': 'FR', 'FR': 'FL', 'RL': 'RR', 'RR': 'RL'}
+    # The ARB drop-link force closes EACH rocker's own moment about its pivot
+    # axis (core: rocker_arb_freebody).  compute_all_corners already split each
+    # axle's rocker moment into springs (heave + their share of roll) and bar
+    # (its roll share, equal-and-opposite L/R), so no pairing happens here.
+    # ONE MODEL: every corner is drawn at the POSE its loads were solved at
+    # (ComponentLoads.state, the dynamic roll travel) — never a re-solve at 0.
+    def _pose(lbl, c):
+        st_ = getattr(c, 'state', None)
+        if st_ is None:
+            st_ = win._solvers[lbl].solve(float(res.travel.get(lbl, 0.0)) / 1000.0)
+        return st_
 
-    def _rocker_m0(lbl):
-        c = loads.get(lbl)
-        if c is None:
-            return None
-        try:
-            st = win._solvers[lbl].solve(0.)
-            arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
-            hp = win._front_hp if lbl[0] == 'F' else win._rear_hp
-            mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else 1.0
-            axis = (np.asarray(hp['rocker_axis_pt'], float)
-                    - np.asarray(hp['rocker_pivot'], float)) * mir
-            ae = np.asarray(arb['arb_arm_end'], float)
-            if lbl in ('FR', 'RR'):
-                ae = ae * np.array([-1.0, 1.0, 1.0])
-            fb = _loads.rocker_arb_freebody(
-                pushrod_inner=np.asarray(st.pushrod_inner, float),
-                pushrod_outer=np.asarray(st.pushrod_outer, float),
-                pushrod_N=float(c.pushrod_N),
-                rocker_pivot=np.asarray(st.rocker_pivot, float), rocker_axis=axis,
-                rocker_spring_pt=np.asarray(st.rocker_spring_pt, float),
-                spring_chassis_pt=np.asarray(st.spring_chassis_pt, float),
-                spring_force_N=float(c.spring_force_N),
-                arb_drop_top=win._arb_drop_top_world(lbl, st), arb_arm_end=ae,
-                arb_pivot=arb.get('arb_pivot'))
-            return fb.get('m0')
-        except Exception:
-            return None
-    _m0_corner = {L: _rocker_m0(L) for L in ('FL', 'FR', 'RL', 'RR')}
     for lbl in corners:
         c = loads.get(lbl)
         if c is None:
             continue
-        st = win._solvers[lbl].solve(0.)
+        st = _pose(lbl, c)
         wc = np.asarray(st.wheel_center, float)
         spin = np.asarray(st.spin_axis, float)
         spin = spin / max(np.linalg.norm(spin), 1e-9)
+        if not getattr(c, 'valid', True):
+            # An invalid member solve is NOT drawn as forces (it would be drawn
+            # as numbers that mean nothing).  The label says why.
+            items.append((wc, np.zeros(3), _C_COMP,
+                          f'{lbl} MEMBER SOLVE INVALID · {c.invalid_reason}'))
 
         # ── CHASSIS: reaction at each inboard pickup (force ON the frame) ──
-        MEM = (('uca_front', 'uca_outer', 'uca_front_N', 'upper arm front'),
-               ('uca_rear', 'uca_outer', 'uca_rear_N', 'upper arm rear'),
-               ('lca_front', 'lca_outer', 'lca_front_N', 'lower arm front'),
-               ('lca_rear', 'lca_outer', 'lca_rear_N', 'lower arm rear'),
-               ('tr_inner', 'tr_outer', 'tierod_N', 'tie / toe rod'),
-               ('pushrod_inner', 'pushrod_outer', 'pushrod_N', 'pushrod'))
-        for ik, ok, attr, nm in MEM:
+        #    Vectors straight from the core solver (chassis_forces).  On the arm
+        #    that carries the pushrod they are NOT along the leg (the leg also
+        #    carries shear) — the label gives both parts.
+        MEM = (('uca_front', 'uca_front', 'uca_front_N', 'upper arm front'),
+               ('uca_rear', 'uca_rear', 'uca_rear_N', 'upper arm rear'),
+               ('lca_front', 'lca_front', 'lca_front_N', 'lower arm front'),
+               ('lca_rear', 'lca_rear', 'lca_rear_N', 'lower arm rear'),
+               ('tierod', 'tr_inner', 'tierod_N', 'tie / toe rod'),
+               ('pushrod', 'pushrod_inner', 'pushrod_N', 'pushrod'))
+        cf = getattr(c, 'chassis_forces', {}) or {}
+        for key, ik, attr, nm in MEM:
             F = float(getattr(c, attr))
-            u = _u(st, ik, ok)                       # inboard -> outboard
+            v = cf.get(key)
             p = np.asarray(getattr(st, ik), float)
+            if v is None or not np.all(np.isfinite(v)) or not np.isfinite(F):
+                continue
             tag = 'tension' if F >= 0 else 'compression'
-            items.append((p, F * u, _C_TEN if F >= 0 else _C_COMP,
-                          f'{lbl} CHASSIS · {nm} pickup · {abs(F):,.0f} N {tag} '
+            sh = float(getattr(c, attr.replace('_N', '_shear_N'), 0.0) or 0.0)
+            sh_txt = f' + {sh:,.0f} N shear (arm carries the pushrod)' if sh > 1.0 else ''
+            items.append((p, np.asarray(v, float), _C_TEN if F >= 0 else _C_COMP,
+                          f'{lbl} CHASSIS · {nm} pickup · {abs(F):,.0f} N {tag}{sh_txt} '
                           f'(the frame is {"pulled outboard" if F >= 0 else "pushed inboard"})'))
 
-        # ── UPRIGHT: ball joints (resultant of the arm legs) ──
-        R_uca = -(c.uca_front_N * _u(st, 'uca_front', 'uca_outer')
-                  + c.uca_rear_N * _u(st, 'uca_rear', 'uca_outer'))
-        R_lca = -(c.lca_front_N * _u(st, 'lca_front', 'lca_outer')
-                  + c.lca_rear_N * _u(st, 'lca_rear', 'lca_outer'))
-        R_tie = -(c.tierod_N * _u(st, 'tr_inner', 'tr_outer'))
-        for pt, v, nm in ((st.uca_outer, R_uca, 'upper ball joint'),
-                          (st.lca_outer, R_lca, 'lower ball joint'),
-                          (st.tr_outer, R_tie, 'tie / toe ball joint')):
-            items.append((np.asarray(pt, float), v, _C_UP,
+        # ── UPRIGHT: ball joints — force ON the upright, from the core solver ──
+        jf = getattr(c, 'joint_forces', {}) or {}
+        for key, pt, nm in (('uca', st.uca_outer, 'upper ball joint'),
+                            ('lca', st.lca_outer, 'lower ball joint'),
+                            ('tie', st.tr_outer, 'tie / toe ball joint')):
+            v = jf.get(key)
+            if v is None or not np.all(np.isfinite(v)):
+                continue
+            items.append((np.asarray(pt, float), np.asarray(v, float), _C_UP,
                           f'{lbl} UPRIGHT · {nm} · {np.linalg.norm(v):,.0f} N'))
 
         # ── UPRIGHT: wheel BEARINGS (radial + axial), along the spin axis ──
@@ -163,75 +269,47 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             nin = spin * (-1.0 if spin[0] * wc[0] > 0 else 1.0)
             p_out = wc + nin * off                    # near (outer) bearing, inboard
             p_in = wc + nin * (off + l1)              # far (inner) bearing
-            radial_out = np.array([0.0, float(c.bearing_outer_H), float(c.bearing_outer_V)])
-            radial_in = np.array([0.0, float(c.bearing_inner_H), float(c.bearing_inner_V)])
+            # Table V/H are up+/FORWARD+; the world frame is +Y = REARWARD, so the
+            # world vector is (0, -H, V).  (Drawing +H on +Y pointed every
+            # fore-aft bearing arrow backwards.)
+            radial_out = np.array([0.0, -float(c.bearing_outer_H), float(c.bearing_outer_V)])
+            radial_in = np.array([0.0, -float(c.bearing_inner_H), float(c.bearing_inner_V)])
             items.append((p_out, radial_out, _C_UP,
                           f'{lbl} UPRIGHT · outer bearing RADIAL · {np.linalg.norm(radial_out):,.0f} N'))
             items.append((p_in, radial_in, _C_UP,
                           f'{lbl} UPRIGHT · inner bearing RADIAL · {np.linalg.norm(radial_in):,.0f} N'))
-            ax = float(c.bearing_axial_N)
+            ax = float(c.bearing_axial_N)              # + = INBOARD thrust
             if abs(ax) > 1.0:                          # only the OUTER bearing takes axial
-                items.append((p_out, ax * spin, _C_UP,
+                items.append((p_out, ax * nin, _C_UP,
                               f'{lbl} UPRIGHT · outer bearing AXIAL · {abs(ax):,.0f} N'))
         except Exception:
             pass
 
         # ── UPRIGHT: brake CALIPER mount lugs (Seward Ch.6, Fig 6.15) ──
-        # The single tangential pad-friction force F_brake = brake_torque / R_pad
-        # is reacted at the TWO mounting lugs as BOTH a shared tangential force
-        # V_brake = F_brake/2 (same direction on both lugs) AND a horizontal
-        # COUPLE H_brake = F_brake·l4/l5 (equal-and-opposite on the two lugs),
-        # because the pad centre-of-area is offset l4 from the bolt line.  The
-        # OLD code applied only the tangential force and dropped H_brake — that
-        # was the "no horizontal caliper force" bug.  The caliper MOUNT ANGLE
-        # (up.caliper_angle_deg) sets where it sits around the disc.
+        # Positions and forces come from the core caliper free body
+        # (vahan.loads._compute_caliper_bolt_loads via caliper_frame): the SAME
+        # clocking and the SAME numbers as the Loads table.  Per lug, force ON the
+        # upright = shared tangential F/2 (along the disc motion) -/+ the couple
+        # F*l4/l5 along the radial (pad centre offset l4 from the bolt line).
         bt = float(getattr(c, 'brake_torque_Nm', 0.0))
-        if abs(bt) > 1.0:
-            vup = np.array([0., 0., 1.]) - np.dot([0., 0., 1.], spin) * spin
-            vup = vup / max(np.linalg.norm(vup), 1e-9)          # vertical in wheel plane
-            fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
-            fwd = fwd / max(np.linalg.norm(fwd), 1e-9)          # fore-aft in wheel plane
-            # CLOCKING.  With the caliper radial pointing FORE-AFT, the two mount
-            # bolts (spaced along t_hat = spin x r_hat) stack VERTICALLY — one
-            # above the other — which lets the upright carry them on a single
-            # vertical boss.  Clock it to the tie-rod's fore-aft side so the
-            # caliper and the steering arm share the same face of the upright.
-            if bool(getattr(up, 'caliper_vertical_mounts', True)):
-                dy = float(np.asarray(st.tr_outer, float)[1] - wc[1])   # +y = rearward
-                r_hat = np.sign(dy) * fwd if abs(dy) > 1e-6 else -fwd   # toward the tie rod
-            else:
-                phi = np.radians(float(getattr(up, 'caliper_angle_deg', 45.0)))
-                r_hat = vup * np.cos(phi) + fwd * np.sin(phi)   # manual clock angle
-            r_hat = r_hat / max(np.linalg.norm(r_hat), 1e-9)
-            t_hat = np.cross(spin, r_hat); t_hat /= max(np.linalg.norm(t_hat), 1e-9)
-            # Seward geometry, straight off the brake params (front/rear):
-            #   R_pad = pad centre-of-area radius, l4 = pad-centre offset from the
-            #   bolt line, l5 = bolt (lug) spacing.
-            _bp = bp_f if lbl[0] == 'F' else bp_r
-            R_pad = max(float(_bp.pad_radius_mm) / 1000.0, 0.03)
-            # Mount geometry comes from the caliper DRAWING (see BrakeParams):
-            # the bolt line sits at D1 = rotor_dia/2 - mount height, and l4 is
-            # derived from it, not typed.  The old code put the bolts at
-            # R_pad - 25 mm, which is 23 mm inboard of where they actually are.
-            bolt_r = max(float(_bp.bolt_line_radius_mm) / 1000.0, 0.02)
-            l4 = max(float(_bp.caliper_l4_mm) / 1000.0, 0.0)
-            l5 = max(float(_bp.caliper_bolt_spacing_mm) / 1000.0, 0.01)
-            F_brake = bt / R_pad
-            V_brake = 0.5 * F_brake                             # shared tangential (both lugs)
-            H_brake = F_brake * l4 / l5                         # couple (opposite on the lugs)
-            s = float(np.sign(bt))
-            for sgn in (+1.0, -1.0):
-                pos = wc + r_hat * bolt_r + t_hat * (sgn * 0.5 * l5)
-                F = s * V_brake * t_hat + sgn * H_brake * r_hat
-                items.append((pos, F, _C_CAL,
-                              f'{lbl} CALIPER · mount lug · V {V_brake:,.0f} N + H {H_brake:,.0f} N '
-                              f'(brake torque {bt:,.0f} Nm)'))
+        _bp = bp_f if lbl[0] == 'F' else bp_r
+        for pos, F in (getattr(c, 'caliper_lugs', None) or []):
+            F = np.asarray(F, float)
+            _R_pad = max(float(_bp.pad_radius_mm) / 1000.0, 0.03)
+            _Fb = bt / _R_pad
+            # l4 is SIGNED (bolt line outside the pad centre -> couple reverses);
+            # the label quotes its magnitude, the arrow is the core's signed vector.
+            _Hc = _Fb * abs(float(_bp.caliper_l4_mm)) / max(float(_bp.caliper_bolt_spacing_mm), 1e-3)
+            items.append((np.asarray(pos, float), F, _C_CAL,
+                          f'{lbl} CALIPER · mount lug · V {0.5 * _Fb:,.0f} N + H {_Hc:,.0f} N '
+                          f'(brake torque {bt:,.0f} Nm)'))
 
         # ── UPRIGHT / TYRE: contact-patch load into the hub ──
-        patch = np.array([wc[0], wc[1], 0.0])
-        Fpatch = np.array([float(res.Fy.get(lbl, 0.0)),
-                           float(res.Fx.get(lbl, 0.0)),
-                           float(res.Fz.get(lbl, 0.0))])
+        #    Same patch point and the same signed world force the member solver
+        #    used (vahan.loads.contact_patch_point / patch_force_world).
+        _R = float(getattr(veh, 'tire_radius_m', wc[2]))
+        patch = _loads.contact_patch_point(wc, spin, _R)
+        Fpatch = _loads.patch_force_world(c.Fx_N, c.Fy_N, c.Fz_N)
         items.append((patch, Fpatch, _C_UP,
                       f'{lbl} TYRE · contact patch into hub · {np.linalg.norm(Fpatch):,.0f} N'))
 
@@ -247,9 +325,14 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
             arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
             hp = win._front_hp if lbl[0] == 'F' else win._rear_hp
             P = np.asarray(st.rocker_pivot, float)
-            mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else 1.0
-            axis = (np.asarray(hp['rocker_axis_pt'], float)
-                    - np.asarray(hp['rocker_pivot'], float)) * mir
+            # The rocker's REAL pivot axis is the one the kinematic solver turns
+            # it about (normal of the rocker plate), not the raw axis point —
+            # the core spring balance uses the same axis.
+            axis = getattr(win._solvers[lbl], '_rocker_axis', None)
+            if axis is None:
+                mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else 1.0
+                axis = (np.asarray(hp['rocker_axis_pt'], float)
+                        - np.asarray(hp['rocker_pivot'], float)) * mir
             pi = np.asarray(st.pushrod_inner, float); po = np.asarray(st.pushrod_outer, float)
             sp = np.asarray(st.rocker_spring_pt, float); sc = np.asarray(st.spring_chassis_pt, float)
             dt = win._arb_drop_top_world(lbl, st)
@@ -266,8 +349,7 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
                 rocker_pivot=P, rocker_axis=axis,
                 rocker_spring_pt=sp, spring_chassis_pt=sc,
                 spring_force_N=float(c.spring_force_N),
-                arb_drop_top=dt, arb_arm_end=ae, arb_pivot=arb_piv,
-                m0_opposite=_m0_corner.get(_OPP.get(lbl)))
+                arb_drop_top=dt, arb_arm_end=ae, arb_pivot=arb_piv)
             F_push = fb['F_push']; F_spr = fb['F_spr']
             F_arb = fb['F_arb']; F_pivot = fb['F_pivot']
             rows = [(pi, F_push, 'ROCKER · pushrod force', _C_RK),
@@ -298,28 +380,30 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
         #    view only supplies the drawing DIRECTIONS (spin/fore-aft/kingpin/
         #    vertical/bar axes); every VALUE comes from core (ONE MODEL), so the
         #    binder and this view show identical numbers.
-        Fx = float(res.Fx.get(lbl, 0.0)); Fy = float(res.Fy.get(lbl, 0.0))
-        fwd = np.array([0., 1., 0.]) - np.dot([0., 1., 0.], spin) * spin
-        fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
+        # SIGNED wheel forces straight off the ComponentLoads (the member
+        # solver's own inputs), so moments, arrows and member table agree.
         _tm = getattr(dyn, '_tire' if lbl[0] == 'F' else '_tire_rear', None)
         mom = _loads.corner_moments(
-            Fx=Fx, Fy=Fy, Fz=float(res.Fz.get(lbl, 0.0)),
+            Fx=float(c.Fx_N), Fy=float(c.Fy_N), Fz=float(c.Fz_N),
             camber_deg=float((getattr(res, 'inclination', None) or {}).get(lbl, 0.0)),
             wheel_center=wc, spin_axis=spin,
             lca_outer=st.lca_outer, uca_outer=st.uca_outer,
-            tire_model=_tm, freebody=fb)
+            tire_model=_tm, freebody=fb,
+            wheel_radius_m=float(getattr(veh, 'tire_radius_m', wc[2])))
 
         # HUB brake/drive torque about the spin axis (reacted by the caliper
         # couple front / the driveshaft rear).
         T_hub = float(mom.get('hub_torque_Nm', 0.0))
         if abs(T_hub) > 1.0:
-            items.append((wc, T_hub * spin, _C_MOM,
+            # vector = value * axis from core (moment of the patch force about
+            # the wheel centre; the scalar alone has no drawing direction)
+            items.append((wc, T_hub * np.asarray(mom['hub_torque_axis'], float), _C_MOM,
                           f'{lbl} HUB · brake/drive torque (about axle) · {abs(T_hub):,.0f} N·m'))
         # OVERTURNING moment about the fore-aft axis (reacted by the two wheel
         # bearings as a vertical force couple).
         M_ot = float(mom.get('overturning_Nm', 0.0))
         if abs(M_ot) > 1.0:
-            items.append((wc, M_ot * fwd, _C_MOM,
+            items.append((wc, M_ot * np.asarray(mom['overturning_axis'], float), _C_MOM,
                           f'{lbl} BEARINGS · overturning moment · {abs(M_ot):,.0f} N·m'))
         # STEERING moment about the kingpin axis through the two ball joints.
         M_kp = mom.get('kingpin_Nm')
@@ -347,11 +431,12 @@ def _load_items(win, lat_g, lon_g, only_corner=None):
     return items
 
 
-def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None):
+def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None, speed_kph=None):
     """Force-vector arrows for Load mode.  Returns (p, tip, rgba, label).
     mode='resultant' = one arrow per load in the true direction; 'components'
-    = split into lateral(X)/fore-aft(Y)/vertical(Z)."""
-    items = _load_items(win, lat_g, lon_g, only_corner)
+    = split into lateral(X)/fore-aft(Y)/vertical(Z).  speed_kph: the case
+    speed for the aero load (None = the case rule)."""
+    items = _load_items(win, lat_g, lon_g, only_corner, speed_kph)
     if not items:
         return []
     # Moments (N·m) are a different UNIT from forces (N) — scale each group by its
@@ -419,6 +504,9 @@ def build_dialog(win):
                   'grey = ball-joint · amber = ground / caliper.')
     info.setWordWrap(True); info.setStyleSheet('color:#888;font-size:11px')
     lay.addWidget(info)
+    speed_lab = QLabel(''); speed_lab.setWordWrap(True)
+    speed_lab.setStyleSheet('color:#9A9AA2;font-size:11px')
+    lay.addWidget(speed_lab)
 
     def apply():
         lat, lon = next((c[1], c[2]) for c in CASES if c[0] == case_cb.currentText())
@@ -426,6 +514,10 @@ def build_dialog(win):
             win._dynamics_panel._lat_g.setValue(lat); win._dynamics_panel._lon_g.setValue(lon)
         except Exception:
             pass
+        try:
+            speed_lab.setText('Case speed ' + case_aero_text(case_aero(win, lat, lon)))
+        except Exception as e:
+            speed_lab.setText(f'Case speed: {e}')
         win._car['view_mode'] = 'load'
         win._car['load_vec_mode'] = 'components' if r_comp.isChecked() else 'resultant'
         cc = corner_cb.currentText()

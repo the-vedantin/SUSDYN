@@ -113,7 +113,7 @@ def _resolve_source(source, radius_m):
 # ═══════════════════════════════════════════════════════════════════════════
 #  the live computation — every number the report prints comes from here
 # ═══════════════════════════════════════════════════════════════════════════
-def compute_ackermann_evidence(source, radius_m=8.0, grip_multiplier=0.70):
+def compute_ackermann_evidence(source, radius_m=8.0, grip_multiplier=None):
     """Recompute the whole evidence base LIVE and return it as a dict.
 
     This is deliberately separated from the HTML so the numbers can be checked
@@ -123,8 +123,9 @@ def compute_ackermann_evidence(source, radius_m=8.0, grip_multiplier=0.70):
     from vahan.ymd import mmm_metrics_sweep, build_loads_table
 
     R = float(radius_m)
-    grip = float(grip_multiplier)
     solver, tire, aero, probe_fn = _resolve_source(source, R)
+    from vahan.dynamics import resolve_grip_scale   # None = project scale
+    grip = resolve_grip_scale(grip_multiplier, solver)
 
     # ── as-built %, probed from the steering linkage at full lock ────────────
     try:
@@ -685,7 +686,7 @@ _PAGE = """<!doctype html>
 #  the public entry point
 # ═══════════════════════════════════════════════════════════════════════════
 def build_ackermann_report(source, out_html=None, radius_m=8.0,
-                           grip_multiplier=0.70):
+                           grip_multiplier=None):
     """Build the Ackermann justification report and write a self-contained HTML.
 
     source : a MainWindow, or a (solver, tire, aero, probe_fn) tuple.

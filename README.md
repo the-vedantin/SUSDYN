@@ -41,22 +41,54 @@ python test_one_model.py
 
 ## Pages
 
-- The app is organized into five full-window pages (Page menu):
+- The app is organized into nine full-window pages (Page menu):
 
 | Shortcut | Page | What it does |
 |----------|------|--------------|
 | Ctrl+1 | Suspension | 3D view, kinematic graphs, all side panels (the main workspace) |
 | Ctrl+2 | Lap Time | quasi-static lap simulator on a digitized track |
-| Ctrl+3 | Design City | gallery of candidate designs; click a card to load it into the main window |
+| Ctrl+3 | Design City | front/rear packaging alternatives that hold EVERY parameter within 0.1 %, rendered and grouped by similarity; click a card to load it |
 | Ctrl+4 | Loads | full-window component-loads page with a live, hoverable 3D force view |
 | Ctrl+5 | Ackermann | Ackermann demand / capability / MMD analysis suite |
+| Ctrl+6 | Engine | engine model + calibration; the torque curve the lap sim runs on |
+| Ctrl+7 | Packaging | move the inboard actuation with every parameter held in tolerance |
+| Ctrl+8 | Ride | ISO 8608 road response of the solved car (7-DOF) and the ride-rate solve: sweep front x rear ride rate, minimise worst-corner tire-load variation within travel + flat-ride limits, convert to spring rates + catalogue springs |
+| Ctrl+9 | Corner Speed | trimmed maximum speed for each corner radius, with the steering-lock radius; and the per-corner tyre-grip budget |
+
+### Chassis keep-out (red zone)
+A project can name a keep-out solid exported from CAD (`car['keepout_step']`, a planar STEP in the car frame, metres).
+Vahan draws it as a translucent red block in the 3D view, the packaging builders treat it as a hard volume, and the
+regression net fails if any member — including the steering-rack housing and both torsion bars — is inside it at any
+travel / steering state (Rule 18, `vahan/keepout.py`).
+
+### Tyre test-speed / conditioning window
+A TTC run pools several test speeds (Round 9 run 6: 15 / 25 / 45 mph). `TireModel(..., speed_window_kph=(lo, hi))` keeps one block
+after the warm-up discard; a project declares it as `car['tire_speed_window_kph'] = [lo, hi]` (and optionally
+`car['tire_warmup_samples']`), which both tyre-load paths honour and the loader re-applies after the car keys arrive. The model
+records `speed_window_kph` and `samples_selected`; an empty window is refused. Regression line "tyre speed window".
+
+### Rocker plate as a clash body
+The bellcrank is the 6 mm plate the 3D view draws (flat through the pivot, pushrod and spring attach points; an
+off-plane drop top is a standoff stud). `vahan.interference.rocker_plate_gaps` measures every member against it —
+the interference view lights a member red when it passes through the plate, and the regression net requires the
+ARB drop link 3 mm clear of its plate at droop, static and bump. A declared rod-end standoff
+(`car['front_arb_drop_standoff_mm']`) and a Rule 04 waiver (`car['front_arb_rule04_waiver']`) are honoured by
+the laws and printed by the net on every run (`docs/suspension_rules/04_arb_drop_link_in_plane.md`).
+
+### Front-hoop line (Rule 19)
+The front anti-roll bar (bar, blades, drop links, rod ends) must stay ahead of the line through the LCA-aft / UCA-aft
+chassis pickups extended upward (the front hoop) by 3 mm at droop, static and bump —
+`vahan.packaging.front_arb_hoop_line_gap_mm`, gated by the regression net. See `docs/suspension_rules/19_front_hoop_line.md`.
 
 ### Design City (Ctrl+3)
 
 ![Design City page](screenshots/city_page.png)
 
-- A gallery of candidate designs produced by an optimizer run (`designs_city/run_*`), each card showing that design's axle-utilization, camber/toe and roll-centre sweeps plus its key stats (max lateral g, LLTD, roll gradient, bump steer, ride frequencies, sag, clearance).
-- Sort by any figure of merit; click a card to load that design straight into the main window.
+- **What it answers:** "where else could the inboard suspension go without changing the car?"  `design_city.py` starts from the highest `configs/2027_v<N>` config and enumerates chassis-side packaging alternatives for the FRONT and the REAR separately, keeps only the ones that hold **every** parameter within **0.1 %** of the baseline, renders each survivor through the real 3D view, and groups them by similarity.
+- **Moves tried** (all `vahan/packaging.py` primitives, wheel-side hardpoints never touched): the spring pair swung about the rocker axis (rocker shape + coilover chassis mount move, spring law identical by construction), ARB drop-top swings / re-hang branches / drop-link length with the bar rate re-matched, inboard arm pickups slid along their own pivot axis (swing axis unchanged), plus a small share of slice rotations / mirror / translations / lever scaling so the run can report honestly what blocks them (they move the motion-ratio *curve*).
+- **The gate** (`vahan.packaging.parameter_vector` + `compare_parameters`): ~112 parameters — static camber/toe/caster/KPI/scrub/trail/roll-centre, anti-dive/squat, camber + toe curves at 9 travel stations, camber gain, bump steer, motion ratio + slope + MR at 5 stations, damper lengths / stroke use / travel range / damper sign, ARB motion ratio at −25/0/+25 mm, Ackermann at lock, spring/wheel/ride rates, ride frequencies, ARB rates, roll stiffness + split, roll gradient, static sag, LLTD / roll angle / understeer gradient at 1 g.  Tolerance 0.1 % relative with an absolute floor of 0.1 % of each parameter's physical scale (documented per parameter in every `metrics.json`).  Also required: the axle geometry laws (coplanar, drop link in plane, 90° triad, rear damper cant), the rocker rod-end/bearing separations, 0 clash negatives at rack centre and both locks, the 39-state full audit, and a save → reload round trip that passes the same gate with the wheel side byte-identical.
+- **Output** `designs_city/<run>/run.json` (config, sha, parameter list, tried/kept/groups per axle, most-failed parameter), `<axle>/groups.json` (complete-linkage clusters: two solutions share a group only if no chassis-side point differs by more than the cut, default 20 mm), `<axle>/<id>/config.vahan + metrics.json + gui_axle/iso/top.png`.
+- **Page:** one section per group (representative, spread in mm, which points moved), a card per solution with its axle view; click for the full parameter table and *Open in Vahan*.  `py design_city.py --trials 300 --workers 4` runs it (search offscreen, native-GL render in a child process); `--render <run>` / `--cluster <run>` redo those steps.
 
 ---
 
@@ -199,6 +231,12 @@ The decoupled central-spring option has a dedicated solver:
 - Convention: an unqualified Ackermann % is quoted **at full lock** (the ratio drifts with steer angle).
 
 *Ackermann-page screenshot excluded from the repository — the page displays curves derived from FSAE TTC data, which are not redistributed.*
+
+## Corner Speed Page (Ctrl+9)
+
+- **Tightest corner vs speed** uses the same trimmed yaw-moment solve as the Ackermann analysis at each selected radius. It reports the maximum lateral g, speed, body slip, front steer and the stability derivative; optional aero comes from the Dynamics-panel aero path, and a marker shows the full-rack steering-lock radius solved from the loaded linkage.
+- **Per-corner grip budget** reads each tyre's force demand, load, inclination and friction-circle utilization from `SteadyStateSolver`. It finds the first lateral g at which any individual tyre exceeds its budget, alongside the app's axle-aggregate reference limit. The table flags loads below the selected tyre dataset's tested floor. The aero case is the Dynamics-panel package either held fixed at a chosen speed or scaled with g on a chosen radius.
+- Both tabs run in a worker thread with a progress line, fill a table and have a `Copy table` button (tab-separated text). Orchestration lives in `vahan/corner_speed.py` (no physics of its own); the regression net's `corner speed` line checks that the page's rows equal a direct `vahan.ymd.trim_sweep_ackermann` call, that the figure and table are those rows, and that the per-corner utilization equals `SteadyStateSolver.solve`'s own.
 
 ### One yaw-moment engine
 

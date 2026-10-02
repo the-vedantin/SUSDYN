@@ -333,9 +333,14 @@ class PackagingQD:
             PK.set_bundle(self.w, self.axle, bb)
             gl = PK._axle_geometry_laws(self.w, self.axle)
             bg = self.base['geometry'][self.axle]
+            rule04_ok = PK.arb_drop_link_plate_compliant(
+                {'drop_top_signed_mm': gl['arb_drop_top_plate_signed_mm'],
+                 'arm_end_signed_mm': gl['arb_arm_end_plate_signed_mm']},
+                tol.arb_inplane_mm, gl.get('arb_is_bottom', False))
             ok_law = (gl['coplanar_mm'] <= tol.coplanar_mm
-                      and gl['arb_drop_top_inplane_mm'] <= tol.arb_inplane_mm
-                      and gl['arb_arm_end_inplane_mm'] <= tol.arb_inplane_mm
+                      and np.isfinite(gl['rocker_axis_normal_error_deg'])
+                      and gl['rocker_axis_normal_error_deg'] <= tol.rocker_axis_deg
+                      and rule04_ok
                       and all(abs(gl[k] - bg[k]) <= tol.triad_deg for k in
                               ('triad_bar_blade_deg', 'triad_blade_drop_deg',
                                'triad_bar_drop_deg')))
