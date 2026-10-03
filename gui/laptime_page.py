@@ -1,0 +1,1306 @@
+"""
+gui/laptime_page.py — the LAPTIME page.
+
+Layout contract (user-specified):
+  * the TRACK MAP is always visible at the top (proportionate, never scrolled)
+  * every other graph is a CHECKBOX — only checked graphs render, splitting
+    the remaining canvas height between them (fewer checked = bigger graphs)
+  * the user never scrolls to see a graph
+
+Sim: vahan.laptime.LapSimulator on the LIVE MainWindow car (single-model),
+with aero (Cl·A / Cd·A / ρ / CoP), grip derate, and a full 6-speed GEARBOX
+(primary × gear × final, torque-plateau/constant-power engine, redline).
+"""
+from __future__ import annotations
+
+import os
+
+import numpy as np
+from gui.plot_dialog import ReadableCanvas
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
+    QDoubleSpinBox, QSpinBox, QCheckBox, QScrollArea, QFrame, QComboBox,
+    QLineEdit,
+)
+
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+# Selectable tracks: (label, json filename).  The page lists every file that
+# exists; missing ones are skipped.
+_TRACKS = [
+    ('2024', 'autocross26.json'),
+    ('2025', 'autocross_2025.json'),
+    ('MI 2018 Endurance', 'mi2018_endurance.json'),
+]
+
+# The tire-dataset dropdown is built DYNAMICALLY from whatever .mat files the
+# user has placed in tire_data/ (which is gitignored — TTC data is never in
+# the repo).  Each entry's label is read from the file's own tire_id AT
+# RUNTIME, so no TTC tire names / run numbers are hard-coded in this (public)
+# source file.  See LaptimePage._discover_tires().
+
+from vahan.laptime import Track, LapSimulator, assumed_torque_curve
+
+# What the torque-curve box says when the user has no dyno sheet.  The word
+# ASSUMED is the switch: leave it and the generic restrictor-limited 600 SHAPE
+# (scaled to this car's own peak power) is used and LABELLED as assumed.
+_ASSUMED_CURVE_HINT = 'ASSUMED  (generic restricted-600 shape)'
+
+# colour-blind-safe corner colours (matches the suspension page)
+_CC = {'FL': '#FFD600', 'FR': '#E53935', 'RL': '#FFFFFF', 'RR': '#42A5F5'}
+_LS = {'FL': '-', 'FR': '--', 'RL': '-.', 'RR': ':'}
+
+# user-supplied 2026 gearbox (tooth counts verified: 33/12, 32/16, 30/18,
+# 26/18, 30/23, 29/24)
+_DEFAULT_GEARS = [2.750, 2.000, 1.667, 1.444, 1.304, 1.208]
+
+
+class _SimWorker(QThread):
+    progress = pyqtSignal(str, int)
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, sim: LapSimulator, track: Track, n_detail: int):
+        super().__init__()
+        self._sim, self._track, self._nd = sim, track, n_detail
+
+    def run(self):
+        try:
+            res = self._sim.simulate(
+                self._track, n_detail=self._nd,
+                progress_cb=lambda m, p: self.progress.emit(m, p))
+            self.finished_ok.emit(res)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.failed.emit(str(e))
+
+
+class LaptimePage(QWidget):
+    """The Laptime page widget.  `main` is the MainWindow (for the live car)."""
+
+    # (key, checkbox label, default-on) — each graph is single-purpose and
+    # isolatable (no dual-axis mashups except rpm+gear, which reads as one).
+    _GRAPHS = [
+        ('speed',  'Speed',            True),
+        ('gg',     'Lat / Lon g',      True),
+        ('util',   'Tire utilization', True),
+        ('lltd',   'LLTD',             False),
+        ('roll',   'Roll',             False),
+        ('susp',   'Travel + shock',   False),
+        ('aero',   'Aero down/drag',   False),
+        ('rpm',    'RPM + gear',       False),
+        ('power',  'Power',            False),
+        ('diff',   'Diff yaw moment',  False),
+        ('rideh',  'Ride height',      False),
+    ]
+
+    def __init__(self, main):
+        super().__init__()
+        self._main = main
+        self._track: Track | None = None
+        self._worker: _SimWorker | None = None
+        self._result = None
+        self._last_lap_s: float | None = None    # for the Δ-vs-last readout
+        self._build()
+        self._load_default_track()
+        self._redraw()               # placeholder until first sim
+        # Seed CdA / air density from the live car (single source: the
+        # dynamics panel owns them; these are sim-local overrides).
+        try:
+            veh = main._build_dynamics_solver()._veh
+            self._cda.setValue(float(veh.cda_m2))
+            self._rho.setValue(float(veh.air_density_kg_m3))
+            # rotating inertia + shift model live on the CAR (VehicleParams);
+            # these boxes are sim-local overrides seeded from it.
+            self._I_wf.setValue(float(veh.wheel_inertia_front_kgm2))
+            self._I_wr.setValue(float(veh.wheel_inertia_rear_kgm2))
+            self._I_eng.setValue(float(veh.engine_inertia_kgm2))
+            self._shift_time.setValue(float(veh.shift_time_s))
+            self._shift_int.setValue(float(veh.min_shift_interval_s))
+            self._shift_hyst.setValue(float(veh.shift_hysteresis_frac) * 100.0)
+        except Exception:
+            pass
+        self._update_inertia_note()
+        self._update_tq_note()
+        self._refresh_tire_active()
+        self._on_diff_changed()
+
+    # ── UI ───────────────────────────────────────────────────────────────
+    def _build(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+
+        # ── left sidebar (scrollable — the GRAPHS never scroll, this may) ─
+        side = QVBoxLayout()
+        side.setSpacing(6)
+
+        title = QLabel('LAP TIME SIM')
+        title.setStyleSheet('color:#E23B48; font-size:15px; font-weight:bold;')
+        side.addWidget(title)
+
+        self._track_lbl = QLabel('— no track —')
+        self._track_lbl.setStyleSheet('color:#aaa; font-size:11px;')
+        self._track_lbl.setWordWrap(True)
+        side.addWidget(self._track_lbl)
+
+        def hdr(text):
+            l = QLabel(text)
+            l.setStyleSheet('color:#E23B48; font-size:11px; font-weight:bold;'
+                            'padding-top:6px;')
+            side.addWidget(l)
+
+        def grid():
+            g = QGridLayout(); g.setSpacing(4)
+            side.addLayout(g)
+            return g
+
+        def spin(g, row, col, label, lo, hi, val, dec, step, suffix, tip=''):
+            g.addWidget(QLabel(label), row, col * 2)
+            sb = QDoubleSpinBox()
+            sb.setRange(lo, hi); sb.setDecimals(dec)
+            sb.setSingleStep(step); sb.setValue(val); sb.setSuffix(suffix)
+            if tip:
+                sb.setToolTip(tip)
+            g.addWidget(sb, row, col * 2 + 1)
+            return sb
+
+        # ── TIRE selector — separate FRONT and REAR axle dropdowns, both
+        #    populated from local tire_data/ files.  Pick a different tire for
+        #    each axle to run a SPLIT compound setup (e.g. one in front, one in
+        #    back).  Labels are read from each file's tire id at runtime, so no
+        #    tire names are hard-coded here (TTC-compliant).
+        self._tire_rounds = self._discover_tires()
+        if self._tire_rounds:
+            hdr('TIRE  (local dataset)')
+            g = grid()
+            g.addWidget(QLabel('Front:'), 0, 0)
+            self._tire_combo_f = QComboBox()
+            self._tire_combo_f.setStyleSheet('QComboBox { font-size:11px; }')
+            self._tire_combo_f.addItem('(loaded tire — pick to swap)')
+            for lbl, _fn in self._tire_rounds:
+                self._tire_combo_f.addItem(lbl)
+            self._tire_combo_f.setToolTip(
+                'Front-axle tire.  Built from your local tire_data/ files; '
+                'labels are each file’s own tire id.  Re-Sim to compare.')
+            self._tire_combo_f.activated.connect(self._on_tire_front)
+            g.addWidget(self._tire_combo_f, 0, 1)
+
+            g.addWidget(QLabel('Rear:'), 1, 0)
+            self._tire_combo_r = QComboBox()
+            self._tire_combo_r.setStyleSheet('QComboBox { font-size:11px; }')
+            self._tire_combo_r.addItem('(same as front)')
+            for lbl, _fn in self._tire_rounds:
+                self._tire_combo_r.addItem(lbl)
+            self._tire_combo_r.setToolTip(
+                'Rear-axle tire.  Leave on "(same as front)" for one compound '
+                'all round, or pick a different tire to run a SPLIT setup '
+                '(e.g. a grippier compound on the rear).')
+            self._tire_combo_r.activated.connect(self._on_tire_rear)
+            g.addWidget(self._tire_combo_r, 1, 1)
+
+            self._tire_active = QLabel('')
+            self._tire_active.setStyleSheet('color:#8a8a92; font-size:10px;')
+            self._tire_active.setWordWrap(True)
+            side.addWidget(self._tire_active)
+
+        hdr('AERO + GRIP')
+        g = grid()
+        self._cla = spin(g, 0, 0, 'Cl·A (+down):', -5.0, 10.0, 0.0, 2, 0.1,
+                         ' m²',
+                         'SIGN CONVENTION: positive = DOWNFORCE, negative = '
+                         'net LIFT (bad bodywork).  0 = no aero package.')
+        self._cda = spin(g, 1, 0, 'Cd·A:', 0.0, 5.0, 1.0, 2, 0.05, ' m²')
+        self._rho = spin(g, 2, 0, 'Air ρ:', 0.8, 1.5, 1.225, 3, 0.005, ' kg/m³')
+        self._cop = spin(g, 3, 0, 'CoP rear:', 0.0, 100.0, 50.0, 0, 5.0, ' %',
+                         'Share of total downforce on the REAR axle.')
+        self._grip = spin(g, 4, 0, 'Grip scale:', 0.3, 1.2, 0.65, 2, 0.05, ' ×',
+                          'Track-vs-TTC-belt derate (0.6–0.7 typical).')
+        self._rh_f = spin(g, 5, 0, 'Static RH F:', 0.0, 300.0, 50.0, 0, 2.0,
+                          ' mm',
+                          'Front ride height at STATIC SAG (car on its springs '
+                          'with driver).  Aero downforce drops it from here as '
+                          'speed builds — see the Ride height graph.')
+        self._rh_r = spin(g, 6, 0, 'Static RH R:', 0.0, 300.0, 50.0, 0, 2.0,
+                          ' mm', 'Rear ride height at static sag.')
+        # Ride-height CAP: hold ride height >= cap at a reference speed.
+        self._rh_refspeed = spin(g, 7, 0, 'Cap @ speed:', 5.0, 300.0, 100.0, 0,
+                                 5.0, ' kph',
+                                 'Reference speed to size/check the ride-height '
+                                 'cap at (typ. your fastest sustained point).')
+        self._rh_cap_f = spin(g, 8, 0, 'RH cap F:', 0.0, 300.0, 25.0, 0, 1.0,
+                              ' mm', 'Minimum front ride height you will allow '
+                              '(splitter/floor clearance, bump-stop gap).')
+        self._rh_cap_r = spin(g, 9, 0, 'RH cap R:', 0.0, 300.0, 25.0, 0, 1.0,
+                              ' mm', 'Minimum rear ride height you will allow.')
+        # Live reference-speed readout: ties the Cl·A input to the number
+        # aero people actually quote ("N at 60 mph"), so a wrong entry is
+        # obvious immediately.
+        self._aero_ref = QLabel('')
+        self._aero_ref.setStyleSheet('color:#8a8a92; font-size:10px;')
+        side.addWidget(self._aero_ref)
+        self._rh_cap_readout = QLabel('')
+        self._rh_cap_readout.setStyleSheet('font-size:10px;')
+        self._rh_cap_readout.setWordWrap(True)
+        self._rh_cap_readout.setToolTip(
+            'First-order sizing at the operating-point rate.  The Ride height '
+            'GRAPH is the accurate result — it integrates the real (possibly '
+            'nonlinear) MR(travel) curve, so a progressive MR shows less heave '
+            'there.')
+        side.addWidget(self._rh_cap_readout)
+
+        def _upd_ref(*_):
+            v = 60 / 2.23694                      # 60 mph in m/s
+            q = 0.5 * float(self._rho.value()) * v * v
+            F = float(self._cla.value()) * q
+            self._aero_ref.setText(
+                f'≈ {F:+.0f} N ({F/9.81:+.0f} kgf) downforce @ 60 mph · '
+                f'drag {float(self._cda.value())*q:.0f} N @ 60 mph')
+            self._update_rh_cap()
+        for sb in (self._cla, self._cda, self._rho, self._cop, self._rh_f,
+                   self._rh_r, self._rh_refspeed, self._rh_cap_f, self._rh_cap_r):
+            sb.valueChanged.connect(_upd_ref)
+        _upd_ref()
+
+        hdr('GEARBOX  (primary × gear × final)')
+        g = grid()
+        self._primary = spin(g, 0, 0, 'Primary:', 0.5, 10.0, 1.0, 3, 0.01, '',
+                             '1.0 = no primary reduction (this car: total = '
+                             'gear × chain only).')
+        self._final = spin(g, 1, 0, 'Final (chain):', 0.5, 10.0, 3.545, 3,
+                           0.01, '', 'Driven/drive sprocket, e.g. 39/11.')
+        self._redline = spin(g, 2, 0, 'Redline:', 3000, 20000, 11000, 0, 250,
+                             ' rpm')
+        self._gear_spins = []
+        for i, ratio in enumerate(_DEFAULT_GEARS):
+            sb = spin(g, 3 + i // 2, i % 2, f'{i + 1}:', 0.0, 5.0,
+                      ratio, 3, 0.01, '',
+                      'Gearbox internal ratio.  0 = gear not fitted.')
+            self._gear_spins.append(sb)
+
+        # ── ROTATING INERTIA ────────────────────────────────────────────
+        # The single biggest known bias in this lap number, and it always
+        # flattered us: MEASURED +2.00 s on a 41.90 s lap of autocross26.
+        hdr('ROTATING INERTIA  (ASSUMED — measure it)')
+        g = grid()
+        self._I_wf = spin(g, 0, 0, 'Wheel F (each):', 0.0, 2.0, 0.19, 3, 0.01,
+                          ' kg·m²',
+                          'ONE front wheel: tyre + rim + hub + rotor, about '
+                          'the axle.  ASSUMED 0.19 for a 10-inch FSAE wheel — '
+                          'measure it with a bifilar (two-string) swing.')
+        self._I_wr = spin(g, 1, 0, 'Wheel R (each):', 0.0, 2.0, 0.19, 3, 0.01,
+                          ' kg·m²', 'ONE rear wheel, same basis as the front.')
+        self._I_eng = spin(g, 2, 0, 'Engine+clutch:', 0.0, 1.0, 0.05, 3, 0.005,
+                           ' kg·m²',
+                           'Crank + primary gear + clutch basket.  This one '
+                           'DOMINATES: it is referred through the total gear '
+                           'ratio SQUARED (9.75² = 95 in 1st).  ASSUMED 0.05 '
+                           'for a 600 cc four — get it from the engine '
+                           'manufacturer or a run-down test.')
+        self._inertia_readout = QLabel('')
+        self._inertia_readout.setStyleSheet('color:#8a8a92; font-size:10px;')
+        self._inertia_readout.setWordWrap(True)
+        side.addWidget(self._inertia_readout)
+
+        # ── SHIFT MODEL ─────────────────────────────────────────────────
+        hdr('GEARSHIFT  (driver, ASSUMED)')
+        g = grid()
+        self._shift_time = spin(g, 0, 0, 'Dead time:', 0.0, 0.60, 0.10, 3,
+                                0.01, ' s',
+                                'Torque is CUT for this long, end to end: drop '
+                                'drive, select, pick drive back up.  0 = the '
+                                'old free instantaneous shift.')
+        self._shift_int = spin(g, 1, 0, 'Min interval:', 0.0, 3.0, 0.60, 2,
+                               0.05, ' s',
+                               'Shortest allowed gap between two shifts.  This '
+                               'is what bounds CHATTER: without it the picker '
+                               'used 2nd gear for 0.08 s (one station) at the '
+                               'top of a straight, five times a lap.')
+        self._shift_hyst = spin(g, 2, 0, 'Hysteresis:', 0.0, 50.0, 4.0, 0, 1.0,
+                                ' %',
+                                'How much more wheel force the next gear must '
+                                'make before the driver takes it.  On this '
+                                'gearbox the 1-2 force step is about 37%, so '
+                                'any sane hysteresis is inactive — the minimum '
+                                'interval is the knob that does the work.')
+
+        # ── ENGINE TORQUE MODEL ─────────────────────────────────────────
+        hdr('ENGINE TORQUE')
+        self._tq_use = QCheckBox('Use a torque curve instead of the plateau')
+        # ON BY DEFAULT: the engine is a Honda CBR600RR behind the 20 mm
+        # restrictor (user, 2026-07-30), and the plateau is measured 48% high
+        # at 2300 rpm.  The active curve is still the ASSUMED restricted-600
+        # SHAPE scaled to this car's own peak power — the engine's IDENTITY is
+        # known, its dyno sheet is not.  Two columns from a dyno replace it.
+        self._tq_use.setChecked(True)
+        self._tq_use.setToolTip(
+            'OFF = the two-segment model: flat torque below peak-power rpm, '
+            'constant power above.  That plateau reads about 48% high on wheel '
+            'force at 2300 rpm — the whole 75 m acceleration event lives '
+            'there.\nON = the table below, interpolated (held flat outside its '
+            'range, never extrapolated).')
+        self._tq_use.stateChanged.connect(lambda *_: self._update_tq_note())
+        side.addWidget(self._tq_use)
+        self._tq_text = QLineEdit(_ASSUMED_CURVE_HINT)
+        self._tq_text.setToolTip(
+            'CRANK torque against engine speed: "rpm:Nm, rpm:Nm, …".  Two '
+            'columns off a dyno sheet.  Leave it on the word ASSUMED to use '
+            'the generic restrictor-limited 600 SHAPE scaled to this car’s own '
+            'peak power — a placeholder, not a measurement.')
+        self._tq_text.editingFinished.connect(self._update_tq_note)
+        side.addWidget(self._tq_text)
+        self._tq_note = QLabel('')
+        self._tq_note.setStyleSheet('color:#8a8a92; font-size:10px;')
+        self._tq_note.setWordWrap(True)
+        side.addWidget(self._tq_note)
+        for sb in (self._I_wf, self._I_wr, self._I_eng):
+            sb.valueChanged.connect(lambda *_: self._update_inertia_note())
+        for sb in (self._primary, self._final, *self._gear_spins):
+            sb.valueChanged.connect(lambda *_: self._update_inertia_note())
+
+        # ── DIFFERENTIAL (corner entry/exit balance via locking %) ────────
+        from vahan.differential import DREXLER_OPTIONS, Differential
+        # header with an info (ⓘ) button — same style as the suspension panels
+        drow = QHBoxLayout(); drow.setSpacing(6)
+        dlbl = QLabel('DIFFERENTIAL  (Drexler LSD)')
+        dlbl.setStyleSheet('color:#E23B48; font-size:11px; font-weight:bold;'
+                           'padding-top:6px;')
+        drow.addWidget(dlbl)
+        dinfo = QPushButton('ⓘ')
+        dinfo.setFixedSize(20, 20)
+        dinfo.setCursor(Qt.CursorShape.PointingHandCursor)
+        dinfo.setStyleSheet(
+            'QPushButton { background:#111111; color:#E23B48; '
+            'border:1px solid #2a2a2a; border-radius:10px; font-weight:bold; '
+            'font-size:12px; }'
+            'QPushButton:hover { background:#2a1013; border-color:#E23B48; }'
+            'QPushButton:pressed { background:#171208; }')
+        dinfo.setToolTip('What does the differential do? Click for detail.')
+        dinfo.clicked.connect(self._show_diff_info)
+        drow.addWidget(dinfo)
+        drow.addStretch(1)
+        side.addLayout(drow)
+        g = grid()
+        g.addWidget(QLabel('Type:'), 0, 0)
+        self._diff_type = QComboBox()
+        self._diff_type.addItems(['Salisbury LSD', 'Open', 'Spool (locked)'])
+        self._diff_type.setToolTip(
+            'Open = no locking (free diff).  Spool = fully locked.  '
+            'Salisbury = Drexler ramp/clutch LSD (tune via ramp + preload).')
+        self._diff_type.currentIndexChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_type, 0, 1)
+        g.addWidget(QLabel('Ramp (pwr/coast):'), 1, 0)
+        self._diff_ramp = QComboBox()
+        self._diff_opts = list(DREXLER_OPTIONS.items())
+        for opt, (p, c) in self._diff_opts:
+            d = Differential('salisbury', p, c, 30)
+            self._diff_ramp.addItem(
+                f'{p:.0f}°/{c:.0f}°  ({d.power_locking_pct:.0f}/'
+                f'{d.coast_locking_pct:.0f}%)')
+        self._diff_ramp.setToolTip(
+            'Drexler ramp options (power°/coast°).  Smaller angle = more '
+            'locking.  More power-lock = more exit understeer + traction; '
+            'more coast-lock = more corner-entry stability (less rotation).')
+        self._diff_ramp.currentIndexChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_ramp, 1, 1)
+        g.addWidget(QLabel('Preload:'), 2, 0)
+        self._diff_preload = QDoubleSpinBox()
+        self._diff_preload.setRange(0.0, 100.0); self._diff_preload.setDecimals(0)
+        self._diff_preload.setSingleStep(5.0); self._diff_preload.setValue(30.0)
+        self._diff_preload.setSuffix(' Nm')
+        self._diff_preload.setToolTip('Clutch pre-clamp (Drexler: 25–35 Nm). '
+                                      'Acts at all times — baseline entry '
+                                      'stability even at neutral throttle.')
+        self._diff_preload.valueChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_preload, 2, 1)
+        g.addWidget(QLabel('Engine braking:'), 3, 0)
+        self._diff_engbrake = QDoubleSpinBox()
+        self._diff_engbrake.setRange(0.0, 60.0); self._diff_engbrake.setDecimals(0)
+        self._diff_engbrake.setSingleStep(2.0); self._diff_engbrake.setValue(12.0)
+        self._diff_engbrake.setSuffix(' Nm')
+        self._diff_engbrake.setToolTip(
+            'Closed-throttle engine-braking torque at the CRANK.  This is the '
+            'overrun torque that flows through the diff and works the COAST '
+            'ramp (set it from your dyno/feel; without it the coast ramp does '
+            'nothing on corner entry).')
+        self._diff_engbrake.valueChanged.connect(self._on_diff_changed)
+        g.addWidget(self._diff_engbrake, 3, 1)
+        self._diff_readout = QLabel('')
+        self._diff_readout.setStyleSheet('color:#8a8a92; font-size:10px;')
+        self._diff_readout.setWordWrap(True)
+        side.addWidget(self._diff_readout)
+
+        hdr('SIM')
+        g = grid()
+        g.addWidget(QLabel('Detail solves:'), 0, 0)
+        self._ndetail = QSpinBox()
+        self._ndetail.setRange(8, 400); self._ndetail.setValue(80)
+        self._ndetail.setToolTip(
+            'Stations where the FULL steady-state suspension solve runs.')
+        g.addWidget(self._ndetail, 0, 1)
+
+        self._btn = QPushButton('►  Sim Current Car')
+        self._btn.setStyleSheet(
+            'QPushButton { background:#E23B48; color:#ffffff; padding:10px;'
+            ' font-weight:bold; font-size:13px; border-radius:4px; }'
+            'QPushButton:hover { background:#ef5867; }'
+            'QPushButton:disabled { background:#3a3a3a; color:#777; }')
+        self._btn.clicked.connect(self._on_sim)
+        side.addWidget(self._btn)
+
+        self._status = QLabel('')
+        self._status.setStyleSheet('color:#8a8a92; font-size:11px;')
+        self._status.setWordWrap(True)
+        side.addWidget(self._status)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet('color:#2a2a2a;')
+        side.addWidget(sep)
+
+        self._readout = QLabel('—')
+        self._readout.setStyleSheet(
+            "color:#e8e8ec; font-family:'Consolas','SF Mono',monospace;"
+            'font-size:12px; background:#0e0e10; padding:8px;'
+            'border:1px solid #2a2a2a; border-radius:4px;')
+        self._readout.setWordWrap(True)
+        side.addWidget(self._readout)
+
+        # Standing scope caption — the grip model is a fresh-tire, single
+        # thermal-state snapshot from the TTC cornering data.  Valid for
+        # autocross (one ~50 s lap); it does NOT model endurance heat fade,
+        # so the compound ranking here is fresh pace, not stint durability.
+        scope = QLabel('Scope: fresh-tire, single-thermal-state grip (TTC '
+                       'test window 30–73 °C).  Autocross-valid; endurance '
+                       'heat-fade / degradation NOT modelled — compound order '
+                       'may invert over a stint.')
+        scope.setStyleSheet('color:#8a7a3a; font-size:10px; '
+                            'padding:4px 2px; font-style:italic;')
+        scope.setWordWrap(True)
+        side.addWidget(scope)
+        side.addStretch(1)
+
+        side_inner = QWidget(); side_inner.setLayout(side)
+        side_scroll = QScrollArea()
+        side_scroll.setWidget(side_inner)
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFixedWidth(300)
+        side_scroll.setStyleSheet('QScrollArea { border:0; background:#000; }')
+        root.addWidget(side_scroll)
+
+        # ── right side: ONE BIG GRID — track on top, graphs stacked below,
+        #    all in a single figure/canvas.  Scroll = zoom, drag = pan.
+        right = QVBoxLayout(); right.setSpacing(4)
+
+        # top bar: track selector + checkboxes + Solo (one compact control row)
+        topbar = QHBoxLayout(); topbar.setSpacing(8)
+        topbar.addWidget(QLabel('Track:'))
+        self._track_combo = QComboBox()
+        self._track_combo.setStyleSheet('QComboBox { font-size:12px; }')
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._track_files = []
+        for label, fname in _TRACKS:
+            if os.path.isfile(os.path.join(base, 'tracks', fname)):
+                self._track_combo.addItem(label)
+                self._track_files.append(fname)
+        self._track_combo.currentIndexChanged.connect(self._on_track_changed)
+        topbar.addWidget(self._track_combo)
+        topbar.addSpacing(12)
+        topbar.addWidget(QLabel('Solo:'))
+        self._solo = QComboBox()
+        self._solo.addItem('— off —', None)
+        for key, label, _ in self._GRAPHS:
+            self._solo.addItem(label, key)
+        self._solo.setToolTip('Isolate a single graph full-height (overrides '
+                              'the checkboxes).')
+        self._solo.currentIndexChanged.connect(self._redraw)
+        topbar.addWidget(self._solo)
+        topbar.addStretch(1)
+        nav_hint = QLabel('scroll = zoom · drag = pan · double-click = reset')
+        nav_hint.setStyleSheet('color:#666; font-size:10px;')
+        topbar.addWidget(nav_hint)
+        right.addLayout(topbar)
+
+        # graph checkboxes
+        cb_grid = QGridLayout(); cb_grid.setSpacing(8)
+        cb_grid.addWidget(QLabel('Graphs:'), 0, 0)
+        self._graph_cbs = {}
+        for i, (key, label, on) in enumerate(self._GRAPHS):
+            cb = QCheckBox(label)
+            cb.setChecked(on)
+            cb.setStyleSheet('QCheckBox { font-size:11px; }')
+            cb.toggled.connect(self._redraw)
+            self._graph_cbs[key] = cb
+            cb_grid.addWidget(cb, i // 5, 1 + i % 5)
+        cb_grid.setColumnStretch(6, 1)
+        right.addLayout(cb_grid)
+
+        # the ONE canvas — no toolbar; navigation via the scroll/drag handler.
+        # constrained_layout cohabits the equal-aspect track map, the colorbar
+        # and the stacked graphs without the collapse tight_layout caused.
+        self._fig = Figure(facecolor='#000000', layout='constrained')
+        self._canvas = ReadableCanvas(self._fig)
+        right.addWidget(self._canvas, 1)
+        root.addLayout(right, 1)
+
+        # custom navigation: scroll-zoom + drag-pan + double-click reset,
+        # per-subplot (acts on the axes under the cursor).
+        self._home_lims = {}      # ax -> (xlim, ylim) for double-click reset
+        self._pan = None
+        self._canvas.mpl_connect('scroll_event', self._on_scroll)
+        self._canvas.mpl_connect('button_press_event', self._on_press)
+        self._canvas.mpl_connect('motion_notify_event', self._on_drag)
+        self._canvas.mpl_connect('button_release_event', self._on_release)
+
+        # Hover value-readout — same machinery as the kinematics canvas.
+        try:
+            from gui.main_window import HoverAnnotator
+            self._hover = self._canvas.hover
+        except Exception:
+            pass
+
+    # ── canvas navigation: scroll-zoom, drag-pan, dbl-click reset ─────────
+    def _on_scroll(self, event):
+        ax = event.inaxes
+        if ax is None or event.xdata is None:
+            return
+        base = 1.25
+        scale = (1.0 / base) if event.button == 'up' else base   # up = zoom in
+        xd, yd = event.xdata, event.ydata
+        x0, x1 = ax.get_xlim(); y0, y1 = ax.get_ylim()
+        ax.set_xlim(xd - (xd - x0) * scale, xd + (x1 - xd) * scale)
+        ax.set_ylim(yd - (yd - y0) * scale, yd + (y1 - yd) * scale)
+        self._canvas.draw_idle()
+
+    def _on_press(self, event):
+        if event.inaxes is None:
+            return
+        if event.dblclick:                       # double-click → reset view
+            lims = self._home_lims.get(event.inaxes)
+            if lims:
+                event.inaxes.set_xlim(lims[0]); event.inaxes.set_ylim(lims[1])
+                self._canvas.draw_idle()
+            return
+        if event.button == 1:                    # left-drag → pan
+            ax = event.inaxes
+            bbox = ax.get_window_extent()
+            self._pan = dict(ax=ax, px=event.x, py=event.y,
+                             xlim=ax.get_xlim(), ylim=ax.get_ylim(),
+                             wpx=max(bbox.width, 1.0), hpx=max(bbox.height, 1.0))
+
+    def _on_drag(self, event):
+        p = self._pan
+        if not p or event.x is None:
+            return
+        ax = p['ax']
+        x0, x1 = p['xlim']; y0, y1 = p['ylim']
+        dx = (event.x - p['px']) / p['wpx'] * (x1 - x0)
+        dy = (event.y - p['py']) / p['hpx'] * (y1 - y0)
+        ax.set_xlim(x0 - dx, x1 - dx)
+        ax.set_ylim(y0 - dy, y1 - dy)
+        self._canvas.draw_idle()
+
+    def _on_release(self, event):
+        self._pan = None
+
+    # ── track ────────────────────────────────────────────────────────────
+    def _load_default_track(self):
+        if self._track_files:
+            self._load_track_file(self._track_files[0])
+        else:
+            self._track_lbl.setText('no track JSON in tracks/ — run '
+                                    'tools/trace_track.py')
+
+    def _discover_tires(self):
+        """List the tire .mat files in the local tire_data/ folder (gitignored).
+        Each label is the file's own tire_id, read at RUNTIME — so the public
+        source never names a TTC tire or run.  Returns [(label, filename), …]."""
+        import glob
+        base = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), 'tire_data')
+        try:
+            import scipy.io as _sio
+            import numpy as _np
+        except Exception:
+            _sio = None
+        out, seen = [], set()
+        for path in sorted(glob.glob(os.path.join(base, '*.mat'))):
+            label = os.path.splitext(os.path.basename(path))[0]
+            if _sio is not None:
+                try:
+                    m = _sio.loadmat(path, variable_names=['tireid'])
+                    if 'tireid' in m and _np.size(m['tireid']):
+                        label = str(_np.ravel(m['tireid'])[0])
+                except Exception:
+                    pass
+            # dedupe by tire id: many files are the same tire at different test
+            # conditions — show one entry per distinct tire (first file wins).
+            if label in seen:
+                continue
+            seen.add(label)
+            out.append((label, os.path.basename(path)))
+        return out
+
+    def _refresh_tire_active(self):
+        """Show the active front/rear tire under the dropdowns."""
+        if not hasattr(self, '_tire_active'):
+            return
+        tf = getattr(self._main, '_tire_model', None)
+        tr = getattr(self._main, '_tire_model_rear', None)
+        fid = getattr(tf, 'tire_id', None) or '(parametric fallback)'
+        if tr is None:
+            self._tire_active.setText(f'F+R: {fid}')
+        else:
+            rid = getattr(tr, 'tire_id', None) or '(parametric)'
+            self._tire_active.setText(f'SPLIT  F: {fid}\n       R: {rid}')
+
+    def _tire_path(self, idx: int):
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, 'tire_data', self._tire_rounds[idx][1])
+
+    def _after_tire_change(self, msg: str):
+        self._refresh_tire_active()
+        had = self._result is not None
+        self._status.setText(msg + ('  · re-simulating…' if had
+                                    else '  · hit Sim to compare'))
+        if had:
+            self._on_sim()                        # instant A/B
+
+    def _on_tire_front(self, combo_idx: int):
+        """Front-axle tire pick.  Index 0 is the '(loaded tire)' placeholder."""
+        idx = combo_idx - 1
+        if not (0 <= idx < len(self._tire_rounds)):
+            return
+        try:
+            self._main._on_tire_file(self._tire_path(idx))   # sets _tire_model
+        except Exception as e:
+            self._status.setText(f'Front tire load failed: {e}')
+            return
+        self._after_tire_change(f'Front tire → {self._tire_rounds[idx][0]}')
+
+    def _on_tire_rear(self, combo_idx: int):
+        """Rear-axle tire pick.  Index 0 = '(same as front)' -> no split."""
+        try:
+            if combo_idx == 0:
+                self._main._set_rear_tire(None)
+                self._after_tire_change('Rear tire → same as front')
+                return
+            idx = combo_idx - 1
+            if not (0 <= idx < len(self._tire_rounds)):
+                return
+            self._main._set_rear_tire(self._tire_path(idx))
+            self._after_tire_change(f'Rear tire → {self._tire_rounds[idx][0]}')
+        except Exception as e:
+            self._status.setText(f'Rear tire load failed: {e}')
+
+    def _update_rh_cap(self):
+        """Check (and size for) the ride-height cap at the reference speed:
+        does the current setup hold ride height >= cap, and if not, what ride
+        rate / spring rate would?"""
+        if not hasattr(self, '_rh_cap_readout'):
+            return
+        try:
+            from vahan.laptime import (downforce_at_speed_N, aero_heave_mm,
+                                       required_ride_rate_Npm,
+                                       wheel_rate_from_ride_rate_Npm)
+            veh = self._main._build_dynamics_solver()._veh
+            v = float(self._rh_refspeed.value()) / 3.6
+            cla = float(self._cla.value()); cop = float(self._cop.value()) / 100.0
+            rho = float(self._rho.value())
+            D = downforce_at_speed_N(cla, v, rho)
+            lines = [f'@ {self._rh_refspeed.value():.0f} kph: {D:.0f} N down']
+            ok_all = True
+            for tag, Daxle, kr, rh0, cap, mr, spr in (
+                ('F', D * (1 - cop), veh.ride_rate_front_Npm, self._rh_f.value(),
+                 self._rh_cap_f.value(), veh.motion_ratio_front,
+                 veh.spring_rate_front_Npm),
+                ('R', D * cop, veh.ride_rate_rear_Npm, self._rh_r.value(),
+                 self._rh_cap_r.value(), veh.motion_ratio_rear,
+                 veh.spring_rate_rear_Npm)):
+                heave = aero_heave_mm(Daxle, kr)
+                rh = rh0 - heave
+                if rh + 1e-6 >= cap:
+                    lines.append(f'{tag}: {rh:.0f} mm  ✓ (cap {cap:.0f})')
+                else:
+                    ok_all = False
+                    max_heave = max(rh0 - cap, 0.1)
+                    rr_need = required_ride_rate_Npm(Daxle, max_heave)
+                    wr_need = wheel_rate_from_ride_rate_Npm(
+                        rr_need, veh.tire_rate_Npm)
+                    if not np.isfinite(wr_need):
+                        lines.append(f'{tag}: {rh:.0f} mm  ✗ under cap '
+                                     f'{cap:.0f} — TIRE-limited (stiffer tire/'
+                                     f'lower aero needed)')
+                    else:
+                        # two levers to hold the cap: stiffer SPRING (const MR)
+                        # OR a higher MR at compression (the IK nonlinear-MR
+                        # target_hi — design a progressive MR rising to this).
+                        spr_need = wr_need / max(mr * mr, 1e-6)
+                        mr_need = (wr_need / max(spr, 1e-6)) ** 0.5
+                        lines.append(
+                            f'{tag}: {rh:.0f} mm ✗ under cap {cap:.0f} by '
+                            f'{cap-rh:.0f}. Hold it via spring ≥ '
+                            f'{spr_need/175.127:.0f} lbf/in (now '
+                            f'{spr/175.127:.0f}) OR MR→{mr_need:.2f} at '
+                            f'compression (now {mr:.2f}) — IK progressive '
+                            f'target_hi')
+            self._rh_cap_readout.setText('\n'.join(lines))
+            self._rh_cap_readout.setStyleSheet(
+                'font-size:10px; color:%s;' % ('#7a9a5a' if ok_all else '#c08a3a'))
+        except Exception:
+            self._rh_cap_readout.setText('')
+
+    def _show_diff_info(self):
+        """Popup explaining the differential (same look as the suspension
+        panels' ⓘ dialogs)."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextBrowser
+        try:
+            from gui import section_info
+            html = section_info.DIFFERENTIAL
+        except Exception:
+            html = '<p>Differential info unavailable.</p>'
+        dlg = QDialog(self)
+        dlg.setWindowTitle('ⓘ  Differential (Drexler FSAE LSD)')
+        dlg.resize(640, 720)
+        dlg.setStyleSheet('QDialog { background:#0a0a0a; }'
+                          'QTextBrowser { background:#0a0a0a; color:#e0e0e0; '
+                          'border:none; font-size:12px; }')
+        lay = QVBoxLayout(dlg)
+        tb = QTextBrowser(); tb.setOpenExternalLinks(False); tb.setHtml(html)
+        lay.addWidget(tb)
+        btn = QPushButton('Close'); btn.clicked.connect(dlg.accept)
+        from gui.panels import BTN_PRIMARY
+        btn.setStyleSheet(BTN_PRIMARY)
+        lay.addWidget(btn)
+        dlg.exec()
+
+    def _on_diff_changed(self, *_):
+        """Push the differential config onto the live car, update the readout,
+        and (if a lap exists) re-sim so the balance effect is immediate."""
+        from vahan.differential import Differential
+        kinds = {0: 'salisbury', 1: 'open', 2: 'spool'}
+        kind = kinds.get(self._diff_type.currentIndex(), 'salisbury')
+        p, c = self._diff_opts[self._diff_ramp.currentIndex()][1]
+        d = Differential(kind, p, c, float(self._diff_preload.value()))
+        self._main._diff = d
+        self._main._engine_braking_Nm = float(self._diff_engbrake.value())
+        # gray out ramp/preload for open/spool (no ramp tuning there)
+        is_lsd = (kind == 'salisbury')
+        self._diff_ramp.setEnabled(is_lsd)
+        self._diff_preload.setEnabled(is_lsd)
+        self._diff_engbrake.setEnabled(is_lsd)
+        # readout: locking % + a representative exit-understeer yaw moment
+        try:
+            _ss = self._main._build_dynamics_solver()
+            veh = _ss._veh
+            r_t = max(veh.tire_radius_m, 1e-3)
+            track = float(getattr(veh, 'rear_track_m', 1.2))
+            # the car's own rear tyre on THE project grip scale (no 1.5 literal)
+            mu0 = float(_ss._tire_rear.peak_mu(700.0, 0.0)) * float(_ss._mu_scale)
+            cap = mu0 * veh.total_mass_kg * 9.80665 * (1.0 - veh.front_weight_fraction)
+            # ~200 Nm axle drive torque is a typical FSAE corner-exit value
+            mz_exit = d.yaw_moment_Nm(200.0, track, r_t, True, max_bias_N=cap)
+            mz_entry = d.yaw_moment_Nm(0.0, track, r_t, False, max_bias_N=cap)
+        except Exception:
+            mz_exit = mz_entry = 0.0
+        # the DECISION numbers: actual understeer-gradient shift this diff adds
+        # vs an open diff, at a power-on and a trailing-throttle corner.
+        du_pwr = du_coast = 0.0
+        try:
+            from vahan.differential import Differential as _D
+
+            def ug(diff, lon):
+                self._main._diff = diff
+                return self._main._build_dynamics_solver().solve(
+                    1.3, lon).understeer_gradient_deg
+            u_open_p, u_d_p = ug(_D('open'), 0.4), ug(d, 0.4)
+            u_open_c, u_d_c = ug(_D('open'), -0.4), ug(d, -0.4)
+            du_pwr, du_coast = u_d_p - u_open_p, u_d_c - u_open_c
+        except Exception:
+            pass
+        finally:
+            self._main._diff = d           # restore the chosen diff
+        if kind == 'open':
+            self._diff_readout.setText('Open — free inner/outer (least '
+                                       'understeer, least off-corner traction; '
+                                       'inner wheel spins under power).')
+        elif kind == 'spool':
+            self._diff_readout.setText(
+                f'Spool — fully locked.  vs open: {du_pwr:+.2f}° understeer on '
+                f'exit, {du_coast:+.2f}° on entry (max stability, draggy).')
+        else:
+            self._diff_readout.setText(
+                f'power {d.power_locking_pct:.0f}% / coast '
+                f'{d.coast_locking_pct:.0f}% lock\n'
+                f'vs open: {du_pwr:+.2f}° understeer on EXIT · '
+                f'{du_coast:+.2f}° on ENTRY (+ = more understeer/stable)')
+        had = self._result is not None
+        self._status.setText('Diff → ' + d.describe()
+                             + ('  · re-simulating…' if had else ''))
+        if had:
+            self._on_sim()
+
+    def _on_track_changed(self, idx: int):
+        if 0 <= idx < len(self._track_files):
+            # a new track invalidates the old result FIRST so the redraw
+            # doesn't colour the new map with the old run's speed array.
+            self._result = None
+            self._last_lap_s = None
+            self._readout.setText('—')
+            self._load_track_file(self._track_files[idx])
+
+    def _load_track_file(self, fname: str):
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(base, 'tracks', fname)
+        self._track = Track.from_json(path)
+        t = self._track
+        self._track_lbl.setText(
+            f'{t.name}\n{t.length_m:.0f} m · width {t.width_m:.1f} m '
+            f'· {t.n} stations (1 m)')
+        self._redraw()
+
+    # ── sim ──────────────────────────────────────────────────────────────
+    def _on_sim(self):
+        if self._track is None:
+            self._status.setText('No track loaded.')
+            return
+        try:
+            sim = self.build_sim()
+        except Exception as e:
+            self._status.setText(f'Could not build the car: {e}')
+            return
+        self._btn.setEnabled(False)
+        self._status.setText('Simulating…')
+        self._worker = _SimWorker(sim, self._track,
+                                  int(self._ndetail.value()))
+        self._worker.progress.connect(
+            lambda m, p: self._status.setText(f'{m}  ({p}%)'))
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.failed.connect(self._on_fail)
+        self._worker.start()
+
+    def build_sim(self) -> LapSimulator:
+        """The LapSimulator exactly as the Simulate button configures it
+        (live car + every box on this page).  Split out of _on_sim so a
+        headless caller runs the SAME configuration the user sees."""
+        ss = self._main._build_dynamics_solver()
+        sim = LapSimulator(
+            ss,
+            cla_m2=float(self._cla.value()),
+            cda_m2=float(self._cda.value()),
+            air_density=float(self._rho.value()),
+            aero_cop_rear_frac=float(self._cop.value()) / 100.0,
+            grip_scale=float(self._main.grip_scale()),   # THE project scale
+            static_rh_front_mm=float(self._rh_f.value()),
+            static_rh_rear_mm=float(self._rh_r.value()),
+        )
+        # remembered for the aero graph title + front/rear split
+        self._last_aero = (float(self._cla.value()), float(self._cda.value()),
+                           float(self._cop.value()))
+        sim.set_gearbox(
+            [sb.value() for sb in self._gear_spins],
+            primary_ratio=float(self._primary.value()),
+            final_drive=float(self._final.value()),
+            redline_rpm=float(self._redline.value()),
+        )
+        # 1a rotating inertia, 1b shift realism, 1c torque curve — all three
+        # are sim-local overrides seeded from the car, exactly like Cd·A.
+        sim.set_rotating_inertia(float(self._I_wf.value()),
+                                 float(self._I_wr.value()),
+                                 float(self._I_eng.value()))
+        sim.set_shift_model(float(self._shift_time.value()),
+                            float(self._shift_int.value()),
+                            float(self._shift_hyst.value()) / 100.0)
+        curve = self._torque_curve()
+        if curve is not None:
+            sim.set_torque_curve(curve[0], curve[1], curve[2])
+        else:
+            sim.set_torque_curve(None, None)
+        return sim
+
+    # ── powertrain-realism helpers (1a / 1b / 1c) ────────────────────────
+    def _total_ratio_1st(self) -> float:
+        gs = [sb.value() for sb in self._gear_spins if sb.value() > 0]
+        return (float(self._primary.value()) * float(self._final.value())
+                * (max(gs) if gs else 1.0))
+
+    def _update_inertia_note(self):
+        """Show the equivalent mass the inertias amount to in FIRST gear —
+        the number that makes the engine term's ratio-squared amplification
+        visible instead of buried."""
+        try:
+            veh = self._main._build_dynamics_solver()._veh
+            m, r = float(veh.total_mass_kg), float(veh.tire_radius_m)
+        except Exception:
+            m, r = 286.0, 0.203
+        ratio = self._total_ratio_1st()
+        I = 2.0 * (self._I_wf.value() + self._I_wr.value())
+        m_eq = (I + self._I_eng.value() * ratio ** 2) / max(r * r, 1e-6)
+        self._inertia_readout.setText(
+            f'≈ {m_eq:.0f} kg equivalent mass in 1st ({100 * m_eq / m:.0f}% of '
+            f'the car), of which the engine is '
+            f'{100 * (self._I_eng.value() * ratio ** 2) / max(I + self._I_eng.value() * ratio ** 2, 1e-9):.0f}% '
+            f'(ratio {ratio:.2f}, squared = {ratio ** 2:.0f}).  ASSUMED until '
+            f'measured.')
+
+    def _torque_curve(self):
+        """(rpm[], Nm[], label) or None — parsed from the box, or the ASSUMED
+        generic shape scaled to this car's own peak power."""
+        if not self._tq_use.isChecked():
+            return None
+        txt = self._tq_text.text().strip()
+        pairs = []
+        for tok in txt.replace(';', ',').split(','):
+            if ':' not in tok:
+                continue
+            a, b = tok.split(':', 1)
+            try:
+                pairs.append((float(a), float(b)))
+            except ValueError:
+                continue
+        if len(pairs) >= 2:
+            pairs.sort()
+            return ([p[0] for p in pairs], [p[1] for p in pairs],
+                    'user-entered dyno points')
+        # Default engine = the SDM26 curve with the CALIBRATION the user chose
+        # on the Engine page (saved in the project car dict; 'corrected' if
+        # unset).  ONE engine source.  Only if the data files are missing do we
+        # fall back to the ASSUMED generic shape scaled to peak power.
+        import vahan.engine as _VE
+        car = getattr(self._main, '_car', {})
+        # every knob passed EXPLICITLY (no module-global mutation — the old
+        # global writes never reached ve_target_curve; audit item 21)
+        c = _VE.engine_curve(
+            car.get('engine_method', _VE.DEFAULT_METHOD),
+            ve_target=float(car.get('engine_ve_target', _VE.VE_TARGET)),
+            ve_fall_rpm=float(car.get('engine_ve_fall_rpm',
+                                      _VE.VE_FALL_START_RPM)),
+            ve_13k=float(car.get('engine_ve_13k', _VE.VE_AT_13K)),
+            fmep_a=float(car.get('engine_fmep_a', _VE.FMEP_A_BAR)),
+            fmep_b=float(car.get('engine_fmep_b', _VE.FMEP_B_BAR)),
+            anchor_hp=float(car.get('engine_anchor_hp', _VE.ANCHOR_HP)))
+        if c is not None:
+            return list(c[0]), list(c[1]), c[2]
+        try:
+            veh = self._main._build_dynamics_solver()._veh
+            P_eng = float(veh.wheel_power_W) / max(
+                float(veh.drivetrain_efficiency), 1e-3)
+            rpm, tq = assumed_torque_curve(P_eng, float(veh.engine_rpm))
+            return list(rpm), list(tq), 'CBR600RR 20mm-restricted — ASSUMED shape, scaled to this car'
+        except Exception:
+            return None
+
+    def _update_tq_note(self):
+        c = self._torque_curve()
+        if c is None:
+            self._tq_note.setText(
+                'IN USE: torque plateau then constant power (ASSUMED shape — '
+                'no measured curve).')
+            return
+        rpm, tq, lbl = c
+        self._tq_note.setText(
+            f'IN USE: {lbl} — {len(rpm)} points, {min(rpm):.0f}–{max(rpm):.0f} '
+            f'rpm, peak {max(tq):.1f} N·m at '
+            f'{rpm[int(np.argmax(tq))]:.0f} rpm.')
+
+    def _on_fail(self, msg: str):
+        self._btn.setEnabled(True)
+        self._status.setText(f'Sim failed: {msg}')
+
+    def _on_done(self, res):
+        self._btn.setEnabled(True)
+        self._result = res
+        if getattr(res, 'notes', None):
+            self._status.setText('⚠ ' + '  |  '.join(res.notes))
+            self._status.setToolTip('\n'.join(res.notes))
+        else:
+            self._status.setText('Done.')
+            self._status.setToolTip('')
+        m, s = divmod(res.lap_time_s, 60.0)
+        sect = '  /  '.join(f'{x:.2f}' for x in res.sector_times_s)
+        top_gear = int(np.nanmax(res.gear)) if res.gear is not None else 0
+        # Geared top speed @ redline — instant sanity check on the ratio set.
+        # (If this reads absurdly low/high, one of primary/final/redline is
+        # inconsistent with the gear ratios.)
+        try:
+            r_t = self._main._build_dynamics_solver()._veh.tire_radius_m
+        except Exception:
+            r_t = 0.2032
+        ratio_top = (float(self._primary.value())
+                     * float(min(sb.value() for sb in self._gear_spins
+                                 if sb.value() > 0))
+                     * float(self._final.value()))
+        v_top = (float(self._redline.value()) / ratio_top / 60.0
+                 * 2 * np.pi * r_t * 3.6)
+        # Δ vs the previous run — the design-iteration number.
+        delta = ''
+        if self._last_lap_s is not None:
+            dv = res.lap_time_s - self._last_lap_s
+            delta = f'   ({dv:+.2f} s vs last)'
+        self._last_lap_s = res.lap_time_s
+        self._readout.setText(
+            f'LAP TIME   {int(m)}:{s:05.2f}{delta}\n'
+            f'sectors    {sect}\n'
+            f'avg speed  {res.avg_speed_kph:6.1f} kph   min {res.min_speed_kph:5.1f} / max {res.max_speed_kph:5.1f} kph\n'
+            f'corners    avg {res.avg_corner_lat_g:4.2f} g   peak {res.peak_lat_g:4.2f} g   {res.time_cornering_pct:4.1f}% of lap\n'
+            f'  cornering-only (straights excluded):  avg speed {res.avg_corner_speed_kph:5.1f} kph   avg radius {res.avg_corner_radius_m:5.1f} m\n'
+            f'long accel peak {res.peak_accel_g:4.2f} g   brake peak {res.peak_brake_g:4.2f} g\n'
+            f'max speed  {res.max_speed_kph:6.1f} kph\n'
+            f'peak lat   {np.nanmax(res.lat_g):6.2f} g\n'
+            f'peak brake {np.nanmin(res.lon_g):6.2f} g\n'
+            f'peak accel {np.nanmax(res.lon_g):6.2f} g\n'
+            f'top gear   {top_gear}   (geared top {v_top:.0f} kph '
+            f'@ {self._redline.value():.0f})\n'
+            f'shifts     {res.n_upshifts} up / {res.n_downshifts} down, '
+            f'{res.shift_time_lost_s:.2f} s of torque cut\n'
+            f'rot inertia{max(res.equiv_mass_kg.values()) if res.equiv_mass_kg else 0.0:7.0f} kg equivalent (ASSUMED)')
+        # min ride height (aero squat) — the "don't bottom out" number
+        try:
+            rf, rr = res.rh_front_mm, res.rh_rear_mm
+            if rf is not None and rr is not None:
+                self._readout.setText(self._readout.text() +
+                    f'\nmin RH     F {np.nanmin(rf):.0f} / R {np.nanmin(rr):.0f} mm'
+                    f'  (from {self._rh_f.value():.0f}/{self._rh_r.value():.0f})')
+        except Exception:
+            pass
+        self._redraw()
+
+    # ── drawing ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _style(ax, xlabel, ylabel, title):
+        ax.set_facecolor('#080808')
+        ax.tick_params(colors='#777777', labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_edgecolor('#222222')
+        ax.set_xlabel(xlabel, color='#888888', fontsize=8)
+        ax.set_ylabel(ylabel, color='#888888', fontsize=8)
+        ax.set_title(title, color='#cccccc', fontsize=9)
+        ax.grid(True, color='#1a1a1a', lw=0.5)
+
+    @staticmethod
+    def _legend(ax):
+        ax.legend(fontsize=7, facecolor='#06060e', labelcolor='white',
+                  framealpha=0.7, ncol=4, loc='best', handlelength=1.2)
+
+    def _checked(self):
+        return [k for k, _l, _d in self._GRAPHS
+                if self._graph_cbs[k].isChecked()]
+
+    def _redraw(self, *_):
+        """ONE big grid in a single canvas: the TRACK map always on top
+        (equal-aspect, speed-coloured), then the checked graphs (or the Solo
+        graph) stacked below as proper rectangular plots.  Navigate per
+        subplot with scroll (zoom), drag (pan), double-click (reset)."""
+        if self._track is None:
+            return
+        self._fig.clf()
+        self._home_lims = {}
+        t = self._track
+        res = self._result
+
+        solo_key = self._solo.currentData()
+        if res is None:
+            checked = []
+        elif solo_key is not None:
+            checked = [solo_key]
+        else:
+            checked = self._checked()
+
+        n_rows = 1 + len(checked)
+        # Track row ratio scales with how many graphs share the canvas, so the
+        # map stays a usable size without a giant equal-aspect gap.
+        track_ratio = 1.8 if len(checked) <= 1 else 1.3
+        ratios = [track_ratio] + [1.0] * len(checked)
+        gs = self._fig.add_gridspec(n_rows, 1, height_ratios=ratios)
+
+        # ── row 0: the track, always ──────────────────────────────────────
+        tax = self._fig.add_subplot(gs[0])
+        if res is None:
+            self._style(tax, 'x (m)', 'y (m)',
+                        f'{t.name} — {t.length_m:.0f} m  (Sim to colour by speed)')
+            tax.plot(t.x_m, t.y_m, color='#666666', lw=2.5)
+        else:
+            self._style(tax, 'x (m)', 'y (m)',
+                        f'{t.name} — speed (lap {res.lap_time_s:.2f} s)')
+            sc = tax.scatter(t.x_m, t.y_m, c=res.v_ms * 3.6, s=9, cmap='plasma')
+            cb = self._fig.colorbar(sc, ax=tax, fraction=0.025, pad=0.01)
+            cb.set_label('kph', color='#888888', fontsize=8)
+            cb.ax.tick_params(colors='#777777', labelsize=7)
+        tax.plot(t.x_m[0], t.y_m[0], 'g^', ms=12)
+        tax.set_aspect('equal')
+        self._home_lims[tax] = (tax.get_xlim(), tax.get_ylim())
+
+        if res is None:
+            self._canvas.draw_idle()
+            return
+
+        # ── graph rows: proper rectangles, shared distance x-axis ─────────
+        s = res.s_m
+        d = res.det_channels
+        ds_ = res.det_s_m
+        ax0 = None
+        for gi, key in enumerate(checked):
+            ax = self._fig.add_subplot(gs[1 + gi], sharex=ax0)
+            if ax0 is None:
+                ax0 = ax
+            if key == 'speed':
+                self._style(ax, 's (m)', 'kph', 'Speed vs distance')
+                vmax_plot = np.nanmax(res.v_ms * 3.6) * 1.15
+                cap = res.v_corner_cap_ms * 3.6
+                cap_masked = np.where(cap < vmax_plot * 1.05, cap, np.nan)
+                ax.plot(s, cap_masked, color='#555555',
+                        lw=1.0, ls='--', label='corner cap')
+                ax.plot(s, res.v_ms * 3.6, color='#FFD600', lw=1.6,
+                        label='speed')
+                ax.set_ylim(0, np.nanmax(res.v_ms * 3.6) * 1.15)
+                self._legend(ax)
+            elif key == 'gg':
+                self._style(ax, 's (m)', 'g',
+                            'Lateral + longitudinal acceleration')
+                ax.plot(s, res.lat_g, color='#42A5F5', lw=1.4, label='lat |g|')
+                ax.plot(s, res.lon_g, color='#E53935', lw=1.2, label='lon g')
+                ax.axhline(0, color='#333', lw=0.6)
+                self._legend(ax)
+            elif key == 'util':
+                self._style(ax, 's (m)', 'util',
+                            'Tire utilization (full susp. solve)')
+                for c in ('FL', 'FR', 'RL', 'RR'):
+                    ax.plot(ds_, d[f'util_{c}'], color=_CC[c], ls=_LS[c],
+                            lw=1.3, label=c)
+                ax.axhline(1.0, color='#B0BEC5', lw=0.9, ls='--', alpha=0.7)
+                self._legend(ax)
+            elif key == 'lltd':
+                self._style(ax, 's (m)', '% front', 'LLTD (total LT front share)')
+                ax.ticklabel_format(axis='y', useOffset=False)
+                ax.plot(ds_, d['lltd_pct'], color='#FFD600', lw=1.5,
+                        label='LLTD %F')
+                self._legend(ax)
+            elif key == 'roll':
+                self._style(ax, 's (m)', 'deg', 'Body roll')
+                ax.plot(ds_, d['roll_deg'], color='#42A5F5', lw=1.5,
+                        label='roll')
+                ax.axhline(0, color='#333', lw=0.6)
+                self._legend(ax)
+            elif key == 'susp':
+                self._style(ax, 's (m)', 'mm',
+                            'Suspension travel (corner) + shock = travel × MR '
+                            '(corner-coil convention; decoupled cars: see '
+                            'heave/roll springs on the Suspension page)')
+                for c in ('FL', 'FR', 'RL', 'RR'):
+                    ax.plot(ds_, d[f'travel_{c}'], color=_CC[c], ls=_LS[c],
+                            lw=1.1, label=c)
+                ax.plot(ds_, d['shock_F_mm'], color='#FF9100', lw=1.6,
+                        label='shock F')
+                ax.plot(ds_, d['shock_R_mm'], color='#B0BEC5', lw=1.6,
+                        label='shock R')
+                self._legend(ax)
+            elif key == 'aero':
+                cla, cda, cop = getattr(self, '_last_aero',
+                                        (0.0, 0.0, 50.0))
+                self._style(ax, 's (m)', 'N',
+                            f'Aero — Cl·A {cla:+.2f} · Cd·A {cda:.2f} · '
+                            f'CoP {cop:.0f}%R   (down and drag are both '
+                            f'∝ v² — same shape, different scale)')
+                # distinct LINESTYLES: with Cl·A == Cd·A the curves are
+                # numerically identical and would hide one another.
+                ax.plot(s, res.aero_down_N, color='#42A5F5', lw=2.2,
+                        ls='-', label='downforce total')
+                ax.plot(s, res.aero_down_N * (1.0 - cop / 100.0),
+                        color='#FFFFFF', lw=1.0, ls='--', label='down F')
+                ax.plot(s, res.aero_down_N * (cop / 100.0),
+                        color='#FFD600', lw=1.0, ls='-.', label='down R')
+                ax.plot(s, res.aero_drag_N, color='#E53935', lw=1.4,
+                        ls=':', label='drag')
+                ax.axhline(0, color='#333', lw=0.6)
+                if abs(np.nanmax(np.abs(res.aero_down_N))) < 1.0:
+                    ax.text(0.5, 0.7, 'Cl·A = 0  —  no downforce package',
+                            transform=ax.transAxes, ha='center',
+                            color='#777777', fontsize=9)
+                self._legend(ax)
+            elif key == 'rpm':
+                self._style(ax, 's (m)', 'rpm', 'Engine RPM + gear')
+                ax.plot(s, res.engine_rpm, color='#FFD600', lw=1.3,
+                        label='rpm')
+                ax.axhline(float(self._redline.value()), color='#E53935',
+                           lw=0.8, ls='--', alpha=0.6, label='redline')
+                if res.gear is not None and np.nanmax(res.gear) > 0:
+                    ax2 = ax.twinx()
+                    ax2.step(s, res.gear, color='#42A5F5', lw=1.3,
+                             where='post')
+                    ax2.set_ylabel('gear', color='#42A5F5', fontsize=8)
+                    ax2.tick_params(colors='#42A5F5', labelsize=8)
+                    ax2.set_yticks(range(0, int(np.nanmax(res.gear)) + 2))
+                    ax2.set_ylim(0, np.nanmax(res.gear) + 1)
+                # SHOW the shift dead time: the stations where drive torque is
+                # cut.  Without this the gear trace looks free, which is the
+                # thing the shift model exists to stop it claiming.
+                sh = getattr(res, 'shifting', None)
+                if sh is not None and np.any(sh):
+                    first = True
+                    for i in np.where(np.asarray(sh) > 0)[0]:
+                        ax.axvspan(s[max(i - 1, 0)], s[min(i + 1, len(s) - 1)],
+                                   color='#E53935', alpha=0.30, lw=0,
+                                   label='torque cut (shift)' if first else None)
+                        first = False
+                self._legend(ax)
+            elif key == 'power':
+                self._style(ax, 's (m)', 'hp', 'Power used (drive)')
+                ax.plot(s, res.power_used_W / 745.7, color='#FFD600',
+                        lw=1.3, label='power')
+                try:
+                    pk = float(self._main._dynamics_panel._power_hp.value())
+                    ax.axhline(pk, color='#E53935', lw=0.8, ls='--',
+                               alpha=0.6, label='engine peak')
+                except Exception:
+                    pass
+                self._legend(ax)
+            elif key == 'diff':
+                self._style(ax, 's (m)', 'N·m',
+                            'Differential yaw moment  (+ = understeer on exit / '
+                            'stabilising on entry)')
+                dy = getattr(res, 'diff_yaw_Nm', None)
+                if dy is not None:
+                    ax.fill_between(s, 0, dy, color='#FFD600', alpha=0.25)
+                    ax.plot(s, dy, color='#FFD600', lw=1.4, label='diff Mz')
+                ax.axhline(0, color='#555', lw=0.6)
+                self._legend(ax)
+            elif key == 'rideh':
+                self._style(ax, 's (m)', 'mm',
+                            'Ride height (drops as aero downforce builds)')
+                rf = getattr(res, 'rh_front_mm', None)
+                rr = getattr(res, 'rh_rear_mm', None)
+                if rf is not None:
+                    ax.plot(s, rf, color='#FFD600', lw=1.5, label='front')
+                    ax.axhline(float(np.nanmin(rf)), color='#FFD600', lw=0.7,
+                               ls=':', alpha=0.5,
+                               label=f'min F {np.nanmin(rf):.0f}')
+                if rr is not None:
+                    ax.plot(s, rr, color='#42A5F5', lw=1.5, label='rear')
+                    ax.axhline(float(np.nanmin(rr)), color='#42A5F5', lw=0.7,
+                               ls=':', alpha=0.5,
+                               label=f'min R {np.nanmin(rr):.0f}')
+                # ride-height CAPS — the floor you don't want to drop below
+                try:
+                    cf, cr = float(self._rh_cap_f.value()), float(self._rh_cap_r.value())
+                    ax.axhline(cf, color='#FF1744', lw=1.0, ls='--',
+                               label=f'cap F {cf:.0f}')
+                    if abs(cr - cf) > 0.5:
+                        ax.axhline(cr, color='#FF6E6E', lw=1.0, ls='--',
+                                   label=f'cap R {cr:.0f}')
+                    # shade the violation zone if the car drops below a cap
+                    lo = min(np.nanmin(rf) if rf is not None else cf,
+                             np.nanmin(rr) if rr is not None else cr)
+                    if lo < max(cf, cr):
+                        ax.axhspan(lo - 1, max(cf, cr), color='#FF1744',
+                                   alpha=0.06)
+                except Exception:
+                    pass
+                self._legend(ax)
+            # only the bottom graph keeps its x tick labels (shared axis)
+            if gi < len(checked) - 1:
+                ax.tick_params(labelbottom=False)
+                ax.set_xlabel('')
+            self._home_lims[ax] = (ax.get_xlim(), ax.get_ylim())
+
+        self._canvas.draw_idle()

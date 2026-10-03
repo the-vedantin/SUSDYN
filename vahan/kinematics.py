@@ -1,0 +1,309 @@
+"""
+Kinematic metrics derived from a SolvedState.
+
+Axis convention (matches CAD environment):
+    X  →  lateral   (outboard positive for the corner being modelled)
+    Y  →  longitudinal (REARWARD positive — front axle sits at Y=0, rear axle
+                        at Y=+wheelbase, matching the CAD export convention)
+    Z  →  up (positive)
+
+All angles in degrees. All lengths in metres unless stated otherwise.
+
+Sign conventions (left corner default, right mirrors via _sign):
+    Camber   negative = top of wheel leans inboard  (negative camber)
+    Toe      positive = toe-in
+    Caster   positive = top of kingpin tilts rearward (+Y, toward rear axle)
+    KPI      positive = top of kingpin tilts inboard (-X for left corner)
+    Scrub radius    positive = KP ground point is inboard of contact patch
+    Mechanical trail positive = contact patch is behind KP ground point (+Y behind)
+    Roll-centre height positive = above ground
+"""
+
+import numpy as np
+from .solver import SolvedState, _norm
+
+
+def road_plane_camber_deg(spin_axis, road_normal=(0., 0., 1.), *, side='left'):
+    """Signed wheel inclination relative to a road plane, in degrees.
+
+    Negative means wheel top leans inboard. Unlike the historical front-view
+    ``KinematicMetrics.camber``, this includes the complete horizontal spin
+    projection and remains valid at steering angle. Inputs must share a frame;
+    apply alignment and body orientation before calling. The road normal points
+    up and the spin uses the solver's +X-at-design orientation on BOTH sides.
+    This function applies no alignment, body rotation, or tire-sign conversion.
+    """
+    if side not in ('left', 'right'):
+        raise ValueError("side must be 'left' or 'right'")
+
+    def unit(value, name):
+        vector = np.asarray(value, dtype=float)
+        if vector.shape != (3,) or not np.all(np.isfinite(vector)):
+            raise ValueError(f'{name} must be a finite three-vector')
+        scale = float(np.max(np.abs(vector)))
+        if scale == 0.:
+            raise ValueError(f'{name} must be nonzero')
+        vector = vector / scale
+        return vector / np.linalg.norm(vector)
+
+    spin = unit(spin_axis, 'spin_axis')
+    normal = unit(road_normal, 'road_normal')
+    vertical = float(np.dot(spin, normal))
+    in_plane = float(np.linalg.norm(spin - vertical * normal))
+    sign = 1. if side == 'left' else -1.
+    return float(-sign * np.degrees(np.arctan2(vertical, in_plane)))
+
+
+def _intersect_2d(p1, p2, p3, p4):
+    """2-D line intersection. Returns None if parallel."""
+    d1 = p2 - p1
+    d2 = p4 - p3
+    denom = d1[0]*d2[1] - d1[1]*d2[0]
+    if abs(denom) < 1e-12:
+        return None
+    t = ((p3[0]-p1[0])*d2[1] - (p3[1]-p1[1])*d2[0]) / denom
+    return p1 + t * d1
+
+
+class KinematicMetrics:
+    """
+    All suspension kinematic metrics from a single SolvedState.
+
+    Args:
+        state : SolvedState from SuspensionConstraints.solve()
+        side  : 'left' or 'right' — controls sign conventions
+    """
+
+    def __init__(self, state: SolvedState, side: str = 'left'):
+        if side not in ('left', 'right'):
+            raise ValueError("side must be 'left' or 'right'")
+        self._s    = state
+        self._sign = 1.0 if side == 'left' else -1.0
+
+    # ── kingpin axis ─────────────────────────────────────────────────────────
+
+    @property
+    def kingpin_axis(self) -> np.ndarray:
+        """Unit vector of kingpin, pointing LCA BJ → UCA BJ."""
+        return _norm(self._s.uca_outer - self._s.lca_outer)
+
+    # ── camber ───────────────────────────────────────────────────────────────
+
+    @property
+    def camber(self) -> float:
+        """
+        Camber angle (deg).
+        Front view (XZ plane). Negative = top of wheel leans inboard.
+        Spin axis deviation from horizontal, measured in XZ plane.
+        """
+        spin  = self._s.spin_axis
+        # angle of spin axis from horizontal; tilt in X direction
+        angle = np.degrees(np.arctan2(spin[2], abs(spin[0])))
+        return -angle * self._sign
+
+    # ── toe ──────────────────────────────────────────────────────────────────
+
+    @property
+    def toe(self) -> float:
+        """
+        Toe angle (deg). Positive = toe-in.
+        Top view (XY plane). Deviation of spin axis from pure lateral (X).
+        """
+        spin  = self._s.spin_axis
+        angle = np.degrees(np.arctan2(spin[1], abs(spin[0])))
+        return -angle * self._sign
+
+    # ── caster ───────────────────────────────────────────────────────────────
+
+    @property
+    def caster(self) -> float:
+        """
+        Caster angle (deg). Positive = top of kingpin leans rearward, toward
+        the rear axle.  +Y is REARWARD in this model (front axle Y=0, rear at
+        +wheelbase), so a rearward-leaning kingpin has uca_outer at greater Y
+        than lca_outer (kp[1] > 0) → positive caster.
+        Side view (YZ plane).
+        """
+        kp = self.kingpin_axis
+        return np.degrees(np.arctan2(kp[1], kp[2]))
+
+    # ── KPI ──────────────────────────────────────────────────────────────────
+
+    @property
+    def kpi(self) -> float:
+        """
+        Kingpin inclination (deg). Positive = top leans inboard.
+        Front view (XZ plane).
+        """
+        kp = self.kingpin_axis
+        return np.degrees(np.arctan2(-kp[0] * self._sign, kp[2]))
+
+    # ── kingpin ground intersection ──────────────────────────────────────────
+
+    def _kingpin_ground(self) -> np.ndarray:
+        """Point where kingpin axis intersects the ground plane (Z=0)."""
+        kp_dir = self.kingpin_axis
+        kp_pt  = self._s.lca_outer
+        if abs(kp_dir[2]) < 1e-9:
+            return kp_pt.copy()
+        t = -kp_pt[2] / kp_dir[2]
+        return kp_pt + t * kp_dir
+
+    @property
+    def scrub_radius(self) -> float:
+        """
+        Scrub radius (m). Positive = KP ground point is inboard of contact patch.
+        Lateral (X) distance.
+        """
+        kg   = self._kingpin_ground()
+        cp_x = self._s.wheel_center[0]
+        return (cp_x - kg[0]) * self._sign
+
+    @property
+    def mechanical_trail(self) -> float:
+        """
+        Mechanical trail (m). Positive = contact patch behind KP ground point.
+        +Y is REARWARD in this model, so "behind" = contact patch further
+        rearward than the KP ground point → cp_y > kg_y → positive trail.
+        """
+        kg   = self._kingpin_ground()
+        cp_y = self._s.wheel_center[1]
+        return (cp_y - kg[1])
+
+    # ── roll centre ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _arm_trace_xz(pin_a, pin_b, bj, y_ref):
+        """Front-view (XZ) trace of one A-arm plane on the transverse plane
+        Y = y_ref: the two points where the arm's pivot axis and the parallel
+        through the ball joint pierce that plane.  Depends only on the pivot
+        AXIS (line through the two inboard pickups), so sliding a pickup along
+        its own axis — a physical no-op — leaves the result unchanged.  A
+        purely lateral axis (u_y ~ 0) cannot be projected this way; fall back
+        to the pickup midpoint (identical result when the axis is along Y)."""
+        pin_a = np.asarray(pin_a, float); pin_b = np.asarray(pin_b, float)
+        bj = np.asarray(bj, float)
+        u = pin_b - pin_a
+        if abs(u[1]) < 1e-9:
+            mid = 0.5 * (pin_a + pin_b)
+            return np.array([mid[0], mid[2]]), np.array([bj[0], bj[2]])
+        p_axis = pin_a + u * ((y_ref - pin_a[1]) / u[1])
+        p_bj = bj + u * ((y_ref - bj[1]) / u[1])
+        return np.array([p_axis[0], p_axis[2]]), np.array([p_bj[0], p_bj[2]])
+
+    @property
+    def ic_front_view(self):
+        """
+        Instant-centre in the front view (XZ plane) for this corner.
+        Returns a 2-element array [x_m, z_m], or None if arms are parallel.
+        Used by the axle-level roll-centre computation (requires both corners).
+
+        Instant-axis method (RCVD ch. 17): the upright's instant axis is the
+        intersection of the two arm planes; its trace on the transverse plane
+        through the wheel centre is the front-view IC.  Each arm plane is drawn
+        in that transverse plane from its pivot AXIS, not the pickup midpoint,
+        so the IC is invariant to where along the axis the pickups sit
+        (2026-09-09: the midpoint construction moved the front RC 1.1 mm for a
+        pickup slid 38.7 mm along its own axis — a metric artifact).
+        """
+        s = self._s
+        y_ref = float(s.wheel_center[1])
+        uca_in, uca_out = self._arm_trace_xz(s.uca_front, s.uca_rear, s.uca_outer, y_ref)
+        lca_in, lca_out = self._arm_trace_xz(s.lca_front, s.lca_rear, s.lca_outer, y_ref)
+        return _intersect_2d(uca_in, uca_out, lca_in, lca_out)
+
+    @property
+    def roll_center_height(self) -> float:
+        """
+        Roll-centre height (m) — instant-centre method, front view (XZ plane).
+
+        1. Trace each arm plane on the transverse plane through the wheel
+           centre from its pivot AXIS + ball joint (see ic_front_view).
+        2. Find IC = intersection of arm lines.
+        3. Line from IC → contact patch; intersect with X=0 (centreline).
+        """
+        s = self._s
+
+        ic = self.ic_front_view
+
+        # Contact patch in XZ (Z=0, X=wheel centre lateral pos)
+        cp = np.array([s.wheel_center[0], 0.0])
+
+        if ic is None:
+            return 0.0   # parallel arms → RC at ground
+
+        if abs(ic[0]) < 1e-6:
+            return float(ic[1])
+
+        # Centreline in XZ is the vertical line X=0
+        cl_a = np.array([0.0, -1.0])
+        cl_b = np.array([0.0,  1.0])
+        rc = _intersect_2d(ic, cp, cl_a, cl_b)
+        return float(rc[1]) if rc is not None else float(ic[1])
+
+    # ── rim-fit envelope ─────────────────────────────────────────────────────
+    #  The kingpin ball joints (and tie-rod end) must physically fit inside
+    #  the wheel rim, else the upright cannot be built.  Each joint's radial
+    #  distance from the wheel spin axis must stay within the rim's clear
+    #  inner radius.  A hard packaging constraint — flagged here so the
+    #  design tooling can never quietly violate it.
+
+    def _spin_axis(self) -> np.ndarray:
+        ax = np.asarray(getattr(self._s, 'spin_axis', None)
+                        if getattr(self._s, 'spin_axis', None) is not None
+                        else [1.0, 0.0, 0.0], float)
+        n = np.linalg.norm(ax)
+        return ax / n if n > 1e-9 else np.array([1.0, 0.0, 0.0])
+
+    def joint_rim_radius(self, joint: str) -> float:
+        """Radial distance (m) of a hardpoint from the wheel spin axis —
+        i.e. how far out in the rim it sits.  `joint` is a SolvedState
+        attribute name (e.g. 'uca_outer', 'lca_outer', 'tr_outer')."""
+        p = np.asarray(getattr(self._s, joint), float)
+        wc = np.asarray(self._s.wheel_center, float)
+        ax = self._spin_axis()
+        d = p - wc
+        return float(np.linalg.norm(d - np.dot(d, ax) * ax))
+
+    def rim_fit(self, rim_clear_diameter_m: float = 9.5 * 0.0254) -> dict:
+        """Check the outboard joints against the rim clear circle.
+        Default = a 9.5 in clear circle (fits inside a 10 in rim)."""
+        r_max = rim_clear_diameter_m / 2.0
+        out = {}
+        worst = 0.0
+        for j in ('uca_outer', 'lca_outer', 'tr_outer'):
+            try:
+                r = self.joint_rim_radius(j)
+            except Exception:
+                continue
+            out[j] = r
+            worst = max(worst, r)
+        return {'radii_m': out, 'worst_m': worst,
+                'clear_radius_m': r_max, 'fits': worst <= r_max}
+
+    # ── spring / rocker ──────────────────────────────────────────────────────
+
+    @property
+    def spring_length(self) -> float:
+        return self._s.spring_length
+
+    @property
+    def rocker_angle_deg(self) -> float:
+        return float(np.degrees(self._s.rocker_angle))
+
+    # ── summary ───────────────────────────────────────────────────────────────
+
+    def summary(self) -> dict:
+        """All metrics. Lengths in mm, angles in degrees."""
+        return {
+            'travel_mm':             self._s.travel * 1000,
+            'camber_deg':            self.camber,
+            'toe_deg':               self.toe,
+            'caster_deg':            self.caster,
+            'kpi_deg':               self.kpi,
+            'scrub_radius_mm':       self.scrub_radius * 1000,
+            'mechanical_trail_mm':   self.mechanical_trail * 1000,
+            'roll_center_height_mm': self.roll_center_height * 1000,
+            'spring_length_mm':      self.spring_length * 1000,
+            'rocker_angle_deg':      self.rocker_angle_deg,
+        }
