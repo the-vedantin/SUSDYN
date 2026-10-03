@@ -5,11 +5,11 @@ pushrod/pullrod/direct-actuated race-car suspension and the vehicle dynamics tha
 It was built by Cougar Racing for the 2027 FSAE car. This repository tracks the **software only**;
 the team's design files, tyre data and design binder live outside it (see [Data policy](#data-policy)).
 
-**One solved model.** Every number the app shows — the 3-D view, each kinematic graph, the
-steady-state dynamics, the member loads, the lap simulation, the Ackermann and corner-speed
-pages — is computed from the same solved hardpoint model. Change a hardpoint and everything
-updates together. There is no second, simplified or hard-coded model anywhere in the pipeline
-(`docs/suspension_rules/00_one_model.md`).
+**One project geometry.** The 3-D view, kinematic graphs, steady-state dynamics, member loads,
+lap simulation, Ackermann and corner-speed pages use the project's hardpoints and shared
+solver paths. Individual analyses still have their own approximations,
+fallbacks and update controls; these are described below. ONE MODEL is the architecture rule
+(`docs/suspension_rules/00_one_model.md`), not proof that every path is equivalent.
 
 ![Main window](screenshots/main_window.png)
 
@@ -85,7 +85,8 @@ updates together. There is no second, simplified or hard-coded model anywhere in
 What Vahan does **not** contain: a compliance model (every link, the upright and the chassis are
 rigid; the only compliance in the code is the anti-roll-bar arm's own bending/torsion in its rate
 and a first-order steer-actuator lag in the transient model), any FEA/CFD solver or exporter, any
-control or autonomy layer, and any design-version branching beyond saving numbered files.
+autonomous-driving design layer, and any design-version branching beyond saving numbered files.
+The transient skidpad model does include a path follower and speed controller.
 
 ---
 
@@ -103,6 +104,9 @@ Verified runtime for this README (fresh container, 2026-10-03):
 | python-docx, Pillow | 1.2.0, 12.3.0 | `.docx` report export |
 
 Optional packages (features degrade gracefully without them):
+
+`cascadio`, `trimesh` and `cadquery-ocp` are currently included in `requirements.txt`,
+so that install command also installs the STEP dependencies even though those features are optional.
 
 | Package | Enables |
 |---|---|
