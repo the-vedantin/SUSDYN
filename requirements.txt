@@ -2,8 +2,18 @@ numpy>=1.24
 scipy>=1.10
 matplotlib>=3.8
 PyQt6>=6.6
+vispy>=0.14
 python-docx>=1.0
 Pillow>=10.0
+
+# Optional — MCP server (gui/mcp_server.py) that lets an agent operate the running app.
+# Without it start_mcp() is a silent no-op.
+# mcp>=1.0
+# Optional — tyre data from CSV / XLSX instead of a TTC .mat (vahan/tire_model.py).
+# pandas>=2.0
+# openpyxl>=3.1
+# Optional, Windows only — tools/sw_link.py SolidWorks bridge (untested against a live install).
+# pywin32
 
 # Optional — STEP import (File → Import STEP, for diff/engine clearance).
 # Without these the feature is disabled and the dialog explains how to install.

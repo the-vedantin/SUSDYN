@@ -33,5 +33,7 @@ Units: millimetres and degrees. Frame: X lateral (outboard +), Y longitudinal
 | [17](17_roll_centre_instant_axis.md) | Roll centre from the instant axis | Arms are traced from their pivot AXIS on the wheel-centre plane, never from the pickup midpoint — a pickup slid along its own axis must not move the roll centre. |
 | [18](18_chassis_keepout.md) | Chassis keep-out (red zone) | A STEP keep-out named by the project is a hard volume: no member inside it at droop/static/bump × lock/centre/lock — rack housing under the floor, torsion bar above the roof. |
 | [19](19_front_hoop_line.md) | Front ARB ahead of the front-hoop line | Bar, blades, links and rod ends of the front ARB stay ≥ 3 mm ahead of the line through the LCA-aft / UCA-aft pickups extended upward, at droop/static/bump (user rule 2026-09-14). |
+| [20](20_rear_toe_link_inner_on_lca_rear_pickup.md) | Rear toe-link inner IS the aft LCA inboard point | The rear toe link's inboard end shares the LCA-aft chassis pickup; no separate toe bracket (user hard rule 2026-09-21). |
+| [21](21_pushrod_tap_path_in_actuation_plane.md) | Pushrod arm mount in the actuation plane through travel | The pushrod's arm mount must move within the corner's actuation plane; its lean out of the rocker plane is reported by the net (2026-09-22). |
 
 Tyre evidence note (2026-09-15): the tyre model can be pinned to one test-speed block (`car['tire_speed_window_kph']`), used for the rim-matched 7-in run-6 surface; see the top-level README.
