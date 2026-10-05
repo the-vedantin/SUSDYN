@@ -517,6 +517,10 @@ allowance, with the slope per 10 mm.
   `docs/ONSHAPE_TO_SOLIDWORKS.md` describes the STEP route to SolidWorks.
 - **SolidWorks:** *Copy for SW* (two frames) and *Export SW equations*; `tools/sw_link.py`
   drives a 3-D sketch through pywin32 and has no recorded test against a running SolidWorks.
+  For a live SolidWorks part use the companion tool
+  [vahan-to-solidworks](https://github.com/the-vedantin/vahan-to-solidworks): a C# COM-API
+  utility that takes the *Copy for SW* paste format (`name,FLx,FLy,FLz,...|...`, mm) and moves
+  the existing sketch points in place, so entity IDs and every downstream reference survive.
 - **STEP import:** a differential or engine solid becomes a clearance body (cascadio + trimesh);
   move, flip, recolour, write back out (cadquery-ocp).
 - **Reports:** Export Report (`.docx`: parameters, kinematics, cornering, acceleration, braking,
