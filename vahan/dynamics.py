@@ -2503,7 +2503,10 @@ class SteadyStateSolver:
                 tire = self._tire_for(c)
                 if tire is None:
                     continue
-                fz_lo = float(np.asarray(tire.fz_range).ravel()[0])
+                # LinearTireModel has no test-load range: same guard as the
+                # solve() grip budget (fz_data_min / fz_lo above) so the
+                # parametric tyre reaches this criterion instead of raising.
+                fz_lo = float(np.asarray(getattr(tire, 'fz_range', (0.0,))).ravel()[0])
                 # signed IA (inner/outer by the solve's Fz), SA > 0 branch —
                 # identical lookup to the solve() grip budget
                 mu = float(tire.peak_mu(max(fz, fz_lo),

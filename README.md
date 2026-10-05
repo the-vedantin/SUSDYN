@@ -63,7 +63,9 @@ origin: centreline, front axle line, ground      metres inside vahan/, mm and de
 
 Positive: camber = top out, toe = toe-in, caster = top rearward, KPI = top inboard, scrub =
 kingpin ground point inboard of the patch, trail = patch behind that point, member force =
-tension, V/H = up/forward, lateral g = left turn, longitudinal g = acceleration.
+tension, V/H = up/forward, longitudinal g = acceleration. Lateral g is positive for a
+right-hand turn in the steady-state solver and loads (left side gains load); the yaw-moment
+and Ackermann modules use left-turn positive and index the solver by |g|.
 Only FL and RL are stored; FR and RR are X mirrors. Hardpoints are entered at design ride height
 with the wheel centre one tyre radius above ground. The contact patch is the wheel centre dropped
 to the ground plane. A few old comments and `examples/fsae_front.py` use a different frame;
