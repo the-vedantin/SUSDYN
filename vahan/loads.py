@@ -907,9 +907,14 @@ def _compute_brake_forces(result: ComponentLoads, bp: BrakeParams):
     if bp.pad_mu > 0 and r_pad > 0:
         result.caliper_clamp_N = T / (bp.pad_mu * r_pad * 2)
 
-        A_piston = bp.piston_area_mm2  # mm²
-        if A_piston > 0:
-            result.line_pressure_MPa = result.caliper_clamp_N / A_piston  # N/mm² = MPa
+        # clamp = P x A_piston x num_pistons (pistons on one side of a
+        # floating caliper; the floating side mirrors the force).  The SAME
+        # definition as compute_brake_system's lockup pressure below: with
+        # num_pistons > 1 this line used to read num_pistons times too high
+        # (audit C7, 2026-10-05).
+        A_eff = bp.piston_area_mm2 * max(int(bp.num_pistons), 1)  # mm²
+        if A_eff > 0:
+            result.line_pressure_MPa = result.caliper_clamp_N / A_eff  # N/mm² = MPa
 
 
 # ═══════════════════════════════════════════════════════════════════════════

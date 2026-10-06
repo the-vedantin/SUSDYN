@@ -310,6 +310,12 @@ def per_corner_limit_g(solver, *, aero_Fz=None, aero_Fz_per_g=None,
         else:
             hi = mid
     g_lim = 0.5 * (lo + hi)
+    if n_fail >= int(iters):
+        # Every probe raised: nothing was measured.  Returning the lower
+        # bracket here printed a fake "0.300 g" limit on the Corner Speed and
+        # Build Tolerance pages when the tyre chain could not solve at all
+        # (audit C2, 2026-10-05).  NaN + the failure count instead.
+        g_lim = float('nan')
     try:
         _, at = _metric(g_lim)
     except Exception:                            # noqa: BLE001
@@ -414,7 +420,8 @@ def grip_budget_study(solver, *, lateral_g: float, aero_cases: dict,
         lim_a = per_corner_limit_g(solver, criterion='axle', lo=lo, hi=hi,
                                    iters=iters, **kw)
         gs = (list(sweep_g) if sweep_g is not None else
-              list(np.linspace(lo, max(lim_c['limit_g'], lim_a['limit_g']) + 0.3, 12)))
+              list(np.linspace(lo, max([x for x in (lim_c['limit_g'], lim_a['limit_g'])
+                                        if np.isfinite(x)] or [hi]) + 0.3, 12)))
         if progress is not None:
             progress(f'{label}: utilization vs g ({len(gs)} solves)')
         sweep = {'g': [], 'utilization': {c: [] for c in CORNERS},

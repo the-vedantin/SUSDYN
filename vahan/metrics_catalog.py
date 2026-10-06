@@ -489,8 +489,8 @@ def compute_ackermann_post(toe_curve: np.ndarray,
     For a symmetric car, both corners share the same hardpoints (mirrored).
     A steer sweep on the left corner at input angles [-A ... 0 ... +A] gives
     the left-wheel steer angle at each step.  By mirror symmetry, the
-    right-wheel steer angle at input +d equals the left-wheel angle at -d
-    (with sign flip because toe-in is positive and the directions mirror).
+    right-wheel signed toe-in at input +d equals the left-wheel toe-in at -d
+    (toe-in is mirror-invariant, so there is NO sign flip).
 
     At each steer input d:
         delta_near  = |toe(+d)|   (this corner — nearer to turn centre)
@@ -550,9 +550,24 @@ def compute_ackermann_post(toe_curve: np.ndarray,
         delta_near = abs(toe_this)       # this corner
         delta_far  = abs(toe_mirror)     # opposite corner (by symmetry)
 
-        # Identify inner (larger angle) vs outer (smaller angle)
-        delta_inner = max(delta_near, delta_far)
-        delta_outer = min(delta_near, delta_far)
+        # Inner wheel from the TURN DIRECTION, never from "whichever steers
+        # more": in reverse-Ackermann geometry the OUTER wheel steers more, so
+        # max/min crowned it inner and mirrored every reverse reading into pro
+        # (+121.6 % for a 10 deg inner / 12 deg outer pair whose canonical
+        # value is -121.6 %; audit C9, 2026-10-05).  Same rule as the GUI's
+        # _ackermann_from_pair: physical yaw = (toe_right - toe_left)/2 and
+        # this (left) corner is inner when yaw > 0.  By mirror symmetry the
+        # right wheel's signed toe-in at input +d IS the left wheel's at -d
+        # (toe-in is mirror-invariant: no sign flip, the old docstring's flip
+        # was wrong and harmless only because everything went through abs()).
+        toe_opposite = toe_mirror
+        yaw = 0.5 * (toe_opposite - toe_this)
+        if abs(yaw) < 1e-9:
+            continue
+        if yaw > 0:
+            delta_inner, delta_outer = delta_near, delta_far
+        else:
+            delta_inner, delta_outer = delta_far, delta_near
 
         # CANONICAL Ackermann % (vahan.ackermann.ackermann_pct_from_pair,
         # Astra F-08 2026-09-22): 100*(L/t)*(cot d_out - cot d_in), exact at

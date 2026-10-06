@@ -231,6 +231,78 @@ if not caster_ok:
 print(f'caster sign      : front caster {casterF:+.2f} deg (uca_outer rearward of lca)   '
       f'{"pass" if caster_ok else "UNEXPECTED FAIL (should be POSITIVE)"}')
 
+# ── AUDIT 2026-10-05 (lock-gate maths audit, items C2/C4/C7/C9): four plain
+#    bugs, each guarded here.  All four FAIL on 82a40de/40f9230 and pass after.
+print('-' * 64)
+_aud_fails = []
+# C4: the sweep's "static" station must be t = 0 exactly, not the grid point
+#     nearest it (default window -19.975..+42.733/81 put it at -0.379 mm; the
+#     roll centre read +0.36 mm off solve(0)).  Snapshot the job, force that
+#     window, run the ONE compute path and compare the static row with solve(0).
+_jobA = win._snapshot_sweep_job(); _jobA['motion'] = 'heave'
+_jobA['lo'], _jobA['hi'] = -19.975, 42.733
+_resA = win._compute_sweep(_jobA)
+_xA = np.asarray(_resA['x_arr'], float); _i0A = int(np.argmin(np.abs(_xA)))
+_rcA = float(_resA['sweep_results']['FL']['rc_height'][_i0A])
+_rc0 = float(KinematicMetrics(win._solvers['FL'].solve(0.), 'left').roll_center_height * 1000.)
+_c4_ok = abs(_xA[_i0A]) < 1e-12 and abs(_rcA - _rc0) < 1e-6
+if not _c4_ok: _aud_fails.append('C4 static station')
+print(f'audit C4 static  : window -19.975..+42.733/81 -> static station {_xA[_i0A]:+.4f} mm, '
+      f'graph RC {_rcA:.4f} vs solve(0) {_rc0:.4f} mm   {"pass" if _c4_ok else "UNEXPECTED FAIL"}')
+# C9: catalogue Ackermann (IK objective) must take the inner wheel from the turn
+#     direction.  Left corner, left turn at +d: inner (left) wheel 10 deg
+#     toe-OUT (-10), outer (right) wheel 12 deg toe-IN; by mirror symmetry the
+#     left corner at -d (right turn, now outer) reads +12.  Reverse Ackermann
+#     -> NEGATIVE at both ends, equal to the canonical pair value.  Then the
+#     real model: the catalogue on the FL toe curve of a steer sweep must equal
+#     the GUI's own FL+FR pair readout (same %, same sign) at every station.
+from vahan.metrics_catalog import compute_ackermann_post as _cap
+from vahan.ackermann import ackermann_pct_from_pair as _apfp
+_st9 = np.linspace(-30., 30., 7)
+_toe9 = np.where(_st9 > 0, -10.0, np.where(_st9 < 0, 12.0, 0.0))
+_ack9 = _cap(_toe9, _st9, wheelbase_m=1.537, front_track_m=1.270)
+_ref9 = _apfp(10.0, 12.0, 1.270, 1.537)
+_c9_syn = (np.isfinite(_ack9[-1]) and abs(_ack9[-1] - _ref9) < 1e-9 and _ack9[-1] < 0
+           and abs(_ack9[0] - _ref9) < 1e-9)
+_job9 = win._snapshot_sweep_job(); _job9['motion'] = 'steer'; _job9['lo'], _job9['hi'] = -40., 40.
+_res9 = win._compute_sweep(_job9)
+_toe_off9 = float(_job9.get('alignment', {}).get('front_toe_deg', 0.) if isinstance(_job9.get('alignment'), dict) else 0.)
+_fl9 = np.asarray(_res9['sweep_results']['FL']['toe'], float) - _toe_off9
+_gui9 = np.asarray(_res9['sweep_results']['FL']['ackermann'], float)
+_cat9 = _cap(_fl9, np.asarray(_res9['x_arr'], float),
+             wheelbase_m=_job9['car'].get('wheelbase_mm', 1537.) / 1000.,
+             front_track_m=_job9['car'].get('track_f_mm', 1222.) / 1000.)
+_m9 = np.isfinite(_gui9) & np.isfinite(_cat9)
+_d9 = float(np.max(np.abs(_gui9[_m9] - _cat9[_m9]))) if _m9.any() else float('nan')
+_c9_ok = _c9_syn and _m9.sum() >= 10 and _d9 < 1e-6
+if not _c9_ok: _aud_fails.append('C9 ackermann sign')
+print(f'audit C9 ack sign: inner 10 / outer 12 deg -> catalogue {_ack9[-1]:+.1f} % / {_ack9[0]:+.1f} % at -d, '
+      f'canonical {_ref9:+.1f} %; model steer sweep catalogue vs GUI pair worst {_d9:.2e} pts on {int(_m9.sum())} stations'
+      f'   {"pass" if _c9_ok else "UNEXPECTED FAIL"}')
+# C2: a grip-limit bisection in which EVERY probe raised must return NaN, not
+#     the 0.3 g lower bracket (the Corner Speed / Build Tolerance pages printed
+#     0.300 g as a number when the tyre chain could not solve).
+from vahan import corner_speed as _CS2
+class _RaisingSolver:
+    def solve(self, *a, **k): raise RuntimeError('no solve')
+_lim2 = _CS2.per_corner_limit_g(_RaisingSolver(), iters=6)
+_c2_ok = (not np.isfinite(_lim2['limit_g'])) and _lim2['n_failed_solves'] == 6
+if not _c2_ok: _aud_fails.append('C2 limit NaN')
+print(f'audit C2 limit   : all 6 probes raised -> limit_g {_lim2["limit_g"]} (n_failed {_lim2["n_failed_solves"]})   '
+      f'{"pass" if _c2_ok else "UNEXPECTED FAIL (bracket returned as a number)"}')
+# C7: line pressure = clamp / (piston area x pistons per side) in BOTH brake
+#     paths.  With 4 pistons the loads-table pressure read 4x the lockup path.
+from vahan.loads import BrakeParams as _BP7, ComponentLoads as _CL7, _compute_brake_forces as _cbf7
+_bp7 = _BP7(pad_mu=0.45, piston_area_mm2=793.5, pad_radius_mm=92.1, num_pistons=4)
+_cl7 = _CL7(); _cl7.brake_torque_Nm = 300.0; _cbf7(_cl7, _bp7)
+_p7_expect = _cl7.caliper_clamp_N / (793.5 * 4)
+_c7_ok = abs(_cl7.line_pressure_MPa - _p7_expect) < 1e-9
+if not _c7_ok: _aud_fails.append('C7 brake pressure')
+print(f'audit C7 pressure: 4 pistons, 300 N.m -> loads table {_cl7.line_pressure_MPa:.3f} MPa vs '
+      f'clamp/(A x n) {_p7_expect:.3f} MPa   {"pass" if _c7_ok else "UNEXPECTED FAIL (x4)"}')
+if _aud_fails:
+    fails += len(_aud_fails)
+
 # ── ARB SWEEP METRICS LIVE: _do_sweep referenced an undefined `label`, silently
 #    NaN-ing arb_angle/arb_drop_travel/arb_mr (NameError eaten by except).  Guard
 #    that a heave sweep on a bellcrank ARB now produces finite ARB metrics.

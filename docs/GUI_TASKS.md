@@ -17,7 +17,7 @@ Claude appends here when a feature is promised for later; the user ticks or edit
 - [x] Contact patch vs ride Hz + launch load lag tabs (Ride page) - 2026-09-21
 - [x] ONE MODEL check: rear roll centre reads 68.0 mm on the Kinematics graph (axle post-processing in _compute_sweep) but 75.4 mm from the per-corner sweep the binder dumps - find which construction each uses and make them one - 2026-09-21
 - [x] Roll centre on the Kinematics graph now uses the solver's instant-axis construction (was the retired pickup-midpoint; rear read 68.0 instead of 75.7) - 2026-09-21
-- [ ] Roll centre: axle construction on the graph (75.67 rear) vs per-corner property in the catalog/binder (75.41) differ by 0.26 mm - trace why (contact-patch X or mirrored corner) and unify - 2026-09-21
+- [x] Roll centre: axle construction on the graph (75.67 rear) vs per-corner property in the catalog/binder (75.41) differ by 0.26 mm - cause: the sweep's static row was the grid point nearest 0, not 0; the grid now holds t = 0 exactly (net 'audit C4') - 2026-10-06
 - [ ] Net: "ackermann sweep" reports NaN because both capability values are inf (never front-limited); compare with isfinite-aware logic - 2026-09-21
 - [ ] Net gates missing for Rule 07 (ARB rate preserved) and Rule 11 (pushrod mount near the ball joint) - 2026-09-21
 - [x] Rim model: real Keizer 10x7 / 10x8 (6 in BS) profiles from the STEP files, net gate "real wheel profile" - 2026-09-21

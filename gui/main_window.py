@@ -637,6 +637,23 @@ def _validate_project_data(data) -> None:
         raise ValueError('"imported_parts" must be a list')
 
 
+def _linspace_holding_zero(lo: float, hi: float, n: int) -> np.ndarray:
+    """np.linspace(lo, hi, n) with the station nearest 0 snapped to exactly 0
+    whenever the window straddles 0.
+
+    The sweep's "static" row (graph cursor at 0, catalogue static values, the
+    rc-sphere = graph gate) must be the DESIGN position, not the grid point
+    nearest it: the default window (-19.975..+42.733 mm / 81) put that station
+    at -0.379 mm and the v150 window (-31.09..+50.58 / 81) at -0.464 mm, which
+    read the roll centre +0.33 mm and camber +0.03 deg off the solved static
+    model (audit C4, 2026-10-05). One station moves by < half a step; the
+    station count and the window are unchanged."""
+    arr = np.linspace(lo, hi, n)
+    if n > 1 and lo < 0.0 < hi:
+        arr[int(np.argmin(np.abs(arr)))] = 0.0
+    return arr
+
+
 def _ackermann_from_pair(toe_left_deg: float, toe_right_deg: float,
                          wheelbase_m: float, front_track_m: float,
                          inner: str = None) -> float:
@@ -6270,7 +6287,7 @@ class MainWindow(QMainWindow):
 
         if True:   # (indent kept from the old _run_sweep body — reviewable diff)
             if motion == 'heave':
-                t_arr   = np.linspace(lo/1000, hi/1000, n)
+                t_arr   = _linspace_holding_zero(lo/1000, hi/1000, n)
                 x_arr   = t_arr * 1000
                 x_label = 'Wheel Travel (mm)'
                 sweeps  = {lbl: t_arr for lbl in ('FL', 'FR', 'RL', 'RR')}
@@ -6280,7 +6297,7 @@ class MainWindow(QMainWindow):
                 }
 
             elif motion == 'roll':
-                angles  = np.linspace(lo, hi, n)
+                angles  = _linspace_holding_zero(lo, hi, n)
                 x_arr   = angles
                 x_label = 'Roll Angle (deg)'
                 # Wheel-centre X is signed (+ left, - right).  Use each
@@ -6298,7 +6315,7 @@ class MainWindow(QMainWindow):
                 }
 
             elif motion == 'pitch':
-                t_arr   = np.linspace(lo/1000, hi/1000, n)
+                t_arr   = _linspace_holding_zero(lo/1000, hi/1000, n)
                 x_arr   = t_arr * 1000
                 x_label = 'Pitch Travel (mm)'
                 sweeps  = {'FL': t_arr, 'FR': t_arr, 'RL': -t_arr, 'RR': -t_arr}
@@ -6308,7 +6325,7 @@ class MainWindow(QMainWindow):
                 }
 
             else:  # steer -- vary steering wheel angle, zero heave
-                steer_angles = np.linspace(lo, hi, n)   # steering wheel deg
+                steer_angles = _linspace_holding_zero(lo, hi, n)   # steering wheel deg
                 x_arr        = steer_angles
                 x_label      = 'Steering Wheel Angle (deg)'
                 res_fl = {e['key']: np.full(n, float('nan')) for e in CATALOG}
