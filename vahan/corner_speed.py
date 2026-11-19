@@ -474,3 +474,133 @@ def grip_budget_table_text(study: dict, sep: str = '\t') -> str:
         out.append(sep.join([label, f'{la["limit_g"]:.3f}', 'axle-aggregate limit (reference)',
                              str(la['binding']), '', '', '', '', '', '']))
     return '\n'.join(out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DOWNFORCE TO MAKE A CORNER (user 2026-10-10)
+#  "I want to take radius R at speed V — what aero package do I need, quoted
+#   as N at my reference speed?"  Same solver, same axle budget as the G-G
+#  diagram, the Dynamics sweep and the corner-speed tab (ONE MODEL).
+# ═══════════════════════════════════════════════════════════════════════════
+def _axle_util_with_total(solver, ay_g, total_N, cop_rear_frac):
+    """Max axle utilization at ay_g with total_N of downforce split by the
+    package CoP (symmetric per axle).  A solve that raises counts as over."""
+    rear = float(np.clip(cop_rear_frac, 0.0, 1.0))
+    af = {'FL': 0.5 * total_N * (1.0 - rear), 'FR': 0.5 * total_N * (1.0 - rear),
+          'RL': 0.5 * total_N * rear, 'RR': 0.5 * total_N * rear} if total_N > 0.0 else None
+    try:
+        r = solver.solve(float(ay_g), 0.0, aero_Fz=af)
+    except Exception:                            # noqa: BLE001 — wheel-lift refusal etc.
+        return float('inf')
+    if r.grip_exceeded and any(bool(v) for v in r.grip_exceeded.values()):
+        return float('inf')
+    return float(max(solver.axle_utilization(r).values()))
+
+
+def downforce_for_corner(solver, radius_m: float, speed_mps: float, *,
+                         cop_rear_frac: float, ref_speed_mps: float,
+                         rho: float = 1.225, target_util: float = 1.0,
+                         max_total_N: float = 8000.0, iters: int = 30,
+                         mech_limit: dict | None = None) -> dict:
+    """The downforce the car needs ON IT to hold radius_m at speed_mps with
+    every axle inside target_util of its grip budget, and that load expressed
+    as the package that makes it: 'package_ref_N at ref_speed' (F scales with
+    V², so F_ref = D · (V_ref / V)²) and the ClA it implies.
+
+    downforce_at_corner_N = 0 when the car makes the corner mechanically;
+    feasible = False when even max_total_N (8 kN: beyond any FSAE wing and past the
+    tyre data's load range) cannot hold it; the package is then reported at the cap.  mech_limit may pass a per_corner_limit_g(...,
+    criterion='axle') result for this solver to skip recomputing it."""
+    R = float(radius_m); V = float(speed_mps); Vr = float(ref_speed_mps)
+    if not (R > 0.0 and V > 0.0 and Vr > 0.0):
+        raise ValueError('radius, corner speed and reference speed must be > 0')
+    ay = V * V / (G * R)
+    if mech_limit is None:
+        mech_limit = per_corner_limit_g(solver, criterion='axle')
+    g_mech = float(mech_limit['limit_g'])
+    v_mech = speed_from_lateral_g(g_mech, R)
+    u0 = _axle_util_with_total(solver, ay, 0.0, cop_rear_frac)
+    out = {'radius_m': R, 'speed_mps': V, 'speed_kph': V * 3.6, 'ay_g': ay,
+           'ref_speed_mps': Vr, 'ref_speed_kph': Vr * 3.6, 'cop_rear_frac': float(cop_rear_frac),
+           'target_util': float(target_util), 'mu_scale': float(solver._mu_scale),
+           'mech_limit_g': g_mech, 'mech_limit_speed_mps': v_mech, 'mech_limit_speed_kph': v_mech * 3.6,
+           'util_no_aero': u0, 'feasible': True, 'capped': False,
+           'downforce_at_corner_N': 0.0, 'front_N': 0.0, 'rear_N': 0.0,
+           'package_ref_N': 0.0, 'cla_m2': 0.0, 'util_with': u0, 'n_solves': 1}
+    if u0 <= target_util:
+        return out                               # makes it on tyres alone
+    u_cap = _axle_util_with_total(solver, ay, max_total_N, cop_rear_frac)
+    out['n_solves'] += 1
+    if u_cap > target_util:
+        out.update(feasible=False, capped=True, downforce_at_corner_N=float(max_total_N),
+                   util_with=u_cap)
+        D = float(max_total_N)
+    else:
+        lo, hi = 0.0, float(max_total_N)         # util(lo) > target, util(hi) <= target
+        for _ in range(int(iters)):
+            mid = 0.5 * (lo + hi)
+            if _axle_util_with_total(solver, ay, mid, cop_rear_frac) <= target_util:
+                hi = mid
+            else:
+                lo = mid
+            out['n_solves'] += 1
+            if hi - lo < 5.0:                    # N — nobody builds a wing to 1 N
+                break
+        D = hi
+        out['downforce_at_corner_N'] = D
+        out['util_with'] = _axle_util_with_total(solver, ay, D, cop_rear_frac)
+    rear = float(np.clip(cop_rear_frac, 0.0, 1.0))
+    out['front_N'] = D * (1.0 - rear); out['rear_N'] = D * rear
+    out['package_ref_N'] = D * (Vr / V) ** 2
+    out['cla_m2'] = 2.0 * D / (float(rho) * V * V) if rho > 0 else float('nan')
+    return out
+
+
+def downforce_for_corner_curves(solver, radius_m: float, speed_mps: float, *,
+                                cop_rear_frac: float, ref_speed_mps: float,
+                                rho: float = 1.225, target_util: float = 1.0,
+                                speed_pts: int = 9, radii_m=None,
+                                progress=None, cancelled=None) -> dict:
+    """The point (downforce_for_corner at R, V) plus two curves: the package
+    needed vs corner speed on radius R (from the mechanical limit speed up to
+    1.6x it) and vs radius at speed V.  Each point is its own bisection."""
+    mech = per_corner_limit_g(solver, criterion='axle')
+    kw = dict(cop_rear_frac=cop_rear_frac, ref_speed_mps=ref_speed_mps, rho=rho,
+              target_util=target_util, mech_limit=mech)
+    point = downforce_for_corner(solver, radius_m, speed_mps, **kw)
+    v_mech = point['mech_limit_speed_mps']
+    speeds = list(np.linspace(v_mech, 1.4 * v_mech, int(max(speed_pts, 3))))   # 1.4x speed = ~2x the mechanical g
+    if speed_mps > v_mech and all(abs(s - speed_mps) > 1e-6 for s in speeds):
+        speeds = sorted(speeds + [float(speed_mps)])
+    radii = list(radii_m) if radii_m is not None else DEFAULT_RADII_M
+    radii = sorted({float(r) for r in radii if r > 0.0} | {float(radius_m)})
+    vs_speed, vs_radius = [], []
+    total = len(speeds) + len(radii); done = 0
+    for s in speeds:
+        if cancelled and cancelled():
+            break
+        vs_speed.append(downforce_for_corner(solver, radius_m, s, **kw)); done += 1
+        if progress:
+            progress(f'{done} / {total}: {s * 3.6:.1f} km/h on {radius_m:.1f} m')
+    for r in radii:
+        if cancelled and cancelled():
+            break
+        vs_radius.append(downforce_for_corner(solver, r, speed_mps, **kw)); done += 1
+        if progress:
+            progress(f'{done} / {total}: {r:.1f} m at {speed_mps * 3.6:.1f} km/h')
+    return {'point': point, 'vs_speed': vs_speed, 'vs_radius': vs_radius,
+            'mech_limit_g': float(mech['limit_g']), 'mu_scale': float(solver._mu_scale)}
+
+
+def downforce_table_text(study: dict, sep: str = '\t') -> str:
+    cols = ('curve', 'radius m', 'corner speed km/h', 'lateral g', 'util no aero',
+            'downforce at corner N', 'front N', 'rear N', 'package N at ref speed', 'ClA m2', 'feasible')
+    lines = [sep.join(cols)]
+    for name, rows in (('vs speed', study.get('vs_speed', [])), ('vs radius', study.get('vs_radius', []))):
+        for r in rows:
+            lines.append(sep.join((name, f'{r["radius_m"]:.2f}', f'{r["speed_kph"]:.1f}', f'{r["ay_g"]:.3f}',
+                                   f'{r["util_no_aero"]:.3f}', f'{r["downforce_at_corner_N"]:.0f}',
+                                   f'{r["front_N"]:.0f}', f'{r["rear_N"]:.0f}', f'{r["package_ref_N"]:.0f}',
+                                   f'{r["cla_m2"]:.3f}', 'yes' if r['feasible'] else 'NO (capped)')))
+    return '\n'.join(lines)
+

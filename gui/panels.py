@@ -653,7 +653,12 @@ class SteeringPanel(CollapsibleSection):
     not by a slider here.
 
     Signals:
-        steering_changed(dict) — {'rack_travel_per_rev_mm', 'total_rack_travel_mm'}
+        steering_changed(dict) — {'rack_travel_per_rev_mm', 'total_rack_travel_mm',
+                                  'rack_direction', 'wheel_od_mm'}
+    ``wheel_od_mm`` is the steering-wheel outer diameter (user 2026-10-11):
+    the hand torque divided by its radius is the RIM FORCE the hands feel.
+    0 in the spinbox = unknown -> None in the steer block, and the rim force
+    is then not reported anywhere (never a default).
     """
     steering_changed = pyqtSignal(dict)
 
@@ -666,6 +671,8 @@ class SteeringPanel(CollapsibleSection):
             'rack_travel_per_rev_mm': self._rack_ratio.value(),
             'total_rack_travel_mm':   self._rack_total.value(),
             'rack_direction': self._rack_direction.currentData(),
+            'wheel_od_mm': (float(self._wheel_od.value())
+                            if self._wheel_od.value() > 0 else None),
         }
 
     def set_params(self, d: dict):
@@ -696,6 +703,12 @@ class SteeringPanel(CollapsibleSection):
             self._rack_direction.setCurrentIndex(1 if d.get('rack_direction', 1) == -1 else 0)
         finally:
             self._rack_direction.blockSignals(False)
+        # Steering-wheel OD: the key may be absent/None (older project) -> 0 = unknown.
+        self._wheel_od.blockSignals(True)
+        try:
+            self._wheel_od.setValue(float(d.get('wheel_od_mm') or 0.0))
+        finally:
+            self._wheel_od.blockSignals(False)
         self._refresh_max_hw()
 
     def _build(self):
@@ -719,6 +732,15 @@ class SteeringPanel(CollapsibleSection):
         self._rack_direction.setToolTip('Physical rack travel direction for positive steering-wheel input. Must match the pinion installation.')
         self._rack_direction.currentIndexChanged.connect(self._on_rack_changed)
         grid.addWidget(self._rack_direction, 2, 1)
+        grid.addWidget(QLabel('Steering wheel OD:'), 3, 0)
+        # 0 = unknown (no default is invented; the project file carries the value)
+        self._wheel_od = _spin(0.0, 1000.0, 0.0, ' mm', dec=1, step=1.0)
+        self._wheel_od.setSpecialValueText('unknown')
+        self._wheel_od.setToolTip('Steering-wheel outer diameter. Hand torque / (OD/2) = the '
+                                  'force the hands feel at the rim. Leave at "unknown" to '
+                                  'suppress the rim force rather than guess a wheel.')
+        self._wheel_od.valueChanged.connect(self._on_rack_changed)
+        grid.addWidget(self._wheel_od, 3, 1)
         self.add_layout(grid)
 
         # ── Readout: max steering-wheel angle achievable ────────────────────
@@ -752,10 +774,14 @@ class SteeringPanel(CollapsibleSection):
             return
         max_hw = (total_mm / 2.0) / rack_per_rev * 360.0
         turns  = max_hw / 360.0
+        od = float(self._wheel_od.value()) if hasattr(self, '_wheel_od') else 0.0
+        od_txt = (f'\nSteering wheel Ø{od:.1f} mm ({od / 25.4:.2f} in): rim force = torque / {od / 2000.0:.4f} m'
+                  if od > 0 else '\nSteering wheel OD unknown — rim force not reported')
         self._max_hw_lbl.setText(
+            f'Rack {rack_per_rev / 25.4:.2f} in/rev  |  '
             f'Max steering-wheel angle: ±{max_hw:.0f}°  '
             f'({turns:.2f} turns from centre)\n'
-            f'Lock-to-lock: {2*max_hw:.0f}° ({2*turns:.2f} turns)')
+            f'Lock-to-lock: {2*max_hw:.0f}° ({2*turns:.2f} turns)' + od_txt)
 
     def max_handwheel_deg(self) -> float:
         """One-way max hand-wheel angle (deg) from the two rack params."""
@@ -1619,23 +1645,34 @@ class AlignmentPanel(CollapsibleSection):
             'rear_camber_deg':  self._rc.value(),
         }
 
+    def set_params(self, d: dict):
+        """Show the model's alignment (e.g. from a loaded file) without
+        emitting alignment_changed.  Without this the boxes stayed at 0.00
+        while the model used the file's values, and pressing Apply silently
+        replaced them with zeros."""
+        for box, key in ((self._ft, 'front_toe_deg'), (self._fc, 'front_camber_deg'),
+                         (self._rt, 'rear_toe_deg'), (self._rc, 'rear_camber_deg')):
+            box.blockSignals(True)
+            box.setValue(float(d.get(key, 0.0) or 0.0))
+            box.blockSignals(False)
+
     def _build(self):
         grid = QGridLayout(); grid.setSpacing(4)
 
         grid.addWidget(QLabel('Front toe:'),    0, 0)
-        self._ft = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
+        self._ft = _spin(-90.0, 90.0, 0.0, ' deg', dec=3, step=0.1)
         grid.addWidget(self._ft, 0, 1)
 
         grid.addWidget(QLabel('Front camber:'), 1, 0)
-        self._fc = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
+        self._fc = _spin(-90.0, 90.0, 0.0, ' deg', dec=3, step=0.1)
         grid.addWidget(self._fc, 1, 1)
 
         grid.addWidget(QLabel('Rear toe:'),     2, 0)
-        self._rt = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
+        self._rt = _spin(-90.0, 90.0, 0.0, ' deg', dec=3, step=0.1)
         grid.addWidget(self._rt, 2, 1)
 
         grid.addWidget(QLabel('Rear camber:'),  3, 0)
-        self._rc = _spin(-90.0, 90.0, 0.0, ' deg', dec=2, step=0.1)
+        self._rc = _spin(-90.0, 90.0, 0.0, ' deg', dec=3, step=0.1)
         grid.addWidget(self._rc, 3, 1)
 
         self.add_layout(grid)
@@ -1972,7 +2009,7 @@ class InverseKinematicsPanel(CollapsibleSection):
         for i, (label, keys, default_mm) in enumerate(_tube_defaults):
             tube_grid.addWidget(QLabel(label), i, 0)
             sp = _spin(0, 1e6, default_mm, ' mm', dec=5, step=1.0)
-            sp.setMaximumWidth(80)
+            sp.setMaximumWidth(110)   # 80 cut '25.40000 mm' in half
             tube_grid.addWidget(sp, i, 1)
             for k in keys:
                 self._tube_od_spins[k] = sp   # shared spinner for grouped
@@ -2514,6 +2551,7 @@ class DynamicsPanel(CollapsibleSection):
     sweep_requested        = pyqtSignal(dict)
     tire_file_changed      = pyqtSignal(str)
     tire_pressure_changed  = pyqtSignal(float)
+    tire_fit_method_changed = pyqtSignal(str)
     tire_plots_requested   = pyqtSignal()   # show tire/grip characterization plots
     params_changed         = pyqtSignal(dict)
     graph_selection_changed = pyqtSignal(list)   # selected graph keys
@@ -2584,6 +2622,25 @@ class DynamicsPanel(CollapsibleSection):
         self._tire_psi_avail.setSizePolicy(_pp)
         p_row.addWidget(self._tire_psi_avail, 1)
         self.add_layout(p_row)
+
+        # ── How the TTC data is read (user 2026-11-16) ──────────────────
+        from vahan.tire_model import FIT_METHODS, FIT_METHOD_LABELS
+        fm_row = QHBoxLayout()
+        fm_row.addWidget(QLabel('Tyre data:'))
+        self._tire_fit = QComboBox()
+        for _k in FIT_METHODS:
+            self._tire_fit.addItem(FIT_METHOD_LABELS[_k], _k)
+        self._tire_fit.setToolTip(
+            'How the TTC data becomes the tyre model. Lookup = median of the '
+            'raw points in 0.5 deg slip bins. MF 5.2 = Pacejka curve fit, one '
+            'per tested camber, all loads together. Spline = smooth cubic '
+            'spline through each test load. All three fill the same tyre grid, '
+            'so the lap sim, loads and MMD all switch together. Fit quality '
+            '(R2, RMS) shows on the tyre label.')
+        self._tire_fit.currentIndexChanged.connect(
+            lambda _i: self.tire_fit_method_changed.emit(self.get_tire_fit_method()))
+        fm_row.addWidget(self._tire_fit, 1)
+        self.add_layout(fm_row)
 
         # The "peak-slip trend" spinbox that used to sit here is GONE.  It was
         # a hand knob for how the tyre's best slip angle moves with load —
@@ -2729,6 +2786,17 @@ class DynamicsPanel(CollapsibleSection):
             'Hollow bars cut mass dramatically with only modest stiffness loss '
             '(stiffness scales with OD⁴−ID⁴ — the outer fibres carry almost all the load).')
         self._arb_ID_r.setToolTip(self._arb_ID_f.toolTip().replace('front', 'rear'))
+        # Chassis torsional stiffness (hub to hub) -> VehicleParams.chassis_compliance /
+        # chassis_torsion_Nm_rad.  Off = rigid chassis.  The Chassis page mirrors these two.
+        self._chassis_kc = row('Chassis torsional stiffness:', 0.0, 1e7, 2711.6, ' N·m/deg', r, dec=2, step=50); r += 1
+        self._chassis_kc.setToolTip('Chassis torsional stiffness as the suspension sees it, hub to hub (N·m per degree of '
+                                    'twist between the front and rear axles).  Used only when the box below is ticked.')
+        self._chassis_on = QCheckBox('Apply chassis compliance (else rigid chassis)')
+        self._chassis_on.setToolTip('On: the front and rear of the body roll by their own angles (three-spring model) — '
+                                    'each axle gets its own camber and the elastic load-transfer split moves.  '
+                                    'Kinematics are unchanged.')
+        self._chassis_on.toggled.connect(lambda _: self.params_changed.emit(self.get_params()))
+        g.addWidget(self._chassis_on, r, 0, 1, 2); r += 1
         self.add_layout(g)
 
         # Cached derived geometry (populated by set_derived_arb_geometry).
@@ -3070,12 +3138,15 @@ class DynamicsPanel(CollapsibleSection):
         self._test_mode = QComboBox()
         self._test_mode.addItem('Cornering',  'cornering')
         self._test_mode.addItem('Straights',  'straights')
+        # Steady-state straight-line g sweep, braking (-) to accelerating (+)
+        # (user 2026-11-14: "no plotting against long") - X = long g
+        self._test_mode.addItem('Braking / accel (long g)', 'lon_sweep')
         self._test_mode.setStyleSheet(
             'QComboBox { background: #1a1a1a; color: #e0e0e0; '
             'border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }'
             'QComboBox QAbstractItemView { background: #1a1a1a; color: #e0e0e0; '
             'selection-background-color: #2e2e38; }')
-        self._test_mode.setMaximumWidth(140)
+        self._test_mode.setMaximumWidth(190)
         self._test_mode.currentIndexChanged.connect(self._on_test_mode_changed)
         mode_row.addWidget(self._test_mode)
         mode_row.addStretch()
@@ -3144,6 +3215,40 @@ class DynamicsPanel(CollapsibleSection):
         self._v_sweep_host.setVisible(False)
         self.add_widget(self._v_sweep_host)
 
+        # Front steer in the cornering sweep (user 2026-11-14: "steady state
+        # sweep doesnt take in account for camber gain from caster").  On: each
+        # point steers the front wheels for the Turn radius box (lat-g sweeps)
+        # or the sweep's own radius (speed sweeps), so caster / kingpin-tilt
+        # camber, toe and scrub at that steer are in the camber, tyre angle and
+        # grip results.  Off: the front wheels stay straight (as before).
+        self._steer_sweep_cb = QCheckBox(
+            'Steer the front wheels in the sweep (caster/KPI camber)')
+        self._steer_sweep_cb.setChecked(True)
+        self._steer_sweep_cb.setToolTip(
+            'On: at every point the front wheels are turned by the steering\n'
+            'the car needs on a circle of the "Turn radius" box\n'
+            '(wheelbase / radius + front slip - rear slip), through the real\n'
+            'rack and tie rods.  Camber from caster and kingpin tilt then\n'
+            'shows up in the camber, tyre angle and grip results.\n'
+            'Off: the front wheels stay pointing straight ahead.')
+        self.add_widget(self._steer_sweep_cb)
+        # What is held while lateral g is swept.  Speed held (default): the corner
+        # tightens as g rises, so steer and its caster camber GROW from zero at
+        # 0 g.  0 = hold the Turn radius instead: steer is then about
+        # wheelbase / radius at every g, including 0 g.
+        self._steer_speed = QDoubleSpinBox()
+        self._steer_speed.setRange(0.0, 150.0); self._steer_speed.setDecimals(1)
+        self._steer_speed.setValue(25.0); self._steer_speed.setSuffix(' mph')
+        self._steer_speed.setToolTip(
+            'Lateral-g sweeps with front steer on. '
+            'Above 0: this speed is held, so radius = speed squared / lateral g and the '
+            'steering angle grows with g (no steer at 0 g). '
+            '0: the Turn radius is held, so the steering angle is about '
+            'wheelbase / radius at every g, already at 0 g.')
+        _srow = QWidget(); _sl = QHBoxLayout(_srow); _sl.setContentsMargins(0, 0, 0, 0)
+        _sl.addWidget(QLabel('Speed held for the steer (0 = hold radius):')); _sl.addWidget(self._steer_speed)
+        self.add_widget(_srow)
+
         # Wire sweep-mode checkboxes to update visibility too — the
         # "Sweep by" combo + range rows only apply when at least one
         # of {Lateral, combined} is being swept.  Pure longitudinal is
@@ -3180,6 +3285,28 @@ class DynamicsPanel(CollapsibleSection):
         sv_row.addWidget(self._end_speed)
         sv_row.addStretch()
         self.add_layout(sv_row)
+
+        # Braking / accel (long g) sweep: the straight-line speed the aero load
+        # is taken at (only used when Apply Aero is on).  Lowest value = the
+        # aero package's own reference speed (V_ref below), so nothing new is
+        # assumed unless the user types a speed.
+        lsv_row = QHBoxLayout()
+        lsv_row.setContentsMargins(0, 0, 0, 0)
+        lsv_row.addWidget(QLabel('Speed for aero load:'))
+        self._lon_sweep_speed = _spin(0.0, 1e4, 0.0, ' mph', dec=1, step=5.0)
+        self._lon_sweep_speed.setSpecialValueText('aero ref. speed')
+        self._lon_sweep_speed.setMaximumWidth(120)
+        self._lon_sweep_speed.setToolTip(
+            'Braking / accel (long g) sweep only, and only with Apply Aero on:\n'
+            'the straight-line speed the downforce is worked out at\n'
+            '(F = F_ref x (V / V_ref)^2, same front/rear split).\n'
+            '0 = use the aero package reference speed V_ref.')
+        lsv_row.addWidget(self._lon_sweep_speed)
+        lsv_row.addStretch()
+        self._lon_sweep_host = QWidget()
+        self._lon_sweep_host.setLayout(lsv_row)
+        self._lon_sweep_host.setVisible(False)
+        self.add_widget(self._lon_sweep_host)
 
         # ── Trajectory direction (longitudinal mode) ───────────────────
         # Picks whether the time-domain run is an acceleration (engine
@@ -3235,14 +3362,24 @@ class DynamicsPanel(CollapsibleSection):
             ('roll',           'Roll Angle'),
             ('pitch',          'Pitch Angle'),
             ('travel',         'Suspension Travel'),
+            ('wheel_rate',     'Wheel Rate'),
+            ('ride_rate',      'Ride Rate (wheel + tyre)'),
+            ('ride_freq',      'Ride Frequency'),
+            ('roll_gradient',  'Roll Gradient (deg/g)'),
+            ('roll_stiffness', 'Roll Stiffness'),
+            ('lt_split',       'Load Transfer Split %'),
+            ('pitch_gradient', 'Pitch Gradient (deg/g)'),
+            ('pitch_stiffness', 'Pitch Stiffness'),
             ('camber',         'Camber to road'),
             ('lt',             'Load Transfer'),
             ('rc',             'Roll Centre Height'),
             ('jacking',        'Jacking (body lift)'),
             ('utilization',    'Tire Utilization'),
+            ('gg',             'G-G Diagram'),
             ('understeer',     'Understeer Gradient'),
             ('steer_correction', 'Steer Correction'),
             ('steering_wheel_angle', 'Steering Wheel Angle'),
+            ('steering_torque', 'Steering Torque (hand)'),
             ('path_deviation',   'Path Deviation'),
             ('speed',          'Speed'),
         ]
@@ -3585,6 +3722,9 @@ class DynamicsPanel(CollapsibleSection):
             'powertrain_type':        self._powertrain_type.currentText(),
             'peak_torque_Nm':         self._peak_torque.value(),
         }
+        if hasattr(self, '_chassis_on'):
+            params['chassis_compliance'] = bool(self._chassis_on.isChecked())
+            params['chassis_torsion_Nm_rad'] = float(self._chassis_kc.value()) * 180.0 / np.pi
         # Aero drag — bounds terminal speed in time-domain trajectory.
         # Guarded with hasattr because get_params can fire from another
         # widget's signal during _build() before these spinboxes exist
@@ -3644,6 +3784,8 @@ class DynamicsPanel(CollapsibleSection):
             'arb_blade_t_r_mm':    float(self._arb_blade_t_r.value()),
             'arb_G_Npmm2':         float(self._arb_G.value()),
             'arb_E_Npmm2':         float(self._arb_E.value()),
+            'chassis_kc_Nm_deg':   float(self._chassis_kc.value()),
+            'chassis_compliance':  bool(self._chassis_on.isChecked()),
             # Powertrain — primary_ratio + sprocket_* are obsolete (collapsed
             # into final_drive_ratio).  Kept in save dict for backward read
             # by older readers but ignored on load.
@@ -3656,6 +3798,8 @@ class DynamicsPanel(CollapsibleSection):
             'tire_radius_mm':        float(self._tire_radius.value()),
             'rim_clear_dia_mm':      float(self._rim_clear_dia.value()),
             'turn_radius_m':         float(self._turn_radius.value()),
+            'steer_front_in_sweep':  bool(self._steer_sweep_cb.isChecked()),
+            'steer_speed_mph':       float(self._steer_speed.value()),
             'drivetrain':          self._drivetrain.currentText(),
             # Solve / sweep setpoints
             'lateral_g':           float(self._lat_g.value()),
@@ -3668,6 +3812,7 @@ class DynamicsPanel(CollapsibleSection):
             'v_max_mph':           float(self._v_max.value()),
             'sweep_axis':          self._sweep_axis.currentData() or 'g',
             'test_mode':           self._test_mode.currentData() or 'cornering',
+            'lon_sweep_aero_speed_mph': float(self._lon_sweep_speed.value()),
             'start_speed_mph':     float(self._start_speed.value()),
             'end_speed_mph':       float(self._end_speed.value()),
             'cda_m2':              float(self._cda.value()),
@@ -3688,6 +3833,7 @@ class DynamicsPanel(CollapsibleSection):
             # the file moved between save & load)
             'tire_path':           str(self._tire_path),
             'tire_pressure_psi':   float(self._tire_psi.value()),
+            'tire_fit_method':     self.get_tire_fit_method(),
             'grip_multiplier':     float(self._grip_mult.value()),
             'grip_scale_list':     self.grip_scale_list(),
         }
@@ -3743,7 +3889,7 @@ class DynamicsPanel(CollapsibleSection):
             self._decoupled_heave_r, self._decoupled_roll_r,
             self._heave_3rd_f, self._heave_3rd_r,
             self._arb_OD_f, self._arb_ID_f, self._arb_OD_r, self._arb_ID_r,
-            self._arb_G, self._arb_E,
+            self._arb_G, self._arb_E, self._chassis_kc,
             self._power_hp, self._engine_rpm,
             self._final_ratio, self._drivetrain_eff, self._peak_torque,
             self._tire_radius, self._rim_clear_dia, self._turn_radius,
@@ -3795,6 +3941,11 @@ class DynamicsPanel(CollapsibleSection):
             _set_spin(self._arb_blade_t_r,   'arb_blade_t_r_mm')
             _set_spin(self._arb_G,           'arb_G_Npmm2')
             _set_spin(self._arb_E,           'arb_E_Npmm2')
+            _set_spin(self._chassis_kc,      'chassis_kc_Nm_deg')
+            if 'chassis_compliance' in d:
+                self._chassis_on.blockSignals(True)
+                self._chassis_on.setChecked(bool(d['chassis_compliance']))
+                self._chassis_on.blockSignals(False)
             _set_spin(self._power_hp,        'power_hp')
             _set_spin(self._engine_rpm,      'engine_rpm')
             # Final drive ratio replaces primary + sprocket_drive +
@@ -3845,6 +3996,8 @@ class DynamicsPanel(CollapsibleSection):
                     if self._traj_direction.itemData(i) == target:
                         self._traj_direction.setCurrentIndex(i)
                         break
+            if 'lon_sweep_aero_speed_mph' in d:
+                self._lon_sweep_speed.setValue(float(d['lon_sweep_aero_speed_mph']))
             # Test mode combo
             if 'test_mode' in d:
                 target = str(d['test_mode'])
@@ -3858,6 +4011,14 @@ class DynamicsPanel(CollapsibleSection):
                 if idx >= 0:
                     self._drivetrain.setCurrentIndex(idx)
 
+            if 'steer_speed_mph' in d:
+                self._steer_speed.blockSignals(True)
+                self._steer_speed.setValue(float(d['steer_speed_mph']))
+                self._steer_speed.blockSignals(False)
+            if 'steer_front_in_sweep' in d:
+                self._steer_sweep_cb.blockSignals(True)
+                self._steer_sweep_cb.setChecked(bool(d['steer_front_in_sweep']))
+                self._steer_sweep_cb.blockSignals(False)
             if 'sweep_lat' in d:
                 self._sweep_lat_cb.setChecked(bool(d['sweep_lat']))
             if 'sweep_lon' in d:
@@ -3899,6 +4060,10 @@ class DynamicsPanel(CollapsibleSection):
             # actually saved; empty string means "no tire loaded".
             if 'tire_pressure_psi' in d:
                 self._tire_psi.setValue(float(d['tire_pressure_psi'] or 0.0))
+            _fm = str(d.get('tire_fit_method', 'lookup') or 'lookup')
+            _fi = self._tire_fit.findData(_fm)
+            if _fi >= 0 and _fi != self._tire_fit.currentIndex():
+                self._tire_fit.setCurrentIndex(_fi)
             if 'tire_path' in d:
                 path = str(d['tire_path'])
                 self._tire_path = path
@@ -4001,6 +4166,9 @@ class DynamicsPanel(CollapsibleSection):
 
     def get_tire_path(self) -> str:
         return self._tire_path
+
+    def get_tire_fit_method(self) -> str:
+        return str(self._tire_fit.currentData() or 'lookup')
 
     def get_tire_pressure_psi(self):
         """Pressure to build the tyre at.  Blending is banned — a zero spin
@@ -4205,6 +4373,20 @@ class DynamicsPanel(CollapsibleSection):
         #               from start_speed (0 = accel from rest, > 0 =
         #               brake from velocity).
         test = self._test_mode.currentData() or 'cornering'
+        if test == 'lon_sweep':
+            # straight-line steady-state g sweep, X = long g (- braking,
+            # + accelerating), lateral g held at 0
+            self.sweep_requested.emit({
+                'mode': 'lon_sweep',
+                'g_min': self._g_min.value(),
+                'g_max': self._g_max.value(),
+                'n_points': 41,
+                'lateral_g': 0.0,
+                'longitudinal_g': 0.0,
+                'turn_radius_m': self._turn_radius.value(),
+                'aero_speed_mph': self._lon_sweep_speed.value(),
+            })
+            return
         if test == 'straights':
             # Pure straight line — lat-g forced to 0.  The trajectory's
             # applied longitudinal-g comes from the Lon-g spin (sign
@@ -4233,6 +4415,8 @@ class DynamicsPanel(CollapsibleSection):
             'lateral_g':        lat_g_fixed,
             'longitudinal_g':   lon_g_fixed,
             'turn_radius_m':    self._turn_radius.value(),
+            'steer_front':      bool(self._steer_sweep_cb.isChecked()),
+            'steer_speed_mph':  float(self._steer_speed.value()),
             # Acceleration-trajectory inputs.  Only the longitudinal
             # sweep uses these.
             'start_speed_mph':  self._start_speed.value(),
@@ -4320,15 +4504,22 @@ class DynamicsPanel(CollapsibleSection):
           • Trajectory inputs visible iff long-only.
           • Lateral-axis inputs visible iff lateral checked.
         """
+        is_lon_sweep = (self._test_mode.currentData() == 'lon_sweep')
         is_cornering = (self._test_mode.currentData() == 'cornering')
-        is_straights = not is_cornering
+        is_straights = not is_cornering and not is_lon_sweep
+        if hasattr(self, '_lon_sweep_host'):
+            self._lon_sweep_host.setVisible(is_lon_sweep)
+        if is_lon_sweep and self._g_min.value() >= 0.0:
+            # a long-g sweep needs braking (-) AND accelerating (+)
+            self._g_min.setValue(-1.5)
+            self._g_max.setValue(1.5)
 
         # Cornering visible inputs:  lat-g range + lat-g spin + lon-g spin.
         # Straights visible inputs:  start_speed + lon-g spin only.
         # Everything else hidden in both modes (Poka Yoke — user can't
         # enter a value that doesn't apply to the active test).
         self._axis_host.setVisible(False)
-        self._g_sweep_host.setVisible(is_cornering)
+        self._g_sweep_host.setVisible(is_cornering or is_lon_sweep)
         self._v_sweep_host.setVisible(False)
 
         # Lat-g spin: cornering only (Straights is straight-line, lat=0)
@@ -4338,7 +4529,7 @@ class DynamicsPanel(CollapsibleSection):
         #   Cornering : held lon-g for the combined sweep
         #   Straights : applied lon-g for the trajectory
         if hasattr(self, '_lon_row_host'):
-            self._lon_row_host.setVisible(True)
+            self._lon_row_host.setVisible(not is_lon_sweep)
 
         # Straights-only: start_speed.  end_speed / CdA / ρ no longer
         # surface in the UI per the "two inputs only" spec — they
@@ -6512,7 +6703,8 @@ class SkidpadPanel(CollapsibleSection):
                       sim_duration_s: float = float('nan'),
                       peak_steer_deg: float = float('nan'),
                       derived_speed_ms: float = float('nan'),
-                      derived_roll_damping: float = float('nan')):
+                      derived_roll_damping: float = float('nan'),
+                      roll_damping_source: str = ''):
         """Echo the auto-computed transient parameters back to the UI
         so the user can see what the dispatch used.  ``derived_speed_ms``
         is only populated when the panel is in target-lat-g mode — it's
@@ -6526,7 +6718,8 @@ class SkidpadPanel(CollapsibleSection):
             f'Ackermann = {ackermann_pct:+.0f} %',
         ]
         if not np.isnan(derived_roll_damping):
-            parts.append(f'c_phi = {derived_roll_damping:,.0f} N·m·s/rad')
+            parts.append(f'c_phi = {derived_roll_damping:,.0f} N·m·s/rad'
+                         + (f' ({roll_damping_source})' if roll_damping_source else ''))
         if not np.isnan(peak_steer_deg):
             parts.append(f'Peak steer = {peak_steer_deg:.2f}°')
         if not np.isnan(sim_duration_s):
@@ -6537,6 +6730,16 @@ class SkidpadPanel(CollapsibleSection):
             mph = derived_speed_ms / 0.44704
             parts.append(f'Derived speed = {derived_speed_ms:.2f} m/s ({mph:.1f} mph)')
         self._auto_info.setText('Auto: ' + '   '.join(parts))
+
+    def set_dyno_damping(self, note):
+        """The project declares dyno dampers (car['damper']): the four
+        linear coefficients below are then NOT used — grey them out and say
+        why.  note=None = no dyno, the coefficients are live again."""
+        spins = (self._dmp_F_bump, self._dmp_F_reb, self._dmp_R_bump, self._dmp_R_reb)
+        for sb in spins:
+            sb.setEnabled(note is None)
+            sb.setToolTip('' if note is None else str(note))
+        self._dyno_damping_note = note
 
     def get_selected_signals(self) -> list:
         out = []
@@ -6791,8 +6994,11 @@ class AnalysisPlotsPanel(CollapsibleSection):
     ride_freq_requested         = pyqtSignal()
     rc_vs_roll_requested        = pyqtSignal()
     steering_torque_requested   = pyqtSignal()
+    self_centring_requested     = pyqtSignal()
     ackermann_demand_requested  = pyqtSignal()
     ackermann_fzfy_requested    = pyqtSignal()
+    ackermann_pct_vs_g_requested = pyqtSignal()
+    ackermann_from_laps_requested = pyqtSignal()
     ackermann_pair_requested    = pyqtSignal()
     slip_load_force_requested   = pyqtSignal()
     ackermann_solve_requested   = pyqtSignal()
@@ -6906,12 +7112,60 @@ class AnalysisPlotsPanel(CollapsibleSection):
         lbl = QLabel('Steering effort (torque at the driver\'s hands)')
         lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
-        sp = QLabel('probed arm + solved loads + config rack — no inputs needed')
+        sp = QLabel('probed arm + solved loads + config rack; aero follows Apply Aero')
         sp.setStyleSheet('color:#888;font-size:10px;')
         g.addWidget(sp, 1, 0, 1, 4)
+        g.addWidget(QLabel('Target at the wheel:'), 2, 0)
+        # team target (user 2026-10-10): ~15 N·m — lower = not enough steering
+        # response, higher = heavy steering.  Drawn as a band on the plot.
+        self._steer_torque_target = _spin(0.0, 60.0, 15.0, ' N·m', dec=1, step=1.0)
+        g.addWidget(self._steer_torque_target, 2, 1)
+        g.addWidget(QLabel('± band:'), 2, 2)
+        self._steer_torque_band = _spin(0.0, 30.0, 5.0, ' N·m', dec=1, step=1.0)
+        g.addWidget(self._steer_torque_band, 2, 3)
         self.add_layout(g)
-        btn = QPushButton('Plot steering torque vs lateral g')
+        btn = QPushButton('Plot steering torque + kingpin moment vs lateral g')
         btn.clicked.connect(lambda: self.steering_torque_requested.emit())
+        self.add_widget(btn)
+        self.add_widget(_panel_sep())
+
+        # Self-centring (user 2026-11-14): the torque that pulls the steering
+        # wheel back to centre when the driver lets go, current car vs another
+        # project file (e.g. last year's car).  Same steering-effort model.
+        g = QGridLayout(); g.setSpacing(4)
+        lbl = QLabel('Self-centring (wheel returns to centre when let go)')
+        lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
+        g.addWidget(lbl, 0, 0, 1, 4)
+        sp = QLabel('return torque at the steering wheel; aero follows Apply Aero')
+        sp.setStyleSheet('color:#888;font-size:10px;')
+        g.addWidget(sp, 1, 0, 1, 4)
+        g.addWidget(QLabel('Corner radius:'), 2, 0)
+        self._sc_radius = _spin(2.0, 200.0, 9.125, ' m', dec=3, step=0.5)
+        self._sc_radius.setToolTip('Constant corner radius for the steering-wheel-angle '
+                                   'view (9.125 m = skidpad centre line).')
+        g.addWidget(self._sc_radius, 2, 1)
+        g.addWidget(QLabel('Compare with:'), 3, 0)
+        import os as _os
+        _here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        _sam = _os.path.join(_here, 'configs', 'Sam.vahan')
+        self._sc_ref = QLineEdit(_sam if _os.path.isfile(_sam) else '')
+        self._sc_ref.setPlaceholderText('no comparison (current car only)')
+        g.addWidget(self._sc_ref, 3, 1, 1, 3)
+        _pick = QPushButton('Compare with project file…')
+        def _pick_ref():
+            start = self._sc_ref.text() or _os.path.join(_here, 'configs')
+            f, _ = QFileDialog.getOpenFileName(self, 'Project file to compare with', start,
+                                               'Vahan project (*.vahan *.json)')
+            if f:
+                self._sc_ref.setText(f)
+        _pick.clicked.connect(_pick_ref)
+        g.addWidget(_pick, 4, 0, 1, 3)
+        _clr = QPushButton('Clear')
+        _clr.clicked.connect(lambda: self._sc_ref.setText(''))
+        g.addWidget(_clr, 4, 3)
+        self.add_layout(g)
+        btn = QPushButton('Plot self-centring torque (current vs compare)')
+        btn.clicked.connect(lambda: self.self_centring_requested.emit())
         self.add_widget(btn)
         self.add_widget(_panel_sep())
 
@@ -6973,7 +7227,7 @@ class AnalysisPlotsPanel(CollapsibleSection):
         # the g list.  Default OFF because the package comes from the
         # Dynamics panel's aero source, which may not be configured yet.
         self._ack_aero = QCheckBox('Include aero downforce')
-        self._ack_aero.setChecked(False)
+        self._ack_aero.setChecked(True)   # the car runs with the package; untick for the mechanical limit (user 2026-10-11)
         self._ack_aero.setToolTip(
             'Adds downforce at each row\'s speed (the speed follows from '
             'radius + lateral g) to the vertical loads, using the same aero '
@@ -6982,6 +7236,60 @@ class AnalysisPlotsPanel(CollapsibleSection):
             'unchanged — so it lowers each wheel\'s required grip fraction: '
             'expect SMALLER slip angles and a HIGHER grip limit.')
         g.addWidget(self._ack_aero, 3, 2, 1, 2)
+        # THE CAR'S OWN CURVE (user 2026-10-10): every Ackermann calc that
+        # takes a setting (Fz-Fy map, YMD trim sweep, MMD) uses the probed
+        # linkage's inner/outer angles at each steer instead of a static %.
+        self._ack_curve = QCheckBox('Use the as-built linkage curve (not a static %)')
+        self._ack_curve.setChecked(True)
+        self._ack_curve.setToolTip('Inner/outer road-wheel angles come from the probed steering '
+                                   'linkage at every steer angle (SteeringGeometry.pair_from_mean). '
+                                   'Unticked: the % spin above is applied as a constant split.')
+        g.addWidget(self._ack_curve, 4, 0, 1, 4)
+        btn_g = QPushButton('Plot Ackermann DEMAND vs lateral g (with our curve)')
+        btn_g.setToolTip('Per radius: the % that puts both front tires at the same fraction of '
+                         'their peak at each lateral g (falls with g), against the % our linkage '
+                         'gives at the steer that g needs.')
+        btn_g.clicked.connect(lambda: self.ackermann_pct_vs_g_requested.emit())
+        g.addWidget(btn_g, 5, 0, 1, 4)
+        # ACKERMANN FROM THE LAP SIMS (user method, 2026-10-10): run the ticked
+        # tracks with the aero package, isolate the corners, average lateral g
+        # and radius, take the % the tyres want there, rotate the arm to it.
+        lbl2 = QLabel('Ackermann from the lap sims (tracks to pool):')
+        lbl2.setStyleSheet('color:#aaa;font-size:10px;')
+        g.addWidget(lbl2, 6, 0, 1, 4)
+        self._ack_tracks = []
+        try:
+            import os as _os
+            _tdir = _os.path.join(_os.getcwd(), 'tracks')
+            _files = sorted(f for f in _os.listdir(_tdir) if f.lower().endswith('.json'))
+        except Exception:
+            _files = []
+        for i, f in enumerate(_files):
+            cb = QCheckBox(f)
+            cb.setChecked('autocross' in f.lower())
+            cb.setToolTip('tracks/' + f)
+            self._ack_tracks.append(cb)
+            g.addWidget(cb, 7 + i // 2, 2 * (i % 2), 1, 2)
+        btn_l = QPushButton('Ackermann from lap sims → fit the steering arm')
+        btn_l.setToolTip('Lap sim on each ticked track WITH the aero package; corner stations (> 0.3 g) '
+                         'pooled, time-weighted mean lateral g and radius; the Ackermann % that uses '
+                         'both front tyres equally there; the steering arm is rotated about the kingpin '
+                         'to give that % (arm height re-levelled for bump steer). You confirm before it '
+                         'is applied to the car.')
+        btn_l.clicked.connect(lambda: self.ackermann_from_laps_requested.emit())
+        g.addWidget(btn_l, 7 + (len(_files) + 1) // 2, 0, 1, 4)
+        # ... or ONE condition the user picks (2026-10-11: "1.4 g average, average
+        # radius, whatever % fits that"): the same arm fit at that (R, g) instead
+        # of the lap pool.  Take the numbers from the Lap Time page corner table.
+        _r2 = 8 + (len(_files) + 1) // 2
+        self._ack_cond_use = QCheckBox('or at one condition instead of the laps:')
+        self._ack_cond_use.setToolTip('Ticked: skip the lap pooling and fit the arm to the equal-use % at this '
+                                      'radius and lateral g (aero per g at that radius). Lap Time page -> corner '
+                                      'table gives the averages.')
+        g.addWidget(self._ack_cond_use, _r2, 0, 1, 2)
+        self._ack_cond_R = _spin(3.0, 200.0, 43.0, ' m', dec=1, step=1.0)
+        self._ack_cond_g = _spin(0.1, 3.0, 1.4, ' g', dec=2, step=0.1)
+        g.addWidget(self._ack_cond_R, _r2, 2); g.addWidget(self._ack_cond_g, _r2, 3)
         # No wheel-placement rules.  There used to be a dropdown of them here
         # (equal slip / equal utilisation / fraction-of-peak): every one was an
         # invented equalisation, and the user rejected the premise — the two
@@ -7054,14 +7362,22 @@ class AnalysisPlotsPanel(CollapsibleSection):
         lbl.setStyleSheet('font-weight:bold;color:#E23B48;')
         g.addWidget(lbl, 0, 0, 1, 4)
         g.addWidget(QLabel('Speed:'), 1, 0)
-        self._mmd_speed = _spin(5, 40, 13.4, ' m/s', dec=1, step=0.5)
+        self._mmd_speed = _spin(0.5, 150, 13.4, ' m/s', dec=1, step=0.5)   # no artificial cap (user 2026-10-10)
         g.addWidget(self._mmd_speed, 1, 1)
         g.addWidget(QLabel('β range:'), 1, 2)
-        self._mmd_beta = _spin(2, 20, 8, ' deg', dec=0, step=1)
+        self._mmd_beta = _spin(1, 90, 8, ' deg', dec=0, step=1)
         g.addWidget(self._mmd_beta, 1, 3)
         g.addWidget(QLabel('δ range:'), 2, 0)
-        self._mmd_delta = _spin(5, 30, 20, ' deg', dec=0, step=1)
+        self._mmd_delta = _spin(1, 90, 20, ' deg', dec=0, step=1)
         g.addWidget(self._mmd_delta, 2, 1)
+        # Downforce at the diagram's speed (the car's aero package, sized by
+        # main_window._aero_Fz_at_speed).  Without it the MMD is the no-aero
+        # car and reads ~0.5 g below the G-G at the same speed (2026-10-10).
+        self._mmd_aero = QCheckBox('Apply downforce at this speed')
+        self._mmd_aero.setChecked(True)
+        self._mmd_aero.setToolTip('Constant downforce from the Dynamics-panel aero package '
+                                  'at the MMD speed (F = F_ref·(V/V_ref)²), split by CoP.')
+        g.addWidget(self._mmd_aero, 2, 2, 1, 2)
         # ARB lever arm deltas (mm; positive = longer arm = softer)
         lbl_arm = QLabel('ARB lever arm Δ  (+ longer = softer):')
         lbl_arm.setStyleSheet('color:#888;font-size:10px;')
@@ -7124,7 +7440,9 @@ class AnalysisPlotsPanel(CollapsibleSection):
         from its one aero path, _get_aero_Fz_per_g)."""
         return dict(radius_m=float(self._ack_radius.value()),
                     grip_multiplier=_project_grip_scale(self, self._ack_grip),
-                    aero=bool(self._ack_aero.isChecked()))
+                    aero=bool(self._ack_aero.isChecked()),
+                    use_curve=bool(getattr(self, '_ack_curve', None) is not None
+                                   and self._ack_curve.isChecked()))
 
     def ackermann_pair_inputs(self):
         """Inputs for the RCVD ch.7 pair analysis — kept separate from
@@ -7133,9 +7451,30 @@ class AnalysisPlotsPanel(CollapsibleSection):
         return dict(ackermann_pct=self._ack_demand_pct.value(),
                     lat_g=self._ack_pair_g.value())
 
+    def ackermann_condition_override(self):
+        """(R_m, lat_g) when the user ticked 'at one condition', else None."""
+        cb = getattr(self, '_ack_cond_use', None)
+        if cb is not None and cb.isChecked():
+            return (float(self._ack_cond_R.value()), float(self._ack_cond_g.value()))
+        return None
+
+    def ackermann_lap_tracks(self) -> list:
+        """tracks/<file> for every ticked track in the Ackermann block."""
+        import os as _os
+        return [_os.path.join('tracks', cb.text()) for cb in getattr(self, '_ack_tracks', []) if cb.isChecked()]
+
+    def self_centring_inputs(self):
+        return dict(turn_radius_m=float(self._sc_radius.value()),
+                    ref_path=(self._sc_ref.text().strip() or None))
+
+    def steering_torque_inputs(self):
+        return dict(target_Nm=float(self._steer_torque_target.value()),
+                    target_band_Nm=float(self._steer_torque_band.value()))
+
     def mmd_inputs(self):
         return dict(
             velocity_mps=self._mmd_speed.value(),
+            aero=bool(self._mmd_aero.isChecked()),
             beta_range_deg=(-self._mmd_beta.value(), self._mmd_beta.value()),
             beta_n=int(self._mmd_beta.value()) + 1,
             delta_range_deg=(-self._mmd_delta.value(), self._mmd_delta.value()),

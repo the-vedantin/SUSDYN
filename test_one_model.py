@@ -627,6 +627,51 @@ try:
     _v3mp.go_to_static()
 except Exception as _e:
     print(f'3D view rim/ground : UNEXPECTED FAIL {_e}'); fails += 1
+# ── 3-D ISOLATE (2026-10-07): View → Isolate draws one axle / one corner; the model is untouched ──
+# View-only: the hidden corners' meshes go invisible, the drawn corners are IDENTICAL to the full
+# draw (same vertices), an axle keeps its own bar only, a single corner drops the bar, the solver
+# behind the view is unchanged, and the choice round-trips through car['isolate_view'] in the file.
+try:
+    import os as _os_iso, tempfile as _tf_iso
+    _vi = MainWindow(); _vi._load_project_from_path(_design); _vi._rebuild_solvers(0.)
+    _vi._motion_panel.go_to_static(); _vi._update_3d()
+    _vi_lab = [c['label'] for c in _vi._assemble_corners_draw({_l: 0.0 for _l in ('FL', 'FR', 'RL', 'RR')}, 0.0)[0]]
+    def _vi_snap():
+        _vi._update_3d()
+        return ({_l: bool(_vi.view3d._tire_meshes[_i].visible) for _i, _l in enumerate(_vi_lab)},
+                {_l: bool(_vi.view3d._spring_meshes[_i].visible) for _i, _l in enumerate(_vi_lab)},
+                len(_vi.view3d._last_arb_segs),
+                {_l: np.array(_vi.view3d._tire_meshes[_i].mesh_data.get_vertices(), float).copy()
+                 for _i, _l in enumerate(_vi_lab)})
+    _vi_full = _vi_snap(); _vi_ok = all(_vi_full[0].values()) and _vi_full[2] > 0
+    _vi_wc0 = np.asarray(_vi._solvers['FL'].solve(0.0).wheel_center, float).copy()
+    _vi_msgs = []
+    for _k, _want in (('front', {'FL', 'FR'}), ('rear', {'RL', 'RR'}), ('FL', {'FL'}), ('RR', {'RR'})):
+        _vi._set_isolate_view(_k)
+        _t, _s, _na, _vv = _vi_snap()
+        _ok = (all(_t[_l] == (_l in _want) and _s[_l] == (_l in _want) for _l in _vi_lab)
+               and all(np.array_equal(_vv[_l], _vi_full[3][_l]) for _l in _want)
+               and ((0 < _na < _vi_full[2]) if len(_want) == 2 else _na == 0)
+               and [_kk for _kk, _a in _vi._isolate_actions.items() if _a.isChecked()] == [_k]
+               and np.allclose(np.asarray(_vi._solvers['FL'].solve(0.0).wheel_center, float), _vi_wc0))
+        _vi_ok &= _ok
+        _vi_msgs.append(f'{_k}:{"+".join(_l for _l in _vi_lab if _t[_l])}/arb{_na}{"" if _ok else "!!"}')
+    _vi._set_isolate_view('')
+    _t, _s, _na, _ = _vi_snap()
+    _vi_ok &= all(_t.values()) and _na == _vi_full[2] and 'isolate_view' not in _vi._car
+    _vi._set_isolate_view('rear')
+    _vi_tmp = _os_iso.path.join(_tf_iso.gettempdir(), 'vahan_isolate_rt.vahan'); _vi._save_project_to_path(_vi_tmp)
+    _vi2 = MainWindow(); _vi2._load_project_from_path(_vi_tmp); _vi2._rebuild_solvers(0.)
+    _vi2._motion_panel.go_to_static(); _vi2._update_3d()
+    _vi_rt = (_vi2._car.get('isolate_view') == 'rear' and sorted(_vi2.view3d.isolate_selection()) == ['RL', 'RR']
+              and [_kk for _kk, _a in _vi2._isolate_actions.items() if _a.isChecked()] == ['rear'])
+    _vi_ok &= _vi_rt
+    print(f'3D view isolate    : {" ".join(_vi_msgs)} all/arb{_vi_full[2]} save-load rear {"ok" if _vi_rt else "LOST"}   '
+          f'{"pass" if _vi_ok else "UNEXPECTED FAIL"}')
+    if not _vi_ok:
+        fails += 1
+except Exception as _e:
+    print(f'3D view isolate    : UNEXPECTED FAIL {_e}'); fails += 1
 # ── STALE BACKGROUND SWEEP (2026-09-21) ────────────────────────────────────
 # A hardpoint-edit sweep worker started DURING project load landed after the
 # synchronous load sweep and drew a 1.48 deg front toe swing on v141 that the
@@ -1230,6 +1275,56 @@ if _design:
         fails += 1
         print(f'steering effort  : UNEXPECTED FAIL (exception: {_e})')
 
+    # ── STEERING WHEEL (user 2026-10-11): the wheel OD is a PROJECT input
+    #    (steer.wheel_od_mm, Steering panel, saved with the file); the rim
+    #    force the hands feel = T / (OD/2) and the hand-wheel angle to the
+    #    stop = (stroke/2)/C x 360 both derive from it — ONE MODEL, no second
+    #    copy of the number in code, and the Steering panel's readout agrees.
+    try:
+        from vahan.steering import compute_steering_effort as _cse
+        _ssW = wD._build_dynamics_solver()
+        _tfW = getattr(_ssW, '_tire_front', None) or getattr(_ssW, '_tire', None)
+        _cfgW = dict(getattr(wD, '_steer', None) or {})
+        _odW = _cfgW.get('wheel_od_mm')
+        _wfail = []
+        _wtxt = ''
+        if _tfW is None:
+            _wfail.append('no tire model loaded')
+        elif not _odW:
+            _wfail.append('design config has no steer.wheel_od_mm')
+        else:
+            _effW = _cse(_ssW, wD._front_hp, wD._topology.front.damper_mount.value, _tfW,
+                         steer_cfg=_cfgW, front_solver=wD._solvers['FL'])
+            if _effW.get('wheel_od_mm') != float(_odW):
+                _wfail.append(f'report wheel_od_mm {_effW.get("wheel_od_mm")} != config {_odW}')
+            _rim_exp = float(_effW['T_max_Nm']) / (float(_odW) / 2000.0)
+            _rim = _effW.get('F_rim_max_N')
+            if _rim is None or abs(float(_rim) - _rim_exp) > 0.005 * _rim_exp:
+                _wfail.append(f'F_rim_max_N {_rim} != T_max/(OD/2) {_rim_exp:.1f}')
+            _lock_exp = (float(_cfgW['total_rack_travel_mm']) / 2.0
+                         / float(_cfgW['rack_travel_per_rev_mm']) * 360.0)
+            _lock = _effW.get('handwheel_to_lock_deg')
+            if _lock is None or abs(float(_lock) - _lock_exp) > 0.1:
+                _wfail.append(f'handwheel_to_lock_deg {_lock} != stroke/2/C*360 {_lock_exp:.2f}')
+            _pnl = float(wD._steer_panel.max_handwheel_deg())
+            if abs(_pnl - _lock_exp) > 0.1:
+                _wfail.append(f'Steering panel max_handwheel_deg {_pnl:.2f} != {_lock_exp:.2f}')
+            _hw = _effW.get('handwheel_deg_vs_latg') or []
+            if not _hw or not all(np.isfinite(v) for _, v in _hw):
+                _wfail.append('no finite handwheel_deg_vs_latg')
+            _wtxt = (f'OD {float(_odW):.1f} mm, T_max {_effW["T_max_Nm"]:.2f} N.m -> rim '
+                     f'{float(_rim) if _rim is not None else float("nan"):.0f} N, wheel to stop '
+                     f'{float(_lock) if _lock is not None else float("nan"):.1f} deg (panel {_pnl:.1f}), '
+                     f'hand wheel {_hw[-1][1] if _hw else float("nan"):.0f} deg at {_hw[-1][0] if _hw else 0:.2f} g '
+                     f'on R {_effW.get("turn_radius_m", 0):.2f} m [{_effW.get("handwheel_source")}]')
+        if _wfail:
+            fails += 1
+        print(f'steering wheel     : {_wtxt}   '
+              f'{"pass" if not _wfail else "UNEXPECTED FAIL: " + "; ".join(_wfail)}')
+    except Exception as _e:
+        fails += 1
+        print(f'steering wheel     : UNEXPECTED FAIL (exception: {_e})')
+
     # ── WHEEL-RATE GEOMETRIC TERM = TANGENT dMR/ddelta (solver-bug register,
     #    2026-09-02).  RCVD 16.3: K_wheel = Ks*MR^2 + Fs*(dIR/ddelta), where
     #    dIR/ddelta is the slope of the INSTANTANEOUS (tangent) motion ratio.
@@ -1344,7 +1439,8 @@ if _design:
         for _corner in (_fo, _fi):
             _spin = _ss1._solvers[_corner].solve(_r1.travel[_corner] / 1000.).spin_axis
             _side = 1. if _corner.endswith('L') else -1.
-            _angle = np.radians(_side * _stat + _r1.roll_angle_deg)
+            # each axle's own body-section roll (= roll_angle_deg on a rigid chassis)
+            _angle = np.radians(_side * _stat + (_r1.roll_front_deg if _corner[0] == 'F' else _r1.roll_rear_deg))
             _z = -np.sin(_angle)*_spin[0] + np.cos(_angle)*_spin[2]
             _expected = -_side*np.degrees(np.arcsin(np.clip(_z/np.linalg.norm(_spin), -1., 1.)))
             if abs(_expected - float(_cg1.get(_corner, 0.0))) > 1e-6:
@@ -2446,6 +2542,54 @@ except Exception as _e:
     fails += 1
     print(f'bearings/pivot   : UNEXPECTED FAIL ({_e})')
 
+# ── LOAD ARROWS SIT ON THE DRAWN HARDPOINTS (2026-11-14, binder 3-D loads view):
+#    every hardpoint arrow from _load_items must start exactly where the Loads
+#    view draws that point at the case POSE (_assemble_corners_draw at the case
+#    travel).  Was failing: the ARB lever-tip ("arm end") arrow and the drop-link
+#    axis used the STATIC design arm end while the drawn lever had rotated with
+#    the rocker (5.2 mm off at FL, 2.0 g).  Also: the upright ball-joint forces
+#    are the arm forces reversed (tie rod two-force: upright = -chassis).
+print('-' * 64)
+try:
+    from gui import wheel_package as _WPh
+    _hf = []; _hworst = 0.0
+    _hres = _WPh.compute_case(win, 2.0, 0.0)[3]
+    _htr = {l: float(_hres.travel.get(l, 0.0)) / 1000.0 for l in ('FL', 'FR', 'RL', 'RR')}
+    _hcd = {c['label']: c['pts'] for c in win._assemble_corners_draw(_htr, 0.0)[0]}
+    _HMAP = {'upper arm front pickup': 'uca_front', 'upper arm rear pickup': 'uca_rear',
+             'lower arm front pickup': 'lca_front', 'lower arm rear pickup': 'lca_rear',
+             'tie / toe rod pickup': 'tie_rod_inner', 'pushrod pickup': 'pushrod_inner',
+             'upper ball joint': 'uca_outer', 'lower ball joint': 'lca_outer',
+             'tie / toe ball joint': 'tie_rod_outer', 'pushrod force': 'pushrod_inner',
+             'spring force': 'rocker_spring_pt', 'spring mount': 'spring_chassis_pt',
+             'rocker pivot mount': 'rocker_pivot', 'drop-link (axial)': 'arb_drop_top',
+             'arm end (axial)': 'arb_arm_end_world'}
+    _hn = 0
+    for _p, _v, _c, _lab in _WPh._load_items(win, 2.0, 0.0):
+        _parts = [s.strip() for s in _lab.split('·')]
+        _key = _HMAP.get(_parts[1] if len(_parts) > 1 else '')
+        _lbl = _parts[0].split()[0]
+        if _key is None or 'N·m' in _lab or _key not in _hcd.get(_lbl, {}):
+            continue
+        _d = float(np.linalg.norm(np.asarray(_p, float) - np.asarray(_hcd[_lbl][_key], float))) * 1000
+        _hn += 1; _hworst = max(_hworst, _d)
+        if not np.isfinite(_d) or _d > 0.01:
+            _hf.append(f'{_lbl} {_parts[1]} {_d:.2f} mm off')
+    _hL = _WPh.compute_case(win, 2.0, 0.0)[0]['FL']
+    _tie_up = np.asarray(_hL.joint_forces['tie'], float)
+    _tie_ch = np.asarray(_hL.chassis_forces['tierod'], float)
+    if np.linalg.norm(_tie_up + _tie_ch) > 1e-6 * max(1.0, np.linalg.norm(_tie_ch)):
+        _hf.append('tie-rod upright force is not the chassis force reversed')
+    if _hn < 40:
+        _hf.append(f'only {_hn} hardpoint arrows found')
+    if _hf:
+        fails += 1
+    print(f'load arrows on pts: {_hn} hardpoint arrows, worst {_hworst:.4f} mm from the drawn pose   '
+          + ('pass' if not _hf else 'UNEXPECTED FAIL: ' + '; '.join(_hf[:6])))
+except Exception as _e:
+    fails += 1
+    print(f'load arrows on pts: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
 # ── REAR ROCKER COPLANAR across travel (config 2027_v28): the pushrod, rocker
 #    and shock must stay in the rocker plate plane through the whole wheel travel
 #    (was 48 mm off / 68 mm across travel before v28). Guards the coplanar re-tune
@@ -2784,6 +2928,276 @@ except Exception as _e:
     fails += 1
     import traceback as _tbL; _tbL.print_exc()
     print(f'lap sim honesty  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── TYRE TEMPERATURE (2026-11-13, vahan/tyre_temperature.py) ─────────────────
+#    Synthetic curve + heat constants (no tyre data in the net).  Gates:
+#    (i) mode off and 'fixed at the reference temperature' reproduce the plain
+#    lap EXACTLY; (ii) colder-than-reference tyres are slower and the lap says
+#    the grip there is ASSUMED; (iii) 'estimated' heats the tyres above ambient,
+#    reports per-lap lines and per-station temperatures; (iv) the grip wrapper
+#    scales force and inverts slip consistently and is removed afterwards.
+print('-' * 64)
+try:
+    from vahan import tyre_temperature as _TT
+    if '_mk_lap' not in globals():
+        print('tyre temperature : lap sim block skipped — skipped')
+    else:
+        _ttD = {'grip_curve': {'T_C': [40.0, 55.0, 70.0], 'rel_mu': [0.97, 1.0, 0.96],
+                               'ref_T_C': 55.0, 'measured_C': [40.0, 70.0]},
+                'maker_window_C': [20.0, 85.0],
+                'thermal': {'a_K_per_J': 0.003, 'k1_per_s': 1.0, 'h0_per_s': 0.03,
+                            'h1_per_m': 0.01, 'k2_per_s': 0.1, 'hb_per_s': 0.0005}}
+        _ttf = []
+        _cv = _TT.GripTempCurve(_ttD['grip_curve'], 5.0, 5.0)
+        if abs(_cv.factor(55.0) - 1.0) > 1e-12:
+            _ttf.append(f'factor at the reference temperature {_cv.factor(55.0):.4f} != 1')
+        if not (_cv.factor(10.0) < _cv.factor(30.0) < _cv.factor(40.0)):
+            _ttf.append('grip does not fall as the tyre gets colder below the tested range')
+        if _cv.where(30.0) == 'measured' or _cv.where(50.0) != 'measured':
+            _ttf.append('measured/assumed flag wrong')
+        _sTT = _mk_lap(True, (0.10, _MININT, 0.04))
+        _r0 = _sTT.simulate(_trL, n_detail=8)
+        _base_ids = (id(_sTT.ss._tire), id(_sTT.ss._tire_rear), id(_sTT.tire), id(_sTT.tire_rear))
+        _sTT.set_tyre_temperature(_TT.TyreTempSettings.from_data(_ttD, 'net', mode='off'))
+        _rOffT = _sTT.simulate(_trL, n_detail=8)
+        _sTT.set_tyre_temperature(_TT.TyreTempSettings.from_data(_ttD, 'net', mode='fixed', fixed_C=55.0))
+        _rRef = _sTT.simulate(_trL, n_detail=8)
+        _sTT.set_tyre_temperature(_TT.TyreTempSettings.from_data(_ttD, 'net', mode='fixed', fixed_C=15.0))
+        _rCold = _sTT.simulate(_trL, n_detail=8)
+        _sTT.set_tyre_temperature(_TT.TyreTempSettings.from_data(
+            _ttD, 'net', mode='estimated', ambient_C=15.0, track_C=20.0, laps=2))
+        _rEst = _sTT.simulate(_trL, n_detail=8)
+        _sTT.set_tyre_temperature(None)
+        if _rOffT.lap_time_s != _r0.lap_time_s:
+            _ttf.append(f'mode off changed the lap {_r0.lap_time_s:.4f} -> {_rOffT.lap_time_s:.4f} s')
+        if abs(_rRef.lap_time_s - _r0.lap_time_s) > 1e-9:
+            _ttf.append(f'fixed at the reference temperature changed the lap '
+                        f'{_r0.lap_time_s:.4f} -> {_rRef.lap_time_s:.4f} s')
+        if _rCold.lap_time_s <= _r0.lap_time_s + 0.05:
+            _ttf.append(f'15 °C tyres not slower ({_rCold.lap_time_s:.3f} vs {_r0.lap_time_s:.3f} s)')
+        if not any('ASSUMED' in n for n in _rCold.notes):
+            _ttf.append('cold lap not flagged as assumed grip')
+        if _rEst.tyre_temp_front_C is None or len(_rEst.tyre_temp_front_C) != len(_rEst.s_m):
+            _ttf.append('estimated mode has no per-station tyre temperature')
+        elif not (float(np.max(_rEst.tyre_temp_rear_C)) > 15.0 + 1.0):
+            _ttf.append('estimated tyres never warmed above ambient')
+        if len(_rEst.tyre_temp_log) < 2:
+            _ttf.append('estimated mode did not report each lap')
+        if (id(_sTT.ss._tire), id(_sTT.ss._tire_rear), id(_sTT.tire), id(_sTT.tire_rear)) != _base_ids:
+            _ttf.append('grip wrapper left on the car after the lap')
+        _base_t = _TT.unwrap(_sTT.tire)
+        _st2 = _TT.ScaledTyre(_base_t, 0.8)
+        _fz = 700.0
+        if abs(_st2.peak_mu(_fz) - 0.8 * _base_t.peak_mu(_fz)) > 1e-9:
+            _ttf.append('scaled peak grip wrong')
+        _Fy = 0.5 * _st2.peak_mu(_fz) * _fz
+        _sa = _st2.slip_angle_for_Fy(_Fy, _fz)
+        if abs(abs(float(_st2.Fy(_sa, _fz))) - _Fy) > 0.02 * _Fy:   # tyre sign convention: +slip -> -Fy
+            _ttf.append('scaled slip-for-force does not invert the scaled curve')
+        if _ttf:
+            fails += 1
+        print(f'tyre temperature : off {_rOffT.lap_time_s:.3f} = plain {_r0.lap_time_s:.3f} s, '
+              f'15 °C {_rCold.lap_time_s:.3f} s (grip x{_rCold.tyre_grip_factor[0]:.3f}), '
+              f'estimated amb 15 °C rear peak {float(np.max(_rEst.tyre_temp_rear_C)):.0f} °C   '
+              + ('pass' if not _ttf else 'UNEXPECTED FAIL: ' + '; '.join(_ttf)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbT; _tbT.print_exc()
+    print(f'tyre temperature : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── ENGINE OPTIONS (2026-11-13, user: "for 2027 i want options", "power is
+#    capped at 75hp", "nothing should be baked in").  Named torque tables
+#    (car['engine_tables'] + engine_table_choice) and the power cap
+#    (engine_power_cap_hp) applied at USE time — the saved table is never
+#    rewritten.  Plus the launch-rpm plateau bug: a FLAT torque table's argmax
+#    is its first point, so the clutch launched at 2000 rpm and the more
+#    powerful flat curve lapped 0.3 s SLOWER (failing-then-passing).
+try:
+    import copy as _cpE, math as _mE
+    from types import SimpleNamespace as _SNE
+    import vahan.engine as _VEo
+    from vahan.laptime import LapSimulator as _LSE
+    _flat = [[r, 52.945] for r in range(2000, 14501, 500)]           # 93 hp at 14500
+    _peak = [[2000, 18.0], [6000, 41.5], [10000, 48.81], [12000, 37.8], [15000, 27.1]]  # 68.5 hp
+    _carE = {'engine_method': 'table', 'engine_power_cap_hp': 75.0,
+             'engine_tables': {'flat': {'label': 'flat', 'table': _flat},
+                               'peak': {'label': 'peak', 'table': _peak}},
+             'engine_table_choice': 'flat'}
+    _snap = _cpE.deepcopy(_carE)
+    _hp = lambda c: max(t * r * 2 * _mE.pi / 60 / 745.7 for r, t in zip(c[0], c[1]))
+    _ef = []
+    _c75 = _VEo.car_engine_curve(_carE)
+    if not _hp(_c75) <= 75.0 + 1e-6 or _hp(_c75) < 74.9:
+        _ef.append(f'cap 75 gave {_hp(_c75):.2f} hp')
+    if _carE != _snap:
+        _ef.append('the cap rewrote the saved table/car dict')
+    _carE['engine_power_cap_hp'] = 0.0
+    _c0 = _VEo.car_engine_curve(_carE)
+    if abs(_hp(_c0) - 52.945 * 14500 * 2 * _mE.pi / 60 / 745.7) > 0.05:
+        _ef.append(f'cap 0 should be the raw table, got {_hp(_c0):.2f} hp')
+    _carE['engine_table_choice'] = 'peak'; _carE['engine_power_cap_hp'] = 75.0
+    _cp = _VEo.car_engine_curve(_carE)
+    if _cp[2] != 'peak' or [list(x) for x in zip(_cp[0], _cp[1])] != [[float(a), float(b)] for a, b in _peak]:
+        _ef.append('choice switch / cap below the table changed a curve it should not')
+    if _VEo.car_engine_curve({'engine_method': 'table', 'engine_table': _peak})[2] != 'project torque table':
+        _ef.append('old single engine_table key not honoured')
+    _ns = _SNE(_launch_rpm_c=None, _redline_rpm=13000.0, _tq_rpm=np.array([r for r, _ in _flat], float),
+               _engine_torque_Nm=lambda x: 52.945)
+    _lr = _LSE.launch_rpm(_ns)
+    if _lr < 12000.0:
+        _ef.append(f'flat torque table launches at {_lr:.0f} rpm (plateau start), not its top')
+    if _ef:
+        fails += 1
+    print(f'engine options   : cap 75 -> {_hp(_c75):.1f} hp (raw {_hp(_c0):.1f}), table untouched, '
+          f'choice switch ok, flat launch {_lr:.0f} rpm   '
+          + ('pass' if not _ef else 'UNEXPECTED FAIL: ' + '; '.join(_ef)))
+except Exception as _e:
+    fails += 1
+    print(f'engine options   : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── LAP SIM GRAPHS (2026-10-21, user: "graphs very hard to read and jagged").
+#    FAILING-THEN-PASSING, on a synthetic track: 40 m straight, then a
+#    LEFT-hand 12 m-radius arc (curvature +, heading increasing) for 60 m.
+#      (a) LEFT/RIGHT: the detail pass solved |lat g| for every corner, i.e.
+#          drove every left-hander as a right-hander — per-tyre loads/grip/
+#          travel had left and right swapped.  In a left turn the RIGHT
+#          (outside) tyres must carry more load.  Before: Fz_FL > Fz_FR.
+#      (b) LIMIT CYCLE: the corner speed ceiling ignored the forward tyre force
+#          needed to cancel drag, so at the ceiling the car lost speed on one
+#          station and regained it on the next (±0.03 g saw-tooth in forward
+#          g on v191).  Inside the arc the car is steady: forward g must stay
+#          ~0.  Before: |forward g| 0.03 g alternating sign.
+print('-' * 64)
+try:
+    from vahan.laptime import Track as _TkG, LapSimulator as _LsG
+    if not _cands:
+        print('lap graphs       : no config — skipped')
+    else:
+        _wG = MainWindow(); _wG._load_project_from_path(max(_cands)[1])
+        _ssG = _wG._build_dynamics_solver()
+        _R = 12.0
+        _s1 = np.arange(0.0, 40.0, 1.0)
+        _ang = np.arange(0.0, 60.0, 1.0) / _R
+        _xG = np.concatenate([_s1 - 40.0, _R * np.sin(_ang)])
+        _yG = np.concatenate([np.zeros_like(_s1), _R * (1.0 - np.cos(_ang))])
+        _kG = np.concatenate([np.zeros_like(_s1), np.full_like(_ang, 1.0 / _R)])
+        _trG = _TkG(name='net-left', x_m=_xG, y_m=_yG, kappa_1pm=_kG)
+        _simG = _LsG(_ssG, cla_m2=0.0, cda_m2=1.0, grip_scale=0.75)
+        _rG = _simG.simulate(_trG, n_detail=30, detail_tol_g=0.03)
+        _gf = []
+        _ch = _rG.det_channels
+        _arc = _rG.det_s_m > 60.0                      # well inside the arc
+        _fl, _fr = np.nanmean(_ch['Fz_FL'][_arc]), np.nanmean(_ch['Fz_FR'][_arc])
+        if not _fr > _fl + 50.0:
+            _gf.append(f'left-hand arc: Fz front-left {_fl:.0f} N vs '
+                       f'front-right {_fr:.0f} N — outside (right) tyre must '
+                       f'carry more (left/right swapped)')
+        _lonA = np.asarray(_rG.lon_g)[70:98]
+        if np.max(np.abs(_lonA)) > 0.005:
+            _gf.append(f'forward g inside a steady arc swings '
+                       f'{np.min(_lonA):+.3f}..{np.max(_lonA):+.3f} g '
+                       f'(speed-ceiling limit cycle)')
+        if _gf:
+            fails += 1
+        print(f'lap graphs       : left arc Fz FL {_fl:.0f} / FR {_fr:.0f} N, '
+              f'arc forward g max {np.max(np.abs(_lonA)):.4f} g   '
+              + ('pass' if not _gf else 'UNEXPECTED FAIL: ' + '; '.join(_gf)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbG; _tbG.print_exc()
+    print(f'lap graphs       : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── LAP SIM ON THE CAR'S G-G LIMITS (2026-10-21, user: "fix lap time sim";
+#    "it was never able to reach 2.5 g on MMD").  FAILING-THEN-PASSING:
+#    method 'pointmass' (the old default) cornered on the PER-TYRE limit
+#    (1.46 g on v191, no aero) but braked on a grip circle with no brake
+#    balance (1.58 g net, rear pair asked for 1.20-1.25x its grip on entry),
+#    and launched with a one-station 1.35 g spike then 0.55 g.  method 'ggv'
+#    drives the lap on SteadyStateSolver.gg_envelope at a grid of speeds
+#    (axle grip use <= 1 on the full solve, downforce at each speed):
+#      (a) the map's sideways limit at rest = corner_speed axle limit (0.02 g)
+#      (b) every station inside the map: sideways, tyre forward, tyre braking
+#      (c) the full solve along the lap: both axle pairs <= 1.03
+#      (d) launch from standstill: no spike (first 5 stations, 25 m, within 0.1 g of
+#          each other, none above the map's forward tyre limit)
+#      (e) with downforce: lap peak sideways g <= a FRESH envelope solved at
+#          that exact speed (+0.01 g) — the lap can never out-corner the model
+#    Subsampled track (every 5th station), 3 speed nodes with aero.
+print('-' * 64)
+try:
+    from vahan.laptime import Track as _TkV, LapSimulator as _LsV
+    from vahan.corner_speed import per_corner_limit_g as _pclV
+    _trkV = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tracks', 'autocross26.json')
+    if not _cands or not os.path.isfile(_trkV):
+        print('lap g-g-V        : no config/track — skipped')
+    else:
+        _wV = MainWindow(); _wV._load_project_from_path(max(_cands)[1])
+        _ssV = _wV._build_dynamics_solver()
+        _fullV = _TkV.from_json(_trkV)
+        _trV = _TkV(name='net', x_m=_fullV.x_m[::5], y_m=_fullV.y_m[::5],
+                    kappa_1pm=_fullV.kappa_1pm[::5], width_m=_fullV.width_m)
+        _gsV = float(_wV.grip_scale())
+
+        def _mkV(cla):
+            _s = _LsV(_ssV, cla_m2=cla, cda_m2=1.0, grip_scale=_gsV, aero_cop_rear_frac=0.54)
+            _s.set_gearbox([2.750, 2.000, 1.667, 1.444, 1.304, 1.208], primary_ratio=1.0,
+                           final_drive=3.545, redline_rpm=11000.0)
+            return _s
+        _vf = []
+        _sV = _mkV(0.0)
+        _rV = _sV.simulate(_trV, n_detail=30, detail_tol_g=0.03, method='ggv')
+        _gm = _rV.ggv
+        _prevV = _ssV._mu_scale; _ssV._mu_scale = _gsV
+        try:
+            _axl = _pclV(_ssV, criterion='axle')['limit_g']
+        finally:
+            _ssV._mu_scale = _prevV
+        if abs(_gm.lat_limit_g(0.0) - _axl) > 0.02:
+            _vf.append(f'map sideways limit {_gm.lat_limit_g(0.0):.3f} g vs corner-speed axle limit {_axl:.3f} g')
+        _v = np.asarray(_rV.v_ms); _lat = np.asarray(_rV.lat_g); _lt = np.asarray(_rV.lon_tyre_g)
+        _o_lat = max(_lat[i] - _gm.lat_limit_g(_v[i]) for i in range(len(_v)))
+        _o_acc = max((_lt[i] - _gm.accel_g(_v[i], _lat[i])) for i in range(1, len(_v)) if _lt[i] > 0)
+        _o_brk = max((-_lt[i] - _gm.brake_g(_v[i], _lat[i])) for i in range(len(_v)) if _lt[i] < 0)
+        if max(_o_lat, _o_acc, _o_brk) > 0.005:
+            _vf.append(f'lap outside the map by {_o_lat:+.3f} sideways / {_o_acc:+.3f} forward / {_o_brk:+.3f} braking g')
+        _chV = _rV.det_channels
+        _ua = float(np.nanmax(np.maximum(_chV['util_axle_F'], _chV['util_axle_R'])))
+        if _ua > 1.03:
+            _vf.append(f'full solve along the lap: an axle pair at {_ua:.3f} of its grip')
+        _l15 = np.asarray(_rV.lon_g)[1:6]
+        if _v[0] > 0.11 or np.ptp(_l15) > 0.1 or np.max(_l15) > _gm.accel_g(_v[5], 0.0) + 0.01:
+            _vf.append(f'launch: start {_v[0]:.2f} m/s, first stations {np.min(_l15):.2f}..{np.max(_l15):.2f} g')
+        # the old default must still show the spike this gate exists for
+        _rOld = _mkV(0.0).simulate(_trV, n_detail=8)
+        _spike_old = float(np.asarray(_rOld.lon_g)[1] - np.asarray(_rOld.lon_g)[2])
+        if _spike_old < 0.3:
+            _vf.append(f'old method launch spike {_spike_old:.2f} g — gate no longer proves anything')
+        # (e) with downforce (the car's package if on, else 1000 N @ 72.4 km/h)
+        _rhoV = float(_ssV._veh.air_density_kg_m3)
+        _claV = 2.0 * 1000.0 / (_rhoV * (72.42 / 3.6) ** 2)
+        _sA = _mkV(_claV)
+        _rA = _sA.simulate(_trV, n_detail=8, method='ggv', ggv_n_speeds=3)
+        _iA = int(np.argmax(_rA.lat_g)); _vA = float(_rA.v_ms[_iA])
+        _FdA = 0.5 * _rhoV * _claV * _vA ** 2
+        _aeA = {'FL': _FdA * 0.23, 'FR': _FdA * 0.23, 'RL': _FdA * 0.27, 'RR': _FdA * 0.27}
+        _ssV._mu_scale = _gsV
+        try:
+            _eA = _ssV.gg_envelope(n_ay=3, iters=8, aero_Fz=_aeA, ay_hi=4.0, ax_hi=4.0)
+        finally:
+            _ssV._mu_scale = _prevV
+        if float(_rA.lat_g[_iA]) > float(_eA['ay_limit_g']) + 0.01:
+            _vf.append(f'with aero: lap {float(_rA.lat_g[_iA]):.3f} g at {_vA * 3.6:.0f} km/h > envelope {_eA["ay_limit_g"]:.3f} g')
+        if _vf:
+            fails += 1
+        print(f'lap g-g-V        : limit {_gm.lat_limit_g(0.0):.3f} g (axle {_axl:.3f}), outside map '
+              f'{max(_o_lat, _o_acc, _o_brk):+.4f} g, axle use {_ua:.3f}, launch {np.min(_l15):.2f}-{np.max(_l15):.2f} g '
+              f'(old spike {_spike_old:.2f}), aero lap {float(_rA.lat_g[_iA]):.2f} g @ {_vA * 3.6:.0f} km/h '
+              f'vs envelope {_eA["ay_limit_g"]:.2f}, lap {_rOld.lap_time_s:.2f} -> {_rV.lap_time_s:.2f} s   '
+              + ('pass' if not _vf else 'UNEXPECTED FAIL: ' + '; '.join(_vf)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbV; _tbV.print_exc()
+    print(f'lap g-g-V        : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
 # ── AUDIT 2026-09-22 items 21-24, 27 (SOFTWARE_MATH_AND_USABILITY_AUDIT,
 #    Appendix 4; verified in DESIGN_2027/binder_run/ASTRA_AUDIT_VERIFY_*).
@@ -3694,6 +4108,130 @@ except Exception as _e:
     import traceback as _tbl; _tbl.print_exc()
     print(f'loads sign contract: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
+# 8. TYRE ALIGNING TORQUE IN THE MEMBER SOLVE (2026-10-11).  The steering chain
+#    (vahan.steering) always carried TTC Mz + Fy x trail; the upright free body
+#    did not, so the Loads page tie rod reacted only the patch-force kingpin
+#    moment (FL 267 N at 1.5 g on v162 vs 1,059 N in the steering chain).  Gate:
+#    with the tyre model the FL tie rod at 1.5 g must (a) exceed the no-Mz solve
+#    and (b) agree with the steering chain's planar tie-rod force within 25 %.
+try:
+    _f = []
+    _ld, _vehm, _upm, _resm, _bpf, _bpr, _solm = _LWP.compute_case(win, 1.5, 0.0)
+    _no = _LL.compute_all_corners(win._solvers, _resm, brake_params_f=_bpf, brake_params_r=_bpr,
+                                  upright_params_f=_upm, upright_params_r=_upm, wheel_radius_m=_vehm.tire_radius_m,
+                                  veh=_vehm, topology=getattr(win, '_topology', None),
+                                  arb_geometry=_LWP.arb_geometry_fn(win), tire_model=None)
+    _with, _wo = abs(float(_ld['FL'].tierod_N)), abs(float(_no['FL'].tierod_N))
+    _mz = float(getattr(_ld['FL'], 'mz_Nm', 0.0))
+    if not (_mz > 1.0):
+        _f.append(f'FL Mz {_mz:.1f} N.m not applied (tyre model missing from the Loads path?)')
+    if not (_with > _wo * 1.2):
+        _f.append(f'FL tie rod with Mz {_with:.0f} N not above the no-Mz solve {_wo:.0f} N')
+    from vahan.steering import compute_steering_effort as _cse
+    _ssm = win._build_dynamics_solver()
+    _eff = _cse(_ssm, win._front_hp, win._topology.front.damper_mount.value, win._tire_model,
+                steer_cfg=dict(win._steer), front_solver=win._solvers['FL'])
+    _tr = dict((round(g, 2), max(abs(a), abs(b))) for g, a, b in _eff.get('tie_rod_force_vs_latg', []))
+    _chain = _tr.get(1.5)
+    if _chain is None or not (0.75 <= _with / _chain <= 1.25):
+        _f.append(f'FL tie rod with Mz {_with:.0f} N vs steering chain {_chain} N (need within 25 %)')
+    if _f:
+        fails += 1
+    print(f'loads Mz in member: FL @1.5 g Mz {_mz:.1f} N.m, tie rod {_with:.0f} N with / {_wo:.0f} N without, '
+          f'steering chain {_chain if _chain is None else round(_chain)} N   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    import traceback as _tbm; _tbm.print_exc()
+    print(f'loads Mz in member: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 9. TYRE IDENTITY (2026-10-11).  The loaded tyre MODEL must be the tyre the
+#    project declares (compared by the test file's own tyre id string, not by a
+#    panel label that can go stale), at the declared pressure.  Until this gate
+#    the pressure spin's load-time signal could swap in the alphabetically first
+#    file (another compound) and nothing said so.  Judged on the DESIGN window.
+try:
+    _f = []
+    _want = str(wD._car.get('tire_file', '') or '').strip()
+    _tm = wD._tire_model
+    _tid_loaded = str(getattr(_tm, 'tire_id', '') or '') if _tm is not None else ''
+    _tid_want = ''
+    if not _want:
+        _f.append('project declares no tyre file')
+    else:
+        try:
+            import scipy.io as _sio
+            _tid_want = str(_sio.loadmat(os.path.join('tire_data', _want), squeeze_me=True).get('tireid', '')).strip()
+        except Exception as _e2:
+            _f.append(f'declared tyre file {_want!r} unreadable: {_e2}')
+    if _tm is None:
+        _f.append('no tyre model loaded (' + str(getattr(wD, '_tire_selection_error', '')) + ')')
+    else:
+        if _tid_want and _tid_loaded.strip() != _tid_want:
+            _f.append(f'loaded tyre {_tid_loaded!r} but the project declares {_want!r} = {_tid_want!r}')
+        _pcfg = float(wD._dynamics_panel.get_tire_pressure_psi())
+        _pld = float(getattr(_tm, 'pressure_psi', float('nan')))
+        if not (abs(_pld - _pcfg) <= 0.6):
+            _f.append(f'tyre built at {_pld:.1f} psi, project says {_pcfg:.1f}')
+    if _f:
+        fails += 1
+    print(f'tyre identity    : declared {_want!r} ({_tid_want[:34]!r}), loaded {_tid_loaded[:34]!r} at '
+          f'{(getattr(_tm, "pressure_psi", float("nan")) if _tm is not None else float("nan")):.1f} psi   '
+          + ('pass' if not _f else 'UNEXPECTED FAIL: ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    print(f'tyre identity    : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# 10. TYRE PEAK vs RAW (2026-10-11, user: "peak slip angle is like 12 degrees").
+#     The grid's peak per load bin must sit where the RAW test samples peak
+#     (binned medians, zero camber, the declared file and pressure) and reach
+#     the raw peak mu: the old single-line clamp cut the light loads at 7.5 deg
+#     and 3 % below their measured peak.  Censored bins (raw peak at the sweep
+#     end) only need the mu check.
+try:
+    import scipy.io as _sio
+    _f = []
+    _tmp = wD._tire_model; _wantp = str(wD._car.get('tire_file', '') or '')
+    _dd = _sio.loadmat(os.path.join('tire_data', _wantp), squeeze_me=True)
+    _FZ = -np.asarray(_dd['FZ'], float); _FY = np.asarray(_dd['FY'], float); _SA = np.asarray(_dd['SA'], float)
+    _IA = np.asarray(_dd['IA'], float); _P = np.asarray(_dd['P'], float) * 0.145; _V = np.asarray(_dd['V'], float)
+    _psi = float(wD._dynamics_panel.get_tire_pressure_psi())
+    _win = wD._car.get('tire_speed_window_kph') or [0.0, 1e9]
+    _m = (np.abs(_P - _psi) < 0.6) & (np.abs(_IA) < 0.5) & (_V >= float(_win[0])) & (_V <= float(_win[1]))
+    _sa_b = np.arange(0.0, 13.01, 0.5); _sa_end = float(np.nanmax(np.abs(_SA[_m]))) if _m.any() else 0.0
+    _rows = []
+    for _fz0 in sorted(set(np.round(_tmp._fz_axis / 10.0) * 10.0)):
+        _mm = _m & (np.abs(_FZ - _fz0) < 70)
+        if _mm.sum() < 300:
+            continue
+        _med = np.array([np.median(np.abs(_FY[_mm & (np.abs(_SA - _s) < 0.3)])) if (_mm & (np.abs(_SA - _s) < 0.3)).sum() >= 3 else np.nan for _s in _sa_b])
+        if np.all(np.isnan(_med)):
+            continue
+        _k = int(np.nanargmax(_med)); _raw_pk, _raw_mu = float(_sa_b[_k]), float(_med[_k] / _fz0)
+        _sa = np.linspace(0.0, 20.0, 801); _fy = np.abs(np.atleast_1d(_tmp.Fy(_sa, np.full_like(_sa, float(_fz0)), np.zeros_like(_sa))))
+        _g_pk, _g_mu = float(_sa[int(_fy.argmax())]), float(_fy.max() / _fz0)
+        _cens = _raw_pk >= _sa_end - 1.0
+        _rows.append((_fz0, _raw_pk, _raw_mu, _g_pk, _g_mu, _cens))
+        if _g_mu < 0.97 * _raw_mu:
+            _f.append(f'{_fz0:.0f} N: grid peak mu {_g_mu:.2f} < 0.97 x raw {_raw_mu:.2f}')
+        if (not _cens) and abs(_g_pk - _raw_pk) > 1.5:
+            _f.append(f'{_fz0:.0f} N: grid peak at {_g_pk:.1f} deg vs raw {_raw_pk:.1f}')
+    if len(_rows) < 3:
+        _f.append(f'only {len(_rows)} load bins resolved from the raw file')
+    # KNOWN-FAIL, documented (2026-10-11): the grid's single peak-slip line
+    # (anchored at the top load bin) cuts the light-load columns below their
+    # measured peak.  A per-column clamp was tried and reverted: it changes
+    # every dynamics number and re-opens the >100 % Ackermann preference the
+    # 'ackermann ceiling' gate guards.  Fix waits on the tyre-model decision
+    # (lookup vs fitted surface) — see docs/TODO_gui_integration.md.
+    if _f:
+        known += 1
+    print('tyre peak vs raw : ' + '; '.join(f'{r[0]:.0f}N raw {r[1]:.1f}deg/{r[2]:.2f} grid {r[3]:.1f}deg/{r[4]:.2f}{"c" if r[5] else ""}' for r in _rows)
+          + '   ' + ('pass' if not _f else 'KNOWN-FAIL (grid peak line vs raw; tyre-model decision pending): ' + '; '.join(_f)))
+except Exception as _e:
+    fails += 1
+    print(f'tyre peak vs raw : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
 # ── PACKAGING SYSTEM (vahan/packaging.py): the ONE validity oracle both the
 #    manual page and the generator run.  Two invariants: (a) the untouched
 #    current design config must meet the absolute geometry laws, even against
@@ -4180,13 +4718,25 @@ try:
         print('ride page        : no config — skipped')
     else:
         from vahan import ride_solve as _RS
-        from gui.ride_page import RidePage as _RidePage
+        from gui.ride_page import RidePage as _RidePage, SUMMARY_SPEEDS_KPH as _RS_SPEEDS
         _wr = MainWindow(); _wr._load_project_from_path(_rcur); _wr._rebuild_solvers(0.)
+        # this block judges the page's LINEAR-damping path; a config that
+        # declares dyno dampers (car['damper'], v170+) is judged by the
+        # 'dyno dampers' gate below
+        _wr._car.pop('damper', None)
         _wr._switch_page(7)
         _rp = _wr._ride_page
         assert isinstance(_rp, _RidePage) and _wr._pages.currentIndex() == 7, 'Ride page not on Ctrl+8 / index 7'
         # small deterministic study; inputs must write straight into the car dict
         _rp._npts.setValue(3); _rp._v_n.setValue(2); _rp._seed_n.setValue(1)
+        # body inertia: the ONE estimate by default (same rules as the transient model), user values only when ticked
+        _rveh0 = _wr._build_dynamics_solver()._veh
+        _rest = _RS.estimated_inertias(_rveh0)
+        _rin0 = _rp.inputs()
+        assert not _rp._inertia_entered.isChecked()
+        assert (_rin0.pitch_inertia_kgm2, _rin0.roll_inertia_kgm2) == (_rest['pitch_kgm2'], _rest['roll_kgm2']), 'ride page ignores the inertia estimate'
+        assert abs(_rest['roll_kgm2'] - _rveh0.sprung_mass_kg * (_rveh0.roll_gyradius_track_frac * 0.5 * (_rveh0.front_track_m + _rveh0.rear_track_m)) ** 2) < 1e-9
+        _rp._inertia_entered.setChecked(True)
         _rp._coh.setCurrentText('coherent'); _rp._pitch_I.setValue(90.); _rp._damp['RR'].setValue(1234.)
         assert _wr._car['ride_pitch_inertia_kgm2'] == 90. and _wr._car['ride_damping_wheel_Nspm'][3] == 1234.
         _inp = _rp.inputs()
@@ -4208,6 +4758,7 @@ try:
         assert np.isclose(_chk.ride_rate_rear_Npm, _sel['rear_ride_rate_Npm'], rtol=1e-9)
         # study DLC == vahan.ride periodic_response recomputed here
         _m0, _case0, _model = _study['metrics'][0], _study['cases'][0], _study['model']
+        _model, _ = _RS.loaded_model(_model, _inp, _case0.speed_mps)    # aero-loaded state (2026-10-19)
         _load = _model.periodic_response(_case0.dt_s, _case0.road_heights_m)['dynamic_tire_load_N'] + _model.baseline_loads
         _dlc = np.sqrt(np.mean((_load - _load.mean(0)) ** 2, 0)) / _load.mean(0)
         assert np.allclose(_dlc, _m0.dlc), (_dlc, _m0.dlc)
@@ -4217,6 +4768,18 @@ try:
         _wr2 = MainWindow(); _wr2._load_project_from_path(_rpath)
         assert _wr2._car['ride_pitch_inertia_kgm2'] == 90. and _wr2._car['ride_damping_wheel_Nspm'][3] == 1234.
         assert _wr2._car['ride_coherence'] == 'coherent' and _wr2._car['ride_sweep_points'] == 3
+        assert _wr2._car['ride_inertia_entered'] is True, 'measured-inertia choice lost in save -> load'
+        # SUMMARY (user 2026-10-23): tyre-load swing vs SPEED; the independent one-corner check agrees
+        # with the full model within 10 % from 40 km/h up on both roads
+        _summ = _rp.last_summary
+        assert list(_summ['swing']) == ['A', 'B'] and np.allclose(_summ['swing']['A']['speed_kph'], _RS_SPEEDS)
+        for _cls in ('A', 'B'):
+            _fast = _summ['swing'][_cls]['speed_kph'] >= 40.
+            _rel = _summ['check'][_cls][_fast] / _summ['swing'][_cls]['rms_N'][_fast, 0]
+            assert np.all(np.abs(_rel - 1.) < 0.10), (_cls, _rel)
+        assert _summ['swing']['B']['rms_N'][-1, 0] > 1.5 * _summ['swing']['A']['rms_N'][-1, 0], 'road B not rougher than A'
+        from PyQt6.QtWidgets import QLabel as _RQL
+        assert any(_RS.NOT_CONSIDERED[0] in l.text() for l in _rp.findChildren(_RQL)), 'NOT CONSIDERED list not on the page'
         _wr.close(); _wr2.close()
         print(f'ride page        : Ctrl+8 built; solve {_sel["status"]}: front {_sel["front_ride_frequency_Hz"]:.2f} / '
               f'rear {_sel["rear_ride_frequency_Hz"]:.2f} Hz -> {_sel["front_spring_rate_lbf_in"]:.0f} / '
@@ -4226,6 +4789,390 @@ except Exception as _er:
     fails += 1
     import traceback as _tbr; _tbr.print_exc()
     print(f'ride page        : UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── SPRINGS x DAMPERS vs SPEED on the fixed reference road (2026-10-23).
+#    The grid study must reproduce the headline load swing for the car's own
+#    springs + dampers, read contact-patch position from the SOLVED corner,
+#    and drive every case over the same stored road (B = same bumps x2).
+try:
+    import glob as _gg, re as _gre
+    _gcfgs = _gg.glob('configs/2027_v*.vahan')
+    _gcur = (max(_gcfgs, key=lambda p: int(_gre.search(r'2027_v(\d+)', p).group(1))
+                 if _gre.search(r'2027_v(\d+)', p) else -1) if _gcfgs else None)
+    if _gcur is None:
+        print('springs x dampers: no config — skipped')
+    else:
+        from vahan import ride_solve as _RS
+        from vahan.damper import WheelDampers as _GWD
+        from vahan.loads import contact_patch_point as _gcpp
+        from gui import ride_page as _GRP
+        _wg = MainWindow(); _wg._load_project_from_path(_gcur); _wg._rebuild_solvers(0.)
+        _wg._switch_page(7); _gp = _wg._ride_page
+        _gdm = _wg._damper_model()
+        assert _gdm is not None, 'latest config has no dyno dampers'
+        _gveh = _wg._build_dynamics_solver()._veh
+        _ginp = _gp.summary_inputs(_gveh)
+        # fixed road: B is A x 2 exactly, band heights match the ISO closed form
+        _ra, _rb = _RS.reference_road('A'), _RS.reference_road('B')
+        assert np.allclose(_rb['left_m'], 2. * _ra['left_m']) and np.allclose(_rb['right_m'], 2. * _ra['right_m'])
+        assert np.all(np.abs(_ra['band_rms_m'] / _ra['band_rms_theory_m'] - 1.) < 0.05), _ra['band_rms_m']
+        # contact-patch table = the solver's own contact point
+        _gt = _RS.contact_patch_table(_wg._solvers['FL'], _gveh.tire_radius_m)
+        assert abs(np.interp(0., _gt['travel_m'], _gt['lateral_m'])) < 1e-12
+        _s0, _s1 = _wg._solvers['FL'].solve(0.), _wg._solvers['FL'].solve(0.02)
+        _p0 = _gcpp(_s0.wheel_center, _s0.spin_axis, _gveh.tire_radius_m)
+        _p1 = _gcpp(_s1.wheel_center, _s1.spin_axis, _gveh.tire_radius_m)
+        assert abs(np.interp(0.02, _gt['travel_m'], _gt['lateral_m']) - (_p1[0] - _p0[0])) < 1e-6
+        assert abs(np.interp(0.02, _gt['travel_m'], _gt['fore_aft_m']) - (_p1[1] - _p0[1])) < 1e-6
+        # the car's own springs round-trip through ride_rate_options
+        _mf, _ = _RS.sprung_corner_masses_kg(_gveh)
+        _ro = _RS.ride_rate_options(_gveh, [_RS.ride_frequency_Hz(_gveh.ride_rate_front_Npm, _mf)])[0]
+        assert _ro['is_current'] and abs(_ro['spring_front_Npm'] / _gveh.spring_rate_front_Npm - 1.) < 1e-6
+        assert abs(_ro['spring_rear_Npm'] / _gveh.spring_rate_rear_Npm - 1.) < 1e-6
+        _gsets = _GRP.grid_damper_settings(_gdm.setting)
+        assert [s for l, s in _gsets if l.startswith('current')][0] == _gdm.setting
+        # one cell of the grid == the headline load swing (same road, same dampers)
+        _gtabs = [_RS.contact_patch_table(_wg._solvers[c], _gveh.tire_radius_m) for c in ('FL', 'FR', 'RL', 'RR')]
+        _gwd = _GWD(_gdm.dyno, _gdm.setting, _RS.corner_motion_ratios(_gveh))
+        _gst = _RS.spring_damper_speed_study(_gveh, _ginp, [_ro], [('current', _gwd)], [60. / 3.6], _gtabs,
+                                             road_classes=('A',))
+        _gsw = _RS.load_swing_vs_speed(_gveh, _ginp, [60. / 3.6], ('A',))
+        assert np.allclose(_gst['A']['load_rms_N'][0, 0, 0], _gsw['A']['rms_N'][0], rtol=1e-9), \
+            (_gst['A']['load_rms_N'][0, 0, 0], _gsw['A']['rms_N'][0])
+        assert np.all(_gst['A']['lat_rms_mm'] >= 0) and np.all(_gst['A']['lat_p99_mm'] >= _gst['A']['lat_rms_mm'])
+        _gtab_names = [_gp._tabs.tabText(i) for i in range(_gp._tabs.count())]
+        assert 'Springs x dampers vs speed' in _gtab_names, _gtab_names
+        _wg.close()
+        print(f'springs x dampers: fixed road B = 2 x A, contact patch = solver, current cell == headline '
+              f'({_gst["A"]["load_rms_N"][0, 0, 0, 0]:.0f} N front at 60 km/h, side-to-side '
+              f'{_gst["A"]["lat_rms_mm"][0, 0, 0, 0]:.3f} mm)   pass')
+except Exception as _er:
+    fails += 1
+    import traceback as _tbg; _tbg.print_exc()
+    print(f'springs x dampers: UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── FRONT / REAR AXLE CG HEIGHTS (2026-10-25).  Split heights (front lower,
+#    rear higher) keep the share-weighted mean = cg_height_m, leave the rigid
+#    chassis exactly unchanged (only the total roll moment matters), and move
+#    the compliant-chassis split; unset = both ends at the sprung CG height.
+try:
+    from dataclasses import replace as _crep
+    from vahan.dynamics import _extract_outputs as _CXO
+    from vahan import chassis_stiffness as _CCS
+    _wcg = MainWindow(); _wcg._load_project_from_path(_design); _wcg._rebuild_solvers(0.)
+    _css = _wcg._build_dynamics_solver()
+    _cv0 = _crep(_css._veh, cg_height_front_m=0.0, cg_height_rear_m=0.0, chassis_compliance=True,
+                 chassis_torsion_Nm_rad=_CCS.nm_deg_to_nm_rad(2516.23))
+    assert _cv0.sprung_end_cg_heights_m == (_cv0.sprung_cg_height_m, _cv0.sprung_cg_height_m)
+    _cb = _cv0.cg_to_front_axle_m / _cv0.wheelbase_m
+    _cv1 = _crep(_cv0, cg_height_front_m=_cv0.cg_height_m - _cb * 0.022, cg_height_rear_m=_cv0.cg_height_m + (1 - _cb) * 0.022)
+    _hsf, _hsr = _cv1.sprung_end_cg_heights_m
+    assert abs((1 - _cb) * _hsf + _cb * _hsr - _cv1.sprung_cg_height_m) < 1e-12 and abs((_hsr - _hsf) - 0.022) < 1e-12
+    _clt = {}
+    for _ct, _cvv in (('flat', _cv0), ('split', _cv1)):
+        for _crg in (False, True):
+            _css._veh = _crep(_cvv, chassis_compliance=not _crg)
+            _clt[(_ct, _crg)] = _CXO(_css.solve(1.0))['lltd_pct']
+    assert abs(_clt[('flat', True)] - _clt[('split', True)]) < 1e-9, _clt
+    assert _clt[('split', False)] < _clt[('flat', False)] - 1e-4, _clt      # rear higher -> rear end takes more
+    _cin = _CCS.inputs_from_vehicle(_cv1, 0.03, 0.053, _cv1.chassis_torsion_Nm_rad)
+    assert abs(_cin.h_f_m - _hsf) < 1e-12 and abs(_cin.h_r_m - _hsr) < 1e-12
+    print(f'axle CG heights  : split 22 mm, mean kept; rigid LT {_clt[("flat", True)]:.3f} == {_clt[("split", True)]:.3f} %, '
+          f'compliant {_clt[("flat", False)]:.3f} -> {_clt[("split", False)]:.3f} %, chassis page lumps match   pass')
+    _wcg.close()
+except Exception as _er:
+    fails += 1
+    import traceback as _tbc; _tbc.print_exc()
+    print(f'axle CG heights  : UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── RIDE ROAD PHYSICS (2026-10-19 road-analysis audit).  Pure vahan, no GUI.
+#    (1) ISO 8608: a synthesised class A / B record must carry the closed-form
+#        band variance G0 n0^2 (1/n_lo - 1/n_hi) — the point-sampled bin power
+#        overstated it by 4.7 % (each bin now gets the PSD integrated over it).
+#    (2) quarter car: with pitch inertia = m_s a_s b_s (dynamic index 1) and no
+#        ARB, every axle's closed-form 2-DOF quarter-car frequencies must be
+#        eigenfrequencies of the 7-DOF model (guard; passed before the audit).
+#    (3) aero: each road case runs about the loaded state at its speed — mean
+#        tyre load = static + downforce share, aero sink = corner downforce /
+#        wheel rate, the bump side judged against the bump margin.  Before the
+#        audit the ride analysis had no aero at all (RideInputs had no package).
+try:
+    from vahan.road import RoadSpectrum as _RPs, synthesize_profile as _RPsyn
+    from vahan import ride_solve as _RPS
+    from vahan.dynamics import VehicleParams as _RPVP
+    from dataclasses import replace as _RPrep
+    _rpf = []
+    for _cls, _g0 in (('A', 16e-6), ('B', 64e-6)):
+        _sp = _RPs(_cls)
+        _closed = _g0 * 0.1 ** 2 * (1. / _sp.low_cycles_per_m - 1. / _sp.high_cycles_per_m)
+        _var = float(np.var(_RPsyn(_sp, length_m=1000., spacing_m=0.02, seed=1)[1]))
+        if abs(_var / _closed - 1.) > 2e-3:
+            _rpf.append(f'class {_cls} variance {_var:.4e} vs ISO {_closed:.4e} m2')
+    _qv = _RPrep(_RPVP(), arb_rate_front_Npm=0., arb_rate_rear_Npm=0.)
+    _mt = _qv.total_mass_kg; _L = _qv.wheelbase_m; _a = _qv.cg_to_front_axle_m
+    _fs = _mt * (_L - _a) / _L - _qv.unsprung_mass_front_kg
+    _as = _L * (_mt * _a / _L - _qv.unsprung_mass_rear_kg) / _qv.sprung_mass_kg
+    _qinp = _RPS.RideInputs(pitch_inertia_kgm2=_qv.sprung_mass_kg * _as * (_L - _as),
+                            roll_inertia_kgm2=40., corner_damping_Nspm=(0., 0., 0., 0.))
+    _qm = _RPS.ride_model_for(_qv, _qinp)
+    _eig = np.sqrt(np.linalg.eigvals(np.linalg.solve(_qm.mass, _qm.stiffness)).real) / (2 * np.pi)
+    _msf, _msr = _RPS.sprung_corner_masses_kg(_qv)
+    for _ms, _mu, _kw in ((_msf, _qv.unsprung_mass_front_kg / 2, _qv.wheel_rate_front_Npm),
+                          (_msr, _qv.unsprung_mass_rear_kg / 2, _qv.wheel_rate_rear_Npm)):
+        _kt = _qv.tire_rate_Npm
+        _qf = np.sqrt(np.roots([_ms * _mu, -(_ms * (_kw + _kt) + _mu * _kw), _kw * _kt]).real) / (2 * np.pi)
+        for _f in _qf:
+            if np.min(np.abs(_eig / _f - 1.)) > 1e-6:
+                _rpf.append(f'quarter-car {_f:.4f} Hz not a 7-DOF frequency {np.sort(_eig).round(4)}')
+    _ainp = _RPS.RideInputs(pitch_inertia_kgm2=100., roll_inertia_kgm2=40., corner_damping_Nspm=(1500.,) * 4,
+                            road_class='A', speeds_mps=(25.,), coherence='coherent', record_length_m=200.,
+                            stop_margin_m=0.03, bump_stop_margin_m=0.05,
+                            aero_cla_m2=4.0, aero_cop_rear=0.54, air_density=1.225)
+    _am = _RPS.ride_model_for(_qv, _ainp)
+    _acase = _RPS.build_road_cases(_ainp, _qv.wheelbase_m)[0]
+    _amet = _RPS.evaluate_case(_am, _acase, motion_ratios=_RPS.corner_motion_ratios(_qv),
+                               stop_margin_m=0.03, inputs=_ainp)
+    _d = 4.0 * 0.5 * 1.225 * 25. ** 2
+    _fa = np.array([_d * 0.46 / 2] * 2 + [_d * 0.54 / 2] * 2)
+    _kw4 = np.array([_qv.wheel_rate_front_Npm] * 2 + [_qv.wheel_rate_rear_Npm] * 2)
+    _load = _amet.load_rms_N / _amet.dlc
+    if not np.allclose(_load, _am.baseline_loads + _fa, rtol=1e-6):
+        _rpf.append(f'mean tyre load {_load.round(1)} != static + aero {(_am.baseline_loads + _fa).round(1)}')
+    if not np.allclose(_amet.aero_sink_m, _fa / _kw4, rtol=1e-6):
+        _rpf.append(f'aero sink {_amet.aero_sink_m} != downforce / wheel rate {_fa / _kw4}')
+    if not np.all(_amet.travel_usage >= _amet.aero_sink_m / 0.05 - 1e-12):
+        _rpf.append('travel usage does not start from the aero sink')
+    _m0 = _RPS.evaluate_case(_am, _acase, motion_ratios=_RPS.corner_motion_ratios(_qv), stop_margin_m=0.03)
+    if not np.allclose(_m0.load_rms_N, _amet.load_rms_N, rtol=1e-9):
+        _rpf.append('aero changed the linear load RMS (it only moves the operating point)')
+    if _rpf:
+        fails += 1
+    print('ride road physics: ISO A/B band variance exact, quarter-car == 7-DOF, aero loads/sink/bump margin   '
+          + ('pass' if not _rpf else 'UNEXPECTED FAIL: ' + '; '.join(_rpf)))
+except Exception as _er:
+    fails += 1
+    print(f'ride road physics: UNEXPECTED FAIL ({type(_er).__name__}: {_er})')
+
+# ── DYNO DAMPERS (vahan/damper.py, 2026-10-12).  A synthetic parallel-flow
+#    damper written in the TTX25 dyno-file schema into a TEMP dir (never the
+#    repo): the LS/HS parallel-flow superposition must reproduce every measured
+#    curve at its own setting within 3 %, F(0) = 0, F monotone in v, a stiffer
+#    adjuster gives more force, the beyond-dyno extension is the flagged 50 mm/s
+#    secant; RideModel.contact_response's nonlinear damper path must equal the
+#    matrix path for a linear law and RK4 must match DOP853 on the dyno law.
+#    ONE MODEL: a project WITHOUT car['damper'] -> _damper_model() None and the
+#    ride DLC identical (1e-9) to RideModel recomputed here; WITH a block the
+#    ride inputs carry the dyno at the solved MR, the study runs the time-domain
+#    path, the transient roll moment is the dyno pure-roll moment, the skidpad
+#    linear spins are disabled, and the block round-trips save -> load without
+#    leaking into a project that has none.  The real Ohlins file
+#    (DESIGN_2027/ohlins_ttx25/ttx25_mkII_dyno.json) gets the same 3 % check
+#    when it exists.
+try:
+    import json as _dj, tempfile as _dtmp
+    from dataclasses import replace as _dreplace
+    from vahan import damper as _DM, ride_solve as _DRS
+    from vahan.ride import RideModel as _DRideModel
+
+    def _dfix_curves(ls, hs, reb, vgrid):
+        k = 1.8 if reb else 1.0
+        def vel(F):
+            v = F / (60000. * k) + np.maximum(0., F - (120. + 110. * hs) * k) / ((6000. + 2500. * hs) * k)
+            return v + (np.sqrt(F / (3e6 * (2. / ls) ** 1.2 * k)) if ls > 0 else 0.)
+        lo, hi = np.zeros_like(vgrid), np.full_like(vgrid, 1e5)
+        for _ in range(80):
+            mid = 0.5 * (lo + hi); below = vel(mid) < vgrid / 1000.
+            lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+        return [[float(a), float(b)] for a, b in zip(vgrid, 0.5 * (lo + hi))]
+    _dv = np.arange(0., 251., 10.)
+    _dfix = {'damper': 'synthetic net fixture', 'units': {'velocity': 'mm/s', 'force': 'N'},
+             'delivered_valve_spec': 'C12/R12', 'valve_specs': {'C12/R12': {
+                 'ls_sweep': {'hs_turns': 4.3, 'curves': {str(c): {'comp': _dfix_curves(c, 4.3, False, _dv),
+                                                                  'reb': _dfix_curves(c, 4.3, True, _dv)}
+                                                          for c in (0, 2, 4, 6, 10, 15, 25)}},
+                 'hs_sweep': {'ls_clicks': 0, 'curves': {h: {'comp': _dfix_curves(0, float(h), False, _dv),
+                                                             'reb': _dfix_curves(0, float(h), True, _dv)}
+                                                         for h in ('4.3', '3', '2', '1', '0')}}}}}
+    _dpath = os.path.join(_dtmp.mkdtemp(prefix='vahan_dyno_'), 'fixture_dyno.json')
+    with open(_dpath, 'w') as _df:
+        _dj.dump(_dfix, _df)
+
+    def _dreproduce(dyno):
+        """Worst miss over every measured curve at its own setting: relative
+        at >= 25 mm/s, and relative to the curve's peak force everywhere.
+        The sheet measures (LS 0, HS 4.3) twice; the model follows the LS
+        sweep there, so the HS-sweep duplicate is reported, not gated."""
+        worst, dup = 0., 0.
+        for valve in dyno.valve_specs:
+            for sweep, key, st, d, v, F in dyno.measured_curves(valve):
+                sign = 1. if d == 'comp' else -1.
+                Fm = np.abs(dyno.force(sign * v, st))
+                ok = v >= 0.025
+                err = max(float(np.max(np.abs(Fm - F)[ok] / F[ok])),
+                          float(np.max(np.abs(Fm - F)) / F.max()))
+                hs_ref = float(dyno.raw['valve_specs'][valve]['ls_sweep'].get('hs_turns', 4.3))
+                if sweep == 'hs' and np.isclose(float(key), hs_ref):
+                    dup = max(dup, err)
+                else:
+                    worst = max(worst, err)
+        return worst, dup
+    _dd = _DM.DamperDyno.from_file(_dpath)
+    _dworst, _ = _dreproduce(_dd)
+    assert _dworst <= 0.03, f'superposition misses a measured curve by {100*_dworst:.2f} %'
+    _dset = {'valve': 'C12/R12', 'lsc': 6, 'hsc': 2., 'lsr': 6, 'hsr': 2.}
+    assert _dd.force(0., _dset) == 0., 'F(0) != 0'
+    _dvv = np.linspace(-0.4, 0.4, 1601)
+    _dF = _dd.force(_dvv, _dset)
+    assert np.all(np.diff(_dF) >= 0) and np.all(np.sign(_dF) == np.sign(_dvv)), 'F(v) not monotone / not signed'
+    for _x in (0.05, 0.15):
+        for _sg, _lk, _hk in ((1., 'lsc', 'hsc'), (-1., 'lsr', 'hsr')):
+            _fl = [abs(_dd.force(_sg * _x, dict(_dset, **{_lk: c}))) for c in (0, 3, 6, 12, 25)]
+            _fh = [abs(_dd.force(_sg * _x, dict(_dset, **{_hk: h}))) for h in (0., 1.5, 3., 4.3)]
+            assert all(a > b for a, b in zip(_fl, _fl[1:])), f'LS clicks not monotone (0 = stiffest) {_lk} {_fl}'
+            assert all(a < b for a, b in zip(_fh, _fh[1:])), f'HS turns not monotone (4.3 = stiffest) {_hk} {_fh}'
+    _dc = _dd.curve(_dset)
+    assert np.allclose(_dc(_dvv), _dF, rtol=1e-9, atol=1e-6), 'tabulated curve != force()'
+    _dsl = (_dd.force(0.25, _dset) - _dd.force(0.20, _dset)) / 0.05
+    assert abs(_dd.force(0.35, _dset) - (_dd.force(0.25, _dset) + 0.1 * _dsl)) < 1e-6 * _dsl, 'beyond-dyno extension is not the 50 mm/s secant'
+    assert abs(_dc.beyond_dyno_mps([0.1, -0.3]) - 0.05) < 1e-12 and _dc.beyond_dyno_mps([0.2, -0.2]) == 0.
+    _deq = _dd.equivalent_linear_c(_dset, 0.05)
+    assert abs(_deq['comp_Nspm'] - _dd.force(0.05, _dset) / 0.05) < 1e-9 and abs(_deq['c_Nspm'] - 0.5 * (_deq['comp_Nspm'] + _deq['reb_Nspm'])) < 1e-9
+    # real Ohlins file, when digitised
+    _dreal = os.path.join('DESIGN_2027', 'ohlins_ttx25', 'ttx25_mkII_dyno.json')
+    _dreal_note = 'real Ohlins file not present'
+    if os.path.isfile(_dreal):
+        _drd = _DM.DamperDyno.from_file(_dreal)
+        _drw, _drdup = _dreproduce(_drd)
+        assert _drw <= 0.03, f'real dyno file: superposition misses a measured curve by {100*_drw:.2f} %'
+        for _drv in _drd.valve_specs:
+            _drF = _drd.force(np.linspace(-0.4, 0.4, 801), dict(_dset, valve=_drv))
+            assert np.all(np.diff(_drF) >= 0), f'real dyno {_drv}: F(v) not monotone'
+        _dreal_note = (f'real Ohlins file ({len(_drd.valve_specs)} valve specs) reproduced within {100*_drw:.2f} % '
+                       f'(sheet\'s own LS0/HS4.3 duplicate differs by up to {100*_drdup:.1f} % of peak)')
+    # PATH layout (2008 / 2011 sheets: LS and HS move together).  Built in
+    # memory from the fixture: every printed setting reproduced, HS snapped
+    # onto the path and flagged, force monotone in clicks between settings;
+    # sheet_curves / compare_curve / leave_one_out run on it.
+    _dpsheet = {'damper': 'path fixture', 'units': {'velocity': 'mm/s', 'force': 'N'},
+                'valve_specs': {'P1': {'settings': {}}}}
+    _dpv = np.array([0., 5., 12.7, 25., 50., 100., 150., 200., 250.])
+    for _dls, _dhs in ((0, 4.3), (6, 3.), (12, 2.), (24, 0.)):
+        _dpsheet['valve_specs']['P1']['settings'][f'{_dls}-{_dhs:g}'] = {
+            'ls_clicks': _dls, 'hs_turns': _dhs,
+            'comp': _dfix_curves(_dls, _dhs, False, _dpv), 'reb': _dfix_curves(_dls, _dhs, True, _dpv)}
+    _dpd = _DM.DamperDyno(_dpsheet)
+    assert _dpd.layout('P1') == 'path'
+    _dprec = _DM.reproduce_sheet(_dpd)
+    assert len(_dprec) == 4 and _DM.check_summary(_dprec)['max_abs_N'] < 1e-3, 'path layout misses a printed setting'
+    _dps = _dpd.normalize_setting({'valve': 'P1', 'lsc': 9, 'hsc': 4.0, 'lsr': 9, 'hsr': 2.5})
+    assert abs(_dps['hsc'] - 2.5) < 1e-12 and _dps['off_path'] == ['hsc'], _dps
+    _dpF = [_dpd.force(0.1, {'valve': 'P1', 'lsc': x, 'hsc': 0, 'lsr': x, 'hsr': 0}) for x in range(0, 25)]
+    assert np.all(np.diff(_dpF) <= 1e-9), 'path model: more LS clicks must not add force'
+    assert len(_DM.leave_one_out(_dpsheet)) == 2
+    # every printed curve of the real sheets recreated by the model
+    _dsheet_note = ''
+    for _dsf in ('ttx25_mkII_dyno.json', 'ttx25_2011_dyno.json', 'ttx25_2008_dyno.json'):
+        _dsp = os.path.join('DESIGN_2027', 'ohlins_ttx25', _dsf)
+        if os.path.isfile(_dsp):
+            _dsd = _DM.DamperDyno.from_file(_dsp)
+            _dsr = [r for r in _DM.reproduce_sheet(_dsd) if r['group'] != 'comparison']
+            _dsm = _DM.check_summary(_dsr)
+            assert _dsm['n'] == sum(('comp' in r) + ('reb' in r) for r in _dsr), f'{_dsf}: a printed curve was not like-for-like'
+            assert _dsm['max_abs_N'] <= 3.0, f'{_dsf}: model misses a printed curve by {_dsm["max_abs_N"]:.1f} N'
+            _dsheet_note += f'{_dsf.split("_")[1]} {len(_dsr)} curves <= {_dsm["max_abs_N"]:.1f} N; '
+
+    # ONE MODEL hookup on the design config
+    from PyQt6.QtWidgets import QApplication as _DQA
+    _dw = MainWindow(); _dw._load_project_from_path(_design); _dw._rebuild_solvers(0.)
+    _ddecl = _dw._car.pop('damper', None)          # a design's own block (v170+): must load
+    if isinstance(_ddecl, dict) and _ddecl.get('model') == 'dyno':
+        _dw._car['damper'] = _ddecl
+        assert _dw._damper_model() is not None, 'the design declares a damper that does not load'
+        _dw._car.pop('damper')
+    assert _dw._damper_model() is None
+    _dnod = os.path.join(os.path.dirname(_dpath), 'design_without_damper.vahan')
+    _dw._save_project_to_path(_dnod)
+    _dveh = _dw._build_dynamics_solver()._veh
+    _dw._switch_page(7); _drp = _dw._ride_page
+    _dinp = _dreplace(_drp.inputs(_dveh), speeds_mps=(20.,), coherence='coherent', record_length_m=200.)
+    assert _dinp.damper is None and _dinp.corner_damping_Nspm == tuple(float(_drp._damp[c].value()) for c in ('FL', 'FR', 'RL', 'RR'))
+    _dcase = _DRS.build_road_cases(_dinp, _dveh.wheelbase_m)[0]
+    _dst = _DRS.current_car_study(_dveh, _dinp)
+    _dmodel = _DRideModel.from_vehicle(_dveh, pitch_inertia_kgm2=_dinp.pitch_inertia_kgm2,
+                                       roll_inertia_kgm2=_dinp.roll_inertia_kgm2,
+                                       corner_damping_Nspm=list(_dinp.corner_damping_Nspm))
+    # about the aero-loaded state at the case speed when the design applies aero (2026-10-19)
+    _dmodel, _ = _DRS.loaded_model(_dmodel, _dinp, _dcase.speed_mps)
+    _dload = _dmodel.periodic_response(_dcase.dt_s, _dcase.road_heights_m)['dynamic_tire_load_N'] + _dmodel.baseline_loads
+    _ddlc0 = np.sqrt(np.mean((_dload - _dload.mean(0)) ** 2, 0)) / _dload.mean(0)
+    assert np.max(np.abs(_dst['metrics'][0].dlc - _ddlc0)) < 1e-9 and 'damping_kind' not in _dst, 'no-damper ride DLC changed'
+    # contact_response: linear law through the nonlinear hook == matrix path; RK4 == DOP853
+    _dn = 1500; _dt = np.arange(_dn) * _dcase.dt_s; _droad = _dcase.road_heights_m[:_dn]
+    _dc0 = np.asarray(_dinp.corner_damping_Nspm)
+    _da = _dmodel.contact_response(_dt, _droad)
+    _db = _dmodel.contact_response(_dt, _droad, damper_force_fn=lambda v: _dc0 * np.asarray(v))
+    _dspan = float(np.ptp(_da['normal_load_N']))
+    assert np.max(np.abs(_da['normal_load_N'] - _db['normal_load_N'])) < 1e-4 * _dspan, 'linear damper_force_fn != damping matrix'
+    _dwd = _DM.WheelDampers(_dd, _dset, _DRS.corner_motion_ratios(_dveh))
+    _dr1 = _dmodel.contact_response(_dt, _droad, damper_force_fn=_dwd)
+    _dr2 = _dmodel.contact_response(_dt, _droad, damper_force_fn=_dwd, integrator='rk4')
+    assert np.max(np.abs(_dr1['normal_load_N'] - _dr2['normal_load_N'])) < 5e-3 * _dspan, 'RK4 != DOP853 on the dyno law'
+    # declare the damper (in memory) -> every consumer reads it
+    _dw._car['damper'] = {'model': 'dyno', 'dyno_file': _dpath, **{k: _dset[k] for k in ('valve', 'lsc', 'hsc', 'lsr', 'hsr')}}
+    _dpm = _dw._damper_model()
+    assert _dpm is not None and _dpm.setting['lsc'] == 6. and not _dpm.setting['clamped']
+    # 'every dyno curve' tab: the project-setting line IS the model's force
+    _drp._refresh_damper_info()
+    _dsl = [l for a in _drp._figs['dynosheet'].axes for l in a.get_lines() if l.get_label().startswith('project:')]
+    assert _dsl, 'every-curve tab has no project-setting line'
+    # the tab's pickers: hiding the project line removes it, the printed curves can be ticked off, an added setting draws
+    _drp._ds_proj.setChecked(False)
+    assert not [l for a in _drp._figs['dynosheet'].axes for l in a.get_lines() if l.get_label().startswith('project:')], 'project line not hidden'
+    _drp._ds_proj.setChecked(True)
+    assert _drp._ds_list.count() > 0, 'dyno tab curve list empty'
+    _drp._ds_added.append((_dpm.setting['valve'], 3.0, 2.0)); _drp._plot_dyno_sheet(_dpm)
+    assert [l for a in _drp._figs['dynosheet'].axes for l in a.get_lines() if l.get_label().startswith('added LS 3')], 'added setting not drawn'
+    _drp._ds_added.clear(); _drp._plot_dyno_sheet(_dpm)
+    assert np.allclose(_dsl[0].get_ydata(), _dpm.dyno.force(np.asarray(_dsl[0].get_xdata()) / 1000., _dpm.setting), atol=1e-6)
+    _dinp2 = _dreplace(_drp.inputs(_dveh), speeds_mps=(20.,), coherence='coherent', record_length_m=200.)
+    assert _dinp2.damper is not None and np.allclose(_dinp2.damper.mr, _DRS.corner_motion_ratios(_dveh))
+    _dst2 = _DRS.current_car_study(_dveh, _dinp2)
+    _de = _dst2['damper_equivalent'][0]
+    assert _dst2['damping_kind'] == 'dyno' and _de['converged'] and _de['iterations'] <= 10
+    assert _dst2['metrics'][0].kind.startswith('time domain')
+    _dvr = _de['damper_v_rms_mps']
+    assert np.allclose(_de['c_wheel_Nspm'], _dwd.equivalent_wheel_c(_dvr)[0], rtol=2e-3), 'equivalent c not at the case RMS damper velocity'
+    _dparams = _dw._skidpad_panel.get_params()
+    _dcphi, _dfn, _dsrc = _dw._transient_roll_damping(_dparams, _dveh)
+    assert _dfn is not None and _dsrc.startswith('dyno')
+    _dmr = _DRS.corner_motion_ratios(_dveh)
+    _dman = sum(0.5 * t * m * (_dd.force(m * 0.5 * t * 0.1, _dset) - _dd.force(-m * 0.5 * t * 0.1, _dset))
+                for t, m in ((_dveh.front_track_m, _dmr[0]), (_dveh.rear_track_m, _dmr[2])))
+    assert abs(_dfn(0.1) - _dman) < 1e-6 * abs(_dman) and abs(_dfn(-0.1) + _dman) < 1e-6 * abs(_dman), 'roll moment != dyno pure-roll moment'
+    _dw._sync_damper_consumers()
+    assert not _dw._skidpad_panel._dmp_F_bump.isEnabled(), 'skidpad linear spins still live with a dyno damper'
+    # round trip + no leak
+    _dsave = os.path.join(os.path.dirname(_dpath), 'damper_roundtrip.vahan')
+    _dw._save_project_to_path(_dsave)
+    _dw2 = MainWindow(); _dw2._load_project_from_path(_dsave)
+    assert _dw2._car.get('damper') == _dw._car['damper'], 'damper block lost in save -> load'
+    _dw2._load_project_from_path(_dnod)
+    assert 'damper' not in _dw2._car and _dw2._damper_model() is None, 'damper block leaked into a project without one'
+    _dw2._sync_damper_consumers()
+    assert _dw2._skidpad_panel._dmp_F_bump.isEnabled()
+    # back to no damper -> the old numbers again
+    _dw._car.pop('damper')
+    _dst3 = _DRS.current_car_study(_dveh, _dreplace(_drp.inputs(_dveh), speeds_mps=(20.,), coherence='coherent', record_length_m=200.))
+    assert np.max(np.abs(_dst3['metrics'][0].dlc - _ddlc0)) < 1e-9
+    _dw.close(); _dw2.close()
+    print(f'dyno dampers     : superposition reproduces the fixture within {100*_dworst:.2e} %; F(0)=0, monotone, '
+          f'clicks/turns ordered, 50 mm/s secant flagged; no-damper DLC identical; dyno study time-domain '
+          f'({_de["iterations"]} it, c_wheel F {_de["c_wheel_Nspm"][0]:.0f} N s/m); roll moment = dyno; '
+          f'save/load, no leak; {_dreal_note}; path layout ok; {_dsheet_note}every-curve tab   pass')
+except Exception as _derr:
+    fails += 1
+    import traceback as _dtb; _dtb.print_exc()
+    print(f'dyno dampers     : UNEXPECTED FAIL ({type(_derr).__name__}: {_derr})')
 
 # ── Corner Speed page (Ctrl+9) + vahan/corner_speed.py.  The page must build
 #    offscreen on the design config; its blocking compute must return the
@@ -4821,7 +5768,10 @@ try:
         _sts = _bw._solvers[_r['corner']].solve(0.0); _arm, _pk = _r['pickup'].split('_')
         _lg = getattr(_sts, f'{_arm}_outer') - getattr(_sts, _r['pickup']); _lg = _lg / np.linalg.norm(_lg)
         _want = 0.0 if _r['orientation'] == 'normal' else 90.0 - np.degrees(np.arccos(abs(_lg @ _SBn.pivot_axis(_sts, _arm))))
-        if abs(_r['tilt_installed_deg'] - _want) > 1e-6 or _r['tilt_worst_deg'] < _r['tilt_installed_deg'] - 1e-9:
+        # 1e-4 deg: tilt_deg() is an arccos, whose round-off floor near 0 deg is sqrt(2 eps) rad = 1.2e-6 deg
+        # (2026-10-07: the 'normal' bore of FL lca_front read 1.2e-6 deg against the 0.0 hand value and the old
+        # 1e-6 deg gate reported it as '0.000 != 0.000' -- a net tolerance bug, not a page bug).
+        if abs(_r['tilt_installed_deg'] - _want) > 1e-4 or _r['tilt_worst_deg'] < _r['tilt_installed_deg'] - 1e-9:
             _bf.append(f"{_r['corner']} {_r['pickup']} {_r['orientation']} built-in tilt {_r['tilt_installed_deg']:.3f} != hand {_want:.3f}"); break
     # force split at the ends: recompute one case directly through the Loads-page path
     from gui import wheel_package as _WPb
@@ -4981,6 +5931,64 @@ except Exception as _e:
     import traceback as _tbp; _tbp.print_exc()
     print(f'pitch + aero sink: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
+# ── PITCH vs LONG g + the "constant 1 deg" pitch on a lateral sweep (2026-11-14, failing-then-passing) ──
+# User: "pitch is fucked, no plotting against long, and pitch shows constant 1 deg over lateral g".
+# Root cause: there was no long-g sweep in the Dynamics panel; the Long g box is a HELD value on a
+# lateral sweep, and with aero on _DynamicsSweepWorker._sweep_with_aero skipped the friction-circle
+# clamp, so a typed -2 g was held at every lateral g -> a flat 1.009 deg (no-aero path clamps).
+# Now: (1) lateral sweep at long g 0 -> pitch 0 on both paths; (2) held long g on the aero path is
+# grip-limited (pitch not flat, falls past the circle); (3) Test 'Braking / accel (long g)' runs
+# SteadyStateSolver.sweep_longitudinal_g: finite, + nose down braking, - accelerating, monotonic.
+try:
+    from gui.main_window import _DynamicsSweepWorker as _LSW
+    _lw = MainWindow(); _lw._load_project_from_path(_design); _lw._rebuild_solvers(0.)
+    _lss = _lw._build_dynamics_solver(); _lf = []
+    _apg = _lw._get_aero_Fz_per_g() or {'FL': 50.0, 'FR': 50.0, 'RL': 60.0, 'RR': 60.0}
+
+    def _lrun(**kw):
+        _o = []
+        _wk = _LSW(_lss, kw.pop('g0'), kw.pop('g1'), kw.pop('n', 9), **kw)
+        _wk.finished.connect(_o.append); _wk.failed.connect(lambda m: _lf.append('worker: ' + m)); _wk.run()
+        return _o[0] if _o else {}
+    for _ap in (None, _apg):
+        _s0 = _lrun(g0=0.0, g1=2.0, longitudinal_g=0.0, mode='combined', aero_Fz_per_g=_ap)
+        if np.max(np.abs(_s0.get('pitch_angle_deg', [9.0]))) > 1e-9:
+            _lf.append(f'lateral sweep pitch not 0 (aero {_ap is not None})')
+    _s2 = _lrun(g0=0.0, g1=2.0, longitudinal_g=-2.0, mode='combined', aero_Fz_per_g=_apg)
+    _p2 = np.asarray(_s2.get('pitch_angle_deg', [1.009] * 9))
+    if np.ptp(_p2) < 0.05 or _p2[-1] >= _p2[0] or 'lon_g_applied' not in _s2:
+        _lf.append(f'held -2 g with aero: pitch flat {_p2.min():.3f}..{_p2.max():.3f} deg (no grip limit)')
+    _lp = _lw._dynamics_panel; _specs = []
+    _lp.sweep_requested.connect(_specs.append)
+    _li = _lp._test_mode.findData('lon_sweep')
+    if _li < 0:
+        _lf.append('no Braking / accel (long g) test mode')
+    else:
+        _lp._test_mode.setCurrentIndex(_li); _lp._on_sweep()
+        if not _specs or _specs[-1].get('mode') != 'lon_sweep' or _specs[-1]['g_min'] >= 0:
+            _lf.append(f'panel spec {_specs[-1:]}')
+    _af = _lw._lon_sweep_aero_Fz(_apg, 0.0)
+    _sl = _lrun(g0=-1.5, g1=1.5, n=13, mode='lon_sweep', aero_Fz_fixed=_af)
+    _pl = np.asarray(_sl.get('pitch_angle_deg', [np.nan]), float); _gl = np.asarray(_sl.get('longitudinal_g', [0.0]))
+    _brk = float(np.interp(-1.0, _gl, _pl)) if len(_pl) == len(_gl) else np.nan
+    _acc = float(np.interp(1.0, _gl, _pl)) if len(_pl) == len(_gl) else np.nan
+    if not (np.all(np.isfinite(_pl)) and _brk > 0 and _acc < 0 and np.all(np.diff(_pl) < 0)):
+        _lf.append(f'long-g pitch braking {_brk:.3f} accel {_acc:.3f} (want + / -, monotonic)')
+    from vahan.channels import dyn_channels as _ldc
+    if 'longitudinal_g' not in {c.key for c in _ldc(_sl)}:
+        _lf.append('plot anything: no longitudinal g x axis')
+    _ptf = float(np.interp(-1.0, _gl, _sl.get('pitch_travel_front_mm', np.zeros(len(_gl)))))
+    _ptr = float(np.interp(-1.0, _gl, _sl.get('pitch_travel_rear_mm', np.zeros(len(_gl)))))
+    print(f'pitch vs long g  : braking {_brk:+.3f} deg/g (F {_ptf:+.1f} / R {_ptr:+.1f} mm at -1 g), '
+          f'accel {_acc:+.3f} deg/g, + = nose down; held -2 g on lateral sweep {_p2[0]:.3f}->{_p2[-1]:.3f} deg'
+          + ('' if not _lf else '   UNEXPECTED FAIL: ' + '; '.join(_lf)))
+    if _lf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbl; _tbl.print_exc()
+    print(f'pitch vs long g  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
 # ── STEER-SWEEP TURN RADIUS + SWEEP MOTION RATIO graphs (2026-09-29, failing-then-passing) ──
 # (1) compute_turn_radius_post averaged the two RAW toe angles (opposite sign
 #     conventions per side), so a steered pair nearly cancelled: v150 read 25.5 m
@@ -5051,6 +6059,853 @@ except Exception as _e:
     fails += 1
     import traceback as _tbr; _tbr.print_exc()
     print(f'turn radius + MR : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── CASTER JACKING (2026-10-07): steer-sweep ride-height change + weight lifted ──
+# The steer sweep's caster_jack_mm is the ride-height change at each front
+# corner with the spring FROZEN (the travel at which the steered corner's spring
+# is back at its straight-ahead length; vahan.steering.caster_jacking), + =
+# chassis UP; caster_jack_N = that lift x the dynamics front wheel rate.
+# Hand check WITHOUT the solver: with the spring frozen the upright can only
+# turn about the STATIC kingpin axis (lca_outer -> uca_outer), so rotate the
+# static wheel centre + spin axis rigidly about that axis by the angle that puts
+# tie_rod_outer at tie-rod length from the rack-shifted tie_rod_inner, and read
+# the contact-patch Z (vahan.loads.contact_patch_point).  Gates: zero at zero
+# steer, FL(+d) = FR(-d) on this symmetric car, N = mm x wheel rate, and the
+# hand lift at +-lock and +-half lock within 0.01 mm.
+try:
+    from vahan.loads import contact_patch_point as _cpp_cj
+    from vahan.corner_speed import full_lock_handwheel_deg as _flh_cj
+    from vahan.steering import rack_travel_from_handwheel_deg as _rtf_cj
+    from vahan.solver import _rodrigues as _rod_cj
+    _cw = MainWindow(); _cw._load_project_from_path(_design); _cw._rebuild_solvers(0.)
+    _cf = []
+    _hl = _flh_cj(_cw._steer)
+    _jb = _cw._snapshot_sweep_job(); _jb['motion'] = 'steer'; _jb['lo'] = -_hl; _jb['hi'] = _hl
+    _out = _cw._compute_sweep(_jb)
+    _xs = np.asarray(_out['x_arr'], float); _srj = _out['sweep_results']
+    _hfl = np.asarray(_srj['FL']['caster_jack_mm'], float); _hfr = np.asarray(_srj['FR']['caster_jack_mm'], float)
+    _nfl = np.asarray(_srj['FL']['caster_jack_N'], float)
+    _kw_cj = float(_jb['wheel_rate_front_Npm']); _R_cj = float(_jb['tire_radius_m'])
+    if not (np.isfinite(_hfl).all() and np.isfinite(_hfr).all() and np.isfinite(_nfl).all()):
+        _cf.append(f'non-finite stations: FL {int((~np.isfinite(_hfl)).sum())}, FR {int((~np.isfinite(_hfr)).sum())}')
+    _i0 = int(np.argmin(np.abs(_xs)))
+    if abs(_hfl[_i0]) > 1e-6 or abs(_hfr[_i0]) > 1e-6:
+        _cf.append(f'lift at zero steer {_hfl[_i0]:.2e} / {_hfr[_i0]:.2e} mm (want 0)')
+    if np.nanmax(np.abs(_hfl - _hfr[::-1])) > 1e-6:
+        _cf.append(f'FL(+d) != FR(-d): max {np.nanmax(np.abs(_hfl - _hfr[::-1])):.2e} mm')
+    if np.nanmax(np.abs(_nfl - _hfl / 1000.0 * _kw_cj)) > 1e-6:
+        _cf.append('caster_jack_N != caster_jack_mm x wheel rate')
+    # hand check: rigid rotation about the static kingpin
+    _s0 = _jb['solvers']['FL'].solve(0.)
+    _ax = _s0.uca_outer - _s0.lca_outer; _ax = _ax / np.linalg.norm(_ax); _org = _s0.lca_outer
+    _L = float(np.linalg.norm(_s0.tr_outer - _s0.tr_inner))
+    _cp0 = float(_cpp_cj(_s0.wheel_center, _s0.spin_axis, _R_cj)[2])
+    def _rotp(p, phi): return _org + _rod_cj(np.asarray(p, float) - _org, _ax, phi)
+    _worst_hand = 0.0
+    for _ang in (-_hl, -_hl / 2, _hl / 2, _hl):
+        _tri = _s0.tr_inner + np.array([_rtf_cj(_ang, _cw._steer), 0., 0.])
+        _g = lambda phi: float(np.linalg.norm(_rotp(_s0.tr_outer, phi) - _tri)) - _L
+        _grid = np.radians(np.linspace(-70, 70, 1401)); _gv = np.array([_g(p) for p in _grid])
+        _roots = [k for k in range(len(_grid) - 1) if _gv[k] * _gv[k + 1] <= 0]
+        if not _roots:
+            _cf.append(f'hand check: no kingpin rotation closes the tie rod at {_ang:+.0f} deg'); continue
+        _k = min(_roots, key=lambda k: abs(_grid[k]))
+        _a, _b = _grid[_k], _grid[_k + 1]
+        for _ in range(60):
+            _m = 0.5 * (_a + _b)
+            if _g(_a) * _g(_m) <= 0: _b = _m
+            else: _a = _m
+        _phi = 0.5 * (_a + _b)
+        _wc1 = _rotp(_s0.wheel_center, _phi); _sp1 = _rod_cj(np.asarray(_s0.spin_axis, float), _ax, _phi)
+        _h_hand = -(float(_cpp_cj(_wc1, _sp1, _R_cj)[2]) - _cp0) * 1000.0
+        _h_sweep = float(np.interp(_ang, _xs, _hfl))
+        _worst_hand = max(_worst_hand, abs(_h_hand - _h_sweep))
+        if abs(_h_hand - _h_sweep) > 0.01:
+            _cf.append(f'hand lift at {_ang:+.0f} deg {_h_hand:+.4f} mm vs sweep {_h_sweep:+.4f} mm')
+    print(f'caster jacking   : FL at -lock/+lock {_hfl[0]:+.2f}/{_hfl[-1]:+.2f} mm = {_nfl[0]:+.0f}/{_nfl[-1]:+.0f} N '
+          f'(wheel rate {_kw_cj:.0f} N/m); FL+FR at lock {_hfl[-1] + _hfr[-1]:+.2f} mm; rigid-kingpin hand check '
+          f'within {_worst_hand:.4f} mm' + ('' if not _cf else '   UNEXPECTED FAIL: ' + '; '.join(_cf)))
+    if _cf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbcj; _tbcj.print_exc()
+    print(f'caster jacking   : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── G-G DIAGRAM (2026-10-07): solved (lateral g, longitudinal g) envelope ──────
+# SteadyStateSolver.gg_envelope bisects, at each lateral station, the forward
+# and the braking g the FULL solve holds with axle_utilization <= 1 (the
+# canonical pair-budget limit); the Dynamics page draws it as the 'G-G Diagram'
+# graph.  Gates: finite, mirror-symmetric, accel >= 0 >= brake; the lateral
+# limit agrees with corner_speed's axle bisection (same criterion, same
+# solver); the boundary IS a boundary (a solve just inside holds, just outside
+# does not); the solver is left/right symmetric (what justifies the mirror);
+# the picker has the key and CurvesCanvas draws the axes.
+try:
+    import time as _time_gg
+    from vahan.corner_speed import per_corner_limit_g as _pclg
+    _gw = MainWindow(); _gw._load_project_from_path(_design)
+    _gss = _gw._build_dynamics_solver()
+    _gf = []
+    _t0 = _time_gg.perf_counter()
+    _env = _gss.gg_envelope(n_ay=5, iters=7)
+    _dt = _time_gg.perf_counter() - _t0
+    _ay = np.asarray(_env['ay_g'], float); _acc = np.asarray(_env['ax_accel_g'], float)
+    _brk = np.asarray(_env['ax_brake_g'], float)
+    if not (np.isfinite(_ay).all() and np.isfinite(_acc).all() and np.isfinite(_brk).all()):
+        _gf.append('non-finite envelope')
+    else:
+        if not (np.allclose(_ay, -_ay[::-1]) and np.allclose(_acc, _acc[::-1]) and np.allclose(_brk, _brk[::-1])):
+            _gf.append('envelope not mirror-symmetric')
+        if (_acc < -1e-9).any() or (_brk > 1e-9).any():
+            _gf.append('accel branch below 0 or brake branch above 0')
+        _lim_cs = float(_pclg(_gss, criterion='axle', iters=12)['limit_g'])
+        if abs(_env['ay_limit_g'] - _lim_cs) > 0.02:
+            _gf.append(f"lateral limit {_env['ay_limit_g']:.3f} g vs corner_speed axle limit {_lim_cs:.3f} g")
+        _i = len(_ay) // 2 + 1                     # first station with ay > 0
+        _ayi = float(_ay[_i])
+        for _sgn, _val in ((+1, float(_acc[_i])), (-1, float(_brk[_i]))):
+            _ui = max(_gss.axle_utilization(_gss.solve(_ayi, _val - _sgn * 0.02)).values())
+            try:
+                _uo = max(_gss.axle_utilization(_gss.solve(_ayi, _val + _sgn * 0.05)).values())
+            except Exception:
+                _uo = float('inf')
+            if not (_ui <= 1.0 < _uo):
+                _gf.append(f'boundary at ay {_ayi:.2f} g {"accel" if _sgn > 0 else "brake"} {_val:+.3f} g: '
+                           f'inside util {_ui:.3f}, outside {_uo:.3f}')
+        _up = max(_gss.axle_utilization(_gss.solve(_ayi, 0.3)).values())
+        _um = max(_gss.axle_utilization(_gss.solve(-_ayi, 0.3)).values())
+        if abs(_up - _um) > 1e-6:
+            _gf.append(f'solver not left/right symmetric ({_up:.6f} vs {_um:.6f}): mirror not justified')
+    if 'gg' not in _gw._dynamics_panel._graph_checks:
+        _gf.append("'gg' missing from the Dynamics graph picker")
+    _sw = _gss.sweep_combined(lat_range=(0.0, 1.5), lon_g=-0.3, n_points=5); _sw['gg'] = _env
+    _gw.curves.plot_dynamics(_sw, graphs=['fz', 'gg'])
+    _tt = [a.get_title() for a in _gw.curves.fig.axes]
+    if 'G-G Diagram' not in _tt:
+        _gf.append(f'G-G axes not drawn (titles {_tt})')
+    _mx = _gss.max_accel_g()
+    print(f"G-G diagram      : lateral limit {_env['ay_limit_g']:.3f} g, accel tip {_env['accel_tip_g']:.3f} g, "
+          f"brake tip {_env['brake_tip_g']:+.3f} g (max_accel_g traction {_mx['traction_g']:.3f} / braking "
+          f"{_mx['braking_g']:.3f} g); {_env['n_solves']} solves in {_dt:.1f} s"
+          + ('' if not _gf else '   UNEXPECTED FAIL: ' + '; '.join(_gf)))
+    if _gf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbgg; _tbgg.print_exc()
+    print(f'G-G diagram      : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── G-G ENVELOPE LOAD CASES (user 2026-10-21): the Loads page slides the case
+# around the border of the fixed-speed envelope (aero at that speed, engine cap
+# on the forward side).  Gates: the 90 deg / 0 deg border points ARE the
+# lateral limit / braking tip; the forward tip respects the engine at that
+# speed; the worst-loads sweep is never below the loads solved at a border
+# point it visited (same compute_case path).
+try:
+    from gui import wheel_package as _WPgg
+    _gf2 = []
+    _vgg = 72.4
+    _eg = _WPgg.gg_envelope_at(_gw, _vgg, n_ay=7, iters=7, engine_limit=True)
+    _p90 = _WPgg.gg_border_point(_eg, 90.0); _p0 = _WPgg.gg_border_point(_eg, 0.0)
+    if abs(_p90[0] - _eg['ay_limit_g']) > 1e-6 or abs(_p90[1]) > 1e-6:
+        _gf2.append(f'90 deg point {_p90} != lateral limit {_eg["ay_limit_g"]:.3f}')
+    if abs(_p0[1] - _eg['brake_tip_g']) > 1e-6 or abs(_p0[0]) > 1e-6:
+        _gf2.append(f'0 deg point {_p0} != braking tip {_eg["brake_tip_g"]:.3f}')
+    _veg = _gw._build_dynamics_solver()._veh
+    if _veg.wheel_power_W > 0.0:
+        _cap = float(_veg.drive_force_at_v_N(_vgg / 3.6)) / (float(_veg.total_mass_kg) * 9.80665)
+        if _eg['accel_tip_g'] > _cap + 1e-6:
+            _gf2.append(f"forward tip {_eg['accel_tip_g']:.3f} g above the engine cap {_cap:.3f} g")
+    # default = tyre-limited (user 2026-10-21): the forward tip may pass the
+    # engine cap but never the engine-capped envelope's own lateral / braking
+    _et = _WPgg.gg_envelope_at(_gw, _vgg, n_ay=7, iters=7)
+    if _et['engine_limit'] or _et['accel_tip_g'] + 1e-6 < _eg['accel_tip_g']:
+        _gf2.append(f"tyre-limited forward tip {_et['accel_tip_g']:.3f} g below the engine-capped {_eg['accel_tip_g']:.3f} g")
+    if abs(_et['brake_tip_g'] - _eg['brake_tip_g']) > 1e-6:
+        _gf2.append(f"engine cap changed the braking tip ({_et['brake_tip_g']:.3f} vs {_eg['brake_tip_g']:.3f} g)")
+    _wg = _WPgg.gg_worst_loads(_gw, _eg, n=8)
+    _lfl = _WPgg.compute_case(_gw, _p90[0], _p90[1], speed_kph=_vgg)[0]['FL']
+    _row = {(r['corner'], r['item']): r['max_abs'] for r in _wg['rows']}
+    for _k in ('lca_front_N', 'lca_rear_N', 'pushrod_N'):
+        if _row.get(('FL', _k), -1.0) + 1e-6 < abs(getattr(_lfl, _k)):
+            _gf2.append(f'worst {_k} {_row.get(("FL", _k))} below the 90 deg value {getattr(_lfl, _k):.1f}')
+    print(f"G-G envelope loads: {_vgg} km/h lateral {_eg['ay_limit_g']:.3f} g, braking {_eg['brake_tip_g']:+.3f} g, "
+          f"forward {_eg['accel_tip_g']:.3f} g (tyre-limited {_et['accel_tip_g']:.3f} g); "
+          f"{len(_wg['points'])} border points, {len(_wg['rows'])} worst rows"
+          + ('' if not _gf2 else '   UNEXPECTED FAIL: ' + '; '.join(_gf2)))
+    if _gf2:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbgg2; _tbgg2.print_exc()
+    print(f'G-G envelope loads: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── RC RELATIVE TO THE CG + LOAD-VECTOR ANGLES (user 2026-10-08) ─────────────
+# Graph keys rc_dz_cg / rc_dx_cg / rc_angle_cg (axle) and roll_arm_cg (vehicle)
+# = the CG->RC vector in the chassis frame, filled by _compute_sweep next to
+# rc_height.  Gates: catalogue has the keys; a roll sweep fills them with
+# finite values; dz = cg_z - rc_height and dx = rc_lateral - cg_x to 1e-9;
+# lean = atan2(dx, dz); roll_arm_cg = cg_z - (rc_f*(1-b) + rc_r*b) at every
+# station.  Loads page: 6 columns, the Angle cell parses to three 0..180
+# numbers that match axis_angles_deg of the row vector, moments included;
+# every resultant / moment hover label carries the same '∠' text.
+try:
+    from vahan.metrics_catalog import CATALOG_MAP as _CMcg
+    from gui.wheel_package import axis_angles_deg as _axang, load_arrows as _la_cg, _load_items as _li_cg
+    from PyQt6.QtCore import Qt as _Qtcg
+    from gui.loads_page import LoadsPage as _LPcg
+    import re as _re_cg
+    _cgf = []
+    for _k, _sc in (('rc_dz_cg', 'axle'), ('rc_dx_cg', 'axle'), ('rc_angle_cg', 'axle'), ('roll_arm_cg', 'vehicle')):
+        if _k not in _CMcg or _CMcg[_k]['scope'] != _sc:
+            _cgf.append(f'catalogue {_k} missing / scope != {_sc}')
+    _wcg = MainWindow(); _wcg._load_project_from_path(_design); _wcg._rebuild_solvers(0.)
+    # +-2 deg (> 5 g at v179's 0.36 deg/g): at +-3 deg the inner rear of a MR 0.74 car needs ~32 mm droop, past
+    # the damper's full extension (~28 mm), so that corner has no solution -- a travel limit, not a metric fault
+    _jcg = _wcg._snapshot_sweep_job(); _jcg['motion'] = 'roll'; _jcg['lo'], _jcg['hi'] = -2.0, 2.0
+    _rcg = _wcg._compute_sweep(_jcg)['sweep_results']
+    _carcg = _wcg._car
+    _cgx, _cgy, _cgz = (float(_carcg.get('cg_x_mm', 0.)), float(_carcg.get('cg_y_mm', 845.)), float(_carcg.get('cg_z_mm', 280.)))
+    _bcg = _cgy / float(_carcg['wheelbase_mm'])
+    for _lbl in ('FL', 'FR', 'RL', 'RR'):
+        _r = _rcg[_lbl]
+        for _k in ('rc_dz_cg', 'rc_dx_cg', 'rc_angle_cg', 'roll_arm_cg'):
+            if _k not in _r or not np.all(np.isfinite(np.asarray(_r[_k], float))):
+                _cgf.append(f'{_lbl} {_k} missing / non-finite')
+        if _cgf:
+            break
+        _rh, _rl = np.asarray(_r['rc_height'], float), np.asarray(_r['rc_lateral'], float)
+        if np.max(np.abs(np.asarray(_r['rc_dz_cg']) - (_cgz - _rh))) > 1e-9: _cgf.append(f'{_lbl} rc_dz_cg != cg_z - rc_height')
+        if np.max(np.abs(np.asarray(_r['rc_dx_cg']) - (_rl - _cgx))) > 1e-9: _cgf.append(f'{_lbl} rc_dx_cg != rc_lateral - cg_x')
+        _lean = np.degrees(np.arctan2(_rl - _cgx, _cgz - _rh))
+        if np.max(np.abs(np.asarray(_r['rc_angle_cg']) - _lean)) > 1e-9: _cgf.append(f'{_lbl} rc_angle_cg != atan2(dx, dz)')
+    if not _cgf:
+        _rcf, _rcr = np.asarray(_rcg['FL']['rc_height'], float), np.asarray(_rcg['RL']['rc_height'], float)
+        _arm = _cgz - (_rcf * (1 - _bcg) + _rcr * _bcg)
+        for _lbl in ('FL', 'FR', 'RL', 'RR'):
+            if np.max(np.abs(np.asarray(_rcg[_lbl]['roll_arm_cg']) - _arm)) > 1e-9:
+                _cgf.append(f'{_lbl} roll_arm_cg != cg_z - roll axis at CG station')
+    _i0cg = int(np.argmin(np.abs(np.asarray(_rcg['FL'].get('rc_height', [0.]), float) * 0 + np.linspace(-3, 3, len(_rcg['FL']['rc_height'])))))
+    # Loads page angle column + hover labels
+    _lp = _LPcg(_wcg); _lp._corner.setCurrentText('FL'); _lp._lat_g.setValue(1.5); _lp._lon_g.setValue(0.0)
+    _lp._refresh_table()
+    if _lp._tbl.columnCount() != 6: _cgf.append(f'loads table columns {_lp._tbl.columnCount()} != 6')
+    _its_cg = _li_cg(_wcg, 1.5, 0.0, only_corner='FL')
+    _by_dir = {f'{v[0]:+,.0f} / {v[1]:+,.0f} / {v[2]:+,.0f}': v for _p, v, _c, _l in _its_cg}   # Direction cell text -> vector
+    _n_mom = 0
+    for _row in range(_lp._tbl.rowCount()):
+        _mag = _lp._tbl.item(_row, 2).data(_Qtcg.ItemDataRole.DisplayRole)
+        _txt = _lp._tbl.item(_row, 4).text()
+        # cell = 'XY plane: θ ±a° ..., tilt ±b° ... · lat a° / f-a b° / vert c°' (2026-10-10): the
+        # three axis angles are the LAST three numbers; the plane part must be there too
+        _nums = [float(x) for x in _re_cg.findall(r'(-?\d+(?:\.\d+)?)°', _txt)][-3:]
+        if len(_nums) != 3 or any(x < 0 or x > 180 for x in _nums) or 'plane: θ' not in _txt:
+            _cgf.append(f'angle cell row {_row}: {_txt!r}'); break
+        _v = _by_dir.get(_lp._tbl.item(_row, 3).text())
+        if _v is not None:
+            _exp = _axang(_v)
+            if max(abs(a - b) for a, b in zip(_nums, _exp)) > 0.51:
+                _cgf.append(f'angle cell row {_row} {_nums} vs {_exp}'); break
+        if 'MOMENT' in _lp._tbl.item(_row, 5).text(): _n_mom += 1
+    if _n_mom == 0: _cgf.append('no moment rows carry an angle')
+    _arr_cg = _la_cg(_wcg, 1.5, 0.0, mode='resultant', only_corner='FL')
+    _no_ang = [l for _p, _t, _c, l in _arr_cg if '∠' not in l]
+    if _no_ang: _cgf.append(f'{len(_no_ang)} hover labels without angle, e.g. {_no_ang[0][:60]!r}')
+    _mom_lab = [l for _p, _t, _c, l in _arr_cg if 'N·m' in l]
+    if not _mom_lab or any('∠ axis' not in l for l in _mom_lab): _cgf.append('moment hover labels lack "∠ axis"')
+    _st = np.argmin(np.abs(np.linspace(-3, 3, len(_rcg['FL']['rc_dz_cg']))))
+    print(f"rc vs CG + angles: static dz F {float(_rcg['FL']['rc_dz_cg'][_st]):.1f} / R {float(_rcg['RL']['rc_dz_cg'][_st]):.1f} mm, "
+          f"dx F {float(_rcg['FL']['rc_dx_cg'][_st]):+.1f} / R {float(_rcg['RL']['rc_dx_cg'][_st]):+.1f} mm, "
+          f"roll arm {float(_rcg['FL']['roll_arm_cg'][_st]):.1f} mm; at +{_jcg['hi']:.0f} deg roll dx F {float(_rcg['FL']['rc_dx_cg'][-1]):+.1f} / R {float(_rcg['RL']['rc_dx_cg'][-1]):+.1f} mm, "
+          f"lean F {float(_rcg['FL']['rc_angle_cg'][-1]):+.1f} deg; loads table {_lp._tbl.rowCount()} rows x 6 cols, {_n_mom} moment rows, {len(_arr_cg)} labelled arrows"
+          + ('' if not _cgf else '   UNEXPECTED FAIL: ' + '; '.join(_cgf)))
+    if _cgf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbcg; _tbcg.print_exc()
+    print(f'rc vs CG + angles: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── CHASSIS STIFFNESS PAGE: three-spring load-transfer model (user 2026-10-09) ──
+# vahan/chassis_stiffness.py: front/rear sprung lumps on their own roll centres,
+# the frame as a torsion spring between the bays.  Gates: (1) rigid chassis
+# (k_c = inf) reproduces the Dynamics solver's elastic / geometric / unsprung
+# transfer at 1 g to 1e-6 N (ONE MODEL); (2) the 2x2 node solve equals the
+# team's closed form at three k_c; (3) k_c -> 0 gives each bay its own lump;
+# (4) kc_for_lltd inverts LLTD(k_c) (round trip 1e-6) and returns NaN outside
+# the reachable band; (5) LLTD is monotone in k_c and the gain rises 0 -> 1;
+# (6) the page builds at index 11 (Ctrl+Shift+2), its table matches the model,
+# the Model / LLTD tabs draw, bay outlines have tubes on both axles, and the
+# chassis_model state round-trips through save / load.
+try:
+    from vahan import chassis_stiffness as _CSm
+    from gui import chassis_page as _CPg
+    import tempfile as _tfc, json as _jsc
+    _cf = []
+    _wc = MainWindow(); _wc._load_project_from_path(_design); _wc._rebuild_solvers(0.)
+    # this gate compares the RIGID three-spring limit with the rigid solver: force the
+    # dynamics' chassis-compliance toggle off (the compliant path has its own gate below)
+    _wc._dynamics_panel.set_state({'chassis_compliance': False})
+    _ssc = _wc._build_dynamics_solver(); _vc = _ssc._veh
+    _r1 = _ssc.solve(1.0, 0.0)
+    _inp, _base = _CPg.page_inputs(_wc, {'a_y_g': 1.0})
+    _rig = _CSm.solve(_CSm.replace(_inp, k_c_Nm_rad=float('inf')), 1.0)
+    for _nm, _a, _b in (('elastic F', _rig.elastic_front_N, _r1.elastic_lt_front_N),
+                        ('elastic R', _rig.elastic_rear_N, _r1.elastic_lt_rear_N),
+                        ('geometric F', _rig.geometric_front_N, _r1.geometric_lt_front_N),
+                        ('geometric R', _rig.geometric_rear_N, _r1.geometric_lt_rear_N),
+                        ('unsprung F', _rig.unsprung_front_N, _r1.unsprung_lt_front_N),
+                        ('unsprung R', _rig.unsprung_rear_N, _r1.unsprung_lt_rear_N)):
+        if abs(float(_a) - float(_b)) > 0.01:      # solver iteration tolerance (RC updated per step)
+            _cf.append(f'rigid model {_nm} {_a:.4f} vs solver {_b:.4f} N')
+    for _kft in (500.0, 2000.0, 8000.0):
+        _ki = _CSm.replace(_inp, k_c_Nm_rad=_CSm.nm_deg_to_nm_rad(_CSm.ftlbf_deg_to_nm_deg(_kft)))
+        _e2 = _CSm.solve(_ki, 1.0).elastic_front_N; _ecf = _CSm.closed_form_front_elastic_N(_ki, 1.0)
+        if abs(_e2 - _ecf) > 1e-6:
+            _cf.append(f'closed form at {_kft:.0f} ft.lbf/deg: {_e2:.4f} vs {_ecf:.4f}')
+    _z = _CSm.solve(_CSm.replace(_inp, k_c_Nm_rad=0.0), 1.0)
+    if abs(_z.elastic_front_N - _z.M_f_Nm / _inp.t_f_m) > 1e-6 or abs(_z.elastic_rear_N - _z.M_r_Nm / _inp.t_r_m) > 1e-6:
+        _cf.append('k_c = 0 does not give each bay its own lump')
+    # inversion on a tuned split (the design split has ~no reachable band)
+    _tun = _CSm.replace(_inp, k_f_Nm_rad=_inp.k_f_Nm_rad * 1.6)
+    _kc_t = _CSm.nm_deg_to_nm_rad(1500.0)
+    _tgt = _CSm.solve(_CSm.replace(_tun, k_c_Nm_rad=_kc_t)).lltd_front
+    _kc_b = _CSm.kc_for_lltd(_tun, _tgt)
+    if not np.isfinite(_kc_b) or abs(_kc_b / _kc_t - 1.0) > 1e-6:
+        _cf.append(f'kc_for_lltd round trip {_kc_b} vs {_kc_t}')
+    if not np.isnan(_CSm.kc_for_lltd(_tun, _tun.lltd_rigid + 0.05)):
+        _cf.append('kc_for_lltd should be NaN beyond the rigid value')
+    _ks = np.logspace(1.5, 5, 40) * _CSm.NM_PER_RAD_PER_NM_PER_DEG
+    _curve = _CSm.lltd_curve(_tun, _ks)
+    _gain = np.array([_CSm.gain(_CSm.replace(_tun, k_c_Nm_rad=k)) for k in _ks])
+    if not (np.all(np.diff(_curve) >= -1e-12) and np.all(np.diff(_gain) >= -1e-12) and _gain[0] < 0.5 and _gain[-1] > 0.99):
+        _cf.append('LLTD / gain not monotone in k_c or gain not spanning 0..1')
+    _ktol = _CSm.kc_for_tolerance(_tun, 0.01)
+    _kg = _CSm.kc_for_gain(_inp, 0.75)
+    # closed form k_c/(k_c+k_series) vs the exact model gain (which includes the
+    # geometric / unsprung paths): agrees to ~1e-5 on this car, gate 1e-3
+    if abs(_CSm.gain(_CSm.replace(_inp, k_c_Nm_rad=_kg)) - 0.75) > 1e-3 or abs(_kg - 3.0 * _CSm.k_series(_inp)) > 1e-9:
+        _cf.append(f'kc_for_gain 0.75 -> {_kg} (gain {_CSm.gain(_CSm.replace(_inp, k_c_Nm_rad=_kg))})')
+    if not (np.isfinite(_ktol) and abs(_CSm.solve(_CSm.replace(_tun, k_c_Nm_rad=_ktol)).lltd_front - (_tun.lltd_rigid - 0.01)) < 1e-6):
+        _cf.append(f'kc_for_tolerance {_ktol}')
+    # page
+    _wc._switch_page(11)
+    _pg = getattr(_wc, '_chassis_page', None)
+    if _pg is None or _wc._pages.currentIndex() != 11 or _wc._pages.count() != 12:
+        _cf.append(f'page not at index 11 (count {_wc._pages.count()}, current {_wc._pages.currentIndex()})')
+    else:
+        _rows = {_pg._tbl.item(r, 0).text(): _pg._tbl.item(r, 1).text() for r in range(_pg._tbl.rowCount())}
+        _s = _pg._summ
+        if abs(float(_rows['LLTD front (rigid)']) - _s['lltd_rigid'] * 100) > 0.006:
+            _cf.append('table rigid LLTD != model')
+        # The table prints 2 dp, so the comparison uses the page's unrounded value against the
+        # solver's 1 g split; 0.02 points covers the page's rigid-chassis model vs the full solve
+        # (measured 0.010 on v151.5/v152; the old 0.006 on the ROUNDED text failed on v152 for a
+        # 0.002-point change from the rear ARB lift, 2026-10-10).
+        _lltd_solver = 100 * (_r1.elastic_lt_front_N + _r1.geometric_lt_front_N + _r1.unsprung_lt_front_N) \
+            / (_r1.elastic_lt_front_N + _r1.geometric_lt_front_N + _r1.unsprung_lt_front_N + _r1.elastic_lt_rear_N + _r1.geometric_lt_rear_N + _r1.unsprung_lt_rear_N)
+        if abs(_s['lltd_rigid'] * 100 - _lltd_solver) > 0.02:
+            _cf.append(f'page rigid LLTD {_s["lltd_rigid"] * 100:.4f} != Dynamics solver LLTD {_lltd_solver:.4f}')
+        if abs(float(_rows['front lump m_sf']) + float(_rows['rear lump m_sr']) - _vc.sprung_mass_kg) > 0.11:
+            _cf.append('lumps do not sum to the sprung mass')
+        if not (len(_pg._slot_model.fig.get_axes()) >= 1 and len(_pg._slot_curve.fig.get_axes()) == 2):
+            _cf.append('tabs did not draw')
+        # Model tab = the real 3-D view: overlay visible on both bays, the lumps
+        # rolled about their RCs by theta x exag, the 2-D sketch demoted to 'Sketch'
+        _sc = getattr(_pg, '_scene', None); _v3 = getattr(_pg, '_v3d', None)
+        if _sc is None or _v3 is None:
+            _cf.append('3-D model scene / view missing')
+        else:
+            for _ax, _h, _z in (('front', _pg._inp.h_f_m, _pg._inp.z_f_m), ('rear', _pg._inp.h_r_m, _pg._inp.z_r_m)):
+                _b = _sc[_ax]
+                _exp_z = _z + (_h - _z) * np.cos(_b['phi_drawn']); _exp_x = -(_h - _z) * np.sin(_b['phi_drawn'])
+                if abs(_b['lump'][2] - _exp_z) > 1e-9 or abs(_b['lump'][0] - _exp_x) > 1e-9 or abs(_b['rc'][2] - _z) > 1e-12:
+                    _cf.append(f'{_ax} lump / RC not rolled about the RC')
+                if len(_b['rolled']) != len(_CPg.bay_members_3d(_wc, _ax)) or not _v3.overlay_visible('tube', _ax):
+                    _cf.append(f'{_ax} bay tubes not drawn in 3-D')
+            if abs(_sc['front']['phi_drawn'] - _s['result'].theta_f_rad * _pg._state()['exag']) > 1e-12:
+                _cf.append('drawn roll != theta x exag')
+            if not (_v3.overlay_visible('text', 'labels') and _v3.overlay_visible('line', 'spring') and _v3._loadvec_count == 5):
+                _cf.append(f'3-D labels / spring / arrows missing ({_v3._loadvec_count} arrows)')
+            if _pg._tabs.tabText(0) != 'Model' or _pg._tabs.widget(0) is not _pg._model_host or _pg._tabs.tabText(3) != 'Sketch':
+                _cf.append('tab order')
+        _sf, _sr = _CPg.bay_outline(_wc, 'front'), _CPg.bay_outline(_wc, 'rear')
+        if len(_sf) < 8 or len(_sr) < 8:
+            _cf.append(f'bay outlines {len(_sf)} / {len(_sr)} segments')
+        # state round trip
+        _pg._ovr.setChecked(True); _pg._hf.setValue(321.0); _pg._kc.setValue(3210.0)
+        _st = dict(_wc._car.get('chassis_model', {}))
+        if not (_st.get('override') and abs(_st.get('h_f_mm', 0) - 321.0) < 1e-9 and abs(_st.get('kc_ftlbf_deg', 0) - 3210.0) < 1e-9):
+            _cf.append(f'state not stored: {_st}')
+        if abs(_pg._inp.h_f_m - 0.321) > 1e-9:
+            _cf.append('override not applied to the model inputs')
+        _tmpc = os.path.join(_tfc.gettempdir(), 'vahan_chassis_rt.vahan')
+        _wc._save_project_to_path(_tmpc) if hasattr(_wc, '_save_project_to_path') else _wc._save_project_as(_tmpc)
+        _w2 = MainWindow(); _w2._load_project_from_path(_tmpc)
+        _st2 = dict(_w2._car.get('chassis_model', {}))
+        if _st2 != _st:
+            _cf.append(f'state did not round-trip: {_st2}')
+    print(f"chassis page      : rigid LLTD {_s['lltd_rigid'] * 100:.2f} % = solver; k_series {_CSm.nm_rad_to_nm_deg(_s['k_series_Nm_rad']):.0f} N.m/deg; "
+          f"gain {_s['gain']:.3f} at {_CSm.nm_deg_to_ftlbf_deg(_CSm.nm_rad_to_nm_deg(_inp.k_c_Nm_rad)):.0f} ft.lbf/deg; "
+          f"k_c for +-1 pt at +10 pt {_CSm.nm_deg_to_ftlbf_deg(_CSm.nm_rad_to_nm_deg(_s['kc_tol_tuned'])):.0f} ft.lbf/deg; "
+          f"k_c for gain 0.75 {_CSm.nm_deg_to_ftlbf_deg(_CSm.nm_rad_to_nm_deg(_kg)):.0f} ft.lbf/deg; "
+          f"bays {len(_sf)} / {len(_sr)} tubes; page index 11"
+          + ('' if not _cf else '   UNEXPECTED FAIL: ' + '; '.join(_cf)))
+    if _cf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbcs; _tbcs.print_exc()
+    print(f'chassis page      : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── STATIC TOE SIGN -> dynamics (2026-10-20 bug: alignment toe is PER WHEEL, + = toe-in,
+#    added to KinematicMetrics.toe; VehicleParams.toe_*_deg is the axle TOTAL, + = toe-out.
+#    main_window passed +2x, so every static toe-in reached the solver as toe-out).
+try:
+    _wts = MainWindow(); _wts._load_project_from_path(_design); _wts._rebuild_solvers(0.)
+    _al_save = dict(_wts._alignment)
+    _wts._alignment.update(front_toe_deg=-0.1, rear_toe_deg=+0.2)      # front 0.1 toe-out, rear 0.2 toe-in per wheel
+    _vts = _wts._build_dynamics_solver()._veh
+    _tsf = []
+    if abs(_vts.toe_rear_deg - (-0.4)) > 1e-9:
+        _tsf.append(f'rear toe-in 0.2/wheel -> VehicleParams {_vts.toe_rear_deg:+.3f} (want -0.400 = toe-in total)')
+    if abs(_vts.toe_front_deg - (+0.2)) > 1e-9:
+        _tsf.append(f'front toe-out 0.1/wheel -> VehicleParams {_vts.toe_front_deg:+.3f} (want +0.200 = toe-out total)')
+    _wts._alignment.clear(); _wts._alignment.update(_al_save)
+    print(f'static toe sign  : alignment +0.2 deg/wheel toe-in -> VehicleParams total {_vts.toe_rear_deg:+.3f} (+ = toe-out)'
+          + ('   pass' if not _tsf else '   UNEXPECTED FAIL: ' + '; '.join(_tsf)))
+    if _tsf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    print(f'static toe sign  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── CHASSIS COMPLIANCE IN THE DYNAMICS (user 2026-10-20: "bake k_c in Vahan as an
+#    input with toggle") ── car['chassis_model'] {kc_ftlbf_deg, apply_dynamics} ->
+#    VehicleParams.chassis_compliance / chassis_torsion_Nm_rad -> SteadyStateSolver._axle_roll.
+# Gates: (a) toggle OFF = the rigid solve bit-for-bit (roll, LT, camber);
+# (b) ON with k_c x1e6 = rigid within 1e-4 deg / 1e-3 pt; (c) ON at the design k_c the
+# solver's (front, rear) roll satisfies the three-spring node balance with the SAME
+# lumps / gravity term as _compute_roll, twist = front - rear, front/rear corners use
+# their own angle (travel = sin(theta) * track / 2).
+try:
+    from vahan.dynamics import _extract_outputs as _eocc, G as _Gcc
+    _wcc = MainWindow(); _wcc._load_project_from_path(_design); _wcc._rebuild_solvers(0.)
+    _dpcc = _wcc._dynamics_panel
+    _ccf = []
+    # the Dynamics panel owns the input (N·m/deg + toggle); _kc_ft is ft·lbf/deg for the print
+    from vahan import chassis_stiffness as _CScc
+    def _ss_cc(on, kc_ft):
+        _dpcc.set_state({'chassis_kc_Nm_deg': _CScc.ftlbf_deg_to_nm_deg(kc_ft), 'chassis_compliance': on})
+        return _wcc._build_dynamics_solver()
+    _kc_ft = _CScc.nm_deg_to_ftlbf_deg(float(_dpcc._chassis_kc.value()))
+    if 'chassis_compliance' not in _dpcc.get_state() or 'chassis_torsion_Nm_rad' not in _dpcc.get_params():
+        _ccf.append('Dynamics panel has no chassis k_c input / toggle in its state or params')
+    _r0 = _ss_cc(False, _kc_ft).solve(1.0)
+    _ssc = _ss_cc(True, _kc_ft); _vc = _ssc._veh; _r1 = _ssc.solve(1.0)
+    _r2 = _ss_cc(True, _kc_ft * 1e6).solve(1.0)
+    if not (_r0.roll_front_deg == _r0.roll_rear_deg == _r0.roll_angle_deg and _r0.chassis_twist_deg == 0.0):
+        _ccf.append('toggle off is not rigid')
+    if abs(_r2.roll_front_deg - _r0.roll_angle_deg) > 1e-4 or abs(_r2.roll_rear_deg - _r0.roll_angle_deg) > 1e-4 \
+            or abs(_eocc(_r2)['lltd_pct'] - _eocc(_r0)['lltd_pct']) > 1e-3:
+        _ccf.append(f'k_c -> inf not rigid: {_r2.roll_front_deg:.5f}/{_r2.roll_rear_deg:.5f} vs {_r0.roll_angle_deg:.5f}')
+    _b = _vc.cg_to_front_axle_m / _vc.wheelbase_m; _mf, _mr = _vc.sprung_mass_kg * (1 - _b), _vc.sprung_mass_kg * _b
+    _hsf_cc, _hsr_cc = _vc.sprung_end_cg_heights_m      # front / rear lump heights (equal unless axle CG heights set)
+    _df, _dr = _hsf_cc - _r1.rc_height_front_m, _hsr_cc - _r1.rc_height_rear_m
+    _thf, _thr = np.radians(_r1.roll_front_deg), np.radians(_r1.roll_rear_deg); _ay = 1.0 * _Gcc; _kc = _vc.chassis_torsion_Nm_rad
+    _resf = (_vc.roll_stiffness_front_Npm_rad - _mf * _Gcc * _df + _kc) * _thf - _kc * _thr - _mf * _ay * _df
+    _resr = -_kc * _thf + (_vc.roll_stiffness_rear_Npm_rad - _mr * _Gcc * _dr + _kc) * _thr - _mr * _ay * _dr
+    if max(abs(_resf), abs(_resr)) > 1e-3 * _vc.sprung_mass_kg * _ay * max(abs(_df), abs(_dr)):
+        _ccf.append(f'node balance residual {_resf:.3g} / {_resr:.3g} N.m')
+    if abs(_r1.chassis_twist_deg - (_r1.roll_front_deg - _r1.roll_rear_deg)) > 1e-12:
+        _ccf.append('twist != front - rear')
+    _tf_mm = np.sin(_thf) * _vc.front_track_m / 2 * 1000
+    # travel is set from the roll of the last iteration; roll then converges within tol_deg (0.002 deg)
+    _tol_mm = np.radians(0.002) * _vc.front_track_m / 2 * 1000 * 2
+    if abs(_r1.travel['FL'] - _tf_mm) > _tol_mm and abs(_r1.travel['FL'] + _tf_mm) > _tol_mm:
+        _ccf.append(f"FL travel {_r1.travel['FL']:.4f} mm != front-section roll {_tf_mm:.4f} mm")
+    if not _vc.chassis_compliance or _kc <= 0:
+        _ccf.append('VehicleParams did not receive the toggle / k_c from car[chassis_model]')
+    # (d) the CHASSIS PAGE checkbox + k_c must reach the solver (2026-11-14: unchecking it there
+    #     changed nothing, because only the Dynamics panel's copy feeds VehicleParams).
+    from gui.chassis_page import ChassisPage as _CPcc
+    _pgcc = _CPcc(_wcc)
+    _pgcc._apply_dyn.setChecked(True); _pgcc._kc.setValue(_kc_ft / 10.0)
+    _ron = _wcc._build_dynamics_solver().solve(1.0)
+    _pgcc._apply_dyn.setChecked(False)
+    _roff = _wcc._build_dynamics_solver().solve(1.0)
+    if not (_dpcc._chassis_on.isChecked() is False and _roff.chassis_twist_deg == 0.0):
+        _ccf.append('Chassis page "apply k_c" unchecked but the solver is still compliant')
+    if abs(_ron.chassis_twist_deg) < 1e-4 or abs(_dpcc._chassis_kc.value() - _CScc.ftlbf_deg_to_nm_deg(float(_pgcc._kc.value()))) > 0.006:   # both spin boxes round
+        _ccf.append(f'Chassis page k_c / toggle ON did not reach the solver (twist {_ron.chassis_twist_deg:.5f} deg)')
+    print(f"chassis compliance: k_c {_kc_ft:.0f} ft.lbf/deg -> roll F {_r1.roll_front_deg:.3f} / R {_r1.roll_rear_deg:.3f} deg "
+          f"(rigid {_r0.roll_angle_deg:.3f}), twist {_r1.chassis_twist_deg:+.4f} deg, front LT {_eocc(_r1)['lltd_pct']:.2f} % "
+          f"(rigid {_eocc(_r0)['lltd_pct']:.2f}); FL camber {_r1.camber['FL']:+.3f} (rigid {_r0.camber['FL']:+.3f}) deg at 1 g"
+          + ('' if not _ccf else '   UNEXPECTED FAIL: ' + '; '.join(_ccf)))
+    if _ccf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbcc; _tbcc.print_exc()
+    print(f'chassis compliance: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── CORNER-EXIT TRANSIENT (2026-10-20): combined slip, differential, pitch DOF
+#    (vahan/transient.py TransientParams.combined_slip / diff_model / pitch_dof /
+#    static_toe / aero_Fz_per_v2, mode 'throttle').  Why: Sam's drivers report
+#    corner-EXIT oversteer, worse with an on/off throttle; the steady front-LT
+#    check calls Sam stable and the old transient had no combined slip, a 50/50
+#    drive split and instant m·ax·h/L, so it could not see it either.
+# Gates: (a) every new flag OFF = the pre-change transient bit-for-bit (SHA-1 of
+# two default runs recorded from the pre-change code); (b) friction ellipse:
+# driven wheel Fy = Fy_pure·sqrt(1-(Fx/Fx_max)²) < Fy_pure when Fx > 0, undriven
+# wheels untouched, too much drive -> Fx = Fx_max and Fy = 0 (wheelspin);
+# (c) the diff split: open = equal forces, spool = the equal-wheel-speed split,
+# salisbury = that split clipped to 2·T_lock/r, wheelspin hands the other wheel
+# min(F - cap, cap + bias, its cap), the sum is the demand; (d) pitch DOF settles
+# to the static m·ax·h/L rear gain and lags it at +20 ms; (e) Sam (2026 baseline)
+# in a steady 10 m corner: an on/off throttle step gives MORE rear slip and more
+# rotation beyond the path in the first 0.5 s than a 400 ms ramp to the same level.
+try:
+    import hashlib as _xh, dataclasses as _xdc, json as _xj, tempfile as _xtmp
+    from vahan import transient as _XT
+    from vahan.dynamics import VehicleParams as _XVP
+    from vahan.tire_model import LinearTireModel as _XLin
+    _xf = []
+
+    def _x_default_fp(lon):
+        _s = _XT.TransientSolver(_XVP(power_hp=75.0), _XLin(C_alpha_N_per_deg=250.0, mu=1.6),
+                                 params=_XT.TransientParams(longitudinal_control_mode='open_loop' if lon else 'speed_hold'),
+                                 grip_scale=0.8)
+        _r = _s.simulate(_XT.TransientInputs(
+            v_x_target_ms=10.4, steering=_XT.SteeringProfile.ramp(0.1, 0.4, 0.15),
+            longitudinal_profile=(lambda t: 800.0 if t > 0.5 else 0.0) if lon else None,
+            duration_s=1.0, dt_s=0.002))
+        _a = np.concatenate([_r.v_x, _r.v_y, _r.yaw_rate, _r.roll, _r.ay, _r.ax, _r.beta]
+                            + [_r.Fz[c] for c in _r.Fz] + [_r.Fy[c] for c in _r.Fy] + [_r.Fx[c] for c in _r.Fx])
+        return _xh.sha1(_a.tobytes()).hexdigest()
+    # recorded 2026-10-20 from the pre-change transient.py (HEAD + the dyno roll-damping hook)
+    for _lon, _ref in ((False, 'd5e8e37370f25f27a06aabcc9cb2548f207f4a32'),
+                       (True, '61dad06f86369192e188d58a81987ae926258b9d')):
+        if _x_default_fp(_lon) != _ref:
+            _xf.append(f'defaults-off run changed ({"open-loop Fx" if _lon else "speed hold"})')
+
+    # (b) friction ellipse on one state (left turn, rear-drive)
+    _xv = _XVP(power_hp=75.0)
+    _xs = _XT.TransientSolver(_xv, _XLin(C_alpha_N_per_deg=250.0, mu=1.6),
+                              params=_XT.TransientParams(combined_slip=True), grip_scale=0.8)
+    _xst = np.array([11.0, -0.2, 1.1, 0.02, 0.0, 0.0, 0.0, 0.0, 0.17, 0.0, 0.0])
+    _, _xd = _xs._deriv(_xst, 0.17, 900.0)
+    for _c in ('RL', 'RR'):
+        _fx, _cap, _fp, _fy = _xd['Fx'][_c], _xd['fx_cap'][_c], _xd['fy_pure'][_c], _xd['Fy'][_c]
+        _exp = _fp * np.sqrt(max(1.0 - (min(abs(_fx) / _cap, 1.0)) ** 2, 0.0))
+        if not (_fx > 0 and abs(_fy - _exp) <= 1e-9 * max(abs(_exp), 1.0) and abs(_fy) < abs(_fp) and _fx <= _cap):
+            _xf.append(f'{_c} ellipse: Fx {_fx:.1f} cap {_cap:.1f} Fy {_fy:.2f} vs {_exp:.2f} (pure {_fp:.2f})')
+    for _c in ('FL', 'FR'):
+        if _xd['Fy'][_c] != _xd['fy_pure'][_c] or _xd['Fx'][_c] != 0.0:
+            _xf.append(f'undriven {_c} touched by the ellipse')
+    _, _xd2 = _xs._deriv(_xst, 0.17, 20000.0)
+    for _c in ('RL', 'RR'):
+        if abs(_xd2['Fx'][_c] - _xd2['fx_cap'][_c]) > 1e-9 or abs(_xd2['Fy'][_c]) > 1e-9:
+            _xf.append(f'{_c} wheelspin: Fx {_xd2["Fx"][_c]:.1f} cap {_xd2["fx_cap"][_c]:.1f} Fy {_xd2["Fy"][_c]:.2f}')
+
+    # (c) differential split, left turn (inner = RL)
+    from vahan.differential import Differential as _XDiff
+    _xFz = {'FL': 300., 'FR': 900., 'RL': 400., 'RR': 1200.}
+    _inf = {k: np.inf for k in _xFz}
+    _rt = _xv.tire_radius_m
+    _ki, _ko = 25.0 * 400., 25.0 * 1200.
+    _dl = 1.1 * _xv.rear_track_m / 11.0
+    _k0 = (1000. - (_ki - _ko) * _dl / 2) / (_ki + _ko)
+    _Dlock = _ki * (_k0 + _dl / 2) - _ko * (_k0 - _dl / 2)
+    for _kind in ('open', 'spool', 'salisbury'):
+        _sv = _XT.TransientSolver(_XVP(power_hp=75.0, diff_kind=_kind), _XLin(), params=_XT.TransientParams(diff_model=True))
+        _sp = _sv._drive_split(1000., _xFz, _inf, 1.1, 11.0)
+        _D = _sp['RL'] - _sp['RR']
+        _B = {'open': 0.0, 'spool': np.inf,
+              'salisbury': 2 * _XDiff.from_vehicle(_sv._veh).locking_torque_Nm(1000. * _rt, True) / _rt}[_kind]
+        if abs(_sp['RL'] + _sp['RR'] - 1000.) > 1e-9 or abs(_D - float(np.clip(_Dlock, -_B, _B))) > 1e-6:
+            _xf.append(f'diff {_kind}: RL {_sp["RL"]:.1f} RR {_sp["RR"]:.1f} (locked bias {_Dlock:.1f}, limit {_B:.1f})')
+        if _kind == 'salisbury':
+            _sp2 = _sv._drive_split(1500., _xFz, {'FL': 0, 'FR': 0, 'RL': 300., 'RR': 2000.}, 1.1, 11.0)
+            _B2 = 2 * _XDiff.from_vehicle(_sv._veh).locking_torque_Nm(1500. * _rt, True) / _rt
+            if abs(_sp2['RL'] - 300.) > 1e-9 or abs(_sp2['RR'] - min(1200., 300. + _B2, 2000.)) > 1e-9:
+                _xf.append(f'salisbury wheelspin: RL {_sp2["RL"]:.1f} RR {_sp2["RR"]:.1f}')
+
+    # (d) pitch DOF: straight line, constant 800 N, anti-squat 0.3
+    _xp = _XT.TransientSolver(_XVP(power_hp=75.0), _XLin(C_alpha_N_per_deg=250.0, mu=1.6),
+                              params=_XT.TransientParams(pitch_dof=True, anti_squat=0.3,
+                                                         longitudinal_control_mode='open_loop'))
+    _rp = _xp.simulate(_XT.TransientInputs(v_x_target_ms=10.0, longitudinal_profile=lambda t: 800.0 if t >= 0.2 else 0.0,
+                                           duration_s=2.5, dt_s=0.002))
+    _xvv = _xp._veh
+    _rear0 = _rp.Fz['RL'][50] + _rp.Fz['RR'][50]
+    _gain = lambda i: _rp.Fz['RL'][i] + _rp.Fz['RR'][i] - _rear0
+    _static = _xvv.total_mass_kg * _rp.ax[-1] * _xvv.cg_height_m / _xvv.wheelbase_m
+    _i20 = int(round(0.22 / 0.002))
+    if abs(_gain(-1) / _static - 1.0) > 0.005:
+        _xf.append(f'pitch steady rear gain {_gain(-1):.1f} N vs m*ax*h/L {_static:.1f} N')
+    if not (_gain(_i20) < 0.8 * _static):
+        _xf.append(f'pitch: no lag ({_gain(_i20):.1f} N at +20 ms vs steady {_static:.1f} N)')
+
+    # (e) Sam corner exit, on/off vs progressive throttle
+    _xsam = os.path.join('configs', '2026_baseline.vahan')
+    _xm = '(Sam config not present: e skipped)'
+    if os.path.isfile(_xsam):
+        _xdd = _xj.load(open(_xsam, encoding='utf-8'))
+        _xref = os.path.join('configs', '2027_v171_(hairpin8.4m_steer22.6Nm_arm0.9x_rot+8)_grip0.75_aero1000N_45mph_ktTTC110.vahan')
+        if os.path.isfile(_xref):      # the 2027 tyre + grip, so only the chassis differs
+            _xr = _xj.load(open(_xref, encoding='utf-8'))
+            for _k in ('tire_path', 'tire_pressure_psi', 'grip_multiplier'):
+                _xdd['panels']['dynamics'][_k] = _xr['panels']['dynamics'][_k]
+            _xdd['car']['tire_file'] = _xr['car']['tire_file']
+        _xtp = os.path.join(_xtmp.gettempdir(), f'net_exit_sam_{os.getpid()}.vahan')
+        _xj.dump(_xdd, open(_xtp, 'w', encoding='utf-8'))
+        _xw = MainWindow(); _xw._load_project_from_path(_xtp); _xw._rebuild_solvers(0.)
+        _xss = _xw._build_dynamics_solver(); _xveh = _xss._veh
+        _m, _a, _b = _xveh.total_mass_kg, _xveh.cg_to_front_axle_m, _xveh.cg_to_rear_axle_m
+        _kr = _xveh.roll_gyradius_track_frac * 0.5 * (_xveh.front_track_m + _xveh.rear_track_m)
+        _ack = _xw._probe_static_ackermann()
+        _xtpar = _XT.TransientParams(
+            sprung_roll_inertia=_xveh.sprung_mass_kg * _kr ** 2, yaw_inertia=_xveh.yaw_inertia_factor * _m * _a * _b,
+            roll_damping_Nms_rad=1500.0, ackermann_pct=_ack if np.isfinite(_ack) else 0.0, steering_tau_s=0.05,
+            longitudinal_control_mode='throttle', speed_hold_kp=3000.0, speed_hold_ki=3000.0,
+            combined_slip=True, diff_model=True, pitch_dof=True,
+            anti_squat=float(_xss.anti_fractions().get('squat', 0.0)))
+        _xsol = _XT.TransientSolver(_xveh, _xw._tire_model, corner_solvers=_xw._solvers, params=_xtpar,
+                                    grip_scale=_xw.grip_scale())
+
+        def _x_exit(rise):
+            _r = _xsol.simulate(_XT.TransientInputs(
+                v_x_target_ms=11.0, steering=_XT.SteeringProfile.constant(np.radians(9.7)), initial_yaw_rate=1.1,
+                throttle_profile=lambda t: 0.0 if t < 1.5 else 0.3 * min((t - 1.5) / rise, 1.0),
+                duration_s=2.0, dt_s=0.004))
+            _w = _r.t >= 1.5
+            _ar = np.degrees(0.5 * (_r.slip_angle['RL'] + _r.slip_angle['RR']))
+            _ex = _r.yaw_rate - _r.ay / np.maximum(_r.v_x, 1.0)
+            return float(np.max(_ar[_w])), float(np.max(_ex[_w])), float(np.mean(_ar[(_r.t > 1.3) & (_r.t < 1.5)]))
+        _st, _rp_ = _x_exit(0.04), _x_exit(0.4)
+        _xm = (f'Sam 10 m / 11 m/s, 0.3 x full drive: rear slip {_st[2]:.2f} -> step {_st[0]:.2f} / ramp {_rp_[0]:.2f} deg, '
+               f'rotation beyond path step {_st[1]:.3f} / ramp {_rp_[1]:.3f} rad/s')
+        if not (_st[0] > _rp_[0] + 0.2 and _st[1] > _rp_[1]):
+            _xf.append('Sam on/off throttle does not out-slip the progressive ramp: ' + _xm)
+    print('corner-exit transient: ellipse/diff/pitch/defaults-off ok; ' + _xm
+          + ('' if not _xf else '   UNEXPECTED FAIL: ' + '; '.join(_xf)))
+    if _xf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _xtb; _xtb.print_exc()
+    print(f'corner-exit transient: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── LOADS 3-D VIEW: arrows ON the hardpoints, moment arcs, wheel toggle, angle
+#    construction (user 2026-10-10: "load arrows are not where the hardpoints
+#    are / no moment arrows (round) / cant hide wheel / angle visualization is bad")
+# Root cause of (3): build_load_view drew the car at 0 travel while the arrows
+# sit at the pose the loads were solved at (ComponentLoads.state, the rolled
+# travel).  Gates: every CHASSIS-pickup / ball-joint / rocker / spring arrow base
+# coincides (1e-9 m) with a point of the car as build_load_view now draws it;
+# every N·m item is drawn as an arc whose head sits 0.75·L from the base; the
+# Wheels toggle hides the tyre + rim meshes; the angle construction draws for a
+# force and plane_angles is right on cardinal vectors.
+try:
+    from gui.wheel_package import load_arrows as _la, _load_items as _li, compute_case as _ccase
+    from gui.view3d import View3D as _V3, plane_angles as _pa
+    _cf = []
+    _wl = MainWindow(); _wl._load_project_from_path(_design); _wl._rebuild_solvers(0.)
+    _v = _V3()
+    _wl.build_load_view(_v, 'FL', 1.4, -1.0, 'resultant')
+    _resl = _ccase(_wl, 1.4, -1.0)[3]
+    _trv = {l: float(_resl.travel.get(l, 0.0)) / 1000.0 for l in ('FL', 'FR', 'RL', 'RR')}
+    _cdl, _ = _wl._assemble_corners_draw(_trv, 0.0)
+    _ptsl = next(c['pts'] for c in _cdl if c['label'] == 'FL')
+    _keys = ('uca_front', 'uca_rear', 'lca_front', 'lca_rear', 'tie_rod_inner', 'pushrod_inner', 'uca_outer',
+             'lca_outer', 'tie_rod_outer', 'rocker_pivot', 'rocker_spring_pt', 'spring_chassis_pt', 'wheel_center')
+    _items = _li(_wl, 1.4, -1.0, only_corner='FL')
+    _on = 0; _hp_items = 0
+    for _p, _vv, _c, _lab in _items:
+        _is_hp = any(k in _lab for k in ('pickup', 'ball joint', 'pushrod force', 'spring force', 'spring mount',
+                                          'rocker pivot mount', 'HUB', 'BEARINGS · overturning'))
+        if not _is_hp:
+            continue
+        _hp_items += 1
+        _d = min(float(np.linalg.norm(np.asarray(_p) - np.asarray(_ptsl[k], float))) for k in _keys if k in _ptsl)
+        if _d < 1e-9:
+            _on += 1
+        else:
+            _cf.append(f'arrow off its hardpoint by {_d * 1000:.2f} mm: {_lab[:50]}')
+    if _hp_items < 10:
+        _cf.append(f'only {_hp_items} hardpoint-based load items')
+    # the old static pose really was somewhere else (the bug was real)
+    _cd0, _ = _wl._assemble_corners_draw({l: 0.0 for l in _trv}, 0.0)
+    _pts0 = next(c['pts'] for c in _cd0 if c['label'] == 'FL')
+    _moved = float(np.linalg.norm(np.asarray(_ptsl['uca_outer']) - np.asarray(_pts0['uca_outer'])))
+    if abs(_trv['FL']) > 1e-4 and _moved < 1e-4:
+        _cf.append('case travel is non-zero but the drawn pose did not move')
+    # moments as arcs
+    _mom = [s for s in _v._loadvec_snap if s[5]]
+    _nmom = sum(1 for it in _items if 'N·m' in it[3])
+    if len(_mom) != _nmom or _nmom < 3:
+        _cf.append(f'{len(_mom)} moment arcs for {_nmom} moment items')
+    for _tip, _lab, _base, _u, _L, _ in _mom:
+        _r = float(np.linalg.norm(np.asarray(_tip) - np.asarray(_base)))
+        if abs(_r - 0.75 * _L) > 1e-6 or abs(float(np.dot(np.asarray(_tip) - np.asarray(_base), _u))) > 1e-6:
+            _cf.append(f'moment arc head not on the 0.75 L circle about the axis: {_lab[:40]}')
+    # wheel toggle
+    _v.set_wheels(False)
+    if any(m.visible for m in list(_v._tire_meshes) + list(_v._rim_meshes)) or _v._wheels_chk.isChecked():
+        _cf.append('Wheels off did not hide the tyre / rim meshes')
+    _v.set_wheels(True)
+    if not all(m.visible for m in _v._tire_meshes):
+        _cf.append('Wheels on did not restore the tyres')
+    # angle construction + plane_angles
+    _fi = next(i for i, s in enumerate(_v._loadvec_snap) if 'lower ball joint' in s[1])
+    _v.set_angle_mode(True); _v._angle_for_index(_fi)
+    if not (_v.overlay_visible('line', '_angle') and _v.overlay_visible('quad', '_angle') and _v.overlay_visible('text', '_angle')):
+        _cf.append('angle construction did not draw')
+    _v.set_angle_mode(False)
+    if _v.overlay_visible('line', '_angle'):
+        _cf.append('angle construction not cleared')
+    for _vec, _pl, _th, _ti in (((1, 0, 0), 'XZ', 0.0, 0.0), ((0, 1, 0), 'YZ', 0.0, 0.0), ((0, 0, 1), 'YZ', 90.0, 0.0),
+                                ((1, 1, 0), 'XY', 45.0, 0.0), ((1, 0, 0.2), 'XZ', 0.0, 0.0)):
+        _a = _pa(_vec)
+        if _a['plane'] != _pl or abs(_a['theta_deg'] - (_th if _vec != (1, 0, 0.2) else np.degrees(np.arctan2(0.2, 1.0)))) > 1e-6:
+            _cf.append(f'plane_angles{_vec} -> {_a["plane"]} {_a["theta_deg"]:.1f}')
+    _g = _pa((0.3, 0.2, 0.9))     # smallest = Y -> XZ plane, theta from +X toward +Z, tilt = asin(y)
+    if not (_g['plane'] == 'XZ' and abs(_g['theta_deg'] - np.degrees(np.arctan2(0.9, 0.3))) < 1e-9
+            and abs(_g['tilt_deg'] - np.degrees(np.arcsin(0.2 / np.linalg.norm([0.3, 0.2, 0.9])))) < 1e-9):
+        _cf.append(f"plane_angles general vector -> {_g['plane']} {_g['theta_deg']:.2f} {_g['tilt_deg']:.2f}")
+    print(f"loads 3-D view    : FL case travel {_trv['FL'] * 1000:+.1f} mm, {_on}/{_hp_items} hardpoint arrows on the drawn points, "
+          f"{len(_mom)} moment arcs, wheels toggle, angle construction"
+          + ('' if not _cf else '   UNEXPECTED FAIL: ' + '; '.join(_cf)))
+    if _cf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tblv; _tblv.print_exc()
+    print(f'loads 3-D view    : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── DOWNFORCE TO MAKE A CORNER (Corner Speed tab 3, user 2026-10-10) ───────────
+# vahan.corner_speed.downforce_for_corner: radius + corner speed -> downforce on
+# the car (axle budget = 1, package CoP) -> the package at a reference speed.
+# ONE MODEL gate: the lateral limit Vahan's own G-G diagram finds on the panel
+# radius with the panel package, fed back as "radius + that speed", must return
+# the panel package (within the two bisections' tolerance, 2 %).  Below the
+# mechanical limit the answer is 0 N.  The page tab builds, runs blocking, and
+# 'Use as the panel package' writes the answer into the Dynamics panel.
+try:
+    from vahan import corner_speed as _CSdf
+    _cf = []
+    _wd = MainWindow(); _wd._load_project_from_path(_design); _wd._rebuild_solvers(0.)
+    _ssd = _wd._build_dynamics_solver(); _Rd = float(_wd._dynamics_panel._turn_radius.value())
+    _pkd = _wd._dynamics_panel.get_custom_aero_params()
+    _ggd = _ssd.gg_envelope(aero_Fz_per_g=_wd._get_aero_Fz_per_g(), turn_radius_m=_Rd)
+    _vlim = float(np.sqrt(_ggd['ay_limit_g'] * 9.80665 * _Rd))
+    _ptd = _CSdf.downforce_for_corner(_ssd, _Rd, _vlim, cop_rear_frac=_pkd['cop_rear_pct'] / 100.0,
+                                      ref_speed_mps=_pkd['V_ref_kph'] / 3.6, rho=_pkd['air_density'])
+    if not (_ptd['feasible'] and abs(_ptd['package_ref_N'] / _pkd['F_ref_N'] - 1.0) < 0.02):
+        _cf.append(f"round trip: G-G limit {_ggd['ay_limit_g']:.3f} g on {_Rd:.0f} m -> tool package {_ptd['package_ref_N']:.0f} N vs panel {_pkd['F_ref_N']:.0f} N")
+    _pt0 = _CSdf.downforce_for_corner(_ssd, _Rd, 0.9 * _ptd['mech_limit_speed_mps'], cop_rear_frac=0.5, ref_speed_mps=20.0)
+    if _pt0['downforce_at_corner_N'] != 0.0 or _pt0['package_ref_N'] != 0.0:
+        _cf.append('below the mechanical limit should need 0 N')
+    # scaling identity: F_ref = D (V_ref / V)^2
+    if abs(_ptd['package_ref_N'] - _ptd['downforce_at_corner_N'] * (_pkd['V_ref_kph'] / 3.6 / _vlim) ** 2) > 1e-6:
+        _cf.append('package scaling identity broken')
+    # page
+    _wd._switch_page(8); _pgd = _wd._corner_speed_page
+    if _pgd._tabs.tabText(2) != 'Downforce to make a corner':
+        _cf.append(f'tab 3 missing: {[ _pgd._tabs.tabText(i) for i in range(_pgd._tabs.count())]}')
+    _pgd._df_radius.setValue(_Rd); _pgd._df_speed.setValue(_vlim * 3.6)
+    _pgd._df_ref.setValue(float(_pkd['V_ref_kph'])); _pgd._df_cop.setValue(float(_pkd['cop_rear_pct']))
+    _std = _pgd.run_downforce(blocking=True, radii_m=[20.0, 8.0])
+    # the page's speed spin box rounds to 0.1 km/h; near the mechanical limit the package is very
+    # sensitive to speed (v177: 0.05 km/h -> 2.5 %), so compare with the module AT the page's speed
+    _ptr = _CSdf.downforce_for_corner(_ssd, _Rd, float(_pgd._df_speed.value()) / 3.6, cop_rear_frac=_pkd['cop_rear_pct'] / 100.0,
+                                      ref_speed_mps=_pkd['V_ref_kph'] / 3.6, rho=_pkd['air_density'])
+    if _std is None or abs(_std['point']['package_ref_N'] / _ptr['package_ref_N'] - 1.0) > 0.02:
+        _cf.append(f"page run {_std['point']['package_ref_N'] if _std else None} != module {_ptr['package_ref_N']:.0f} at the page's speed")
+    if _pgd.df_table.rowCount() != len(_std['vs_speed']) + len(_std['vs_radius']) or _pgd.df_table.rowCount() < 10:
+        _cf.append(f'table rows {_pgd.df_table.rowCount()}')
+    if len(_pgd.df_slot.fig.get_axes()) != 2:
+        _cf.append('tab 3 did not draw')
+    if not all(np.isfinite(r['package_ref_N']) for r in _std['vs_speed'] + _std['vs_radius']):
+        _cf.append('non-finite package in the curves')
+    if _std['vs_speed'][0]['downforce_at_corner_N'] > 5.0:
+        _cf.append('speed curve does not start at ~0 N at the mechanical limit')
+    _pgd._df_ref.setValue(60.0); _pgd._df_cop.setValue(50.0)
+    _std2 = _pgd.run_downforce(blocking=True, radii_m=[8.0])
+    _pgd._use_df_package()
+    _pn = _wd._dynamics_panel.get_custom_aero_params()
+    if abs(_pn['F_ref_N'] - _std2['point']['package_ref_N']) > 0.6 or abs(_pn['V_ref_kph'] - 60.0) > 1e-6 or abs(_pn['cop_rear_pct'] - 50.0) > 1e-6:
+        _cf.append(f'Use-as-package did not write the panel: {_pn}')
+    print(f"downforce tool    : G-G {_ggd['ay_limit_g']:.3f} g on {_Rd:.0f} m = {_vlim * 3.6:.1f} km/h -> needs {_ptd['downforce_at_corner_N']:.0f} N on the car = "
+          f"{_ptd['package_ref_N']:.0f} N at {_pkd['V_ref_kph']:.1f} km/h (panel {_pkd['F_ref_N']:.0f}); mech limit {_ptd['mech_limit_g']:.3f} g; "
+          f"tab 3 {_pgd.df_table.rowCount()} rows"
+          + ('' if not _cf else '   UNEXPECTED FAIL: ' + '; '.join(_cf)))
+    if _cf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbdf; _tbdf.print_exc()
+    print(f'downforce tool    : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── TYRE COMPARISON MODULE (binder design review, user 2026-10-10) ─────────────
+# vahan.tire_compare: characterize() reads the SAME TireModel the dynamics use;
+# car_metrics() swaps the tyre into the loaded car and must reproduce the
+# corner-speed axle limit for the project tyre (ONE MODEL); the module emits no
+# tyre identity; condition_sensitivity drops nonsense blocks; forgiveness and
+# wear proxies come off the measured curve.
+try:
+    from vahan import tire_compare as _TCm
+    from vahan import corner_speed as _CSt
+    _cf = []
+    _wt = MainWindow(); _wt._load_project_from_path(_design); _wt._rebuild_solvers(0.)
+    _tm = _wt._tire_model
+    if _tm is None:
+        raise RuntimeError('no project tyre loaded')
+    _ch = _TCm.characterize(_tm)
+    _p700 = next(p for p in _ch['per_load'] if abs(p['fz_N'] - 700.0) < 1e-9)
+    if abs(_p700['peak_fy_N'] - abs(float(_tm.peak_Fy(700.0, 0.0, slip_sign=1)))) > 1e-9:
+        _cf.append('characterize peak Fy != TireModel.peak_Fy')
+    if abs(_p700['c_alpha_N_per_deg'] - abs(float(_tm.cornering_stiffness(700.0, 0.0)))) > 1e-9:
+        _cf.append('characterize C_alpha != TireModel.cornering_stiffness')
+    if not (0.5 < _ch['load_sensitivity_ratio'] < 1.2 and 0.7 < _ch['camber_gain_m2'] < 1.3):
+        _cf.append(f"sensitivity ratios off: load {_ch['load_sensitivity_ratio']:.3f} camber {_ch['camber_gain_m2']:.3f}")
+    if not (0.5 < _ch['forgiveness']['ratio_past_peak'] <= 1.0 + 1e-9 and 2.0 < _ch['wear']['peak_slip_deg'] < 13.0):
+        _cf.append('forgiveness / wear proxies out of range')
+    _cs = _TCm.condition_sensitivity([(8.0, _tm), (12.0, _tm)])
+    if abs(_cs['spread_frac']) > 1e-12 or _cs['dropped']:
+        _cf.append('identical models should give zero spread')
+    class _Junk:
+        def peak_Fy(self, fz, ia, slip_sign=1): return 0.02 * fz
+    _cs2 = _TCm.condition_sensitivity([(7.0, _Junk()), (12.0, _tm)])
+    if _cs2['dropped'] != [7.0] or len(_cs2['mu']) != 1:
+        _cf.append(f'nonsense block not dropped: {_cs2}')
+    _cm = _TCm.car_metrics(_wt, _tm, tracks=[], aero_per_g=None)
+    _ss_t = _wt._build_dynamics_solver()
+    _lim = _CSt.per_corner_limit_g(_ss_t, criterion='axle')['limit_g']
+    if abs(_cm['mech_limit_g'] - _lim) > 1e-9:
+        _cf.append(f"car_metrics limit {_cm['mech_limit_g']:.4f} != corner-speed axle limit {_lim:.4f}")
+    if _wt._tire_model is not _tm:
+        _cf.append('car_metrics did not restore the project tyre')
+    _sl = _cm['operating_slip']['limit']
+    if not (0.5 < _sl['outer_front_deg'] < 12.0):
+        _cf.append(f"operating slip at the limit {_sl}")
+    _study = _TCm.compare(_wt, [_TCm.TireCandidate('A · 16x7.5-10 (test)', _tm, chosen=True)], with_car=False)
+    _txt = _TCm.comparison_table_text(_study)
+    import re as _re_t
+    if _re_t.search(r'Hoosier|run\d|\.mat|4307\d', _txt + __import__("json").dumps(_study, default=str)):
+        _cf.append('tyre identity leaked from tire_compare')
+    print(f"tyre compare      : mu700 {_p700['mu']:.3f}, C_a {_p700['c_alpha_N_per_deg']:.0f} N/deg, load ratio {_ch['load_sensitivity_ratio']:.3f}, "
+          f"camber gain {_ch['camber_gain_m2']:.3f}, peak slip {_ch['wear']['peak_slip_deg']:.1f} deg, limit {_cm['mech_limit_g']:.3f} g = corner-speed axle limit; "
+          f"outer-front slip at the limit {_sl['outer_front_deg']:.1f} deg"
+          + ('' if not _cf else '   UNEXPECTED FAIL: ' + '; '.join(_cf)))
+    if _cf:
+        fails += 1
+except Exception as _e:
+    fails += 1
+    import traceback as _tbtc; _tbtc.print_exc()
+    print(f'tyre compare      : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
 # ── 3-D ROLL-CENTRE SPHERE = THE GRAPH (ONE MODEL, 2026-10-01) ──────────────
 # The view's RC sphere was still built from the pickup MIDPOINT while every graph
@@ -5306,6 +7161,827 @@ try:
 except Exception as _e:
     fails += 1
     print(f'dynamics camber contract: UNEXPECTED FAIL ({_e})')
+
+
+# ── MMD + Fz-Fy WITH DOWNFORCE, AND THE LINKAGE'S OWN ACKERMANN CURVE
+#    (user, 2026-10-10: "MMD doesn't apply downforce, that's why. Also
+#    ackermann doesn't account for that either" / "Fz-Fy ackermann curve
+#    should use our ackermann CURVE").  plot_mmd carried no aero at all, so
+#    with a package on the car it read the no-aero limit (~1.7 g) while the
+#    G-G at the same speed read 2.2 g; ackermann_fz_fy_data solved the loads
+#    without aero and split inner/outer by ONE constant percentage.  Gates:
+#    (a) build_loads_table(aero_Fz_const) adds exactly the package total at
+#        every row; (b) the MMD trimmed limit with downforce at 20 m/s is
+#        higher than without; (c) the probed SteeringGeometry carries the
+#        per-wheel curve and its inner angle exceeds its outer angle (pro
+#        Ackermann) at 10 deg mean steer; (d) the Fz-Fy map with aero loads
+#        the outer wheel more than without, and on the linkage curve its
+#        delivered rows report a steer-dependent %, not the constant input.
+print('-' * 64)
+try:
+    from vahan.ymd import build_loads_table as _bltA
+    from vahan.analysis_plots import (plot_mmd as _pmA,
+                                      ackermann_fz_fy_data as _afdA)
+    _cfA = [max(_cands)[1]] if _cands else []
+    if not _cfA:
+        print('mmd/fzfy aero    : no config — skipped')
+    else:
+        _wA = MainWindow(); _wA._load_project_from_path(_cfA[0])
+        _wA._dynamics_panel._tire_psi.setValue(12.0)
+        if getattr(_wA, '_tire_model', None) is None:
+            print('mmd/fzfy aero    : no TTC file on this machine — skipped')
+        else:
+            _failA = []
+            _ssA = _wA._build_dynamics_solver()
+            _wasA = _wA._aero_active; _wA._aero_active = True
+            try:
+                _pgA = _wA._get_aero_Fz_per_g()
+                _atA = _wA._aero_Fz_at_speed(20.0)
+                _kwA = _wA._mmd_kwargs()
+            finally:
+                _wA._aero_active = _wasA
+            if not _pgA or not _atA:
+                _failA.append('no aero package from the config (custom F_ref/V_ref)')
+            else:
+                # (a) constant aero reaches every row of the loads table
+                _t0 = _bltA(_ssA, None, ay_max=1.0, n=3)
+                _t1 = _bltA(_ssA, None, ay_max=1.0, n=3, aero_Fz_const=_atA)
+                _totA = sum(_atA.values())
+                for _i in range(3):
+                    _dA = sum(_t1[k][_i] - _t0[k][_i]
+                              for k in ('fz_in_F', 'fz_out_F', 'fz_in_R', 'fz_out_R'))
+                    if abs(_dA - _totA) > 0.03 * _totA + 2.0:
+                        _failA.append(f'loads table row {_i}: const aero adds {_dA:.0f} N, '
+                                      f'package {_totA:.0f} N')
+                # (b) MMD trimmed limit rises with downforce (coarse grid for speed)
+                _kwA.update(velocity_mps=20.0, beta_range_deg=(-6, 6), beta_n=5,
+                            delta_range_deg=(-16, 16), delta_n=5)
+                _kwA['aero_Fz_N'] = None
+                _n0 = _pmA(**_kwA)._mmd_numbers
+                _kwA['aero_Fz_N'] = _atA
+                _n1 = _pmA(**_kwA)._mmd_numbers
+                if not (np.isfinite(_n0['ay_trim_limit_g']) and np.isfinite(_n1['ay_trim_limit_g'])):
+                    _failA.append('MMD trimmed limit not found with/without aero')
+                elif _n1['ay_trim_limit_g'] < _n0['ay_trim_limit_g'] + 0.05:
+                    _failA.append(f'MMD trimmed limit {_n0["ay_trim_limit_g"]:.3f} g no aero -> '
+                                  f'{_n1["ay_trim_limit_g"]:.3f} g with {_totA:.0f} N: not higher')
+                if abs(_n1['aero_total_N'] - _totA) > 1.0:
+                    _failA.append('plot_mmd did not record the aero total it was given')
+                # (c) the probed linkage curve
+                _sgA = _wA._steering_geometry_now()
+                if _sgA is None or not _sgA.has_pair_curve:
+                    _failA.append('SteeringGeometry has no per-wheel curve')
+                else:
+                    _di, _do = _sgA.pair_from_mean(np.radians(10.0))
+                    _pcA = _sgA.ackermann_pct_from_mean(np.radians(10.0),
+                                                       _ssA._veh.front_track_m,
+                                                       _ssA._veh.wheelbase_m)
+                    # sign-consistent, not pro-only: v160 is anti-Ackermann by design (2026-10-10)
+                    if not (_di > 0.0 and _do > 0.0 and np.isfinite(_pcA) and -300.0 < _pcA < 300.0
+                            and ((_di > _do) == (_pcA > 0.0) or abs(_pcA) < 1.0)):
+                        _failA.append(f'linkage at 10 deg mean: inner {np.degrees(_di):.2f} '
+                                      f'outer {np.degrees(_do):.2f} deg vs {_pcA:.1f} % — inconsistent')
+                # (d) Fz-Fy map: aero loads the outer wheel; curve mode reports its own %
+                _glA = (0.4, 0.8, 1.2)
+                _d0 = _afdA(_wA._tire_model, _ssA, radius_m=8.0, ackermann_pct=46.0,
+                            grip_multiplier=0.75, lat_g_list=_glA)
+                _d1 = _afdA(_wA._tire_model, _ssA, radius_m=8.0, ackermann_pct=46.0,
+                            grip_multiplier=0.75, lat_g_list=_glA, aero_Fz_per_g=_pgA,
+                            steer_geo=_sgA)
+                if len(_d1['fz_outer']) and len(_d0['fz_outer']):
+                    _exp = sum(_pgA[k] for k in ('FL', 'FR')) * 1.2 * 0.5
+                    _got = _d1['fz_outer'][-1] + _d1['fz_inner'][-1] - _d0['fz_outer'][-1] - _d0['fz_inner'][-1]
+                    if _got < 0.5 * _exp * 2.0:
+                        _failA.append(f'Fz-Fy front load with aero rose {_got:.0f} N at 1.2 g, '
+                                      f'package front per g says ~{2 * _exp:.0f} N')
+                if not _d1['steer_curve'] or not len(_d1['ack_pct_delivered']):
+                    _failA.append('Fz-Fy map did not run on the linkage curve')
+                elif np.allclose(_d1['ack_pct_delivered'], 46.0, atol=1e-6):
+                    _failA.append('Fz-Fy map on the linkage curve still reports the constant 46 %')
+                # (e) steering effort: aero reaches the hand torque; kingpin-moment and
+                #     tie-rod curves are reported (the "moment about the steering arm")
+                from vahan.steering import compute_steering_effort as _cse
+                _flA = _wA._solvers.get('FL')
+                _e0 = _cse(_ssA, _wA._front_hp, _wA._topology.front.damper_mount.value, _wA._tire_model,
+                           steer_cfg=dict(_wA._steer), front_solver=_flA, lat_grid=(0.5, 1.0, 1.5))
+                _e1 = _cse(_ssA, _wA._front_hp, _wA._topology.front.damper_mount.value, _wA._tire_model,
+                           steer_cfg=dict(_wA._steer), front_solver=_flA, lat_grid=(0.5, 1.0, 1.5),
+                           aero_Fz_per_g=_pgA)
+                if not (_e1.get('M_kp_vs_latg') and _e1.get('tie_rod_force_vs_latg')):
+                    _failA.append('steering effort lacks the kingpin-moment / tie-rod curves')
+                elif not _e1['aero'] or max(abs(a[1] - b[1]) for a, b in zip(_e1['F_rack_vs_latg'], _e0['F_rack_vs_latg'])) < 2.0:
+                    # aero must REACH the rack force; its sign is not fixed: downforce
+                    # lowers the outer kingpin moment and raises the inner one, so with
+                    # pro-Ackermann levers the 1.5 g rack force can drop (v172: 1249 -> 1245 N)
+                    _failA.append(f'steering effort with aero {_e1["F_max_N"]:.0f} N rack does not differ from no aero {_e0["F_max_N"]:.0f} N')
+                from vahan.analysis_plots import plot_steering_torque as _pst
+                _pst(_e1, target_Nm=15.0, target_band_Nm=5.0)       # must draw both panels
+                # (f) THE LINKAGE CURVE as the Ackermann setting (user 2026-10-10: "use the curve
+                #     for the calcs"): ymd_state takes the SteeringGeometry, splits the wheels from
+                #     it, the trim sweep carries a 'linkage curve' row, plot_mmd labels it, and the
+                #     demand-vs-g data shows the demand FALLING with g with a finite linkage %.
+                from vahan import ymd as _ymdC
+                from vahan.analysis_plots import ackermann_pct_vs_g_data as _apg
+                _stC = _ymdC.ymd_state(_wA._tire_model, _ssA, 0.0, 10.0, radius_m=8.0, ackermann_pct=_sgA, grip_multiplier=0.75)
+                _stN = _ymdC.ymd_state(_wA._tire_model, _ssA, 0.0, 10.0, radius_m=8.0, ackermann_pct=46.0, grip_multiplier=0.75)
+                _dwC = _stC['delta_wheel_deg']; _dwN = _stN['delta_wheel_deg']
+                if not (np.isfinite(_stC['Ay_g']) and ((_dwC['FL'] > _dwC['FR']) == (_pcA > 0.0) or abs(_pcA) < 1.0)
+                        and abs(_dwC['FL'] - _dwN['FL']) > 1e-3):
+                    _failA.append(f'ymd_state on the curve: Ay {_stC["Ay_g"]}, wheels {_dwC} vs 46 % {_dwN}')
+                _rowsC = _ymdC.trim_sweep_ackermann(_wA._tire_model, _ssA, radius_m=8.0, ackermann_list=[46.0, _sgA], grip_multiplier=0.75)
+                if not any(r.get('pct_label') == 'linkage curve' and np.isfinite(r['Ay_trim_max']) for r in _rowsC):
+                    _failA.append('trim sweep has no finite linkage-curve row')
+                _kwC = dict(_kwA); _kwC['ackermann_pct'] = _sgA; _kwC['aero_Fz_N'] = None
+                _nC = _pmA(**_kwC)._mmd_numbers
+                if _nC.get('ackermann_label') != 'linkage curve' or not np.isfinite(_nC['ay_trim_limit_g']):
+                    _failA.append(f'plot_mmd on the curve: {_nC.get("ackermann_label")} {_nC["ay_trim_limit_g"]}')
+                _dg = _apg(_wA._tire_model, _ssA, _sgA, radii_m=(8.0,), lat_g_list=(0.4, 0.8, 1.2), grip_multiplier=0.75)
+                _b8 = _dg['by_radius'][8.0]
+                if len(_b8['lat_g']) < 2 or not (_b8['demand_pct'][0] > _b8['demand_pct'][-1]) or not np.all(np.isfinite(_b8['linkage_pct'])):
+                    _failA.append(f'demand vs g: {_b8}')
+            if _failA:
+                fails += 1
+            _msg = (f'MMD 20 m/s trim {_n0["ay_trim_limit_g"]:.3f} -> {_n1["ay_trim_limit_g"]:.3f} g '
+                    f'with {_totA:.0f} N; linkage {_pcA:.1f} % at 10 deg; Fz-Fy curve % '
+                    f'{np.nanmin(_d1["ack_pct_delivered"]):.1f}-{np.nanmax(_d1["ack_pct_delivered"]):.1f}; '
+                    f'hand torque {_e0.get("T_max_Nm")} -> {_e1.get("T_max_Nm")} N·m with aero'
+                    if not _failA else '')
+            print(f'mmd/fzfy aero    : {_msg}   '
+                  + ('pass' if not _failA else 'UNEXPECTED FAIL: ' + '; '.join(_failA)))
+except Exception as _e:
+    fails += 1
+    print(f'mmd/fzfy aero    : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── LOADS AROUND THE LAP (2026-10-21, gui/lap_loads_page.py) ──
+# Every lap station's loads = compute_case at that station's signed lateral g
+# (turn direction from the track curvature), fore-aft g and speed (ONE MODEL).
+try:
+    _fL = []
+    from gui import lap_loads_page as _LLp
+    from gui import wheel_package as _WPl
+    try:
+        _wl = _wj
+    except NameError:
+        _wl = MainWindow(); _wl._load_project_from_path(_design); _wl._rebuild_solvers(0.)
+    _wl._switch_page(1)
+    _lpL = _wl._laptime_page
+    _resL = _lpL.build_sim().simulate(_lpL._track, n_detail=4)
+    _stL = _LLp.lap_stations(_resL, _lpL._track)
+    _kL = np.interp(_stL['s'], np.linspace(_stL['s'][0], _stL['s'][-1], len(_lpL._track.kappa_1pm)), _lpL._track.kappa_1pm)
+    _absL = np.abs(_stL['lat_solver'])
+    _iLeft = int(np.argmax(np.where(_kL > 0, _absL, -1.0)))
+    _iRight = int(np.argmax(np.where(_kL < 0, _absL, -1.0)))
+    _iBrk = int(np.argmin(_stL['lon']))
+    _idxL = sorted({_iLeft, _iRight, _iBrk, _iLeft + 4, 0})
+    _swL = _LLp.LapLoadSweep(_wl, _resL, _lpL._track, indices=_idxL, aero='project').run_all()
+    # (a) a station's loads equal compute_case at that station's g / speed
+    for _i in (_iLeft, _iBrk):
+        _la = -np.sign(_kL[_i]) * abs(float(_resL.lat_g[_i]))
+        _ref = _LLp.member_values(_WPl.compute_case(_wl, _la, float(_resL.lon_g[_i]), speed_kph=float(_resL.v_ms[_i]) * 3.6)[0])
+        _d = max((abs(_swL.solved[_i][k] - v) for k, v in _ref.items() if np.isfinite(v)), default=np.inf)
+        if not _d < 1e-6:
+            _fL.append(f'station {_i} differs from compute_case by {_d}')
+    # (b) left turn loads the RIGHT tyres, right turn the LEFT tyres
+    if _absL[_iLeft] > 0.5 and not _swL.solved[_iLeft][('FR', 'tyre_z')] > _swL.solved[_iLeft][('FL', 'tyre_z')]:
+        _fL.append('left turn does not load the right tyres')
+    if _absL[_iRight] > 0.5 and not _swL.solved[_iRight][('FL', 'tyre_z')] > _swL.solved[_iRight][('FR', 'tyre_z')]:
+        _fL.append('right turn does not load the left tyres')
+    # (c) between solved stations the curve is the straight line
+    _serL = _swL.series()[('FL', 'pushrod')]
+    _m = _iLeft + 2
+    _lo, _hi = sorted((_swL.solved[_iLeft][('FL', 'pushrod')], _swL.solved[_iLeft + 4][('FL', 'pushrod')]))
+    if not (_lo - 1e-6 <= _serL[_m] <= _hi + 1e-6):
+        _fL.append(f'interpolated value {_serL[_m]} outside [{_lo}, {_hi}]')
+    # (d) peak table: one row per corner x part, peak = largest solved size
+    _pk = _swL.peaks()
+    _r0 = [r for r in _pk if r['corner'] == 'FL' and r['key'] == 'lca_front'][0]
+    _mx = max(abs(_swL.solved[i][('FL', 'lca_front')]) for i in _idxL)
+    if len(_pk) != 4 * len(_LLp.MEMBERS) or abs(abs(_r0['value']) - _mx) > 1e-9 or not np.isfinite(_r0['ref_value']):
+        _fL.append(f'peak table: {len(_pk)} rows, FL lca_front {_r0["value"]} vs {_mx}, ref {_r0["ref_value"]}')
+    # (e) a lap with no aero is solved with Apply Aero off, and the flag is restored
+    _was = _wl._aero_active
+    _swN = _LLp.LapLoadSweep(_wl, _resL, _lpL._track, indices=[_iLeft], aero='lap')
+    _lapAero = float(np.nanmax(np.abs(_resL.aero_down_N))) > 1.0
+    if _swN.aero_off == _lapAero:
+        _fL.append('aero "same as the lap" did not follow the lap downforce')
+    _swN.step(1e9)
+    if _wl._aero_active != _was:
+        _fL.append('Apply Aero flag not restored')
+    # (f) the window draws and fills the table
+    _wL = _LLp.LapLoadsWindow(_wl, _lpL); _wL._sweep = _swL; _wL.finished(0.0)
+    if _wL._tbl.rowCount() != len(_LLp.MEMBERS) or len(_wL._fig_tr.axes) < 3 or not _wL._fig_map.axes:
+        _fL.append(f'window: {_wL._tbl.rowCount()} rows, {len(_wL._fig_tr.axes)} trace axes')
+    _wL.close(); _wl._switch_page(0)
+    if _fL:
+        fails += 1
+    print(f'loads around lap : {len(_idxL)} stations, FL lower arm front peak {_r0["value"]:.0f} N   '
+          + ('pass' if not _fL else 'UNEXPECTED FAIL: ' + '; '.join(_fL)))
+except Exception as _e:
+    fails += 1
+    import traceback; traceback.print_exc()
+    print(f'loads around lap : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── DYNAMICS HANDLING GRAPHS (2026-11-05, MainWindow._attach_dyn_extras) ──
+# Roll gradient / roll stiffness / ride rate + frequency / load-transfer split /
+# pitch gradient + stiffness are drawn from the ONE SteadyStateSolver's sweep:
+# the static roll gradient must reproduce the solver's roll at 1 g, the front
+# share of the corner-load transfer must equal _extract_outputs' lltd_pct at 1 g.
+try:
+    from vahan.dynamics import _extract_outputs as _DXO
+    _wdx = MainWindow(); _wdx._load_project_from_path(_design); _wdx._rebuild_solvers(0.)
+    _ssx = _wdx._build_dynamics_solver()
+    _gx = ['roll_gradient', 'roll_stiffness', 'ride_rate', 'ride_freq', 'lt_split']
+    _swx = _ssx.sweep_lateral_g((0.0, 1.2), n_points=13)
+    _wdx._attach_steering_effort(_swx, _gx)
+    _ex = _swx.get('dyn_extras') or {}
+    _fx = []
+    for _k in ('roll_grad_dyn', 'roll_grad_secant', 'roll_stiff', 'ride_rate_FL', 'ride_freq_RR',
+               'ride_static', 'lt_share_front_pct', 'geo_share_front_pct', 'elastic_share_front_pct'):
+        if _k not in _ex:
+            _fx.append(f'missing {_k}')
+    _r1 = float(_ssx.solve(1.0).roll_angle_deg)
+    _rg0 = float(_ex['roll_grad_dyn'][0])
+    if not abs(_rg0 - _r1) <= 0.02 * abs(_r1):
+        _fx.append(f'static roll gradient {_rg0:.4f} deg/g vs roll at 1 g {_r1:.4f} deg')
+    _l1 = float(_DXO(_ssx.solve(1.0))['lltd_pct'])
+    _i1 = int(np.argmin(np.abs(_swx['lateral_g'] - 1.0)))
+    if not abs(float(_ex['lt_share_front_pct'][_i1]) - _l1) < 0.1:
+        _fx.append(f'LT share {_ex["lt_share_front_pct"][_i1]:.3f} vs lltd_pct {_l1:.3f}')
+    _rsx = _ex['roll_stiff']
+    if not abs(_rsx['total'] - _ssx._veh.roll_stiffness_total_Npm_rad * np.pi / 180) < 1e-6:
+        _fx.append('roll stiffness total differs from VehicleParams')
+    _swl = _ssx.sweep_longitudinal_g((-1.0, 1.0), n_points=9)
+    _wdx._attach_steering_effort(_swl, ['pitch_gradient', 'pitch_stiffness'])
+    if 'pitch_grad_dyn' not in (_swl.get('dyn_extras') or {}):
+        _fx.append('missing pitch_grad_dyn')
+    _wdx.curves.plot_dynamics(_swx, graphs=_gx, corners=['FL', 'FR', 'RL', 'RR'])
+    _wdx.curves.plot_dynamics(_swl, graphs=['pitch_gradient', 'pitch_stiffness'], corners=['FL', 'FR', 'RL', 'RR'])
+    _wdx.close()
+    if _fx:
+        fails += 1
+    print(f'dyn handling grph: roll grad {_rg0:.3f} deg/g (roll at 1 g {_r1:.3f}), F LT share {_l1:.1f} %, '
+          f'roll stiffness {_rsx["total"]:.0f} N·m/deg   ' + ('pass' if not _fx else 'UNEXPECTED FAIL: ' + '; '.join(_fx)))
+except Exception as _e:
+    fails += 1
+    import traceback; traceback.print_exc()
+    print(f'dyn handling grph: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── PLOT ANYTHING (user 2026-11-10: "every measurable variable against every measured-against
+#    variable, under the 3-D model, adjustable units"; vahan/channels.py + gui/free_plot.py) ──
+# Gates: every CATALOG metric of the car's topology is a geometry channel and the four sweep
+# inputs are X candidates; the panel's own roll sweep reproduces the main sweep exactly and its
+# cache is dropped when the model is re-swept; the derived wheel rate equals k x MR^2 at static;
+# unit factors are right and applied; a dynamics sweep's Fz passes through untouched (and in
+# lbf) with the roll-stiffness extra attached; the lap straights + corners partition a synthetic
+# lap exactly with the expected mean speeds and speed bands; the panel draws every source.
+try:
+    import types as _types
+    from vahan import channels as _CHN
+    from vahan.metrics_catalog import CATALOG as _CATL
+    from vahan.laptime import LapResult as _LR, Track as _TK, isolate_corners as _ic, isolate_straights as _is
+    from vahan.packaging import _tangent_mr as _tmr
+    _wfp = MainWindow(); _wfp._load_project_from_path(_design); _wfp._rebuild_solvers(0.)
+    _fp = _wfp._free_plot; _ffx = []
+    # (2026-11-14) the panel may sit inside a scroll area that is the tab
+    _fp_in_tabs = _wfp._graph_tabs.indexOf(_fp) >= 0 or any(
+        getattr(_wfp._graph_tabs.widget(_i), 'widget', lambda: None)() is _fp
+        for _i in range(_wfp._graph_tabs.count()))
+    if not _fp_in_tabs or _wfp._graph_tabs.indexOf(_wfp.curves) < 0:
+        _ffx.append('panel not in the tabs under the 3-D view')
+    _fp.set_source('kin')
+    _kk = {c.key for c in _fp._channels}
+    _flav = getattr(_wfp._graph_panel, '_topology_flavors', {'standard'})
+    _miss = [e['key'] for e in _CATL if e['key'] not in _kk and (e.get('topologies') is None or (e['topologies'] & _flav))]
+    if _miss:
+        _ffx.append(f'catalog metrics missing: {_miss}')
+    if not all(f'motion:{m}' in _kk for m in ('heave', 'roll', 'pitch', 'steer')):
+        _ffx.append('sweep inputs missing')
+    _fp.compute_kin_sync('roll', -3.0, 3.0)
+    _fp._motion.setCurrentIndex(_fp._motion.findData('roll')); _fp._lo.setValue(-3.0); _fp._hi.setValue(3.0)
+    _fp.set_x('motion:roll'); _fp.set_y(['camber', 'wheel_rate'])
+    _rows = _fp.rows()
+    _wfp._motion_panel.restore_project_state({'type': 'roll', 'min': -3.0, 'max': 3.0}); _wfp._run_sweep()
+    _ref = np.asarray(_wfp._sweep_results['FL']['camber'], float)
+    _cam = [r for r in _rows if r[0].key == 'camber' and r[1] == 'FL']
+    if not _cam or not np.allclose(_cam[0][3], _ref, equal_nan=True) or not np.allclose(_cam[0][2], _wfp._x_arr):
+        _ffx.append('panel roll sweep differs from the main sweep')
+    if _fp._kin_cache:
+        _ffx.append('kin cache not dropped after the model sweep')
+    _veh = _wfp._build_dynamics_solver()._veh
+    _wr = [r for r in _rows if r[0].key == 'wheel_rate' and r[1] == 'FL'][0]
+    _k0 = float(np.interp(0.0, _wr[2], _wr[3])); _k1 = _veh.spring_rate_front_Npm * _tmr(_wfp._solvers['FL'], 0.0) ** 2 / 1000.0
+    if abs(_k0 - _k1) > 0.01 * _k1:
+        _ffx.append(f'wheel rate {_k0:.2f} vs k x MR^2 {_k1:.2f} N/mm')
+    for _fam, _u, _f in (('angle', 'rad', np.pi / 180), ('length', 'in', 1 / 25.4), ('force', 'lbf', 0.2248089431),
+                         ('speed', 'km/h', 3.6), ('stiffness', 'lbf/in', 5.710147155), ('roll_stiff', 'lbf·ft/deg', 0.7375621493)):
+        if abs(_CHN.unit_factor(_fam, _u) - _f) > 1e-6 * _f:
+            _ffx.append(f'unit {_fam} {_u}')
+    _fp.compute_kin_sync('roll', -3.0, 3.0); _fp.set_unit('angle', 'rad')
+    _c2 = [r for r in _fp.rows() if r[0].key == 'camber' and r[1] == 'FL'][0]
+    if not np.allclose(_c2[3], _ref * np.pi / 180, equal_nan=True) or _c2[5] != 'rad':
+        _ffx.append('rad conversion')
+    _fp.set_unit('angle', '°')
+    # dynamics source
+    _ssf = _wfp._build_dynamics_solver(); _swf = _ssf.sweep_lateral_g((0.0, 1.2), n_points=5)
+    _wfp._dyn_sweep_data = _swf; _wfp._notify_free_plot('dyn')
+    _fp.set_source('dyn'); _fp.set_x('lateral_g'); _fp.set_y(['Fz', 'ex:roll_stiff_static'])
+    _rd = _fp.rows()
+    _fz = [r for r in _rd if r[0].key == 'Fz' and r[1] == 'RR']
+    if not _fz or not np.allclose(_fz[0][3], _swf['Fz_RR']):
+        _ffx.append('dyn Fz not passed through')
+    if not any(r[0].key == 'ex:roll_stiff_static' and r[1] == 'total' for r in _rd):
+        _ffx.append('dyn roll stiffness extra missing')
+    _fp.set_unit('force', 'lbf')
+    _fz2 = [r for r in _fp.rows() if r[0].key == 'Fz' and r[1] == 'RR'][0]
+    if not np.allclose(_fz2[3], _swf['Fz_RR'] * 0.2248089431):
+        _ffx.append('lbf conversion')
+    _fp.set_unit('force', 'N')
+    # lap source: synthetic straight - corner - straight lap (30 m/s, 10 m/s on R 20 m, 30 m/s)
+    _s = np.arange(0, 301, 1.0); _kap = np.where((_s >= 100) & (_s <= 200), 1 / 20.0, 0.0)
+    _v = np.where((_s >= 100) & (_s <= 200), 10.0, 30.0)
+    _dt = np.diff(_s) / (0.5 * (_v[1:] + _v[:-1])); _t = np.concatenate([[0], np.cumsum(_dt)])
+    _trk = _TK(name='syn', x_m=_s, y_m=0 * _s, kappa_1pm=_kap)
+    _lr = _LR(s_m=_s, v_ms=_v, t_s=_t, lat_g=_v ** 2 * np.abs(_kap) / 9.80665, lon_g=0 * _s, lap_time_s=float(_t[-1]), aero_down_N=0 * _s)
+    _lr.corners, _lr.corner_summary = _ic(_lr, _trk); _lr.straights, _lr.straight_summary = _is(_lr, _trk, _lr.corners)
+    _ssm = _lr.straight_summary
+    if len(_lr.straights) != 2 or len(_lr.corners) != 1:
+        _ffx.append(f'synthetic lap: {len(_lr.straights)} straights / {len(_lr.corners)} corners')
+    if abs(_ssm['straight_time_s'] + _ssm['corner_time_s'] - _ssm['lap_time_s']) > 1e-6:
+        _ffx.append('straights + corners != lap')
+    if not (100.0 < _ssm['v_mean_kph'] <= 108.0 + 1e-9) or abs(_ssm['v_mean_corner_kph'] - 36.0) > 1.0:
+        _ffx.append(f'straight/corner mean speeds {_ssm["v_mean_kph"]:.1f}/{_ssm["v_mean_corner_kph"]:.1f}')
+    if not (39.0 < _ssm['speed_bands_pct'][100.0] < 41.0) or _ssm['speed_bands_pct'][120.0] != 0.0:
+        _ffx.append('speed bands')
+    _wfp._laptime_page = _types.SimpleNamespace(_result=_lr, _track=_trk)
+    _fp.set_source('lap'); _fp.set_x('lap:s'); _fp.set_y(['lap:v', 'lap:segment']); _fp.set_unit('speed', 'km/h')
+    _rl = _fp.rows()
+    _vv = [r for r in _rl if r[0].key == 'lap:v']; _sg = [r for r in _rl if r[0].key == 'lap:segment']
+    if (not _vv or abs(float(_vv[0][3][0]) - 108.0) > 1e-6 or not _sg
+            or float(_sg[0][3][150]) != 1.0 or float(_sg[0][3][10]) != 0.0):
+        _ffx.append('lap channels')
+    if len(_fp.draw_into(_fp._fig)) != 2:
+        _ffx.append('lap draw')
+    _fp._layout.setCurrentIndex(1)
+    if len(_fp.draw_into(_fp._fig)) != 1:
+        _ffx.append('overlay draw')
+    _wfp._laptime_page = None
+    _wfp.close()
+    if _ffx:
+        fails += 1
+    print(f'plot anything    : {len(_kk)} geometry channels, {len(_CHN.dyn_channels(_swf))} dynamics, '
+          f'{len(_CHN.lap_channels(_lr))} lap; synthetic lap straights {_ssm["v_mean_kph"]:.1f} / corners '
+          f'{_ssm["v_mean_corner_kph"]:.1f} km/h   ' + ('pass' if not _ffx else 'UNEXPECTED FAIL: ' + '; '.join(_ffx)))
+except Exception as _e:
+    fails += 1
+    import traceback; traceback.print_exc()
+    print(f'plot anything    : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── ALIGNMENT PANEL SHOWS THE LOADED FILE (user 2026-11-11) ────────────────
+# Bug: loading a .vahan set the model's static alignment but left the panel at
+# 0.00, so the user "corrected" rear toe and still saw +0.126 deg; pressing Apply
+# then zeroed the saved cambers.  Gate: after load the panel equals the model
+# (to 0.001 deg), and Apply without edits leaves the model's alignment unchanged.
+try:
+    _alf = []
+    _wal = MainWindow(); _wal._load_project_from_path(_design); _wal._rebuild_solvers(0.)
+    _alm = dict(_wal._alignment); _alp = _wal._alignment_panel.get_params()
+    for _k in ('front_toe_deg', 'front_camber_deg', 'rear_toe_deg', 'rear_camber_deg'):
+        if abs(_alp[_k] - float(_alm.get(_k, 0.))) > 1.0005e-3:
+            _alf.append(f'{_k}: panel {_alp[_k]:+.3f} vs model {float(_alm.get(_k, 0.)):+.4f}')
+    _wal._alignment_panel.alignment_changed.emit(_wal._alignment_panel.get_params())
+    for _k in _alp:
+        if abs(_wal._alignment[_k] - float(_alm.get(_k, 0.))) > 1.0005e-3:
+            _alf.append(f'Apply changed {_k}')
+    _wal.close()
+    if _alf:
+        fails += 1
+    print('alignment panel  : ' + ', '.join(f'{k[:-4]} {float(v):+.3f}' for k, v in _alm.items())
+          + ('   pass' if not _alf else '   UNEXPECTED FAIL: ' + '; '.join(_alf)))
+except Exception as _e:
+    fails += 1
+    print(f'alignment panel  : UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── ACTUATION SNAP PLANE for CAD (user 2026-11-06) ─────────────────────────
+# vahan/snap_plane.py: pushrod outer joint at droop/static/bump -> plane through
+# them.  Gate: the plane normal IS the carrying arm's pivot axis (|n x axis| <
+# 1e-6), a 4th arc point (mid travel) lies on it (< 1e-6 m), and on the v200.x
+# front (rocker axis parallel to the UCA axis) every static actuation-chain
+# point is within 0.1 mm of it.  Paste rows = 3 x 13 fields for hp.cs.
+try:
+    from vahan import snap_plane as _snp
+    _spf = []
+    _spc = sorted(_glob.glob('configs/2027_v200.1_*.vahan') + _glob.glob('configs/2027_v200.3_*.vahan'))
+    if not _spc:
+        _spf.append('no configs/2027_v200.1/.3 file')
+    _spw_front = 0.0
+    for _spp in _spc:
+        _spw = MainWindow(); _spw._load_project_from_path(_spp); _spw._rebuild_solvers(0.)
+        _spP = _snp.actuation_planes(_spw)
+        if set(_spP) != set(_snp.CORNERS):
+            _spf.append(f'{os.path.basename(_spp)}: planes for {sorted(_spP)}')
+        for _spl, _pl in _spP.items():
+            _n = _pl['normal']
+            if _pl['arm_axis'] is not None and np.linalg.norm(np.cross(_n, _pl['arm_axis'])) > 1e-6:
+                _spf.append(f'{_spl} normal not the arm axis ({np.linalg.norm(np.cross(_n, _pl["arm_axis"])):.2e})')
+            _tm = 0.5 * _pl['travel']['bump']
+            _p4 = np.asarray(_spw._solvers[_spl].solve(_tm).pushrod_outer, float)
+            if abs(float(np.dot(_p4 - _pl['point'], _n))) > 1e-6:
+                _spf.append(f'{_spl} mid-travel arc point {float(np.dot(_p4 - _pl["point"], _n))*1e3:.4f} mm off')
+            if _spl in ('FL', 'FR'):
+                if len(_pl['off_plane']) < 7:
+                    _spf.append(f'{_spl} only {len(_pl["off_plane"])} chain points')
+                for _k, _d in _pl['off_plane'].items():
+                    _spw_front = max(_spw_front, abs(_d) * 1e3)
+                    if abs(_d) > 1e-4:
+                        _spf.append(f'{os.path.basename(_spp)[:12]} {_spl} {_k} {_d*1e3:+.3f} mm off plane')
+        _rows = _snp.sw_paste_rows(_spP, lambda p: (-p[1], p[0], p[2]))
+        if len(_rows) != 3 or any(len(r.split(',')) != 13 for r in _rows):
+            _spf.append('paste rows malformed')
+        _spw.close()
+    if _spf:
+        fails += 1
+    print(f'actuation snap plane: {len(_spc)} configs, front chain worst {_spw_front:.4f} mm off plane   '
+          + ('pass' if not _spf else 'UNEXPECTED FAIL: ' + '; '.join(_spf[:6])))
+except Exception as _e:
+    fails += 1
+    print(f'actuation snap plane: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── Self-centring view (2026-11-14): hand-wheel return torque of the design
+# config is finite and positive at 0.25-1.0 g, and a compare against a second
+# project file (configs/Sam.vahan, else the design itself) returns two curves.
+try:
+    from vahan.analysis_plots import plot_self_centring, self_centring_curves
+    _scf = []
+    _scw = MainWindow(); _scw._load_project_from_path(_design); _scw._rebuild_solvers(0.)
+    _scref = os.path.join('configs', 'Sam.vahan')
+    if not os.path.isfile(_scref):
+        _scref = _design
+    _scc = _scw._self_centring_compare(9.125, _scref)
+    if len(_scc) != 2:
+        _scf.append(f'{len(_scc)} curves, expected 2')
+    _scmsg = []
+    for _c in _scc:
+        _cv = self_centring_curves(_c['effort'])
+        _at = dict(zip(_cv['latg'], _cv['torque']))
+        for _g in (0.25, 0.5, 0.75, 1.0):
+            _t = _at.get(_g, float('nan'))
+            if not (np.isfinite(_t) and _t > 0):
+                _scf.append(f'{_c["name"][:20]} {_t} at {_g} g')
+        if not any(np.isfinite(h) for h in _cv['handwheel_deg']):
+            _scf.append(f'{_c["name"][:20]} no hand-wheel angle')
+        _scmsg.append(f'{_at.get(0.5, float("nan")):.1f}/{_at.get(1.0, float("nan")):.1f} {_cv["unit"]}')
+    _scfig = plot_self_centring(_scc, 9.125)
+    if len(_scfig.axes) < 2:
+        _scf.append('figure lacks two panels')
+    _scw.close()
+    if _scf:
+        fails += 1
+    print(f'self-centring: design vs {os.path.basename(_scref)} at 0.5/1.0 g = {" vs ".join(_scmsg)}   '
+          + ('pass' if not _scf else 'UNEXPECTED FAIL: ' + '; '.join(_scf[:6])))
+except Exception as _e:
+    fails += 1
+    print(f'self-centring: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── STEER GROWS WITH g AT A HELD SPEED (2026-11-14): the Dynamics page passes its turn
+#    radius into every solve; that used to win, so the front wheels sat at L/R (~11 deg)
+#    already at 0 g.  With a held speed the steer must start near 0 and rise with g.
+try:
+    _wsg = MainWindow(); _wsg._load_project_from_path(_design); _wsg._rebuild_solvers(0.)
+    _ssg = _wsg._build_dynamics_solver()
+    _wsg._attach_front_steer(_ssg, 10.0, True, speed_mps=25 * 0.44704)
+    _sg0 = _ssg.solve(0.0, turn_radius_m=10.0); _sg1 = _ssg.solve(1.0, turn_radius_m=10.0); _sg2 = _ssg.solve(2.0, turn_radius_m=10.0)
+    _st = [float(getattr(r, 'steer_mean_deg', float('nan'))) for r in (_sg0, _sg1, _sg2)]
+    _sgf = []
+    if not (abs(_st[0]) < 1.0 and _st[0] < _st[1] < _st[2]):
+        _sgf.append(f'steer at 0/1/2 g = {_st[0]:.2f}/{_st[1]:.2f}/{_st[2]:.2f} deg (held speed must start near 0 and rise)')
+    if _sgf:
+        fails += 1
+    print(f'steer vs g (25 mph held): {_st[0]:.2f} / {_st[1]:.2f} / {_st[2]:.2f} deg at 0 / 1 / 2 g   '
+          + ('pass' if not _sgf else 'UNEXPECTED FAIL: ' + '; '.join(_sgf)))
+except Exception as _e:
+    fails += 1
+    print(f'steer vs g: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── LIGHT-THEME COPY (2026-11-14): white dark-theme curves (RL) must turn black on the
+#    white page, then come back white on screen.
+try:
+    import io as _io_lt
+    from matplotlib.figure import Figure as _FigLT
+    from gui.plot_dialog import ReadableCanvas as _RCLT
+    from PIL import Image as _ImLT
+    _flt = _FigLT(figsize=(3, 2)); _flt.set_facecolor('#1b1b1e'); _alt = _flt.add_subplot(111); _alt.set_facecolor('#141417')
+    _alt.plot([0, 1], [0, 1], color='#FFFFFF', lw=6)
+    _clt = _RCLT(_flt)
+    _blt = _clt._fig_to_bytes(light=True)
+    _plt_ = np.asarray(_ImLT.open(_io_lt.BytesIO(_blt)).convert('RGB')).astype(int)
+    _ndark = int((_plt_.sum(axis=2) < 120).sum())
+    _back = _alt.get_lines()[0].get_color()
+    _ltf = [] if (_ndark > 200 and str(_back).upper() == '#FFFFFF') else [f'dark pixels {_ndark}, restored colour {_back}']
+    if _ltf:
+        fails += 1
+    print(f'light-theme copy: white curve -> {_ndark} dark px on the white page, restored {_back}   '
+          + ('pass' if not _ltf else 'UNEXPECTED FAIL: ' + '; '.join(_ltf)))
+except Exception as _e:
+    fails += 1
+    print(f'light-theme copy: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── FRONT STEER IN THE DYNAMICS SWEEP (2026-11-14, user: "steady state sweep doesnt take
+#    in account for camber gain from caster").  Before: the front corners were always solved
+#    at rack 0, so caster / KPI camber at steer never reached the Dynamics sweep (FAILED:
+#    steered outer-front camber == unsteered).  Now SteadyStateSolver.steer_front (opt-in,
+#    Dynamics page only) solves each front corner at the rack delta = L/R + (a_f - a_r) asks
+#    for, via MainWindow._build_corner_solvers (the ONE construction).
+#    (a) steer OFF == today's path exactly; (b) v208 1.5 g / R 8 m: outer front camber more
+#    negative, and the change == a direct kinematic solve at the same rack within 0.05 deg;
+#    (c) +g = right turn: FL toes in, FR toes out, both steer INTO the turn, -g mirrors;
+#    (d) the lap sim never steers (no rack solver built, lap time identical).
+print('-' * 64)
+try:
+    import glob as _glST
+    from vahan.kinematics import KinematicMetrics as _KMST
+    _cST = sorted(_glST.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          'configs', '2027_v208_*.vahan')))
+    _cST = _cST[0] if _cST else _design
+    _wST = MainWindow(); _wST._load_project_from_path(_cST); _wST._rebuild_solvers(0.)
+    _stf = []
+    _R = 8.0
+    # (a) steer off: passing a radius changes nothing, and equals the plain solve
+    _s0 = _wST._build_dynamics_solver()
+    if _s0.steer_front or _s0.steer_active(_R):
+        _stf.append('a fresh solver steers by default')
+    _r0 = _s0.solve(1.5)
+    _r0R = _wST._build_dynamics_solver().solve(1.5, turn_radius_m=_R)
+    for _c in ('FL', 'FR', 'RL', 'RR'):
+        if (_r0.camber[_c] != _r0R.camber[_c] or _r0.Fz[_c] != _r0R.Fz[_c]
+                or _r0.utilization[_c] != _r0R.utilization[_c]):
+            _stf.append(f'steer-off {_c} changed with a radius')
+    if _r0.steer_on or _s0._rack_solvers:
+        _stf.append('steer-off solve built a rack solver')
+    _sw0 = _wST._build_dynamics_solver().sweep_combined((0.0, 2.0), 0.0, 9)
+    _sw0R = _wST._build_dynamics_solver().sweep_combined((0.0, 2.0), 0.0, 9, turn_radius_m=_R)
+    if not all(np.array_equal(_sw0[k], _sw0R[k]) for k in _sw0 if isinstance(_sw0[k], np.ndarray)):
+        _stf.append('steer-off sweep differs with a radius')
+    # (b) steer on
+    _s1 = _wST._build_dynamics_solver()
+    if not _wST._attach_front_steer(_s1, _R, True):
+        _stf.append('steer could not be attached')
+    _r1 = _s1.solve(1.5, turn_radius_m=_R)
+    _fac = _wST._front_solver_at_rack_factory()
+    _rk = _r1.steer_rack_mm / 1000.0
+    _kin = {}
+    for _c in ('FL', 'FR'):
+        _sd = 'left' if _c == 'FL' else 'right'
+        _on = _KMST(_fac(_rk, _c).solve(_r1.travel[_c] / 1000.0), _sd)
+        _off = _KMST(_wST._solvers[_c].solve(_r0.travel[_c] / 1000.0), _sd)
+        _kin[_c] = (_on.camber, _off.camber, _on.toe, _off.toe)
+        if abs(_on.camber - _r1.camber[_c]) > 1e-6:
+            _stf.append(f'{_c} sweep camber != direct solve at the same rack/travel')
+        _dd = _r1.camber[_c] - _r0.camber[_c]
+        _dk = _on.camber - _off.camber
+        if abs(_dd - _dk) > 0.05:
+            _stf.append(f'{_c} camber change {_dd:+.3f} vs kinematic {_dk:+.3f}')
+    _dFL = _r1.camber['FL'] - _r0.camber['FL']
+    if not (_dFL < -0.2):
+        _stf.append(f'outer (FL) camber not more negative with steer ({_dFL:+.3f} deg)')
+    # ground camber from the full steered spin vector (inclination fed to the tyre)
+    if abs(_r1.camber_ground['FL'] - _r0.camber_ground['FL']) < 0.2:
+        _stf.append('ground camber ignores the steer')
+    # (c) direction
+    _L = float(_s1._veh.wheelbase_m)
+    _dexp = np.degrees(_L / _R) + _r1.understeer_gradient_deg
+    if not (_r1.steer_on and abs(_r1.steer_mean_deg - _dexp) < 0.3):
+        _stf.append(f'mean steer {_r1.steer_mean_deg:.2f} vs L/R+US {_dexp:.2f}')
+    if not (_r1.toe['FL'] - _r0.toe['FL'] > 3.0 and _r1.toe['FR'] - _r0.toe['FR'] < -3.0):
+        _stf.append('right turn: FL must toe in, FR toe out')
+    if not (_r1.steer_outer_deg > 3.0 and _r1.steer_inner_deg > 3.0):
+        _stf.append('wheels not steered into the turn')
+    if not (_s1.steering_geometry.road_wheel_from_rack(_rk) < 0):
+        _stf.append('rack is on the left-turn side for a right turn')
+    _r1m = _s1.solve(-1.5, turn_radius_m=_R)
+    if (abs(_r1m.camber['FR'] - _r1.camber['FL']) > 0.03
+            or abs(_r1m.steer_mean_deg - _r1.steer_mean_deg) > 0.2):
+        _stf.append(f'-1.5 g not the mirror (FR {_r1m.camber["FR"]:+.3f} vs FL {_r1.camber["FL"]:+.3f})')
+    # sweep carries the steer channels
+    _sw1 = _s1.sweep_combined((0.0, 2.0), 0.0, 5, turn_radius_m=_R)
+    if not all(k in _sw1 and np.all(np.isfinite(_sw1[k])) for k in
+               ('steer_mean_deg', 'steer_inner_deg', 'steer_outer_deg', 'steer_rack_mm', 'toe_FL')):
+        _stf.append('sweep lacks finite steer channels')
+    # panel input saved with the project state, default ON
+    _ps = _wST._dynamics_panel.get_state()
+    if _ps.get('steer_front_in_sweep') is not True:
+        _stf.append('panel checkbox not ON by default / not saved')
+    _wST._dynamics_panel.set_state({'steer_front_in_sweep': False})
+    if _wST._dynamics_panel.get_state().get('steer_front_in_sweep') is not False:
+        _stf.append('panel checkbox does not load')
+    _wST._dynamics_panel.set_state({'steer_front_in_sweep': True})
+    # (d) lap sim: never steers, lap time identical to the unsteered path
+    from vahan.laptime import Track as _TkST, LapSimulator as _LsST
+    _trkST = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tracks', 'autocross26.json')
+    if os.path.isfile(_trkST):
+        _fST = _TkST.from_json(_trkST)
+        _tST = _TkST(name='net', x_m=_fST.x_m[::10], y_m=_fST.y_m[::10],
+                     kappa_1pm=_fST.kappa_1pm[::10], width_m=_fST.width_m)
+
+        def _lapST(ss):
+            _ls = _LsST(ss, cla_m2=0.0, cda_m2=1.0, air_density=float(ss._veh.air_density_kg_m3),
+                        aero_cop_rear_frac=0.5, grip_scale=0.65,
+                        static_rh_front_mm=50.0, static_rh_rear_mm=50.0)
+            return _ls.simulate(_tST, n_detail=4).lap_time_s
+        _ssA = _wST._build_dynamics_solver()
+        _tA = _lapST(_ssA)
+        _ssB = _wST._build_dynamics_solver()
+        _ssB.solve = (lambda lat, lon=0.0, max_iter=15, tol_deg=0.002, aero_Fz=None, turn_radius_m=None,
+                      _o=_ssB: _o._solve_unsteered(lat, lon, max_iter, tol_deg, aero_Fz))
+        _tB = _lapST(_ssB)
+        if _tA != _tB or _ssA._rack_solvers or _ssA.steer_front:
+            _stf.append(f'lap sim steered (lap {_tA:.4f} vs unsteered {_tB:.4f} s)')
+    else:
+        _tA = float('nan')
+    _wST.close()
+    if _stf:
+        fails += 1
+    print(f'front steer in sweep: {os.path.basename(_cST)[:9]} 1.5 g R {_R:.0f} m: steer {_r1.steer_mean_deg:.2f} deg '
+          f'(in {_r1.steer_inner_deg:.2f} / out {_r1.steer_outer_deg:.2f}, rack {_r1.steer_rack_mm:+.1f} mm); '
+          f'outer FL camber {_r0.camber["FL"]:+.3f} -> {_r1.camber["FL"]:+.3f}, inner FR {_r0.camber["FR"]:+.3f} -> '
+          f'{_r1.camber["FR"]:+.3f} deg; lap {_tA:.3f} s unchanged   '
+          + ('pass' if not _stf else 'UNEXPECTED FAIL: ' + '; '.join(_stf[:6])))
+except Exception as _e:
+    import traceback as _tbST; _tbST.print_exc()
+    fails += 1
+    print(f'front steer in sweep: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── SIDE PANELS NEVER CLIPPED + LONG g NOT HELD AT 0.5 g (2026-11-14, failing-then-passing) ──
+# (1) user: "the side panels just clip and hide half the shit half the time ... i cant do that for
+#     lap time".  Every page's control column was a QScrollArea with a FIXED width (Laptime 300 px)
+#     narrower than its widest row (Laptime 408 px with Windows fonts), and the Suspension sidebars
+#     sat in a splitter at 300/280 px with the sideways bar OFF, so the right part of each row was
+#     hidden until the splitter was dragged wider.  Now gui/side_panel.SideScroll reports the
+#     contents' minimum width as its own minimum (and re-reports it on every re-layout) inside a
+#     QSplitter: at the default 1500x900 window every side panel shows its full width, a row that
+#     grows later widens the panel, and the window is not forced wider than 1500 px.
+# (2) user: "long g is capped at 0.5g again".  The Laptime page's primary ratio defaulted to 1.0
+#     (the powertrain sheet and vahan/acceleration.py say 2.111) - half the wheel torque, so the
+#     lap's forward g sat near 0.4-0.7 g, and every restart reset a hand-typed fix.  Now the page
+#     (and the Ackermann page's lap chain) use acceleration.DEFAULT_PRIMARY: the lap's low-speed
+#     forward g is the tyre/traction limit (> 1 g, within 5 % of the launch model's traction g);
+#     the Dynamics clamp and the long-g sweep go well past 0.5 g both ways.
+try:
+    from PyQt6.QtWidgets import QSplitter as _SPq, QLabel as _SPl
+    from gui.side_panel import SideScroll as _SPs
+    from vahan.acceleration import DEFAULT_PRIMARY as _SPprim
+    _spf = []
+    _wsp = MainWindow(); _wsp._load_project_from_path(_design); _wsp._rebuild_solvers(0.)
+    _wsp.resize(1500, 900); _wsp.show(); app.processEvents()
+
+    def _sp_ok(name, sc):
+        if not isinstance(sc, _SPs) or not isinstance(sc.parentWidget(), _SPq) or not sc.widgetResizable():
+            _spf.append(f'{name}: not a resizable scroll area in a splitter'); return
+        # whole width shown, or (contents wider than 35 % of the screen) reachable by the
+        # sideways bar - never cut with no way to reach it
+        _need = sc.widget().minimumSizeHint().width()
+        if sc.viewport().width() + 1 < _need and                 sc.horizontalScrollBar().maximum() < _need - sc.viewport().width() - 1:
+            _spf.append(f'{name}: clipped (shows {sc.viewport().width()} of {_need} px)')
+    _sp_ok('suspension left', _wsp._h_split.widget(0)); _sp_ok('suspension right', _wsp._h_split.widget(2))
+    _wsp._switch_page(1); app.processEvents()
+    _lpS = _wsp._laptime_page
+    _sp_ok('laptime', getattr(_lpS, '_side_scroll', None))
+    for _ix, _at in ((3, '_loads_page'), (4, '_ackermann_page'), (7, '_ride_page'), (8, '_corner_speed_page')):
+        try:
+            _wsp._switch_page(_ix); app.processEvents()
+            _pg = getattr(_wsp, _at)
+            _sp_ok(_at, _pg._side_split.widget(0))
+        except Exception as _e:
+            _spf.append(f'{_at}: {type(_e).__name__}: {_e}')
+    # (2026-11-16 user: "can't shrink side panels past a certain point, 1/4 of the screen
+    # each side") a panel drags down to MIN_W - everything still reachable by the sideways
+    # bar - and collapses to 0 / comes back at its last width (double-click the divider)
+    from gui.side_panel import MIN_W as _SPmin
+    _wsp._switch_page(1); app.processEvents()
+    _scS = _lpS._side_scroll
+    _w0 = _scS.width()
+    _hs = _wsp._h_split
+    for _nmS, _spX, _iX in (('suspension left', _hs, 0), ('suspension right', _hs, 2),
+                            ('laptime', _lpS._side_split, 0)):
+        _scX = _spX.widget(_iX); _spX._key = ''   # never write the user's saved sizes
+        if _scX.minimumSizeHint().width() > _SPmin:
+            _spf.append(f'{_nmS}: cannot drag below {_scX.minimumSizeHint().width()} px (want {_SPmin})')
+        _sz0 = _spX.sizes()
+        _szN = list(_sz0); _szN[1 if _iX != 1 else 0] += _szN[_iX] - _SPmin; _szN[_iX] = _SPmin
+        _spX.setSizes(_szN); app.processEvents()
+        if _spX.sizes()[_iX] > _SPmin + 2:
+            _spf.append(f'{_nmS}: dragged to {_SPmin} px but stays {_spX.sizes()[_iX]} px')
+        _sp_ok(_nmS + ' (narrow)', _scX)
+        _spX.toggle_side(_iX); app.processEvents()
+        _c = _spX.sizes()[_iX]
+        _spX.toggle_side(_iX); app.processEvents()
+        _r = _spX.sizes()[_iX]
+        if _c != 0 or abs(_r - _SPmin) > 2:
+            _spf.append(f'{_nmS}: collapse {_c} px / restore {_r} px (want 0 / {_SPmin})')
+        _spX.setSizes(_sz0); app.processEvents()
+    _w1 = _scS.width()
+    # (2) long g
+    _gsS = _lpS.build_sim()
+    if abs(float(_lpS._primary.value()) - _SPprim) > 1e-9 or abs(_gsS._primary - _SPprim) > 1e-9:
+        _spf.append(f'lap primary {_lpS._primary.value()} != acceleration model {_SPprim}')
+    _mS = float(_gsS.veh.total_mass_kg) * 9.80665
+    _drv5 = max(_gsS._force_in_gear(5.0, _g)[0] for _g in range(1, len(_gsS._gears) + 1)) / _mS
+    _ssS = _wsp._build_dynamics_solver(); _muS = _ssS._effective_mu()
+    _acc_clamp = float(_ssS._clamp_to_friction_circle(0.0, 5.0, _muS)[1])
+    _brk_clamp = float(_ssS._clamp_to_friction_circle(0.0, -5.0, _muS)[1])
+    _mx = _ssS.max_accel_g()
+    _trkS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tracks', 'autocross26.json')
+    _lapPk = float('nan')
+    if os.path.isfile(_trkS):
+        from vahan.laptime import Track as _TkS
+        _fS = _TkS.from_json(_trkS)
+        _tS = _TkS(name='net', x_m=_fS.x_m[::10], y_m=_fS.y_m[::10], kappa_1pm=_fS.kappa_1pm[::10],
+                   width_m=_fS.width_m)
+        _rS = _gsS.simulate(_tS, n_detail=4, method='pointmass')
+        _lapPk = float(np.nanmax(np.asarray(_rS.lon_g, float)))
+        if not (_lapPk > 1.0 and _lapPk <= 1.05 * float(_mx['traction_g'])):
+            _spf.append(f'lap peak forward g {_lapPk:.2f} (want > 1.0 and <= traction {_mx["traction_g"]:.2f} x1.05)')
+    if _drv5 <= 1.0:
+        _spf.append(f'lap engine force at 5 m/s only {_drv5:.2f} g')
+    if not (_acc_clamp > 0.5 and abs(_acc_clamp - float(_mx['traction_g'])) < 1e-6 and _brk_clamp < -0.5):
+        _spf.append(f'dynamics clamp accel {_acc_clamp:.2f} / brake {_brk_clamp:.2f} g at 0 lat')
+    _lonS = _ssS.sweep_longitudinal_g(g_range=(-1.5, 1.5), n_points=5)
+    if not np.all(np.isfinite(_lonS['pitch_angle_deg'])) or abs(_lonS['longitudinal_g'][0]) < 1.5:
+        _spf.append('long-g sweep does not reach -1.5 g')
+    _wsp.close()
+    if _spf:
+        fails += 1
+    print(f'side panels + long g: laptime panel {_lpS._side_scroll.viewport().width()} px shown '
+          f'(drag to MIN_W, collapse, restore ok); lap primary {_SPprim}, engine at 5 m/s {_drv5:.2f} g, '
+          f'lap peak forward {_lapPk:.2f} g vs traction {_mx["traction_g"]:.2f} g; dynamics at 0 lat: '
+          f'accel {_acc_clamp:.2f} / brake {_brk_clamp:.2f} g   '
+          + ('pass' if not _spf else 'UNEXPECTED FAIL: ' + '; '.join(_spf[:8])))
+except Exception as _e:
+    import traceback as _tbSP; _tbSP.print_exc()
+    fails += 1
+    print(f'side panels + long g: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── EVENT LAPS / DISTANCE on the Laptime page (2026-11-15, user: "give me the option to
+#    set laps and total length in software").  Total = laps x lap time; a distance > 0
+#    sets laps = ceil(distance / lap length).  Checked on a fake result (no sim needed).
+try:
+    from types import SimpleNamespace as _NSev
+    _wEv = MainWindow(); _wEv._load_project_from_path(_design); _wEv._rebuild_solvers(0.)
+    _wEv._switch_page(1)                      # the Laptime page is built on first open
+    _lpEv = _wEv._laptime_page
+    _fake = _NSev(s_m=np.linspace(0.0, 1000.0, 11), lap_time_s=60.0)
+    _evf = []
+    _lpEv._event_km.setValue(0.0); _lpEv._event_laps.setValue(5)
+    _t5 = _lpEv.event_totals(_fake)
+    if _t5 is None or _t5[0] != 5 or abs(_t5[2] - 300.0) > 1e-9:
+        _evf.append(f'5 laps: {_t5}')
+    _lpEv._event_km.setValue(22.0)
+    _t22 = _lpEv.event_totals(_fake)
+    if _t22 is None or _t22[0] != 22 or abs(_t22[2] - 1320.0) > 1e-9:
+        _evf.append(f'22 km on a 1 km lap: {_t22}')
+    _lpEv._event_km.setValue(21.5)
+    _t215 = _lpEv.event_totals(_fake)
+    if _t215 is None or _t215[0] != 22:
+        _evf.append(f'21.5 km should round UP to 22 laps: {_t215}')
+    _lpEv._event_res = _fake; _lpEv._update_event()
+    if 'EVENT' not in _lpEv._event_lbl.text():
+        _evf.append('event readout empty')
+    _wEv.close()
+    if _evf:
+        fails += 1
+    print('event laps/distance: ' + ('pass' if not _evf else 'UNEXPECTED FAIL: ' + '; '.join(_evf)))
+except Exception as _e:
+    import traceback as _tbEv; _tbEv.print_exc()
+    fails += 1
+    print(f'event laps/distance: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
+
+# ── TYRE DATA METHOD (2026-11-16, user: "option to use curve fit TTC data, lookup data and
+#    polynomial spline fit").  The Dynamics-panel choice must rebuild THE tyre model the
+#    whole app uses, each method must fit the raw samples (R2 > 0.99), and the choice must
+#    be in the saved panel state.
+try:
+    _wTf = MainWindow(); _wTf._load_project_from_path(_design); _wTf._rebuild_solvers(0.)
+    _dpTf = _wTf._dynamics_panel
+    _tff, _tfs = [], []
+    for _m in ('mf52', 'spline', 'lookup'):
+        _dpTf._tire_fit.setCurrentIndex(_dpTf._tire_fit.findData(_m))
+        _tmTf = _wTf._tire_model
+        if _tmTf is None or getattr(_tmTf, 'fit_method', None) != _m:
+            _tff.append(f'{_m}: live tyre is {getattr(_tmTf, "fit_method", None)}')
+            continue
+        _q = _tmTf.fit_quality
+        if not _q['r2'] > 0.99:
+            _tff.append(f'{_m}: R2 {_q["r2"]:.4f}')
+        if _dpTf.get_state().get('tire_fit_method') != _m:
+            _tff.append(f'{_m}: not in saved panel state')
+        _tfs.append(f'{_m} R2 {_q["r2"]:.4f} RMS {_q["rms_N"]:.0f} N mu700 {float(_tmTf.peak_mu(700.0)):.3f}')
+    _wTf.close()
+    if _tff:
+        fails += 1
+    print('tyre data method: ' + '; '.join(_tfs) + ('   pass' if not _tff else '   UNEXPECTED FAIL: ' + '; '.join(_tff)))
+except Exception as _e:
+    import traceback as _tbTf; _tbTf.print_exc()
+    fails += 1
+    print(f'tyre data method: UNEXPECTED FAIL ({type(_e).__name__}: {_e})')
 
 print(f'{fails} unexpected failures, {known} known-fail (documented).')
 sys.exit(fails)

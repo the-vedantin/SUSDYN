@@ -33,6 +33,22 @@ class RoadSpectrum:
         result[mask] = g0 * (n[mask] / 0.1) ** (-self.waviness)
         return result
 
+    def band_power(self, lo, hi):
+        """Exact integral of psd over [lo, hi] (m^2; arrays broadcast), clipped
+        to the band. The synthesis gives each Fourier bin THIS power instead of
+        psd(n)*dn: a 1 km record holds only 11 bins below 0.1 cycles/m, and on
+        the n^-2 slope the point-sampled sum overstated the variance by 4.7 %
+        (ISO class A 1.517e-5 vs the closed-form 1.449e-5 m^2)."""
+        lo = np.clip(np.asarray(lo, dtype=float), self.low_cycles_per_m, self.high_cycles_per_m)
+        hi = np.clip(np.asarray(hi, dtype=float), self.low_cycles_per_m, self.high_cycles_per_m)
+        g0 = {'A': 16e-6, 'B': 64e-6}[self.road_class] * 0.1 ** self.waviness
+        w = self.waviness
+        if np.isclose(w, 1.0):
+            out = g0 * np.log(hi / lo)
+        else:
+            out = g0 * (hi ** (1 - w) - lo ** (1 - w)) / (1 - w)
+        return np.maximum(out, 0.0)
+
     def temporal_psd(self, hz, speed_mps):
         """S_z(f)=G_z(f/v)/v, preserving displacement variance."""
         if not np.isfinite(speed_mps) or speed_mps <= 0:
@@ -41,7 +57,8 @@ class RoadSpectrum:
 
 
 def synthesize_profile(spectrum, *, length_m, spacing_m, seed):
-    """Return periodic spatial samples with exact one-sided Fourier-bin power.
+    """Return periodic spatial samples with exact one-sided Fourier-bin power
+    (the PSD integrated over each bin, so the variance is the band integral).
 
     Random phases, no random amplitude; each realization has the specified
     discrete PSD. Excludes Nyquist. Do not concatenate repeats as independent
@@ -58,10 +75,13 @@ def synthesize_profile(spectrum, *, length_m, spacing_m, seed):
     if 1 / length_m > spectrum.low_cycles_per_m:
         raise ValueError('Record too short to resolve low-frequency band')
     n = np.fft.rfftfreq(count, spacing_m)
-    g = spectrum.psd(n)
+    # Variance of each bin = the PSD integrated over the bin (n +- dn/2),
+    # so the record's variance is the ISO band integral exactly.
+    dn = 1.0 / length_m
+    power = spectrum.band_power(n - dn / 2, n + dn / 2)
     phase = np.random.default_rng(seed).uniform(0, 2*np.pi, len(n))
     # irfft contributes 2*abs(X)/N for each positive-frequency cosine.
-    coefficients = count * np.sqrt(g / (2 * length_m)) * np.exp(1j * phase)
+    coefficients = count * np.sqrt(power / 2) * np.exp(1j * phase)
     coefficients[0] = 0
     if count % 2 == 0:
         coefficients[-1] = 0

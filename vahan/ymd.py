@@ -120,8 +120,15 @@ def _dims(solver):
     return m, L, l_f, l_r, t_f, t_r
 
 
-def build_loads_table(solver, aero_Fz_per_g=None, ay_max=3.0, n=13):
+def build_loads_table(solver, aero_Fz_per_g=None, ay_max=3.0, n=13,
+                      aero_Fz_const=None):
     """Per-corner Fz and camber vs |Ay|, solved once and reused.
+
+    aero_Fz_const: falsy, or a per-corner N dict applied UNCHANGED at every
+    grid row — the constant-SPEED frame (the MMD), where the downforce at the
+    diagram's speed does not vary with Ay.  May be combined with
+    aero_Fz_per_g (constant-radius scaling); both reach the solver through
+    its one aero_Fz input.
 
     The steady solver costs real time per solve (it iterates the kinematics),
     and one trim sweep evaluates thousands of operating points, so loads are
@@ -135,8 +142,13 @@ def build_loads_table(solver, aero_Fz_per_g=None, ay_max=3.0, n=13):
     """
     ays, rows = [], []
     for ay in np.linspace(0.0, float(ay_max), int(n)):
-        aero_row = ({k: float(aero_Fz_per_g.get(k, 0.0)) * float(ay)
-                     for k in _CORNERS} if aero_Fz_per_g else None)
+        aero_row = None
+        if aero_Fz_per_g or aero_Fz_const:
+            aero_row = {k: (float(aero_Fz_per_g.get(k, 0.0)) * float(ay)
+                            if aero_Fz_per_g else 0.0)
+                           + (float(aero_Fz_const.get(k, 0.0))
+                              if aero_Fz_const else 0.0)
+                        for k in _CORNERS}
         try:
             res = solver.solve(float(ay), 0.0, aero_Fz=aero_row)
         except Exception:
@@ -170,6 +182,26 @@ def build_loads_table(solver, aero_Fz_per_g=None, ay_max=3.0, n=13):
     return table
 
 
+def _pct_is_curve(p) -> bool:
+    """True when the "Ackermann setting" is the car's probed SteeringGeometry
+    (vahan.steering) — the linkage's OWN inner/outer curve — not a number."""
+    return hasattr(p, 'pair_from_mean')
+
+
+def _pct_arg(p):
+    """What ymd_state accepts: the curve object itself, else float(p)."""
+    return p if _pct_is_curve(p) else float(p)
+
+
+def _pct_value(p) -> float:
+    """Numeric field for result rows: NaN for the curve (it has no single %)."""
+    return float('nan') if _pct_is_curve(p) else float(p)
+
+
+def _pct_label(p) -> str:
+    return 'linkage curve' if _pct_is_curve(p) else f'{float(p):+.0f}%'
+
+
 def _ackermann_split(delta_deg, ackermann_pct, t_f, L):
     """Front steer split.  The 100% (kinematic) spread is the EXACT Ackermann
     geometry — invert cot(d_out) - cot(d_in) = t_f/L about the mean steer, the
@@ -182,6 +214,13 @@ def _ackermann_split(delta_deg, ackermann_pct, t_f, L):
     ad = abs(d)
     if ad < 1e-9:
         return (d, d)
+    if _pct_is_curve(ackermann_pct):
+        # THE CAR'S OWN LINKAGE (user 2026-10-10: "use the curve for the
+        # calcs"): inner/outer road-wheel angles the probed steering gives at
+        # this mean steer, no percentage anywhere.
+        d_in, d_out = ackermann_pct.pair_from_mean(math.radians(ad))
+        d_in, d_out = math.degrees(d_in), math.degrees(d_out)
+        return (d_in, d_out) if d >= 0.0 else (-d_out, -d_in)   # (FL, FR)
     # Split in the COTANGENT domain about the mean steer (the domain
     # _turn_geometry works in): cot(d_in) = cot(d) - off, cot(d_out) =
     # cot(d) + off, with off = (t_f/2L)*(pct/100).  Then
@@ -461,7 +500,7 @@ def control_at_point(tire_model, solver, ackermann_list, *, radius_m=None,
                                                     else V_mps)
 
     def _ay(pct, b, d, seed=0.75):
-        st = ymd_state(tire_model, solver, b, d, ackermann_pct=float(pct),
+        st = ymd_state(tire_model, solver, b, d, ackermann_pct=_pct_arg(pct),
                        Ay0=seed, **kw)
         return st['Ay_g'], st['N_Nm']
 
@@ -487,7 +526,7 @@ def control_at_point(tire_model, solver, ackermann_list, *, radius_m=None,
         hb = steps[1] if len(steps) > 1 else steps[0]
         _, nb_p = _ay(pct, beta_deg + hb, delta_deg, ay0)
         _, nb_m = _ay(pct, beta_deg - hb, delta_deg, ay0)
-        out.append({'pct': float(pct), 'Ay_g': ay0,
+        out.append({'pct': _pct_value(pct), 'pct_label': _pct_label(pct), 'Ay_g': ay0,
                     'beta_deg': float(beta_deg), 'delta_deg': float(delta_deg),
                     'N_delta': float(np.median(nd)),
                     'N_delta_by_step': dict(zip(steps, [float(x) for x in nd])),
@@ -529,7 +568,7 @@ def mmm_metrics(tire_model, solver, ackermann_pct, *, radius_m=None,
 
     Physics is all ymd_state; this only sweeps the diagram and reads it.
     """
-    kw = dict(radius_m=radius_m, V_mps=V_mps, ackermann_pct=float(ackermann_pct),
+    kw = dict(radius_m=radius_m, V_mps=V_mps, ackermann_pct=_pct_arg(ackermann_pct),
               grip_multiplier=grip_multiplier, aero_Fz_per_g=aero_Fz_per_g,
               loads_table=loads_table)
     m, L, l_f, l_r, t_f, t_r = _dims(solver)
@@ -543,13 +582,13 @@ def mmm_metrics(tire_model, solver, ackermann_pct, *, radius_m=None,
     for b in betas:
         tp = trim_point(tire_model, solver, float(b),
                         radius_m=radius_m, V_mps=V_mps,
-                        ackermann_pct=float(ackermann_pct),
+                        ackermann_pct=_pct_arg(ackermann_pct),
                         grip_multiplier=grip_multiplier,
                         aero_Fz_per_g=aero_Fz_per_g, loads_table=loads_table)
         if tp.get('has_trim') and np.isfinite(tp['Ay_g']):
             trims.append((tp['Ay_g'], tp['beta_deg'], tp['delta_deg']))
     if not trims:
-        return {'ackermann_pct': float(ackermann_pct),
+        return {'ackermann_pct': _pct_value(ackermann_pct), 'ackermann_label': _pct_label(ackermann_pct),
                 'ay_trim_max': float('nan'), 'stability_index': float('nan'),
                 'control_moment_avail_CN': float('nan'),
                 'control_moment_avail_Nm': float('nan'),
@@ -604,7 +643,7 @@ def mmm_metrics(tire_model, solver, ackermann_pct, *, radius_m=None,
     else:
         char = 'NEUTRAL drift (race target)'
 
-    return {'ackermann_pct': float(ackermann_pct),
+    return {'ackermann_pct': _pct_value(ackermann_pct), 'ackermann_label': _pct_label(ackermann_pct),
             'ay_trim_max': float(ay_T),
             'beta_at_T': float(b_T), 'delta_at_T': float(d_T),
             'ay_op': float(ay_op), 'beta_op': float(b_op), 'delta_op': float(d_op),
@@ -661,7 +700,7 @@ def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
               aero_Fz_per_g=aero_Fz_per_g, loads_table=table)
     rows = []
     for pct in ackermann_list:
-        pct = float(pct)
+        pct = _pct_arg(pct)
 
         def _trim(b):
             return trim_point(tire_model, solver, b,
@@ -746,7 +785,7 @@ def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
                         b_bad = mid
         best = seen[best_b]
         if not best['has_trim']:
-            rows.append({'pct': pct, 'Ay_trim_max': float('nan'),
+            rows.append({'pct': _pct_value(pct), 'pct_label': _pct_label(pct), 'Ay_trim_max': float('nan'),
                          'beta_at': float('nan'), 'delta_at': float('nan'),
                          'N_delta': float('nan'), 'N_beta': float('nan'),
                          'converged': False})
@@ -766,7 +805,7 @@ def trim_sweep_ackermann(tire_model, solver, radius_m, ackermann_list,
                          ackermann_pct=pct, **dkw)['N_Nm']
         N_bm = ymd_state(tire_model, solver, b0 - h, d0,
                          ackermann_pct=pct, **dkw)['N_Nm']
-        rows.append({'pct': pct,
+        rows.append({'pct': _pct_value(pct), 'pct_label': _pct_label(pct),
                      'Ay_trim_max': best['Ay_g'],
                      'beta_at': b0, 'delta_at': d0,
                      # KEPT FOR CONTINUITY, NOT FOR PHYSICS.  At a maximum-trim

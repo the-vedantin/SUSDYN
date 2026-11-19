@@ -625,6 +625,21 @@ CATALOG = [
     # of the RC sideways in roll is the classic geometry red flag a
     # height-only plot hides.
     dict(key='rc_lateral',     label='Roll Centre Lateral Pos', unit='mm',  category='Geometry',  fn=_roll_axis_incl_placeholder, scope='axle'),
+    # RC MIGRATION RELATIVE TO THE CG (user 2026-10-08).  rc_height /
+    # rc_lateral are measured from the ground and the centreline; what the
+    # sprung mass feels is the vector from the CG (car cg_x_mm / cg_z_mm,
+    # chassis frame) to the RC.  rc_dz_cg = CG height - RC height = this
+    # axle's geometric roll arm (+ = RC below the CG); rc_dx_cg = RC lateral
+    # - CG lateral (+ = towards +X, car left); rc_angle_cg = lean of the
+    # CG->RC line from straight-down (atan2(dx, dz), 0 = RC directly under
+    # the CG).  roll_arm_cg = CG height - roll axis height at the CG station
+    # (rc_f*(1-b) + rc_r*b, the arm SteadyStateSolver uses for the roll
+    # moment, but with the whole-vehicle CG, not the sprung CG).  All filled
+    # in MainWindow._compute_sweep post-processing next to rc_height.
+    dict(key='rc_dz_cg',       label='RC Below CG (axle arm)',  unit='mm',  category='Geometry',  fn=_roll_axis_incl_placeholder, scope='axle'),
+    dict(key='rc_dx_cg',       label='RC Lateral From CG',      unit='mm',  category='Geometry',  fn=_roll_axis_incl_placeholder, scope='axle'),
+    dict(key='rc_angle_cg',    label='CG-to-RC Line Lean',      unit='°',   category='Geometry',  fn=_roll_axis_incl_placeholder, scope='axle'),
+    dict(key='roll_arm_cg',    label='Roll Axis Below CG (arm)', unit='mm', category='Geometry',  fn=_roll_axis_incl_placeholder, scope='vehicle'),
 
     # ── Anti Geometry ─────────────────────────────────────────────────────────
     # Anti-dive is a FRONT-axle property (resistance to nose-dive under
@@ -657,6 +672,11 @@ CATALOG = [
     dict(key='steer_angle',  label='Front Wheel Steer Angle',       unit='°',   category='Steering', fn=_steer_angle,     scope='corner'),
     dict(key='ackermann',    label='Ackermann %',                    unit='%',   category='Steering', fn=_ackermann_pct,   scope='front'),
     dict(key='turn_radius',  label='Geometric Turn Radius',          unit='m',   category='Steering', fn=_turn_radius_geo, scope='vehicle'),
+    # Caster jacking (steer sweep only; filled by main_window's steer branch from
+    # vahan.steering.caster_jacking — the frozen-spring ride-height change at the
+    # corner, + = chassis UP, and that lift x the front wheel rate).  NaN elsewhere.
+    dict(key='caster_jack_mm', label='Caster Jacking: Ride Height Change', unit='mm', category='Steering', fn=_roll_axis_incl_placeholder, scope='front'),
+    dict(key='caster_jack_N',  label='Caster Jacking: Weight Lifted',      unit='N',  category='Steering', fn=_roll_axis_incl_placeholder, scope='front'),
 
     # ── ARB ───────────────────────────────────────────────────────────────────
     dict(key='arb_angle',       label='ARB Angle',                  unit='°',   category='ARB', fn=_arb_angle,       scope='corner',

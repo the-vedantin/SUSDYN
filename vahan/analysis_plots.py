@@ -318,14 +318,26 @@ def plot_rc_vs_body_roll(steady_solver, max_lat_g: float = 2.0) -> Figure:
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. Steering torque vs steer angle
 # ═════════════════════════════════════════════════════════════════════════════
-def plot_steering_torque(effort: dict) -> Figure:
+def plot_steering_torque(effort: dict, target_Nm: float | None = 15.0,
+                         target_band_Nm: float = 5.0) -> Figure:
     """Steering effort vs lateral g from vahan.steering.compute_steering_effort
     — the ONE implementation shared with the binder (probed linkage + per-wheel
     solved loads + TTC aligning torque + mechanical trail).  Replaces the old
     constant-speed estimate, which used static Fz and the wrong lever (scrub)
-    for the side-force term."""
-    fig, ax = _styled_fig(figsize=(9.5, 5.2))
+    for the side-force term.
+
+    Top: hand torque vs lateral g against the team's target band
+    (target_Nm +/- target_band_Nm; user 2026-10-10: ~15 N·m — lower = not
+    enough steering response, higher = heavy steering), with a second y-axis
+    in RIM FORCE (N) = torque / (steering-wheel OD / 2) when the project
+    carries ``steer.wheel_od_mm`` (user 2026-10-11; unknown OD = no rim axis,
+    said so in the title).  Bottom: the moment about the kingpin each wheel
+    makes (what the steering arm reacts) and the tie-rod force on the
+    physical arm."""
+    fig, (ax, ax2) = _styled_fig(figsize=(9.5, 7.6), n=2)
     have_T = 'T_vs_latg' in effort
+    od = effort.get('wheel_od_mm') or None
+    r_rim_m = (float(od) / 2000.0) if (have_T and od) else None
     if have_T:
         xs = [g for g, _ in effort['T_vs_latg']]
         ys = [t for _, t in effort['T_vs_latg']]
@@ -337,13 +349,56 @@ def plot_steering_torque(effort: dict) -> Figure:
     ax.plot(xs, ys, '-o', color=_YELLOW, lw=2.2, ms=5, mfc=_RED, mec=_RED,
             label='steering effort (solved per-wheel loads)')
     ipk = int(np.argmax(ys))
-    ax.annotate(f'peak {ys[ipk]:.1f} at {xs[ipk]:.1f} g\n(before the grip limit — '
-                'pneumatic trail collapses)',
+    _pk = (f'peak {ys[ipk]:.1f} N·m = {ys[ipk] / r_rim_m:.0f} N at the rim at {xs[ipk]:.1f} g'
+           if r_rim_m else f'peak {ys[ipk]:.1f} at {xs[ipk]:.1f} g')
+    ax.annotate(_pk + '\n(before the grip limit — pneumatic trail collapses)',
                 xy=(xs[ipk], ys[ipk]), xytext=(xs[0] + 0.1, ys[ipk] * 0.86),
                 arrowprops=dict(arrowstyle='->', color=_TEXT, lw=1.1),
                 fontsize=9, color=_TEXT)
-    ax.set_xlabel('Lateral acceleration (g)', fontsize=10)
-    bits = [f'effective arm {effort.get("arm_eff_mm", float("nan")):.1f} mm']
+    if have_T and target_Nm is not None:
+        ax.axhspan(target_Nm - target_band_Nm, target_Nm + target_band_Nm,
+                   color=_YELLOW, alpha=0.06, lw=0)
+        ax.axhline(target_Nm, color=_YELLOW, lw=1.0, ls='--')
+        ax.text(xs[-1], target_Nm + target_band_Nm, f'target {target_Nm:.0f} N·m '
+                f'(±{target_band_Nm:.0f}): below = not enough response, above = heavy',
+                ha='right', va='bottom', fontsize=8, color=_YELLOW)
+    if r_rim_m:
+        # Second y-axis: the same curve read as the tangential force at the
+        # rim of the project's steering wheel (both hands together).
+        axr = ax.twinx()
+        y0, y1 = ax.get_ylim()
+        axr.set_ylim(y0 / r_rim_m, y1 / r_rim_m)
+        axr.set_ylabel(f'Force at the rim (N)  —  wheel Ø{float(od):.1f} mm', fontsize=10, color=_BLUE)
+        axr.tick_params(colors=_BLUE)
+        axr.spines['right'].set_color(_BLUE)
+        axr.axhline(ys[ipk] / r_rim_m, color=_BLUE, lw=0.9, ls=':', alpha=0.8)
+        axr.text(xs[0], ys[ipk] / r_rim_m, f' {ys[ipk] / r_rim_m:.0f} N at the rim',
+                 ha='left', va='bottom', fontsize=8, color=_BLUE)
+    # ── bottom: moment about the kingpin per wheel + tie-rod force ──────────
+    mk = effort.get('M_kp_vs_latg') or []
+    if mk:
+        gx = [g for g, _, _ in mk]
+        ax2.plot(gx, [a for _, a, _ in mk], '-o', color=_YELLOW, lw=2.0, ms=4,
+                 label='FL (outer in a right turn) moment about the kingpin')
+        ax2.plot(gx, [b for _, _, b in mk], '-o', color=_RED, lw=2.0, ms=4,
+                 label='FR moment about the kingpin')
+        ax2.set_ylabel('Kingpin moment per wheel (N·m)', fontsize=10)
+        tr = effort.get('tie_rod_force_vs_latg') or []
+        if tr:
+            ax3 = ax2.twinx()
+            ax3.plot([g for g, _, _ in tr], [max(abs(a), abs(b)) for _, a, b in tr],
+                     ':', color=_TEXT, lw=1.6, label='tie-rod force on the physical arm (N)')
+            ax3.set_ylabel('Tie-rod force (N)', fontsize=10, color=_TEXT)
+            ax3.tick_params(colors=_TEXT)
+            h1, l1 = ax2.get_legend_handles_labels(); h3, l3 = ax3.get_legend_handles_labels()
+            ax2.legend(h1 + h3, l1 + l3, facecolor=_PANEL_BG, labelcolor=_TEXT,
+                       edgecolor=_GRID, fontsize=8, loc='upper left')
+        else:
+            ax2.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID,
+                       fontsize=8, loc='upper left')
+    ax2.set_xlabel('Lateral acceleration (g)', fontsize=10)
+    aero_note = ('with the aero package' if effort.get('aero') else 'NO downforce')
+    bits = [f'effective arm {effort.get("arm_eff_mm", float("nan")):.1f} mm', aero_note]
     if effort.get('arm_physical_mm') is not None:
         bits.append(f'physical arm (KP→tie-rod outer) {effort["arm_physical_mm"]:.1f} mm')
     if effort.get('ratio_to1') is not None:
@@ -353,13 +408,102 @@ def plot_steering_torque(effort: dict) -> Figure:
         bits.append(f'lock-to-lock {effort["lock_to_lock_deg"]:.0f}°')
     if effort.get('tie_rod_force_max_N') is not None:
         bits.append(f'tie-rod {effort["tie_rod_force_max_N"]:.0f} N max')
-    half = (len(bits) + 1) // 2
-    ax.set_title('Steering effort vs lateral acceleration\n'
-                 + '  ·  '.join(bits[:half]) + '\n' + '  ·  '.join(bits[half:]),
+    # Steering wheel (user 2026-10-11): OD and the hand-wheel angle to the stop.
+    bits.append(f'steering wheel Ø{float(od):.1f} mm' if od
+                else 'steering-wheel OD unknown (set steer.wheel_od_mm) — rim force not reported')
+    if effort.get('handwheel_to_lock_deg') is not None:
+        bits.append(f'hand wheel ±{effort["handwheel_to_lock_deg"]:.0f}° to the stop '
+                    f'({(effort.get("stroke_total_mm") or 0) / 2:.1f} mm rack each way)')
+    _n = 3                                   # bits per title line
+    _lines = ['  ·  '.join(bits[i:i + _n]) for i in range(0, len(bits), _n)]
+    ax.set_title('Steering effort vs lateral acceleration\n' + '\n'.join(_lines),
                  fontsize=9, color=_TEXT)
     ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=9,
               loc='lower center')
     fig.tight_layout()
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4b. Self-centring: hand-wheel return torque, current car vs a reference file
+# ═════════════════════════════════════════════════════════════════════════════
+def self_centring_curves(effort: dict) -> dict:
+    """The self-centring curves from ONE compute_steering_effort report (no new
+    physics): return torque at the hand wheel vs lateral g, and the same torque
+    against the hand-wheel angle the car holds at each g on the report's
+    constant turn radius.  Torque is N·m when the project has a rack mm/rev,
+    else rack force N (``unit``)."""
+    if 'T_vs_latg' in effort:
+        tv, unit = effort['T_vs_latg'], 'N·m'
+    else:
+        tv, unit = effort.get('F_rack_vs_latg') or [], 'N'
+    g = [float(a) for a, _ in tv]
+    T = [float(b) for _, b in tv]
+    hw = dict((float(a), float(b)) for a, b in (effort.get('handwheel_deg_vs_latg') or []))
+    return dict(latg=g, torque=T, unit=unit,
+                handwheel_deg=[hw.get(x, float('nan')) for x in g])
+
+
+def plot_self_centring(cars: list, turn_radius_m: float, aero_note: str = '') -> Figure:
+    """Self-centring view.  ``cars`` = list of dicts
+    {name, effort (compute_steering_effort report), caster_deg, kpi_deg,
+    tyre_note}; the first is the current car (yellow), the second the
+    reference (blue).  Top: return torque vs lateral g.  Bottom: the same
+    torque vs the hand-wheel angle held on a ``turn_radius_m`` corner — what
+    is there to unwind the wheel when the driver lets go at that angle."""
+    fig, (ax, ax2) = _styled_fig(figsize=(9.5, 8.0), n=2)
+    styles = [(_YELLOW, _RED, '-o'), (_BLUE, _WHITE, '--s')]
+    info = []
+    unit = 'N·m'
+    for i, c in enumerate(cars[:2]):
+        col, mcol, ls = styles[i]
+        cv = self_centring_curves(c['effort'])
+        unit = cv['unit']
+        e = c['effort']
+        ax.plot(cv['latg'], cv['torque'], ls, color=col, lw=2.2, ms=5, mfc=mcol, mec=mcol,
+                label=c['name'])
+        ok = [(h, t, g) for h, t, g in zip(cv['handwheel_deg'], cv['torque'], cv['latg'])
+              if np.isfinite(h)]
+        if ok:
+            # Up to the torque peak solid; past it (tyre near its limit, the
+            # tyre's own twisting torque collapses) thin dotted.
+            ipk = int(np.argmax([t for _, t, _ in ok]))
+            a, b = ok[:ipk + 1], ok[ipk:]
+            ax2.plot([h for h, _, _ in a], [t for _, t, _ in a], ls, color=col, lw=2.2,
+                     ms=5, mfc=mcol, mec=mcol, label=c['name'])
+            if len(b) > 1:
+                ax2.plot([h for h, _, _ in b], [t for _, t, _ in b], ':', color=col, lw=1.0,
+                         alpha=0.7, label=f'{c["name"].split(":")[0]}: past the torque peak')
+            for h, t, g in a:
+                if g in (0.5, 1.0, 1.5):
+                    v = np.sqrt(g * 9.81 * turn_radius_m) * 3.6
+                    ax2.annotate(f'{g:.1f} g\n{v:.0f} km/h', xy=(h, t), xytext=(4, -22 + 30 * i),
+                                 textcoords='offset points', fontsize=7, color=col)
+        info.append(f'{c["name"]}: trail {e.get("mech_trail_mm", float("nan")):.1f} mm, '
+                    f'scrub {e.get("scrub_mm", float("nan")):.1f} mm, '
+                    f'caster {c.get("caster_deg", float("nan")):.2f}°, '
+                    f'KPI {c.get("kpi_deg", float("nan")):.2f}°, '
+                    f'ratio {e.get("ratio_to1") or float("nan"):.2f}:1'
+                    + (f'  ·  {c["tyre_note"]}' if c.get('tyre_note') else ''))
+    ylab = (f'Torque pulling the steering wheel back to centre ({unit})' if unit == 'N·m'
+            else 'Rack force pulling the wheels back to centre (N)  [no rack mm/rev in project]')
+    ax.set_ylabel(ylab, fontsize=9)
+    ax.set_xlabel('Sideways acceleration in the corner (g)', fontsize=9)
+    ax.set_title('Self-centring: torque that returns the wheel to centre when the driver lets go\n'
+                 'front tyres\' own twisting torque + side force × trail, through the steering '
+                 'linkage  ·  ' + (aero_note or 'no downforce'), fontsize=9, color=_TEXT)
+    ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=8, loc='upper left')
+    ax2.set_xlabel(f'Steering-wheel angle held on a {turn_radius_m:.2f} m radius corner (deg)',
+                   fontsize=9)
+    ax2.set_ylabel(ylab.split('  [')[0], fontsize=9)
+    ax2.set_title('Let go of the wheel at this angle: torque there to unwind it '
+                  '(each point = one speed on that corner)', fontsize=9, color=_TEXT)
+    if ax2.lines:
+        ax2.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=7.5,
+                   loc='best')
+    fig.text(0.5, 0.005, '\n'.join(info) + '\nweight lift from caster/KPI when steered is not '
+             'included (small near centre)', ha='center', va='bottom', fontsize=7.5, color=_TEXT)
+    fig.tight_layout(rect=(0, 0.04 + 0.022 * len(info), 1, 1))
     return fig
 
 
@@ -652,9 +796,24 @@ def plot_ackermann_demand(
 def ackermann_fz_fy_data(
     tire_model, solver, radius_m: float = 8.0,
     ackermann_pct: float = 45.0, grip_multiplier: float | None = None,
-    lat_g_list=None,
+    lat_g_list=None, aero_Fz_per_g: dict | None = None, steer_geo=None,
 ) -> dict:
     """THE COMPUTE HALF of the Fz-Fy map — arrays only, no plotting.
+
+    aero_Fz_per_g: falsy, or the per-corner N-per-lateral-g dict from
+    MainWindow._get_aero_Fz_per_g (constant-radius V^2 scaling, the same
+    convention ackermann_bucket and the trim sweep take).  Each row's solve
+    receives dict x lat_g through the solver's own aero_Fz input.  Until
+    2026-10-10 this map ignored downforce entirely, so every wheel load and
+    capability on it was the no-aero car.
+
+    steer_geo: None, or the probed vahan.steering.SteeringGeometry of THIS
+    car.  With it the inner/outer split at every mean steer comes from the
+    solved linkage's own curve (pair_from_mean) — the Ackermann % then
+    varies with steer exactly as the hardware does, and ``ackermann_pct``
+    is only reported, not applied.  Without it (a what-if setting) the
+    split is the kinematic spread x ackermann_pct, constant with steer.
+    ``ack_pct_delivered`` in the result says what each delivered row used.
 
     Split out of ``plot_ackermann_fz_fy`` (which now calls it) so a second
     consumer — the Ackermann page — can draw the same numbers on its own
@@ -711,23 +870,47 @@ def ackermann_fz_fy_data(
         plots below zero instead of being clamped free, same lesson as the
         pair analysis above.
         """
-        s_i = (d_mean + split / 2.0) - th_in
-        s_o = (d_mean - split / 2.0) - th_out
+        d_i, d_o = _wheels_at(d_mean)
+        s_i = d_i - th_in
+        s_o = d_o - th_out
         f_i = -float(tire_model.Fy(s_i, fz_i, 0.0)) * grip_multiplier
         f_o = -float(tire_model.Fy(s_o, fz_o, 0.0)) * grip_multiplier
         return f_i, f_o
 
+    _use_curve = bool(steer_geo is not None
+                      and getattr(steer_geo, 'has_pair_curve', False))
+
+    def _wheels_at(d_mean):
+        """Inner/outer road-wheel angles (deg) at mean steer d_mean: the
+        solved linkage's own curve when we have it, else the constant
+        percentage split."""
+        if _use_curve:
+            d_in, d_out = steer_geo.pair_from_mean(math.radians(d_mean))
+            return math.degrees(d_in), math.degrees(d_out)
+        return d_mean + split / 2.0, d_mean - split / 2.0
+
+    def _pct_at(d_mean):
+        if _use_curve:
+            return float(steer_geo.ackermann_pct_from_mean(
+                math.radians(d_mean), t, L))
+        return float(ackermann_pct)
+
     # ── Sweep lateral g: demand always, delivered until the grip limit ──────
     g_ok, fz_ip, fz_op = [], [], []
     fy_dem_i, fy_dem_o = [], []
+    dem_i, dem_o, axle_dem = [], [], []     # equal-use demand per wheel, axle demand
     n_del = 0                       # delivered points kept (prefix of g_ok)
     fy_del_i, fy_del_o = [], []
+    pct_del = []                    # Ackermann % actually used per row
     g_limit = None                  # first g where demand is unreachable
 
     scan = np.linspace(th_mean - 2.0, th_mean + 16.0, 25)  # mean-steer grid
     for ag in lat_g_arr:
+        aero_row = ({k: float(aero_Fz_per_g.get(k, 0.0)) * float(ag)
+                     for k in ('FL', 'FR', 'RL', 'RR')}
+                    if aero_Fz_per_g else None)
         try:
-            res = solver.solve(float(ag), 0.0)
+            res = solver.solve(float(ag), 0.0, aero_Fz=aero_row)
         except Exception:
             continue                # solver refused (e.g. wheel lift) — skip
         fz_fl, fz_fr = float(res.Fz['FL']), float(res.Fz['FR'])
@@ -752,6 +935,16 @@ def ackermann_fz_fy_data(
                         * grip_multiplier)
         fy_dem_o.append(abs(float(tire_model.peak_Fy(max(fz_o, 1.0), 0.0)))
                         * grip_multiplier)
+        # PER-WHEEL DEMAND (user, 2026-10-10: "demanded and delivered"): the
+        # axle must make (fz_i + fz_o)·ag toward the corner; the fair share
+        # of that for each wheel is in proportion to what it CAN make, i.e.
+        # both wheels at the same fraction of their own peak (equal use).
+        # It is a target, not an assumption about the steering — the
+        # delivered path shows how far the real linkage lands from it.
+        _D = (fz_i + fz_o) * float(ag)
+        _ci, _co = fy_dem_i[-1], fy_dem_o[-1]
+        _sh = _ci / max(_ci + _co, 1.0)
+        dem_i.append(_D * _sh); dem_o.append(_D * (1.0 - _sh)); axle_dem.append(_D)
 
         if g_limit is not None:
             continue                        # delivered path already stopped
@@ -779,24 +972,32 @@ def ackermann_fz_fy_data(
                 break
         f_i, f_o = _pair(0.5 * (lo + hi), fz_i, fz_o)
         fy_del_i.append(f_i);  fy_del_o.append(f_o)
+        pct_del.append(_pct_at(0.5 * (lo + hi)))
         n_del += 1
 
     return {
         'lat_g': np.array(g_ok),
         'fz_inner': np.array(fz_ip), 'fz_outer': np.array(fz_op),
         'cap_inner': np.array(fy_dem_i), 'cap_outer': np.array(fy_dem_o),
+        'dem_inner': np.array(dem_i), 'dem_outer': np.array(dem_o),
+        'axle_demand': np.array(axle_dem),
         'del_inner': np.array(fy_del_i), 'del_outer': np.array(fy_del_o),
         'n_delivered': int(n_del), 'g_limit': g_limit,
         'radius_m': R, 'ackermann_pct': float(ackermann_pct),
+        'ack_pct_delivered': np.array(pct_del),
+        'steer_curve': _use_curve,
         'grip_multiplier': float(grip_multiplier),
         'spread_deg': float(spread), 'split_deg': float(split),
+        'aero': bool(aero_Fz_per_g),
+        'aero_Fz_per_g_total_N': (float(sum(float(v) for v in aero_Fz_per_g.values()))
+                                  if aero_Fz_per_g else 0.0),
     }
 
 
 def plot_ackermann_fz_fy(
     tire_model, solver, radius_m: float = 8.0,
     ackermann_pct: float = 45.0, grip_multiplier: float | None = None,
-    lat_g_list=None,
+    lat_g_list=None, aero_Fz_per_g: dict | None = None, steer_geo=None,
 ) -> Figure:
     """Fz–Fy operating map: DEMAND vs DELIVERED per front wheel vs lateral g.
 
@@ -828,7 +1029,9 @@ def plot_ackermann_fz_fy(
     _d = ackermann_fz_fy_data(tire_model, solver, radius_m=R,
                               ackermann_pct=ackermann_pct,
                               grip_multiplier=grip_multiplier,
-                              lat_g_list=lat_g_list)
+                              lat_g_list=lat_g_list,
+                              aero_Fz_per_g=aero_Fz_per_g,
+                              steer_geo=steer_geo)
     g_ok = _d['lat_g']
     fz_ip, fz_op = _d['fz_inner'], _d['fz_outer']
     fy_dem_i, fy_dem_o = _d['cap_inner'], _d['cap_outer']
@@ -869,13 +1072,25 @@ def plot_ackermann_fz_fy(
             label='Outer CAPABILITY (most it can make)')
     ax.plot(fz_ip, fy_dem_i, color=_YELLOW, lw=2.4,
             label='Inner CAPABILITY (most it can make)')
+    # ── Demand paths (dotted): each wheel's fair share of the axle's m·a ────
+    if 'dem_outer' in _d and len(_d['dem_outer']):
+        ax.plot(fz_op, _d['dem_outer'], color=_RED, lw=1.6, ls=':',
+                label='Outer DEMAND (its share of the axle m·a, equal use)')
+        ax.plot(fz_ip, _d['dem_inner'], color=_BLUE, lw=1.6, ls=':',
+                label='Inner DEMAND (its share, equal use)')
 
     # ── Delivered paths (dashed), stopped at the grip limit ─────────────────
     if n_del > 0:
         ax.plot(fz_op[:n_del], fy_del_o, color=_RED, lw=2.0, ls='--',
-                label=f'Outer delivered at {ackermann_pct:.0f}% Ackermann')
+                label=(f'Outer delivered on the linkage\'s own curve '
+                       f'({np.nanmin(_d["ack_pct_delivered"]):.0f}–'
+                       f'{np.nanmax(_d["ack_pct_delivered"]):.0f}% Ackermann)'
+                       if _d.get('steer_curve') and len(_d['ack_pct_delivered'])
+                       else f'Outer delivered at {ackermann_pct:.0f}% Ackermann'))
         ax.plot(fz_ip[:n_del], fy_del_i, color=_BLUE, lw=2.0, ls='--',
-                label=f'Inner delivered at {ackermann_pct:.0f}% Ackermann')
+                label=('Inner delivered on the linkage\'s own curve'
+                       if _d.get('steer_curve')
+                       else f'Inner delivered at {ackermann_pct:.0f}% Ackermann'))
         if g_limit is not None:
             g_last = float(g_ok[n_del - 1])  # last g the axle still reached
             ax.plot(fz_op[n_del - 1], fy_del_o[-1], 'x', color=_RED,
@@ -894,8 +1109,15 @@ def plot_ackermann_fz_fy(
                         xy=(float(fz_ip[n_del - 1]), float(fy_del_i[-1])),
                         xytext=(-9, -22), textcoords='offset points',
                         ha='right', va='top', fontsize=7, color=_BLUE)
+            # say WHERE this limit sits: on an 8 m circle the car is only doing
+            # ~40 km/h, so the package adds little — the 2+ g numbers live on
+            # the fast corners, not here (user 2026-10-11: "limit is 1.7 g").
+            _V = math.sqrt(max(float(g_limit), 0.0) * 9.81 * float(R))
+            _aero_N = (sum(float(v) for v in aero_Fz_per_g.values()) * float(g_limit)) if aero_Fz_per_g else 0.0
             ax.text(fz_op[n_del - 1], fy_del_o[-1] * 1.04,
-                    f'grip limit — axle demand\nunreachable from {g_limit:.2f} g',
+                    f'grip limit — axle demand\nunreachable from {g_limit:.2f} g\n'
+                    f'(= {_V * 3.6:.0f} km/h on this {R:.0f} m circle, '
+                    + (f'{_aero_N:.0f} N downforce there)' if aero_Fz_per_g else 'no downforce)'),
                     fontsize=8, color=_RED, ha='right', va='bottom')
 
     # ── g-sweep markers: every curve is a PATH over lateral g ───────────────
@@ -1012,8 +1234,16 @@ def plot_ackermann_fz_fy(
                   fontsize=10, color=_TICK)
     ax.set_ylabel('Lateral force toward the corner (N, signed)',
                   fontsize=10, color=_TICK)
-    ax.set_title(f'Fz–Fy Map at R = {R:.1f} m — {ackermann_pct:.0f}% '
-                 f'Ackermann, grip ×{grip_multiplier:.2f}\n'
+    # ONE statement of what split was used (user 2026-10-11: the title said
+    # the spin's 33 % while the curves were on the linkage): on the curve the
+    # constant % is not used anywhere and is not shown.
+    if _d.get('steer_curve') and len(_d.get('ack_pct_delivered', [])):
+        _ack_txt = (f"the CAR'S OWN steering curve ({np.nanmin(_d['ack_pct_delivered']):.0f} to "
+                    f"{np.nanmax(_d['ack_pct_delivered']):.0f}% Ackermann over the sweep)")
+    else:
+        _ack_txt = f'a WHAT-IF constant {ackermann_pct:.0f}% Ackermann (not the car\'s linkage)'
+    _aero_txt = ('with downforce' if aero_Fz_per_g else 'NO DOWNFORCE (tick "Include aero downforce")')
+    ax.set_title(f'Fz–Fy Map at R = {R:.1f} m — {_ack_txt}, grip ×{grip_multiplier:.2f}, {_aero_txt}\n'
                  f'solid = MOST that wheel can make at its own load  ·  '
                  f'dashed = what it delivers  ·  '
                  f'swept over lateral g  ·  below zero = fights the turn',
@@ -1176,6 +1406,7 @@ def plot_mmd(
     grip_multiplier: float | None = None,
     beta_range_deg: tuple = (-8, 8), beta_n: int = 9,
     delta_range_deg: tuple = (-20, 20), delta_n: int = 11,
+    aero_Fz_N: dict | None = None,
 ) -> Figure:
     """Pure-cornering MMD: yaw moment N vs lateral acceleration Ay,
     with constant-β and constant-δ lines.
@@ -1183,6 +1414,13 @@ def plot_mmd(
     Roll stiffness (springs + ARB) drives the lateral load transfer
     distribution (LLTD) between front and rear axles.  Static toe angles
     (+ = toe-in) shift the individual corner slip angles.
+
+    aero_Fz_N: falsy, or the per-corner DOWNFORCE (N) at ``velocity_mps`` —
+    constant across the diagram because the MMD is a constant-speed frame.
+    Until 2026-10-10 this diagram carried no downforce at all, so with an
+    aero package on the car it read the no-aero limit (~1.7 g) while the
+    G-G at the same speed read 2.2 g.  MainWindow._mmd_kwargs sizes it from
+    the ONE aero path (_get_aero_Fz_per_g -> _aero_Fz_at_speed).
     """
     # ── State computation: rerouted through vahan.ymd (the ONE yaw-moment
     # engine).  This function used to carry its own private iteration with
@@ -1205,7 +1443,10 @@ def plot_mmd(
         delta_arb_rear_Npm=delta_arb_rear_Npm)
     LLTD_f = car.lltd_front                     # front fraction, for the box
     # dense enough that the 10 N wheel-lift clamp doesn't kink the interp
-    _loads = ymd.build_loads_table(car, ay_max=3.0, n=61)
+    _aero_tot = (float(sum(float(v) for v in aero_Fz_N.values()))
+                 if aero_Fz_N else 0.0)
+    _loads = ymd.build_loads_table(car, ay_max=3.0, n=61,
+                                   aero_Fz_const=aero_Fz_N or None)
 
     # Warm-start each state from the previous one along the sweep: the
     # fixed-point map holds one attractor per turn hand, and cold 0-starts
@@ -1340,7 +1581,7 @@ def plot_mmd(
         lim['stab'] = float((n_bp - n_bm) / (2 * h))
     ay_reach = float(np.nanmax([np.nanmax(Ay_b), np.nanmax(Ay_d)]))
 
-    fig, ax = _styled_fig(figsize=(10, 8))
+    fig, ax = _styled_fig(figsize=(14, 8))
     # Constant β — solid blue
     # Label only the extreme isolines so tip labels never crowd/overprint.
     b_lab = {betas.min(), betas.max()}
@@ -1375,24 +1616,37 @@ def plot_mmd(
     ax.set_ylabel('Yaw moment  N  about CG  (N·m)', fontsize=10)
     _grip_str = ('RAW BELT GRIP (x1.00) — NOT road' if grip_multiplier >= 0.999
                  else f'asphalt x{grip_multiplier:.2f}')
+    _aero_str = (f'downforce {_aero_tot:.0f} N at this speed' if _aero_tot > 0.5
+                 else 'NO downforce')
     ax.set_title(
         f'Milliken Moment Diagram — Pure Cornering  |  '
         f'{velocity_mps * 3.6:.0f} km/h  ({velocity_mps / 0.44704:.0f} mph)  |  '
-        f'{_grip_str}',
+        f'{_grip_str}  |  {_aero_str}',
         fontsize=11, color=_TEXT)
     # Only the trim point in the legend — the isolines are labelled for the
     # hover readout, not the legend (20 entries would swamp it).
+    # Every box sits in a column RIGHT of the plot, never on the data.
     ax.legend(handles=[trim_handle], facecolor=_PANEL_BG, labelcolor=_TEXT,
-              edgecolor=_GRID, fontsize=9, loc='lower left')
+              edgecolor=_GRID, fontsize=9, loc='upper left',
+              bbox_to_anchor=(1.02, 0.30), borderaxespad=0.0)
 
     # ── Legend box (top-left) ───────────────────────────────────────────────
-    ax.text(0.02, 0.98,
-            'Solid line:   constant β (sweep δ)\n'
-            'Dashed line:  constant δ (sweep β)\n'
-            'Equilibrium turn → on the A_y axis (N = 0)\n'
-            'Max grip   → outermost reach in A_y',
+    ax.text(1.02, 0.62,
+            'HOW TO READ IT\n'
+            'Solid line = one body-slip angle β held, steer δ swept:\n'
+            '   walking along it = turning the wheel at a fixed attitude\n'
+            'Dashed line = one steer δ held, body slip β swept:\n'
+            '   walking along it = the car yawing with the wheel fixed\n'
+            'N = 0 axis = balanced turn (no net yaw moment) — the car\n'
+            '   can only HOLD states on this axis; above it the nose\n'
+            '   turns in, below it the nose runs wide\n'
+            'Trimmed limit = farthest-right N = 0 crossing (ring):\n'
+            '   the most lateral g a driver can hold without spinning\n'
+            'Max reach = outermost tip: grip the car has but cannot balance\n'
+            'Stability = slope of a dashed δ line at trim (down = stable)\n'
+            'Control = height of a solid β line above N = 0 at trim',
             transform=ax.transAxes, ha='left', va='top',
-            fontsize=8.5, color=_TEXT,
+            fontsize=8, color=_TEXT, clip_on=False,
             bbox=dict(facecolor=_PANEL_BG, edgecolor=_GRID, pad=4))
 
     # ── Setup / stability box (top-right) ──────────────────────────────────
@@ -1411,8 +1665,8 @@ def plot_mmd(
         f'{slope_str}'
     )
     stability_color = (_YELLOW if stable else _RED) if stable is not None else _TEXT
-    ax.text(0.98, 0.98, info_lines,
-            transform=ax.transAxes, ha='right', va='top',
+    ax.text(1.02, 1.0, info_lines,
+            transform=ax.transAxes, ha='left', va='top', clip_on=False,
             fontsize=8.5, color=stability_color,
             bbox=dict(facecolor=_PANEL_BG, edgecolor=_GRID, pad=4))
 
@@ -1429,22 +1683,25 @@ def plot_mmd(
         )
     else:
         num_lines = 'no N = 0 crossing found in the swept range'
-    ax.text(0.98, 0.02, num_lines,
-            transform=ax.transAxes, ha='right', va='bottom',
+    ax.text(1.02, 0.88, num_lines,
+            transform=ax.transAxes, ha='left', va='top', clip_on=False,
             fontsize=9, color=_TEXT, family='monospace',
             bbox=dict(facecolor=_PANEL_BG, edgecolor=_YELLOW, pad=6))
     if np.isfinite(lim['ay']):
         ax.plot([lim['ay']], [0.0], 'o', ms=12, mfc='none',
                 mec=_YELLOW, mew=2.0, zorder=6)
 
-    fig._mmd_numbers = dict(ackermann_pct=float(ackermann_pct),
+    fig._mmd_numbers = dict(ackermann_pct=(float('nan') if hasattr(ackermann_pct, 'pair_from_mean') else float(ackermann_pct)),
+                            ackermann_label=('linkage curve' if hasattr(ackermann_pct, 'pair_from_mean') else f'{float(ackermann_pct):+.0f}%'),
+                            aero_total_N=_aero_tot,
+                            velocity_mps=float(velocity_mps),
                             ay_trim_limit_g=lim['ay'],
                             beta_at_limit_deg=lim['beta'],
                             delta_at_limit_deg=lim['delta'],
                             control_Nm_per_deg=lim['ctrl'],
                             stability_Nm_per_deg=lim['stab'],
                             ay_reach_g=ay_reach)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.07, right=0.64, top=0.94, bottom=0.08)
     return fig
 
 
@@ -2152,3 +2409,157 @@ def plot_ymd_ackermann_grid(tire_model, solver, radius_m=8.0,
         f'{"with" if aero_Fz_per_g else "no"} aero', fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.94))
     return fig, trim
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Ackermann DEMAND vs lateral g, against the car's own linkage curve
+# (user 2026-10-10: "at any corner radius with increasing velocity the
+# Ackermann % demand digresses from 100 % to smaller — then plot OUR curve")
+# ═════════════════════════════════════════════════════════════════════════════
+def ackermann_pct_vs_g_data(tire_model, solver, steer_geo, radii_m=(5.0, 8.0, 12.0),
+                            lat_g_list=None, grip_multiplier=None,
+                            aero_Fz_per_g_by_radius=None) -> dict:
+    """Per radius and lateral g: the Ackermann % that would put BOTH front tyres
+    at the same fraction of their own peak (the demand — it falls with g on
+    every radius), and the % the probed linkage actually gives at the mean
+    steer that g needs on that radius (steer_geo.ackermann_pct_from_mean).
+    Loads come from solver.solve with the package per g (constant-radius
+    convention); tyre forces from the tyre model at each wheel's own slip and
+    load, grip derated like every other Ackermann answer.  No static % anywhere.
+    """
+    veh = solver._veh
+    L = float(veh.wheelbase_m); t = float(veh.front_track_m)
+    from vahan.dynamics import resolve_grip_scale
+    gm = resolve_grip_scale(grip_multiplier, solver)
+    gl = np.asarray(list(lat_g_list) if lat_g_list is not None else np.round(np.arange(0.3, 2.01, 0.1), 2), float)
+    out = {'lat_g': gl, 'radii_m': list(map(float, radii_m)), 'by_radius': {}, 'grip_multiplier': float(gm)}
+
+    def _pair(d_mean, split, th_in, th_out, fz_i, fz_o):
+        f_i = -float(tire_model.Fy((d_mean + split / 2.0) - th_in, fz_i, 0.0)) * gm
+        f_o = -float(tire_model.Fy((d_mean - split / 2.0) - th_out, fz_o, 0.0)) * gm
+        return f_i, f_o
+
+    def _delivered(pct, g, R, fz_i, fz_o):
+        th_in = math.degrees(math.atan(L / max(R - t / 2.0, 0.05))); th_out = math.degrees(math.atan(L / (R + t / 2.0)))
+        split = (th_in - th_out) * pct / 100.0; th_mean = 0.5 * (th_in + th_out)
+        demand = (fz_i + fz_o) * g
+        scan = np.linspace(th_mean - 2.0, th_mean + 16.0, 25)
+        tot = np.array([sum(_pair(d, split, th_in, th_out, fz_i, fz_o)) for d in scan]); k_pk = int(np.argmax(tot))
+        if tot[k_pk] < demand:
+            return None
+        k = 1
+        while k <= k_pk and tot[k] < demand:
+            k += 1
+        lo, hi = float(scan[k - 1]), float(scan[min(k, k_pk)])
+        for _ in range(40):
+            mid = 0.5 * (lo + hi)
+            if sum(_pair(mid, split, th_in, th_out, fz_i, fz_o)) < demand:
+                lo = mid
+            else:
+                hi = mid
+            if hi - lo < 1e-4:
+                break
+        d = 0.5 * (lo + hi)
+        return _pair(d, split, th_in, th_out, fz_i, fz_o) + (d,)
+
+    for R in radii_m:
+        pg = (aero_Fz_per_g_by_radius or {}).get(R) if aero_Fz_per_g_by_radius else None
+        dem, link, mean_steer, g_ok = [], [], [], []
+        for g in gl:
+            aero_row = ({k: float(pg.get(k, 0.0)) * float(g) for k in ('FL', 'FR', 'RL', 'RR')} if pg else None)
+            try:
+                r = solver.solve(float(g), 0.0, aero_Fz=aero_row)
+            except Exception:
+                break
+            fz_i, fz_o = min(r.Fz['FL'], r.Fz['FR']), max(r.Fz['FL'], r.Fz['FR'])
+            cap_i = abs(float(tire_model.peak_Fy(max(fz_i, 1.0), 0.0))) * gm
+            cap_o = abs(float(tire_model.peak_Fy(max(fz_o, 1.0), 0.0))) * gm
+
+            def _imb(pct):
+                d = _delivered(pct, float(g), float(R), fz_i, fz_o)
+                return None if d is None else d[0] / cap_i - d[1] / cap_o
+            # bracket: the % needed grows ~R^2 (the geometric toe split shrinks
+            # as 1/R^2 while the slip split the tyres want does not), so at a
+            # 40 m radius the answer can be thousands of %.  Widen until bracketed.
+            a = b = None
+            for lo, hi in ((-400.0, 300.0), (-4000.0, 3000.0), (-40000.0, 30000.0)):
+                a, b = _imb(lo), _imb(hi)
+                if a is not None and b is not None and a * b <= 0:
+                    break
+            if a is None or b is None or a * b > 0:
+                continue
+            for _ in range(30):
+                mid = 0.5 * (lo + hi); m = _imb(mid)
+                if m is None:
+                    break
+                if (m > 0) == (a > 0):
+                    lo, a = mid, m
+                else:
+                    hi = mid
+            pct_ideal = 0.5 * (lo + hi)
+            d = _delivered(pct_ideal, float(g), float(R), fz_i, fz_o)
+            ms = d[2] if d else float('nan')
+            lk = float('nan')
+            if steer_geo is not None and getattr(steer_geo, 'has_pair_curve', False) and np.isfinite(ms):
+                try:
+                    lk = float(steer_geo.ackermann_pct_from_mean(math.radians(ms), t, L))
+                except Exception:
+                    lk = float('nan')
+            g_ok.append(float(g)); dem.append(float(pct_ideal)); link.append(lk); mean_steer.append(float(ms))
+        out['by_radius'][float(R)] = {'lat_g': np.array(g_ok), 'demand_pct': np.array(dem),
+                                      'linkage_pct': np.array(link), 'mean_steer_deg': np.array(mean_steer)}
+    # the linkage's own curve over its whole steer range (for the steer-angle panel)
+    if steer_geo is not None and getattr(steer_geo, 'has_pair_curve', False):
+        ms = np.linspace(1.5, math.degrees(float(steer_geo.max_road_wheel_rad)) * 0.985, 80)
+        pc = []
+        for m in ms:
+            try:
+                pc.append(float(steer_geo.ackermann_pct_from_mean(math.radians(m), t, L)))
+            except Exception:
+                pc.append(float('nan'))
+        out['linkage_curve'] = {'mean_steer_deg': ms, 'pct': np.array(pc)}
+    return out
+
+
+def plot_ackermann_pct_vs_g(data: dict, title_note: str = '') -> Figure:
+    """Demand % (solid) vs the linkage's own % (dashed) against lateral g, one
+    colour per radius.  Where the dashed line sits below the solid one the
+    inner wheel is under-steered for that corner at that g (scrub); above it,
+    over-steered (the outer wheel runs short)."""
+    fig, (ax, ax2) = _styled_fig(figsize=(14, 6), n=1, m=2)
+    cols = [_YELLOW, _WHITE, _RED, _BLUE, _TICK]
+    for (R, d), col in zip(sorted(data['by_radius'].items()), cols):
+        if not len(d['lat_g']):
+            continue
+        ax.plot(d['lat_g'], d['demand_pct'], color=col, lw=2.4, label=f'{R:.0f} m: DEMAND (both tires at the same fraction of their peak)')
+        if np.any(np.isfinite(d['linkage_pct'])):
+            ax.plot(d['lat_g'], d['linkage_pct'], color=col, lw=2.0, ls='--', label=f'{R:.0f} m: OUR LINKAGE at the steer this g needs')
+        # steer-axis panel: the demand over the steer window this radius uses (entry -> limit)
+        okm = np.isfinite(d['mean_steer_deg'])
+        if okm.any():
+            ax2.plot(d['mean_steer_deg'][okm], d['demand_pct'][okm], color=col, lw=2.4, label=f'{R:.0f} m: DEMAND, entry -> limit')
+            k0 = int(np.flatnonzero(okm)[0]); k1 = int(np.flatnonzero(okm)[-1])
+            ax2.annotate(f'{d["lat_g"][k0]:.1f} g', (d['mean_steer_deg'][k0], d['demand_pct'][k0]), xytext=(-4, 6), textcoords='offset points', ha='right', fontsize=7.5, color=col)
+            ax2.annotate(f'{d["lat_g"][k1]:.1f} g', (d['mean_steer_deg'][k1], d['demand_pct'][k1]), xytext=(4, -10), textcoords='offset points', ha='left', fontsize=7.5, color=col)
+    lc = data.get('linkage_curve')
+    if lc is not None:
+        ax2.plot(lc['mean_steer_deg'], lc['pct'], color=_WHITE, lw=2.6, ls='--', label='OUR LINKAGE: Ackermann % vs steer (probed, lock at the right end)')
+    ax2.axhline(0.0, color=_TICK, lw=0.8); ax2.axhline(100.0, color=_TICK, lw=0.6, ls=':')
+    ax2.set_xlabel('Mean road-wheel steer (deg)', fontsize=10); ax2.set_ylabel('Ackermann %', fontsize=10)
+    ax2.set_title('Same thing on the STEER axis: our curve vs what each corner wants', fontsize=10, color=_TEXT)
+    ax2.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=8, loc='lower left')
+    ax2.set_ylim(-120, 130)
+    ax.axhline(0.0, color=_TICK, lw=0.8); ax.axhline(100.0, color=_TICK, lw=0.6, ls=':')
+    ax.set_xlabel('Lateral acceleration (road g)', fontsize=10)
+    ax.set_ylabel('Ackermann %', fontsize=10)
+    ax.set_title('Ackermann demand vs lateral g, against the car\'s own steering curve'
+                 + (f'  |  {title_note}' if title_note else '')
+                 + f'  |  grip x{data.get("grip_multiplier", 1.0):.2f}', fontsize=10, color=_TEXT)
+    ax.legend(facecolor=_PANEL_BG, labelcolor=_TEXT, edgecolor=_GRID, fontsize=8, loc='lower left')
+    ax.text(0.98, 0.97, 'solid = what the tires want (falls with g on every radius)\n'
+            'dashed = what the linkage gives there (steer rises with g on a radius)\n'
+            'dashed below solid: inner wheel under-steered -> scrub',
+            transform=ax.transAxes, ha='right', va='top', fontsize=8.5, color=_TEXT,
+            bbox=dict(facecolor=_PANEL_BG, edgecolor=_GRID, pad=4))
+    fig.tight_layout()
+    return fig

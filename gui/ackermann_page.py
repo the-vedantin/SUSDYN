@@ -34,6 +34,8 @@ import math
 import os
 
 import numpy as np
+
+from vahan.acceleration import DEFAULT_PRIMARY   # the ONE primary ratio (was 1.0)
 from gui.plot_dialog import ReadableCanvas
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -274,7 +276,9 @@ class _AckWorker(QThread):
         self.stage.emit('fzfy', ackermann_fz_fy_data(
             self._tire, self._solver, radius_m=c['radius'],
             ackermann_pct=c['as_built_pct'], grip_multiplier=c['grip'],
-            lat_g_list=tuple(c['g_list'])))
+            lat_g_list=tuple(c['g_list']),
+            aero_Fz_per_g=c['aero'] or None,
+            steer_geo=c.get('steer_geo')))
 
     # ── graph 4 ─────────────────────────────────────────────────────────
     def _pair(self):
@@ -395,7 +399,7 @@ class _AckWorker(QThread):
             aero_cop_rear_frac=0.5, grip_scale=float(grip_scale),
             static_rh_front_mm=50.0, static_rh_rear_mm=50.0)
         sim.set_gearbox([2.750, 2.000, 1.667, 1.444, 1.304, 1.208],
-                        primary_ratio=1.0, final_drive=3.545,
+                        primary_ratio=DEFAULT_PRIMARY, final_drive=3.545,
                         redline_rpm=11000.0)
         if ack_model is not None:
             sim.set_ackermann(ack_model, ack_pct)
@@ -682,12 +686,9 @@ class AckermannPage(QWidget):
         side.addStretch(1)
 
         inner = QWidget(); inner.setLayout(side)
-        scroll = QScrollArea()
-        scroll.setWidget(inner)
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(300)
+        from gui.side_panel import SideScroll, side_split
+        scroll = SideScroll(inner, 300)   # resizable, never clipped
         scroll.setStyleSheet('QScrollArea { border:0; background:#000; }')
-        root.addWidget(scroll)
 
         # ── right: the grid of canvases ──────────────────────────────────
         self._slots = {
@@ -719,7 +720,8 @@ class AckermannPage(QWidget):
         gscroll.setWidget(gridw)
         gscroll.setWidgetResizable(True)
         gscroll.setStyleSheet('QScrollArea { border:0; background:#000; }')
-        root.addWidget(gscroll, 1)
+        self._side_split = side_split(scroll, gscroll, 300, key='ackermann')
+        root.addWidget(self._side_split, 1)
 
         for s in self._slots.values():
             s.busy('press ANALYSE')
@@ -788,6 +790,9 @@ class AckermannPage(QWidget):
             'pair_g': float(self._pair_g.value()),
             'g_list': g_list, 'radii': radii, 'sweep': sweep,
             'aero': aero, 'as_built_pct': asb, 'as_built_probed': asb_ok,
+            # the probed linkage curve: graph 3 splits inner/outer from it
+            'steer_geo': (self._main._steering_geometry_now()
+                          if hasattr(self._main, '_steering_geometry_now') else None),
             'do_lap': bool(self._do_lap.isChecked()),
             'lap_grip': float(self._main.grip_scale()),
         }
@@ -929,7 +934,7 @@ class AckermannPage(QWidget):
                 aero_cop_rear_frac=0.5, grip_scale=base,
                 static_rh_front_mm=50.0, static_rh_rear_mm=50.0)
             sim.set_gearbox([2.750, 2.000, 1.667, 1.444, 1.304, 1.208],
-                            primary_ratio=1.0, final_drive=3.545,
+                            primary_ratio=DEFAULT_PRIMARY, final_drive=3.545,
                             redline_rpm=11000.0)
             r = sim.simulate(tr, n_detail=8)
             if np.isfinite(r.avg_corner_lat_g) and r.avg_corner_lat_g > 0:
@@ -1676,6 +1681,15 @@ class AckermannPage(QWidget):
                 label='OUTER — most it can make')
         ax.plot(fz_i, d['cap_inner'], color=_YEL, lw=2.4, ls='-',
                 label='INNER — most it can make')
+        # DEMAND (dotted): each wheel's share of the axle's m·a when both run
+        # at the same fraction of their own peak.  The delivered path shows
+        # how far the real linkage lands from it — the inner wheel below its
+        # demand at low g is scrub, the axle total still equals the demand.
+        if 'dem_outer' in d and len(d['dem_outer']):
+            ax.plot(fz_o, d['dem_outer'], color=_WHT, lw=1.4, ls=':',
+                    label='OUTER demand (share of axle m·a, equal use)')
+            ax.plot(fz_i, d['dem_inner'], color=_YEL, lw=1.4, ls=':',
+                    label='INNER demand (share, equal use)')
         if n > 0:
             ax.plot(fz_o[:n], d['del_outer'], color=_WHT, lw=1.7, ls='--',
                     label=f'OUTER delivered at {d["ackermann_pct"]:+.0f}%')

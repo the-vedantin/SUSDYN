@@ -109,6 +109,29 @@ class _GripWorker(QThread):
             self.failed.emit(f'{type(e).__name__}: {e}')
 
 
+class _DownforceWorker(QThread):
+    note = pyqtSignal(str)
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, solver, cfg):
+        super().__init__()
+        self._solver, self._cfg = solver, cfg
+        self.cancel = False
+
+    def run(self):
+        try:
+            c = self._cfg
+            study = CS.downforce_for_corner_curves(
+                self._solver, c['radius_m'], c['speed_mps'], cop_rear_frac=c['cop_rear_frac'],
+                ref_speed_mps=c['ref_speed_mps'], rho=c['rho'], target_util=c['target_util'],
+                radii_m=c.get('radii_m'), progress=self.note.emit, cancelled=lambda: self.cancel)
+            self.done.emit(study)
+        except Exception as e:                  # noqa: BLE001
+            traceback.print_exc()
+            self.failed.emit(f'{type(e).__name__}: {e}')
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  the page
 # ═══════════════════════════════════════════════════════════════════════════
@@ -121,6 +144,8 @@ class CornerSpeedPage(QWidget):
                   'converged', 'note')
     GRIP_COLS = ('case', 'point', 'lateral g', 'corner', 'Fz N', 'inclination deg',
                  'budget N', 'demand N', 'utilization', 'below tyre-data floor')
+    DF_COLS = ('curve', 'radius m', 'corner speed km/h', 'lateral g', 'util no aero',
+               'downforce at corner N', 'front N', 'rear N', 'package N at ref speed', 'ClA m²', 'feasible')
 
     def __init__(self, main):
         super().__init__()
@@ -131,6 +156,9 @@ class CornerSpeedPage(QWidget):
         self.last_speed_cfg: dict | None = None
         self.last_study: dict | None = None     # tab 2 result (compute function's study)
         self.last_grip_cfg: dict | None = None
+        self._df_worker = None
+        self.last_df_study: dict | None = None  # tab 3 result
+        self.last_df_cfg: dict | None = None
         self._rows_live: list = []
         self._build()
         self._seed_grip_defaults()
@@ -268,15 +296,60 @@ class CornerSpeedPage(QWidget):
         l2.addWidget(self._grip_progress, r, 0, 1, 2); r += 1
         side.addWidget(g2)
 
+        # ── tab-3 inputs: DOWNFORCE TO MAKE A CORNER ─────────────────────
+        g3 = QGroupBox('DOWNFORCE TO MAKE A CORNER'); l3 = QGridLayout(g3); l3.setSpacing(4)
+        r = 0
+
+        def row3(label, w, tip=''):
+            nonlocal r
+            lb = QLabel(label); lb.setStyleSheet('font-size:11px;')
+            if tip:
+                lb.setToolTip(tip); w.setToolTip(tip)
+            l3.addWidget(lb, r, 0); l3.addWidget(w, r, 1); r += 1
+            return w
+
+        self._df_radius = row3('Corner radius:', _spin(1.0, 500.0, 10.0, ' m', dec=1, step=1.0),
+                               'The corner you want to make.')
+        self._df_speed = row3('Corner speed:', _spin(1.0, 400.0, 55.0, ' km/h', dec=1, step=1.0),
+                              'The speed you want to hold it at.  Lateral g = V² / (g·R).')
+        self._df_speed_mph = QLabel(''); self._df_speed_mph.setStyleSheet(f'color:{_MUTED}; font-size:10px;')
+        l3.addWidget(self._df_speed_mph, r, 1); r += 1
+        self._df_ref = row3('Quote package at:', _spin(1.0, 400.0, 72.4, ' km/h', dec=1, step=1.0),
+                            'Reference speed the answer is quoted at: the downforce needed at the corner, '
+                            'scaled by (V_ref / V_corner)² — the same way the Dynamics panel defines its package.')
+        self._df_cop = row3('CoP rear:', _spin(0.0, 100.0, 54.0, ' %', dec=0, step=1.0),
+                            'Share of the downforce on the rear axle (the package CoP).')
+        self._df_util = row3('Axle budget:', _spin(0.50, 1.00, 1.00, '', dec=2, step=0.05),
+                             '1.00 = the grip limit (the G-G criterion).  Lower = margin.')
+        self._btn_df = QPushButton('►  DOWNFORCE NEEDED')
+        self._btn_df.setStyleSheet(BTN_PRIMARY)
+        self._btn_df.clicked.connect(lambda: self.run_downforce(blocking=False))
+        l3.addWidget(self._btn_df, r, 0, 1, 2); r += 1
+        self._btn_df_use = QPushButton('Use as the panel package')
+        self._btn_df_use.setStyleSheet(BTN_SECONDARY); self._btn_df_use.setEnabled(False)
+        self._btn_df_use.setToolTip('Write the answer (N at the reference speed, CoP) into the Dynamics panel '
+                                    'custom aero package so every page uses it.')
+        self._btn_df_use.clicked.connect(self._use_df_package)
+        self._btn_df_copy = QPushButton('Copy table'); self._btn_df_copy.setStyleSheet(BTN_SECONDARY)
+        self._btn_df_copy.clicked.connect(self._copy_df_table)
+        l3.addWidget(self._btn_df_use, r, 0); l3.addWidget(self._btn_df_copy, r, 1); r += 1
+        self._btn_df_cancel = QPushButton('Cancel'); self._btn_df_cancel.setStyleSheet(BTN_SECONDARY)
+        self._btn_df_cancel.setEnabled(False); self._btn_df_cancel.clicked.connect(self._cancel_df)
+        l3.addWidget(self._btn_df_cancel, r, 0, 1, 2); r += 1
+        self._df_progress = QLabel('press DOWNFORCE NEEDED')
+        self._df_progress.setStyleSheet(f'color:{_MUTED}; font-size:11px;'); self._df_progress.setWordWrap(True)
+        l3.addWidget(self._df_progress, r, 0, 1, 2); r += 1
+        side.addWidget(g3)
+        self._df_speed.valueChanged.connect(self._sync_df_mph); self._sync_df_mph()
+
         self._status = QLabel('')
         self._status.setStyleSheet(f'color:{_MUTED}; font-size:11px;'); self._status.setWordWrap(True)
         side.addWidget(self._status)
         side.addStretch(1)
 
         inner = QWidget(); inner.setLayout(side)
-        scroll = QScrollArea(); scroll.setWidget(inner); scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(330); scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        root.addWidget(scroll)
+        from gui.side_panel import SideScroll, side_split
+        scroll = SideScroll(inner, 330)   # resizable, never clipped
 
         # ── right: two tabs ────────────────────────────────────────────
         self._tabs = QTabWidget()
@@ -305,10 +378,28 @@ class CornerSpeedPage(QWidget):
         t2s.setStretchFactor(0, 3); t2s.setStretchFactor(1, 2)
         t2.addWidget(t2s, 1)
         self._tabs.addTab(t2w, 'Per-corner grip budget')
-        root.addWidget(self._tabs, 1)
+        # tab 3
+        t3w = QWidget(); t3 = QVBoxLayout(t3w); t3.setContentsMargins(0, 0, 0, 0); t3.setSpacing(6)
+        self.df_readout = QLabel('press DOWNFORCE NEEDED')
+        self.df_readout.setStyleSheet(_MONO); self.df_readout.setWordWrap(True)
+        t3.addWidget(self.df_readout)
+        t3s = QSplitter(Qt.Orientation.Vertical)
+        self.df_slot = _Slot('DOWNFORCE TO MAKE A CORNER — the package (N at the reference speed) that lets '
+                             'the car hold the radius at the speed with every axle inside its grip budget.  '
+                             'LEFT: vs corner speed on the chosen radius.  RIGHT: vs radius at the chosen speed.  '
+                             'White marker = your point; the curves start at the mechanical limit (0 N).')
+        t3s.addWidget(self.df_slot)
+        self.df_table = self._make_table(self.DF_COLS)
+        t3s.addWidget(self.df_table)
+        t3s.setStretchFactor(0, 3); t3s.setStretchFactor(1, 2)
+        t3.addWidget(t3s, 1)
+        self._tabs.addTab(t3w, 'Downforce to make a corner')
+        self._side_split = side_split(scroll, self._tabs, 330, key='corner_speed')
+        root.addWidget(self._side_split, 1)
 
         self.speed_slot.busy('press ANALYSE CORNER SPEED')
         self.grip_slot.busy('press RUN GRIP BUDGET')
+        self.df_slot.busy('press DOWNFORCE NEEDED')
         self._sync_grip_mode()
 
     @staticmethod
@@ -460,6 +551,8 @@ class CornerSpeedPage(QWidget):
             c = mw._dynamics_panel.get_custom_aero_params()
             self._grip_speed.setValue(float(c['V_ref_kph']))
             self._grip_radius.setValue(float(mw._dynamics_panel._turn_radius.value()))
+            self._df_ref.setValue(float(c['V_ref_kph'])); self._df_cop.setValue(float(c['cop_rear_pct']))
+            self._df_radius.setValue(float(mw._dynamics_panel._turn_radius.value()))
         except Exception:                        # noqa: BLE001
             pass
 
@@ -828,3 +921,189 @@ class CornerSpeedPage(QWidget):
             return
         QApplication.clipboard().setText(CS.grip_budget_table_text(self.last_study))
         self._status.setText('grip-budget table copied (tab-separated)')
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  tab 3 — downforce to make a corner
+    # ═══════════════════════════════════════════════════════════════════
+    def _sync_df_mph(self, *_):
+        v = float(self._df_speed.value())
+        self._df_speed_mph.setText(f'= {v / 1.609344:.1f} mph   lateral g = V²/(g·R) = '
+                                   f'{(v / 3.6) ** 2 / (_G_EARTH * max(float(self._df_radius.value()), 1e-6)):.2f} g')
+
+    def df_config(self) -> dict:
+        try:
+            rho = float(self._main._dynamics_panel.get_custom_aero_params()['air_density'])
+        except Exception:                        # noqa: BLE001
+            rho = 1.225
+        from gui.ackermann_page import _parse_list
+        radii = [float(x) for x in _parse_list(self._radii_txt.text(), CS.DEFAULT_RADII_M) if x > 0.0]
+        return {'radius_m': float(self._df_radius.value()), 'speed_mps': float(self._df_speed.value()) / 3.6,
+                'ref_speed_mps': float(self._df_ref.value()) / 3.6,
+                'cop_rear_frac': float(self._df_cop.value()) / 100.0, 'rho': rho,
+                'target_util': float(self._df_util.value()), 'radii_m': radii}
+
+    def run_downforce(self, blocking: bool = False, radii_m=None):
+        """Tab 3.  blocking=True runs inline (tests) and returns the study dict."""
+        if self._df_worker is not None and self._df_worker.isRunning():
+            self._df_progress.setText('already running — wait or cancel')
+            return None
+        self._refresh_car_note()
+        try:
+            _tire, solver = self._solver()
+        except Exception as e:                   # noqa: BLE001
+            self._df_progress.setText(f'could not build the car: {e}')
+            return None
+        cfg = self.df_config()
+        if radii_m is not None:
+            cfg['radii_m'] = [float(r) for r in radii_m]
+        cfg['mu_scale'] = float(solver._mu_scale)
+        self.last_df_cfg = cfg
+        self.df_slot.busy('bisecting the downforce at each point…'); self.df_slot.summary('—')
+        self.df_table.setRowCount(0); self._btn_df_use.setEnabled(False)
+        if blocking:
+            study = CS.downforce_for_corner_curves(
+                solver, cfg['radius_m'], cfg['speed_mps'], cop_rear_frac=cfg['cop_rear_frac'],
+                ref_speed_mps=cfg['ref_speed_mps'], rho=cfg['rho'], target_util=cfg['target_util'],
+                radii_m=cfg['radii_m'], progress=self._df_progress.setText)
+            self._finish_df(study)
+            return study
+        self._btn_df.setEnabled(False); self._btn_df_cancel.setEnabled(True)
+        self._df_worker = _DownforceWorker(solver, cfg)
+        self._df_worker.note.connect(self._df_progress.setText)
+        self._df_worker.done.connect(self._finish_df)
+        self._df_worker.failed.connect(self._fail_df)
+        self._df_worker.start()
+        return None
+
+    def _cancel_df(self):
+        if self._df_worker is not None:
+            self._df_worker.cancel = True
+            self._df_progress.setText('cancelling after the current point…')
+
+    def _fail_df(self, msg):
+        self._btn_df.setEnabled(True); self._btn_df_cancel.setEnabled(False)
+        self._df_progress.setText(f'run failed: {msg}')
+
+    def _finish_df(self, study):
+        self._btn_df.setEnabled(True); self._btn_df_cancel.setEnabled(False)
+        self.last_df_study = study
+        self._draw_df(study); self._fill_df_table(study); self._show_df_readout(study)
+        p = study['point']
+        self._btn_df_use.setEnabled(bool(p['feasible'] and p['package_ref_N'] > 0.0))
+        self._df_progress.setText(f'done — {len(study["vs_speed"])} speed points, {len(study["vs_radius"])} radii, '
+                                  f'grip scale {study["mu_scale"]:.2f}')
+
+    def _show_df_readout(self, study):
+        p = study['point']
+        kph = lambda v: v * 3.6
+        lines = [f'RADIUS {p["radius_m"]:.1f} m AT {p["speed_kph"]:.1f} km/h ({p["speed_kph"] / 1.609344:.1f} mph) '
+                 f'= {p["ay_g"]:.2f} g lateral   (grip scale {p["mu_scale"]:.2f}, axle budget {p["target_util"]:.2f})',
+                 f'mechanical limit on this radius: {p["mech_limit_g"]:.2f} g = {p["mech_limit_speed_kph"]:.1f} km/h '
+                 f'({p["mech_limit_speed_kph"] / 1.609344:.1f} mph); without aero '
+                 + (f'the worst axle sits at {p["util_no_aero"]:.2f} of its budget at your speed'
+                    if np.isfinite(p['util_no_aero']) else 'the car lifts its inside wheel at your speed (no solution)')]
+        if p['downforce_at_corner_N'] <= 0.0:
+            lines.append('NEEDS NO DOWNFORCE — the tyres make this corner on their own.')
+        elif not p['feasible']:
+            lines.append(f'NOT REACHABLE with up to {p["downforce_at_corner_N"]:.0f} N on the car (worst axle still '
+                         f'{p["util_with"]:.2f}); more load no longer buys enough grip (load sensitivity).')
+        else:
+            lines.append(f'DOWNFORCE NEEDED ON THE CAR AT THE CORNER: {p["downforce_at_corner_N"]:.0f} N '
+                         f'({p["front_N"]:.0f} N front / {p["rear_N"]:.0f} N rear at {100 * p["cop_rear_frac"]:.0f} % rear)')
+            lines.append(f'=> PACKAGE: {p["package_ref_N"]:,.0f} N at {p["ref_speed_kph"]:.1f} km/h '
+                         f'({p["ref_speed_kph"] / 1.609344:.0f} mph)   = ClA {p["cla_m2"]:.2f} m²   '
+                         f'[F_ref = D × (V_ref / V_corner)² = {p["downforce_at_corner_N"]:.0f} × '
+                         f'({p["ref_speed_kph"]:.1f}/{p["speed_kph"]:.1f})²]')
+        self.df_readout.setText('\n'.join(lines))
+
+    def _draw_df(self, study):
+        s = self.df_slot
+        ax1, ax2 = s.axes(2)
+        p = study['point']
+        vs = [r for r in study['vs_speed']]; vr = [r for r in study['vs_radius']]
+        if vs:
+            x = [r['speed_kph'] for r in vs]; y = [r['package_ref_N'] for r in vs]
+            ax1.plot(x, y, 'o-', color=_YEL, lw=2, ms=4, label=f'package needed, R = {p["radius_m"]:.1f} m')
+            cap = [r for r in vs if not r['feasible']]
+            if cap:
+                ax1.plot([r['speed_kph'] for r in cap], [r['package_ref_N'] for r in cap], 'x', color=_RED, ms=7,
+                         label='not reachable (capped)')
+        if vr:
+            x = [r['radius_m'] for r in vr]; y = [r['package_ref_N'] for r in vr]
+            ax2.plot(x, y, 'o-', color=_RED, lw=2, ms=4, label=f'package needed, V = {p["speed_kph"]:.1f} km/h')
+            cap = [r for r in vr if not r['feasible']]
+            if cap:
+                ax2.plot([r['radius_m'] for r in cap], [r['package_ref_N'] for r in cap], 'x', color=_WHT, ms=7,
+                         label='not reachable (capped)')
+        if p['feasible'] and p['package_ref_N'] > 0:
+            ax1.plot([p['speed_kph']], [p['package_ref_N']], 'o', color=_WHT, ms=9, mec='#000', label='your point')
+            ax2.plot([p['radius_m']], [p['package_ref_N']], 'o', color=_WHT, ms=9, mec='#000', label='your point')
+        ax1.axvline(p['mech_limit_speed_kph'], color=_BLU, ls='--', lw=1, label='mechanical limit speed')
+        ax1.set_xlabel('corner speed (km/h)', fontsize=8.5)
+        ax1.set_ylabel(f'package needed (N at {p["ref_speed_kph"]:.0f} km/h)', fontsize=8.5)
+        ax1.set_title(f'on a {p["radius_m"]:.1f} m radius', fontsize=9)
+        ax2.set_xlabel('corner radius (m)', fontsize=8.5)
+        ax2.set_ylabel(f'package needed (N at {p["ref_speed_kph"]:.0f} km/h)', fontsize=8.5)
+        ax2.set_title(f'at {p["speed_kph"]:.1f} km/h', fontsize=9)
+        for ax in (ax1, ax2):
+            if ax.get_lines():
+                s.legend(ax, loc='upper left')
+        s.finish()
+        if p['downforce_at_corner_N'] <= 0.0:
+            s.summary(f'WHAT IT MEANS: a {p["radius_m"]:.1f} m corner at {p["speed_kph"]:.1f} km/h is {p["ay_g"]:.2f} g; '
+                      f'the tyres alone hold {p["mech_limit_g"]:.2f} g there, so no downforce is needed.')
+        elif p['feasible']:
+            s.summary(f'WHAT IT MEANS: a {p["radius_m"]:.1f} m corner at {p["speed_kph"]:.1f} km/h is {p["ay_g"]:.2f} g, '
+                      f'{p["ay_g"] - p["mech_limit_g"]:.2f} g beyond the tyres. It takes {p["downforce_at_corner_N"]:.0f} N '
+                      f'on the car at that speed, which is a {p["package_ref_N"]:,.0f} N at {p["ref_speed_kph"]:.0f} km/h package '
+                      f'(ClA {p["cla_m2"]:.2f} m²). No drag is in this number.')
+        else:
+            s.summary(f'WHAT IT MEANS: {p["ay_g"]:.2f} g on {p["radius_m"]:.1f} m is out of reach even with '
+                      f'{p["downforce_at_corner_N"]:.0f} N — the tyres lose grip per newton faster than the wing adds it.')
+
+    def _fill_df_table(self, study):
+        t = self.df_table
+        rows = [('vs speed', r) for r in study['vs_speed']] + [('vs radius', r) for r in study['vs_radius']]
+        t.setRowCount(len(rows))
+        for i, (name, r) in enumerate(rows):
+            vals = (name, f'{r["radius_m"]:.2f}', f'{r["speed_kph"]:.1f}', f'{r["ay_g"]:.3f}', f'{r["util_no_aero"]:.3f}',
+                    f'{r["downforce_at_corner_N"]:.0f}', f'{r["front_N"]:.0f}', f'{r["rear_N"]:.0f}',
+                    f'{r["package_ref_N"]:.0f}', f'{r["cla_m2"]:.3f}', 'yes' if r['feasible'] else 'NO (capped)')
+            for j, v in enumerate(vals):
+                it = QTableWidgetItem(v)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter if j in (0, 10)
+                                    else Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if j == 10 and not r['feasible']:
+                    it.setForeground(Qt.GlobalColor.red)
+                t.setItem(i, j, it)
+
+    def _copy_df_table(self):
+        if not self.last_df_study:
+            self._status.setText('nothing to copy — run DOWNFORCE NEEDED first')
+            return
+        QApplication.clipboard().setText(CS.downforce_table_text(self.last_df_study))
+        self._status.setText('downforce table copied (tab-separated)')
+
+    def _use_df_package(self):
+        """Write the answer into the Dynamics panel custom aero package (ONE model)."""
+        st = self.last_df_study
+        if not st or not st['point']['feasible'] or st['point']['package_ref_N'] <= 0.0:
+            return
+        p = st['point']
+        try:
+            panel = self._main._dynamics_panel
+            panel._aero_F_ref.setValue(float(p['package_ref_N']))
+            panel._aero_V_ref.setValue(float(p['ref_speed_kph']))
+            panel._aero_cop_rear.setValue(float(100.0 * p['cop_rear_frac']))
+            if hasattr(panel, '_aero_source'):
+                idx = panel._aero_source.findData('custom')
+                if idx < 0:
+                    idx = panel._aero_source.findText('Custom', Qt.MatchFlag.MatchContains)
+                if idx >= 0:
+                    panel._aero_source.setCurrentIndex(idx)
+            self._refresh_car_note()
+            self._status.setText(f'Dynamics panel package set to {p["package_ref_N"]:,.0f} N at '
+                                 f'{p["ref_speed_kph"]:.1f} km/h, {100 * p["cop_rear_frac"]:.0f} % rear')
+        except Exception as e:                   # noqa: BLE001
+            self._status.setText(f'could not write the panel package: {e}')
+

@@ -75,7 +75,8 @@ class AccelerationModel:
         # Launch rpm: below the mapped range the clutch slips and the driver
         # holds the engine near peak torque — that is the force delivered off
         # the line (grip-limited anyway).
-        self.launch_rpm = float(self.erpm[int(np.argmax(self.etq))])
+        # top of the peak-torque plateau (same rule as LapSimulator.launch_rpm)
+        self.launch_rpm = float(np.asarray(self.erpm)[np.nonzero(np.asarray(self.etq) >= 0.995 * np.max(self.etq))[0][-1]])
 
     # ── drivetrain ────────────────────────────────────────────────────────
     def _rpm(self, v_ms, total_ratio):

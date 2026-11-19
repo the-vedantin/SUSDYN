@@ -47,11 +47,32 @@ Explicit assumptions (all shown on the page, none inferred from hardware):
   acceleration RMS, travel RMS) is seed-independent on coherent tracks;
   peaks (travel, min load, damper peak, contact-loss fraction) and the
   independent-track cases (left/right cross terms) do depend on the seed;
+* aero (RideInputs.aero_cla_m2 > 0, the Dynamics panel package when aero is
+  applied): every road case runs about the LOADED state at its own speed
+  (loaded_model) — tyre loads include the downforce and the wheel travel
+  to the stops is counted from rest, i.e. the aero sink plus the road;
 * the linear model reports the fraction of samples where its predicted load
   reaches zero as a contact-loss INDICATOR — the physics there is outside the
   linear regime; RideModel.contact_response is the nonlinear check.
+
+Dyno dampers (RideInputs.damper = vahan.damper.WheelDampers, the project's
+car['damper'] at the solved static MR).  Absent = the four assumed linear
+wheel coefficients above, every number unchanged.  Present:
+* frequency domain: each road case uses the EQUIVALENT LINEAR wheel
+  coefficient (secant F(v)/v, comp/reb averaged) at that case's own RMS
+  damper velocity, found by fixed-point iteration (<= damper_max_iter,
+  relative change <= damper_tol; convergence reported per case);
+* the current-car study ALSO integrates every case in the time domain with
+  the nonlinear asymmetric damper law and the unilateral tyre
+  (RideModel.contact_response, RK4) and reports ITS DLC / travel / damper
+  velocity / contact numbers as the case metrics (the first
+  time_domain_discard_s of each record are the start-from-rest transient and
+  are excluded); the equivalent-linear metrics are kept alongside;
+* transfer curves use the equivalent coefficients of the reference case
+  (middle speed, coherent, first seed), PSDs and the bump check those of the
+  case at the same speed.
 """
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 import numpy as np
 
 from vahan.ride import RideModel, CORNERS
@@ -86,6 +107,24 @@ class RideInputs:
     settle_fraction: float = 0.05
     settle_record_s: float = 6.0
     flat_ride_max_ratio: float = 1.0    # pitch RMS / bounce RMS after the bump
+    # nonlinear dyno dampers at the wheel (vahan.damper.WheelDampers) or None
+    damper: object = field(default=None, compare=False)
+    damper_max_iter: int = 10           # equivalent-linear fixed-point iterations
+    damper_tol: float = 1e-3            # relative change in c that counts as converged
+    time_domain_discard_s: float = 2.0  # start-from-rest transient excluded from stats
+    # Aero package (downforce = ClA x rho/2 x v^2, split by the centre of
+    # pressure). 0 = no aero (every number as before). With aero, each road
+    # case runs about the LOADED state at its own speed: the mean tyre loads
+    # (DLC denominator, unilateral-contact threshold) include the downforce
+    # and the travel to the stops starts from the aero sink, not from rest.
+    aero_cla_m2: float = 0.0
+    aero_cop_rear: float = 0.5           # rear share of the downforce (0..1)
+    air_density: float = 1.225
+    # Wheel travel from rest to the BUMP stop (m); None = stop_margin_m (the
+    # old symmetric margin).  With aero the sink moves the car toward the
+    # bump stop, so the two sides have to be judged separately:
+    # usage = max(bump peak / bump margin, droop peak / stop_margin_m).
+    bump_stop_margin_m: float = None
 
     def __post_init__(self):
         if self.coherence not in COHERENCE_CHOICES:
@@ -102,6 +141,11 @@ class RideInputs:
                 raise ValueError(f'{name} must be positive and finite')
         if not 0 < self.settle_fraction < 1:
             raise ValueError('settle_fraction must lie in (0,1)')
+        if self.bump_stop_margin_m is not None and not float(self.bump_stop_margin_m) > 0:
+            raise ValueError('bump_stop_margin_m must be positive')
+        if (not np.isfinite(self.aero_cla_m2) or self.aero_cla_m2 < 0
+                or not 0 <= self.aero_cop_rear <= 1 or not self.air_density > 0):
+            raise ValueError('aero: ClA >= 0, centre of pressure in [0,1], density > 0')
 
     @property
     def coherence_values(self):
@@ -111,6 +155,43 @@ class RideInputs:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Ride rate <-> frequency <-> spring rate (VehicleParams' own relation)
 # ─────────────────────────────────────────────────────────────────────────────
+# What the road model leaves out — shown word for word on the Ride page and in
+# the binder so nobody has to guess (user 2026-10-23: "everything very
+# explicit as 'this is not being considered'").
+NOT_CONSIDERED = (
+    'Tyre size: the tyre touches the road at one point, so it does not roll over or swallow '
+    'short sharp bumps (a real contact patch smooths them).',
+    'Tyre damping (rubber losses): the tyre is a pure spring.',
+    'Bump stops and droop limits as forces: travel past them is only flagged.',
+    'Motion ratio and wheel rate changing with travel: held at the static values.',
+    'Frame flex: the body is rigid.',
+    'Downforce changing with ride height or pitch: downforce depends on speed only.',
+    'Cornering, braking or throttle at the same time: straight-line driving only.',
+    'Damper friction, gas force and heat fade: the damper is its dyno curve only.',
+    'The real track surface: the road is a made-up ISO 8608 road, nobody measured an FSAE track.',
+)
+
+
+def estimated_inertias(veh):
+    """Body pitch and roll inertia ESTIMATED from the car (no measurement),
+    the same rules the transient model uses (gui/main_window auto inertias):
+      roll  = sprung mass x (roll_gyradius_track_frac x mean track)^2
+      pitch = 0.9 x yaw, yaw = yaw_inertia_factor x total mass x a x b
+    Returns values (kg.m^2) and the plain-words method of each."""
+    track = 0.5 * (float(veh.front_track_m) + float(veh.rear_track_m))
+    k_roll = float(veh.roll_gyradius_track_frac) * track
+    roll = float(veh.sprung_mass_kg) * k_roll ** 2
+    m = float(veh.total_mass_kg)
+    yaw = float(veh.yaw_inertia_factor) * m * float(veh.cg_to_front_axle_m) * float(veh.cg_to_rear_axle_m)
+    pitch = 0.9 * yaw
+    return {'pitch_kgm2': pitch, 'roll_kgm2': roll, 'yaw_kgm2': yaw,
+            'pitch_method': (f'0.9 x yaw inertia {yaw:.0f} kg·m² (yaw = {veh.yaw_inertia_factor:.2f} x '
+                             f'{m:.0f} kg x front {veh.cg_to_front_axle_m*1000:.0f} mm x rear '
+                             f'{veh.cg_to_rear_axle_m*1000:.0f} mm)'),
+            'roll_method': (f'sprung mass {veh.sprung_mass_kg:.0f} kg x ({veh.roll_gyradius_track_frac:.2f} x '
+                            f'mean track {track*1000:.0f} mm)²')}
+
+
 def sprung_corner_masses_kg(veh):
     """(front, rear) sprung mass per corner — the same axle moment balance
     RideModel.from_vehicle uses, so ride frequency and the model agree."""
@@ -269,12 +350,48 @@ def build_road_cases(inputs, wheelbase_m):
     return cases
 
 
+def aero_corner_loads_N(inputs, speed_mps):
+    """Downforce per corner FL FR RL RR (N) of the inputs' aero package."""
+    d = float(inputs.aero_cla_m2) * 0.5 * float(inputs.air_density) * float(speed_mps) ** 2
+    f, r = d * (1. - float(inputs.aero_cop_rear)) / 2., d * float(inputs.aero_cop_rear) / 2.
+    return np.array([f, f, r, r])
+
+
+def loaded_model(model, inputs, speed_mps):
+    """(model about the aero-loaded state at this speed, static suspension
+    sink in m FL FR RL RR, + = bump).  The sink is the same model's own
+    static solution K q = F under the corner downforce (linear wheel rates,
+    tyre in series); the returned model's baseline tyre loads include the
+    downforce. No aero in the inputs -> (model, zeros)."""
+    fa = aero_corner_loads_N(inputs, speed_mps)
+    if not np.any(fa > 0):
+        return model, np.zeros(4)
+    force = np.zeros(7)
+    force[:3] = -model.body_corner_map.T @ fa        # downforce pushes the body corners down
+    sink = model.suspension_map @ np.linalg.solve(model.stiffness, force)
+    return replace(model, baseline_loads=model.baseline_loads + fa), sink
+
+
+def _stop_usage(travel_from_rest, droop_margin_m, inputs):
+    """(peak |travel| from rest, usage) per corner; bump side against
+    inputs.bump_stop_margin_m when set, droop side against the stop margin."""
+    bump = float(droop_margin_m)
+    if inputs is not None and inputs.bump_stop_margin_m is not None:
+        bump = float(inputs.bump_stop_margin_m)
+    up = np.max(travel_from_rest, axis=0)
+    down = np.max(-travel_from_rest, axis=0)
+    usage = np.maximum(up / bump, down / float(droop_margin_m))
+    return np.maximum(np.abs(up), np.abs(down)), usage
+
+
 def road_psd_response(model, inputs, speed_mps, wheelbase_m, track_correlation,
                       frequencies_Hz=None):
     """Spectral (PSD) response of the model to the ISO class road at one
     speed and one left/right correlation — the RideModel.spectral_response
-    wrapper the page plots. Returns (frequencies, outputs)."""
+    wrapper the page plots. Returns (frequencies, outputs). The load
+    coefficient is relative to the tyre load WITH the downforce at that speed."""
     from vahan.road import corner_cross_psd
+    model, _ = loaded_model(model, inputs, speed_mps)
     if frequencies_Hz is None:
         spectrum = RoadSpectrum(inputs.road_class)
         f_hi = spectrum.high_cycles_per_m * float(speed_mps)
@@ -320,32 +437,45 @@ class RideMetrics:
     body_pitch_acc_rms_radps2: float
     body_roll_acc_rms_radps2: float
     body_corner_acc_rms_mps2: np.ndarray  # (4)
+    kind: str = 'linear periodic (frequency domain)'
+    beyond_dyno_mps: float = 0.0        # damper |v| past the dyno range (dyno dampers only)
+    # static aero sink (m, + = bump) the travel peak/usage start from;
+    # travel_rms_m is the road part only
+    aero_sink_m: np.ndarray = field(default_factory=lambda: np.zeros(4))
 
     @property
     def worst_dlc(self):
         return float(np.max(self.dlc))
 
 
-def evaluate_case(model, case, *, motion_ratios, stop_margin_m):
-    """Metrics of one road case from the steady periodic linear response."""
+def evaluate_case(model, case, *, motion_ratios, stop_margin_m, inputs=None):
+    """Metrics of one road case from the steady periodic linear response.
+    With `inputs` carrying an aero package the case runs about the loaded
+    state at its speed (loaded_model): loads include the downforce and the
+    travel peak / stop usage are measured from rest, i.e. aero sink + road."""
     mr = np.asarray(motion_ratios, float)
     if mr.shape != (4,) or np.any(mr <= 0):
         raise ValueError('four positive motion ratios (FL FR RL RR) required')
     if stop_margin_m <= 0:
         raise ValueError('stop margin must be positive')
+    sink = np.zeros(4)
+    if inputs is not None:
+        model, sink = loaded_model(model, inputs, case.speed_mps)
     resp = model.periodic_response(case.dt_s, case.road_heights_m)
     load = resp['dynamic_tire_load_N'] + model.baseline_loads
     mean = load.mean(axis=0)
     rms = np.sqrt(np.mean((load - mean) ** 2, axis=0))
     travel = resp['suspension_displacement_m']
+    from_rest, usage = _stop_usage(travel + sink, stop_margin_m, inputs)
     vel = resp['suspension_velocity_mps'] * mr
     acc = resp['body_acceleration']
     return RideMetrics(
         dlc=rms / mean, load_rms_N=rms, min_load_N=load.min(axis=0),
         contact_loss_fraction_linear=np.mean(load <= 0., axis=0),
-        travel_peak_m=np.max(np.abs(travel), axis=0),
+        travel_peak_m=from_rest,
         travel_rms_m=np.sqrt(np.mean(travel ** 2, axis=0)),
-        travel_usage=np.max(np.abs(travel), axis=0) / float(stop_margin_m),
+        travel_usage=usage,
+        aero_sink_m=sink,
         damper_velocity_rms_mps=np.sqrt(np.mean(vel ** 2, axis=0)),
         damper_velocity_peak_mps=np.max(np.abs(vel), axis=0),
         body_heave_acc_rms_mps2=float(np.sqrt(np.mean(acc[:, 0] ** 2))),
@@ -517,7 +647,7 @@ def contact_patch_vs_ride_frequency(veh, inputs, frequencies_Hz, *, curve_freque
         pct, rms, low = [], [], []
         for f_hz in freqs:
             model = model_at(f_hz)
-            ms = [evaluate_case(model, c, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m) for c in cases]
+            ms = [evaluate_case(model, c, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m, inputs=inputs) for c in cases]
             pct.append(100. * float(np.mean([m.dlc[idx] for m in ms])))
             rms.append(float(np.mean([m.load_rms_N[idx] for m in ms])))
             low.append(float(np.min([m.min_load_N[idx] for m in ms])))
@@ -578,10 +708,12 @@ def current_car_study(veh, inputs, transfer_frequencies_Hz=None):
     """Everything the page shows for the CURRENT springs: per-case metrics,
     the bump-settle traces per speed, transfer curves and the road PSD
     responses per speed and coherence. All on the one VehicleParams."""
+    if inputs.damper is not None:
+        return _current_car_study_dyno(veh, inputs, transfer_frequencies_Hz)
     model = ride_model_for(veh, inputs)
     cases = build_road_cases(inputs, veh.wheelbase_m)
     mr = corner_motion_ratios(veh)
-    metrics = [evaluate_case(model, c, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m)
+    metrics = [evaluate_case(model, c, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m, inputs=inputs)
                for c in cases]
     bumps = {float(v): bump_settling(model, inputs, v, veh.wheelbase_m) for v in inputs.speeds_mps}
     if transfer_frequencies_Hz is None:
@@ -599,6 +731,46 @@ def current_car_study(veh, inputs, transfer_frequencies_Hz=None):
         'front_ride_frequency_Hz': ride_frequency_Hz(veh.ride_rate_front_Npm, mf),
         'rear_ride_frequency_Hz': ride_frequency_Hz(veh.ride_rate_rear_Npm, mr_mass),
         'flat_ride_ratio': flat_ride_ratio(veh),
+    }
+
+
+def _current_car_study_dyno(veh, inputs, transfer_frequencies_Hz=None):
+    """current_car_study with dyno dampers (see the module docstring)."""
+    cases = build_road_cases(inputs, veh.wheelbase_m)
+    mr = corner_motion_ratios(veh)
+    eq = [equivalent_damping_for_case(veh, inputs, c) for c in cases]
+    metrics = [time_domain_case_metrics(e['model'], c, inputs.damper, motion_ratios=mr,
+                                        stop_margin_m=inputs.stop_margin_m,
+                                        discard_s=inputs.time_domain_discard_s, inputs=inputs)
+               for e, c in zip(eq, cases)]
+    ref = reference_case_index(cases, inputs.speeds_mps)
+    model = eq[ref]['model']
+    bumps = {}
+    for v in inputs.speeds_mps:
+        bumps[float(v)] = bump_settling(eq[_speed_case_index(cases, v)]['model'], inputs, v, veh.wheelbase_m)
+    if transfer_frequencies_Hz is None:
+        transfer_frequencies_Hz = np.logspace(-1, np.log10(60.), 600)
+    psd = {}
+    for v in inputs.speeds_mps:
+        for coh in inputs.coherence_values:
+            at = [i for i, c in enumerate(cases)
+                  if np.isclose(c.speed_mps, v) and c.coherence == coh]
+            f, out = road_psd_response(eq[at[0]]['model'], inputs, v, veh.wheelbase_m,
+                                       1. if coh == 'coherent' else 0.)
+            psd[(float(v), coh)] = (f, out)
+    mf, mr_mass = sprung_corner_masses_kg(veh)
+    return {
+        'model': model, 'cases': cases, 'metrics': metrics, 'bumps': bumps,
+        'transfer': transfer_curves(model, transfer_frequencies_Hz), 'psd': psd,
+        'front_ride_frequency_Hz': ride_frequency_Hz(veh.ride_rate_front_Npm, mf),
+        'rear_ride_frequency_Hz': ride_frequency_Hz(veh.ride_rate_rear_Npm, mr_mass),
+        'flat_ride_ratio': flat_ride_ratio(veh),
+        'metrics_equivalent_linear': [e['metrics'] for e in eq],
+        'damper_equivalent': [{k: e[k] for k in ('c_wheel_Nspm', 'c_comp_Nspm', 'c_reb_Nspm',
+                                                  'damper_v_rms_mps', 'iterations', 'converged',
+                                                  'change')} for e in eq],
+        'reference_case_index': ref,
+        'damping_kind': 'dyno',
     }
 
 
@@ -728,10 +900,312 @@ class RideSweep:
                 'n_feasible': int(feasible.sum()), 'n_grid': int(feasible.size)}
 
 
-def ride_model_for(veh, inputs):
+def ride_model_for(veh, inputs, corner_damping_Nspm=None):
+    damping = inputs.corner_damping_Nspm if corner_damping_Nspm is None else corner_damping_Nspm
     return RideModel.from_vehicle(veh, pitch_inertia_kgm2=inputs.pitch_inertia_kgm2,
                                   roll_inertia_kgm2=inputs.roll_inertia_kgm2,
-                                  corner_damping_Nspm=list(inputs.corner_damping_Nspm))
+                                  corner_damping_Nspm=list(damping))
+
+
+def equivalent_damping_for_case(veh, inputs, case):
+    """Equivalent linear wheel coefficients of inputs.damper on one road
+    case: c = c_eq(RMS damper velocity of THIS case) x MR², iterated from
+    inputs.corner_damping_Nspm until the relative change is <= damper_tol
+    (at most damper_max_iter solves).  Returns a dict: c_wheel_Nspm (4),
+    c_comp/c_reb (4), damper_v_rms_mps (4), iterations, converged,
+    change, history, model, metrics (frequency-domain at the final c)."""
+    damper = inputs.damper
+    if damper is None:
+        raise ValueError('no damper model in the ride inputs')
+    mr = corner_motion_ratios(veh)
+    c = np.asarray(inputs.corner_damping_Nspm, float).copy()
+    history, converged, change = [], False, np.inf
+    comp = reb = v_rms = None
+    for it in range(1, int(inputs.damper_max_iter) + 1):
+        model = ride_model_for(veh, inputs, c)
+        m = evaluate_case(model, case, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m, inputs=inputs)
+        v_rms = np.maximum(m.damper_velocity_rms_mps, 1e-5)
+        c_new, comp, reb = damper.equivalent_wheel_c(v_rms)
+        change = float(np.max(np.abs(c_new - c) / c_new))
+        history.append({'c_wheel_Nspm': c.copy(), 'damper_v_rms_mps': v_rms.copy(), 'change': change})
+        c = c_new
+        if change <= inputs.damper_tol:
+            converged = True
+            break
+    model = ride_model_for(veh, inputs, c)
+    metrics = evaluate_case(model, case, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m, inputs=inputs)
+    metrics.kind = 'equivalent linear (frequency domain)'
+    metrics.beyond_dyno_mps = float(damper.curve.beyond_dyno_mps(
+        np.r_[metrics.damper_velocity_peak_mps, -metrics.damper_velocity_peak_mps]))
+    return {'c_wheel_Nspm': c, 'c_comp_Nspm': comp, 'c_reb_Nspm': reb,
+            'damper_v_rms_mps': metrics.damper_velocity_rms_mps, 'iterations': len(history),
+            'converged': converged, 'change': change, 'history': history,
+            'model': model, 'metrics': metrics}
+
+
+def time_domain_case_metrics(model, case, damper, *, motion_ratios, stop_margin_m, discard_s=2.0,
+                             inputs=None):
+    """RideMetrics of one road case from the time-domain integration with
+    the NONLINEAR wheel damper law and the unilateral tyre (RK4). The first
+    discard_s seconds (start from rest) are excluded from every statistic.
+    `inputs` with aero: about the loaded state at the case speed (evaluate_case)."""
+    mr = np.asarray(motion_ratios, float)
+    sink = np.zeros(4)
+    if inputs is not None:
+        model, sink = loaded_model(model, inputs, case.speed_mps)
+    road = case.road_heights_m
+    t = np.arange(len(road)) * case.dt_s
+    res = model.contact_response(t, road, damper_force_fn=damper, integrator='rk4')
+    keep = t >= min(float(discard_s), 0.5 * t[-1])
+    load = res['normal_load_N'][keep]
+    mean = load.mean(axis=0)
+    rms = np.sqrt(np.mean((load - mean) ** 2, axis=0))
+    travel = res['suspension_displacement_m'][keep]
+    from_rest, usage = _stop_usage(travel + sink, stop_margin_m, inputs)
+    vel = (res['velocity'] @ model.suspension_map.T)[keep] * mr
+    acc = res['body_acceleration'][keep]
+    return RideMetrics(
+        dlc=rms / mean, load_rms_N=rms, min_load_N=load.min(axis=0),
+        contact_loss_fraction_linear=np.mean(load <= 0., axis=0),
+        travel_peak_m=from_rest,
+        travel_rms_m=np.sqrt(np.mean(travel ** 2, axis=0)),
+        travel_usage=usage,
+        aero_sink_m=sink,
+        damper_velocity_rms_mps=np.sqrt(np.mean(vel ** 2, axis=0)),
+        damper_velocity_peak_mps=np.max(np.abs(vel), axis=0),
+        body_heave_acc_rms_mps2=float(np.sqrt(np.mean(acc[:, 0] ** 2))),
+        body_pitch_acc_rms_radps2=float(np.sqrt(np.mean(acc[:, 1] ** 2))),
+        body_roll_acc_rms_radps2=float(np.sqrt(np.mean(acc[:, 2] ** 2))),
+        body_corner_acc_rms_mps2=np.sqrt(np.mean(res['body_corner_acceleration_mps2'][keep] ** 2, axis=0)),
+        kind='time domain, nonlinear dampers + unilateral tyre',
+        beyond_dyno_mps=float(damper.curve.beyond_dyno_mps(vel.ravel())))
+
+
+def load_swing_vs_speed(veh, inputs, speeds_mps, road_classes=('A', 'B')):
+    """Tyre-load swing against SPEED (the page's headline plot and the
+    binder's table): for every road class and speed, the worse of the
+    coherent/independent tracks per corner.  Frequency domain on the
+    equivalent linear dampers (dyno: iterated per case; no dyno: the four
+    coefficients).  Loads include the downforce at that speed when the
+    inputs carry an aero package.  Returns {class: {'speed_kph', 'mean_N',
+    'rms_N', 'pct', 'min_N', 'c_wheel_Nspm'}} with (n_speed, 4) arrays."""
+    mr = corner_motion_ratios(veh)
+    out = {}
+    for cls in road_classes:
+        inp = replace(inputs, road_class=cls, speeds_mps=tuple(float(v) for v in speeds_mps),
+                      seeds=inputs.seeds[:1], coherence='both')
+        cases = build_road_cases(inp, veh.wheelbase_m)
+        rows = {k: np.zeros((len(speeds_mps), 4)) for k in ('mean_N', 'rms_N', 'min_N', 'c_wheel_Nspm')}
+        rows['rms_N'][:] = -np.inf; rows['min_N'][:] = np.inf
+        for case in cases:
+            s = int(np.argmin(np.abs(np.asarray(speeds_mps, float) - case.speed_mps)))
+            if inp.damper is not None:
+                e = equivalent_damping_for_case(veh, inp, case)
+                m, c = e['metrics'], e['c_wheel_Nspm']
+            else:
+                m = evaluate_case(ride_model_for(veh, inp), case, motion_ratios=mr,
+                                  stop_margin_m=inp.stop_margin_m, inputs=inp)
+                c = np.asarray(inp.corner_damping_Nspm, float)
+            worse = m.load_rms_N > rows['rms_N'][s]
+            rows['rms_N'][s] = np.where(worse, m.load_rms_N, rows['rms_N'][s])
+            rows['c_wheel_Nspm'][s] = np.where(worse, c, rows['c_wheel_Nspm'][s])
+            rows['mean_N'][s] = m.load_rms_N / m.dlc
+            rows['min_N'][s] = np.minimum(rows['min_N'][s], m.min_load_N)
+        rows['pct'] = 100. * rows['rms_N'] / rows['mean_N']
+        rows['speed_kph'] = np.asarray(speeds_mps, float) * 3.6
+        out[cls] = rows
+    return out
+
+
+def quarter_car_load_rms_N(sprung_kg, unsprung_kg, wheel_rate_Npm, wheel_damping_Nspm,
+                           tire_rate_Npm, road_class, speed_mps, n=200000):
+    """INDEPENDENT cross-check of the tyre-load swing: one corner alone (body
+    on spring + damper, wheel on the tyre), written out here from the two
+    equations of motion and integrated against the ISO road PSD — shares no
+    matrices with RideModel.  RMS dynamic tyre load (N)."""
+    sp = RoadSpectrum(road_class)
+    v = float(speed_mps)
+    f = np.linspace(sp.low_cycles_per_m * v, sp.high_cycles_per_m * v, int(n))
+    w = 2 * np.pi * f
+    S = sp.temporal_psd(f, v)
+    k, c, kt = float(wheel_rate_Npm), float(wheel_damping_Nspm), float(tire_rate_Npm)
+    a11 = -w ** 2 * float(sprung_kg) + 1j * w * c + k
+    a12 = -(1j * w * c + k)
+    a22 = -w ** 2 * float(unsprung_kg) + 1j * w * c + k + kt
+    zu = a11 * kt / (a11 * a22 - a12 ** 2)          # wheel motion per unit road
+    return float(np.sqrt(np.trapezoid(np.abs(kt * (1. - zu)) ** 2 * S, f)))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Springs x dampers x speed: tyre load AND contact-patch location
+# ─────────────────────────────────────────────────────────────────────────────
+# The fixed reference road (user 2026-10-23: "consistent bumps"): one stored
+# seed per track, built once in DISTANCE, so every spring, damper and speed
+# drives over the very same bumps.  Road B uses the same seed, i.e. the same
+# bumps twice as tall (ISO 8608 B = 4x the A power, same n^-2 slope).
+REFERENCE_ROAD_SEED = 1
+ROAD_A_NOTE = ('Road A = ISO 8608 class A (very good road). Used as the STAND-IN for a smooth FSAE '
+               'site such as MIS - it is NOT a measured MIS surface.')
+
+
+def reference_road(road_class, record_length_m=1000., spacing_m=0.02):
+    """The fixed reference road of one class: distance (m), left and right
+    track heights (m), and the bump content per spatial-frequency band
+    (octaves from the ISO band edge up): band edges in cycles/m and the RMS
+    height of each band (m).  Same arrays the road cases replay."""
+    sp = RoadSpectrum(road_class)
+    inp = RideInputs(pitch_inertia_kgm2=1., roll_inertia_kgm2=1., corner_damping_Nspm=(1., 1., 1., 1.),
+                     road_class=road_class, record_length_m=record_length_m, spacing_m=spacing_m)
+    left, right = _profiles(inp, REFERENCE_ROAD_SEED)
+    x = np.arange(len(left)) * float(spacing_m)
+    edges = [sp.low_cycles_per_m]
+    while edges[-1] * 2. < sp.high_cycles_per_m:
+        edges.append(edges[-1] * 2.)
+    if sp.high_cycles_per_m / edges[-1] < 1.5:       # no sliver band at the top
+        edges.pop()
+    edges.append(sp.high_cycles_per_m)
+    edges = np.asarray(edges)
+    zf = np.fft.rfft(left); n = np.fft.rfftfreq(len(left), spacing_m)
+    band_rms = []
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        keep = (n >= lo) & (n < hi)
+        band_rms.append(float(np.sqrt(2. * np.sum(np.abs(zf[keep]) ** 2)) / len(left)))
+    return {'distance_m': x, 'left_m': left, 'right_m': right, 'band_edges_cpm': edges,
+            'band_rms_m': np.asarray(band_rms), 'band_rms_theory_m': np.sqrt(sp.band_power(edges[:-1], edges[1:])),
+            'rms_m': float(np.std(left)), 'seed': REFERENCE_ROAD_SEED}
+
+
+def contact_patch_table(solver, tire_radius_m, travel_limit_m=0.06, n=61):
+    """Contact-patch position against wheel travel from the SOLVED corner
+    (vahan.solver.SuspensionConstraints.solve, the same solve the 3-D view
+    draws), chassis frame: travel (m, + = bump), lateral and fore-aft
+    movement from the static position (m; lateral + = outboard, fore-aft
+    + = rearward).  Solved outward from static with warm starts; stops at
+    the first travel the solver cannot reach."""
+    from vahan.loads import contact_patch_point
+    st0 = solver.solve(0.)
+    p0 = contact_patch_point(st0.wheel_center, st0.spin_axis, tire_radius_m)
+    side = 1. if p0[0] >= 0 else -1.
+    rows = {0.: np.zeros(2)}
+    for sign in (1., -1.):
+        x0 = st0.x_vec()
+        for t in np.linspace(0., sign * travel_limit_m, n // 2 + 1)[1:]:
+            try:
+                st = solver.solve(float(t), x0=x0)
+            except Exception:
+                break
+            p = contact_patch_point(st.wheel_center, st.spin_axis, tire_radius_m)
+            if not np.all(np.isfinite(p)):
+                break
+            rows[float(t)] = np.array([side * (p[0] - p0[0]), p[1] - p0[1]])
+            x0 = st.x_vec()
+    t = np.array(sorted(rows))
+    xy = np.array([rows[k] for k in t])
+    return {'travel_m': t, 'lateral_m': xy[:, 0], 'fore_aft_m': xy[:, 1]}
+
+
+def ride_rate_options(veh, front_frequencies_Hz):
+    """Ride-rate choices for the spring x damper study: each front ride
+    frequency with the rear at the CURRENT rear/front frequency ratio.
+    Returns dicts with Hz, ride rates (N/m) and the corner spring (N/m and
+    lbf/in) on this car's own wheel-rate chain."""
+    mf, mr = sprung_corner_masses_kg(veh)
+    ff0 = ride_frequency_Hz(veh.ride_rate_front_Npm, mf)
+    ratio = ride_frequency_Hz(veh.ride_rate_rear_Npm, mr) / ff0
+    out = []
+    for ff in front_frequencies_Hz:
+        fr = float(ff) * ratio
+        rf, rr = ride_rate_from_frequency_Npm(ff, mf), ride_rate_from_frequency_Npm(fr, mr)
+        kf = spring_rate_for_ride_rate_Npm(veh, 'front', rf)
+        kr = spring_rate_for_ride_rate_Npm(veh, 'rear', rr)
+        out.append({'front_Hz': float(ff), 'rear_Hz': fr, 'ride_front_Npm': rf, 'ride_rear_Npm': rr,
+                    'spring_front_Npm': kf, 'spring_rear_Npm': kr,
+                    'spring_front_lbfin': kf / LBF_PER_IN_TO_NPM, 'spring_rear_lbfin': kr / LBF_PER_IN_TO_NPM,
+                    'is_current': bool(abs(ff - ff0) < 1e-3)})
+    return out
+
+
+def spring_damper_speed_study(veh, inputs, rate_options, dampers, speeds_mps, cp_tables,
+                              road_classes=('A', 'B'), progress=None):
+    """Tyre-load swing AND contact-patch movement on the fixed reference road
+    for every spring choice x damper setting x speed x road class.
+
+    rate_options: ride_rate_options(); dampers: [(label, WheelDampers)];
+    cp_tables: four contact_patch_table() dicts FL FR RL RR.  Per case the
+    equivalent linear dampers are iterated (equivalent_damping_for_case),
+    the steady periodic response gives each corner's wheel travel (plus the
+    aero sink at that speed) and the solved kinematic table turns it into
+    contact-patch lateral / fore-aft position.  Worse of same/different
+    left-right bumps per corner.  Returns arrays (n_rate, n_damper, n_speed, 4)
+    per class: load_rms_N, load_pct, min_load_N, lat_rms_mm, lat_p99_mm,
+    long_rms_mm, long_p99_mm, travel_rms_mm, c_wheel_Nspm; plus speed_kph.
+    *_p99 = the movement exceeded only 1 % of the time (steadier than the
+    single biggest sample of one record).  min_load_N <= 0 = the tyre leaves
+    the road somewhere in the run: the straight-line (equivalent linear)
+    model is not valid there and the page marks it."""
+    speeds = tuple(float(v) for v in speeds_mps)
+    keys = ('load_rms_N', 'load_pct', 'min_load_N', 'lat_rms_mm', 'lat_p99_mm',
+            'long_rms_mm', 'long_p99_mm', 'travel_rms_mm', 'c_wheel_Nspm')
+    shape = (len(rate_options), len(dampers), len(speeds), 4)
+    total = len(road_classes) * shape[0] * shape[1] * len(speeds) * 2
+    done = 0
+    out = {}
+    for cls in road_classes:
+        res = {k: np.full(shape, -np.inf) for k in keys}
+        res['min_load_N'][:] = np.inf
+        base = replace(inputs, road_class=cls, speeds_mps=speeds, seeds=(REFERENCE_ROAD_SEED,), coherence='both')
+        cases = build_road_cases(base, veh.wheelbase_m)
+        for i, ro in enumerate(rate_options):
+            vk = replace(veh, spring_rate_front_Npm=ro['spring_front_Npm'], spring_rate_rear_Npm=ro['spring_rear_Npm'])
+            for j, (_, wd) in enumerate(dampers):
+                inp = replace(base, damper=wd)
+                for case in cases:
+                    s = speeds.index(case.speed_mps)
+                    e = equivalent_damping_for_case(vk, inp, case)
+                    model, sink = loaded_model(e['model'], inp, case.speed_mps)
+                    resp = model.periodic_response(case.dt_s, case.road_heights_m)
+                    travel = resp['suspension_displacement_m'] + sink
+                    m = e['metrics']
+                    vals = {'load_rms_N': m.load_rms_N, 'load_pct': 100. * m.dlc,
+                            'travel_rms_mm': 1000. * m.travel_rms_m, 'c_wheel_Nspm': e['c_wheel_Nspm']}
+                    lat = np.zeros(4); latp = np.zeros(4); lon = np.zeros(4); lonp = np.zeros(4)
+                    for c in range(4):
+                        tb = cp_tables[c]
+                        y = np.interp(travel[:, c], tb['travel_m'], tb['lateral_m'])
+                        z = np.interp(travel[:, c], tb['travel_m'], tb['fore_aft_m'])
+                        lat[c], latp[c] = np.std(y), np.percentile(np.abs(y - y.mean()), 99.)
+                        lon[c], lonp[c] = np.std(z), np.percentile(np.abs(z - z.mean()), 99.)
+                    vals.update(lat_rms_mm=1000. * lat, lat_p99_mm=1000. * latp,
+                                long_rms_mm=1000. * lon, long_p99_mm=1000. * lonp)
+                    worse = m.load_rms_N > res['load_rms_N'][i, j, s]
+                    for k, v in vals.items():
+                        if k in ('lat_rms_mm', 'lat_p99_mm', 'long_rms_mm', 'long_p99_mm', 'travel_rms_mm'):
+                            res[k][i, j, s] = np.maximum(res[k][i, j, s], v)
+                        else:
+                            res[k][i, j, s] = np.where(worse, v, res[k][i, j, s])
+                    res['min_load_N'][i, j, s] = np.minimum(res['min_load_N'][i, j, s], m.min_load_N)
+                    done += 1
+                    if progress is not None:
+                        progress(done, total)
+        res['speed_kph'] = np.asarray(speeds) * 3.6
+        out[cls] = res
+    return out
+
+
+def reference_case_index(cases, speeds_mps):
+    """The case whose equivalent coefficients stand for the car in the
+    speed-independent outputs: middle speed of the bracket, coherent if
+    present, first seed."""
+    v_mid = sorted(float(v) for v in speeds_mps)[(len(speeds_mps) - 1) // 2]
+    at = [i for i, c in enumerate(cases) if np.isclose(c.speed_mps, v_mid)]
+    coh = [i for i in at if cases[i].coherence == 'coherent']
+    return (coh or at or [0])[0]
+
+
+def _speed_case_index(cases, speed_mps):
+    at = [i for i, c in enumerate(cases) if np.isclose(c.speed_mps, speed_mps)]
+    coh = [i for i in at if cases[i].coherence == 'coherent']
+    return (coh or at)[0]
 
 
 def corner_motion_ratios(veh):
@@ -764,9 +1238,18 @@ def sweep_ride_rates(veh, inputs, front_rates_Npm, rear_rates_Npm, *,
         for j, kr in enumerate(rr):
             if cancelled is not None and cancelled():
                 raise RuntimeError('ride sweep cancelled')
-            model = ride_model_for(vehicle_with_ride_rates(veh, kf, kr), inputs)
+            point_veh = vehicle_with_ride_rates(veh, kf, kr)
+            if inputs.damper is None:
+                model = ride_model_for(point_veh, inputs)
+                case_models = None
+            else:      # equivalent linear dampers per case (time domain is the study's)
+                eq = [equivalent_damping_for_case(point_veh, inputs, case) for case in cases]
+                case_models = [e['model'] for e in eq]
             for c, case in enumerate(cases):
-                m = evaluate_case(model, case, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m)
+                if case_models is None:
+                    m = evaluate_case(model, case, motion_ratios=mr, stop_margin_m=inputs.stop_margin_m, inputs=inputs)
+                else:
+                    m = eq[c]['metrics']
                 out['dlc'][i, j, c] = m.dlc
                 out['travel_usage'][i, j, c] = m.travel_usage
                 out['travel_peak_m'][i, j, c] = m.travel_peak_m
@@ -776,7 +1259,8 @@ def sweep_ride_rates(veh, inputs, front_rates_Npm, rear_rates_Npm, *,
                 out['min_load_N'][i, j, c] = m.min_load_N
                 out['body_heave_acc_rms_mps2'][i, j, c] = m.body_heave_acc_rms_mps2
             for s, v in enumerate(inputs.speeds_mps):
-                b = bump_settling(model, inputs, v, veh.wheelbase_m)
+                bmodel = model if case_models is None else case_models[_speed_case_index(cases, v)]
+                b = bump_settling(bmodel, inputs, v, veh.wheelbase_m)
                 out['settle_pass'][i, j, s] = b['settled_in_record']
                 out['pitch_to_bounce'][i, j, s] = b['pitch_to_bounce_ratio']
                 out['front_settle_s'][i, j, s] = b['front_settle_s']
@@ -830,12 +1314,15 @@ def verify_contact(veh, inputs, front_ride_rate_Npm, rear_ride_rate_Npm, *, case
     cases = build_road_cases(inputs, veh.wheelbase_m)
     case = cases[int(case_index)]
     model = ride_model_for(vehicle_with_ride_rates(veh, front_ride_rate_Npm, rear_ride_rate_Npm), inputs)
+    model, sink = loaded_model(model, inputs, case.speed_mps)
     n = len(case.road_heights_m) if length_m is None else int(round(float(length_m) / inputs.spacing_m))
     n = max(4, min(n, len(case.road_heights_m)))
     t = np.arange(n) * case.dt_s
     margin = float(inputs.stop_margin_m)
+    bump = margin if inputs.bump_stop_margin_m is None else float(inputs.bump_stop_margin_m)
     result = model.contact_response(t, case.road_heights_m[:n],
-                                    travel_limits_m=np.array([[-margin] * 4, [margin] * 4]))
+                                    travel_limits_m=np.array([-margin - sink, bump - sink]),
+                                    damper_force_fn=inputs.damper)
     load = result['normal_load_N']
     mean = load.mean(axis=0)
     result['dlc'] = np.sqrt(np.mean((load - mean) ** 2, axis=0)) / mean

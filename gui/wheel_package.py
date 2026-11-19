@@ -26,7 +26,7 @@ _G_EARTH = 9.80665
 SPEED_CORNER, SPEED_VREF, SPEED_STATIC = 'corner_radius', 'aero_V_ref', 'static'
 CASES = [('Max cornering 2.0 g', 2.0, 0.0, SPEED_CORNER),
          ('Full braking 1.6 g', 0.0, -1.6, SPEED_VREF),
-         ('Full acceleration 1.0 g', 0.0, 1.0, SPEED_VREF),
+         ('Full acceleration 1.6 g', 0.0, 1.6, SPEED_VREF),
          ('Cornering 1.4 g + braking 1.0 g', 1.4, -1.0, SPEED_CORNER)]
 
 
@@ -100,7 +100,7 @@ def case_aero(win, lat_g, lon_g=0.0, speed_kph=None) -> dict:
 def case_aero_text(ca: dict) -> str:
     """One-line human readout of case_aero()."""
     why = {SPEED_CORNER: 'on the Dynamics-panel turn radius', SPEED_VREF: 'the aero reference speed',
-           SPEED_STATIC: 'at rest'}.get(ca['rule'], ca['rule'])
+           SPEED_STATIC: 'at rest', 'typed': 'the typed speed'}.get(ca['rule'], ca['rule'])
     if ca['rule'] == SPEED_STATIC and ca['speed_kph'] <= 0.0:
         return '0 km/h (0 g / 0 g = at rest), no aero'
     if not ca['aero_Fz']:
@@ -109,6 +109,132 @@ def case_aero_text(ca: dict) -> str:
     return (f"{ca['speed_kph']:.1f} km/h ({why}), aero {ca['total_N']:.0f} N = "
             f"{a['FL'] + a['FR']:.0f} N front / {a['RL'] + a['RR']:.0f} N rear "
             f"[{ca['package']}]")
+
+
+# ── G-G envelope load cases (user 2026-10-21): instead of typing g's, slide a
+#    point around the border of the car's own G-G envelope at one speed (aero
+#    at that speed) and read the loads there.  The envelope is
+#    SteadyStateSolver.gg_envelope (axle_utilization <= 1 on the full solve,
+#    forward branch capped by the engine at that speed) — the same solver the
+#    Dynamics G-G plot uses; the loads are compute_case at the border point.
+#    Angle convention: 0 deg = straight braking, 90 = pure cornering (+lateral),
+#    180 = straight acceleration, negative = the mirror turn (-lateral).
+GG_LOAD_KEYS = ('uca_front_N', 'uca_rear_N', 'lca_front_N', 'lca_rear_N', 'tierod_N',
+                'pushrod_N', 'spring_damper_force_N', 'arb_link_N', 'bearing_axial_N')
+GG_JOINTS = (('uca', 'upper ball joint'), ('lca', 'lower ball joint'), ('tie', 'tie-rod outer joint'))
+
+
+def gg_envelope_at(win, speed_kph, n_ay=13, iters=9, progress=None, engine_limit=False) -> dict:
+    """The car's G-G envelope at ONE speed, aero at that speed (Apply Aero
+    respected).  Adds 'border' (closed loop of (lat g, lon g)), 'speed_kph',
+    'aero_total_N', 'engine_limit'.
+
+    engine_limit False (default, user 2026-10-21) = TYRE-LIMITED only: the
+    forward side is what the driven tyres can put down, not what the engine
+    can deliver at that speed — the load envelope, not the performance one.
+    True caps the forward side with the engine's drive force at this speed."""
+    solver = win._build_dynamics_solver()
+    v = max(float(speed_kph), 0.0)
+    ca = case_aero(win, 0.0, -1.0, v)
+    env = solver.gg_envelope(n_ay=n_ay, iters=iters, aero_Fz=ca['aero_Fz'],
+                             speed_ms=(v / 3.6 if engine_limit else 0.0), progress=progress)
+    env['engine_limit'] = bool(engine_limit)
+    env['speed_kph'] = v
+    env['aero_total_N'] = float(ca['total_N'])
+    env['border'] = gg_border_polygon(env)
+    return env
+
+
+def gg_border_polygon(env) -> np.ndarray:
+    """Closed border loop (N x 2: lat g, lon g): braking branch left to right,
+    then the forward branch right to left."""
+    ay = np.asarray(env['ay_g'], float)
+    brk = np.asarray(env['ax_brake_g'], float); acc = np.asarray(env['ax_accel_g'], float)
+    return np.vstack([np.column_stack([ay, brk]), np.column_stack([ay[::-1], acc[::-1]])])
+
+
+def gg_border_point(env, theta_deg) -> tuple:
+    """(lat g, lon g) where the ray from 0 g / 0 g at angle theta meets the
+    envelope border (0 = braking, 90 = +lateral, 180 = acceleration)."""
+    th = np.radians(float(theta_deg))
+    d = np.array([np.sin(th), -np.cos(th)])
+    P = env['border'] if 'border' in env else gg_border_polygon(env)
+    best = None
+    for i in range(len(P)):
+        p, q = P[i], P[(i + 1) % len(P)]
+        e = q - p
+        den = d[0] * (-e[1]) - d[1] * (-e[0])
+        if abs(den) < 1e-12:
+            continue
+        # t d = p + u e  ->  [d, -e] [t, u]^T = p
+        t = (p[0] * (-e[1]) - p[1] * (-e[0])) / den
+        u = (d[0] * p[1] - d[1] * p[0]) / den
+        if t > 0.0 and -1e-9 <= u <= 1.0 + 1e-9 and (best is None or t > best):
+            best = t
+    if best is None:
+        return float('nan'), float('nan')
+    lat, lon = best * d
+    return float(lat), float(lon)
+
+
+def gg_worst_loads(win, env, n=36, progress=None) -> dict:
+    """Solve the loads at n points around the envelope border (both turn
+    directions) at the envelope's speed and keep, per corner, the largest
+    |value| of every member force and ball-joint force (and each joint's
+    largest lateral / fore-aft / vertical part) with WHERE it happened.
+    Returns {'speed_kph', 'points': [(theta, lat, lon)], 'rows': [dict]}."""
+    v = float(env['speed_kph'])
+    thetas = np.linspace(-180.0, 180.0, int(n), endpoint=False)
+    worst, pts = {}, []
+    def keep(key, val, th, la, lo):
+        a = abs(float(val))
+        if np.isfinite(a) and (key not in worst or a > worst[key][0]):
+            worst[key] = (a, float(val), th, la, lo)
+    for i, th in enumerate(thetas):
+        la, lo = gg_border_point(env, th)
+        if not (np.isfinite(la) and np.isfinite(lo)):
+            continue
+        pts.append((float(th), la, lo))
+        if progress:
+            progress(i + 1, len(thetas))
+        loads = compute_case(win, la, lo, speed_kph=v)[0]
+        for c, L in loads.items():
+            for k in GG_LOAD_KEYS:
+                keep((c, k), getattr(L, k, float('nan')), th, la, lo)
+            for j, _nm in GG_JOINTS:
+                f = (getattr(L, 'joint_forces', None) or {}).get(j)
+                if f is None:
+                    continue
+                f = np.asarray(f, float)
+                keep((c, j + '_total'), np.linalg.norm(f), th, la, lo)
+                for ax, comp in zip(('lateral', 'fore-aft', 'vertical'), f):
+                    keep((c, f'{j}_{ax}'), comp, th, la, lo)
+    rows = [dict(corner=c, item=k, max_abs=w[0], signed=w[1], theta=w[2], lat_g=w[3], lon_g=w[4])
+            for (c, k), w in sorted(worst.items())]
+    return {'speed_kph': v, 'points': pts, 'rows': rows}
+
+
+def arb_arm_end_world(win, lbl, st, drop_top=None):
+    """The ARB lever tip (drop-link lower end) in WORLD at this corner's POSE:
+    the same bell-crank solve _assemble_corners_draw uses to DRAW the lever
+    (MainWindow._solve_arb_bellcrank on the mirrored arb hardpoints).  The
+    load path used the STATIC design arm end while the drop-link top moved with
+    the rocker, so the drop-link arrow sat off the drawn lever tip (up to
+    ~6 mm in the binder's cases) and its axis was the static-to-posed line.
+    Falls back to the mirrored static point only if the lever cannot solve."""
+    arb = win._front_arb if lbl[0] == 'F' else win._rear_arb
+    mir = np.array([-1.0, 1.0, 1.0]) if lbl in ('FR', 'RR') else np.ones(3)
+    ae0 = np.asarray(arb['arb_arm_end'], float) * mir
+    try:
+        dt = drop_top if drop_top is not None else win._arb_drop_top_world(lbl, st)
+        vis = arb if lbl in ('FL', 'RL') else {k: np.asarray(v, float) * mir
+                                               for k, v in arb.items()}
+        ae = np.asarray(win._solve_arb_bellcrank(np.asarray(dt, float), vis)[1], float)
+        if ae.shape == (3,) and np.all(np.isfinite(ae)):
+            return ae
+    except Exception:
+        pass
+    return ae0
 
 
 def arb_geometry_fn(win):
@@ -125,7 +251,7 @@ def arb_geometry_fn(win):
         if dt is None:
             raise KeyError('no ARB drop top')
         return {'drop_top': np.asarray(dt, float),
-                'arm_end': np.asarray(arb['arb_arm_end'], float) * mir,
+                'arm_end': arb_arm_end_world(win, lbl, st, dt),   # lever tip AT the pose
                 'pivot': np.asarray(arb['arb_pivot'], float) * mir}
     return _geo
 
@@ -150,7 +276,8 @@ def compute_case(win, lat_g, lon_g, speed_kph=None):
         upright_params_f=up, upright_params_r=up, wheel_radius_m=veh.tire_radius_m,
         cradle_solvers=cradle, heave_tbar_solvers=htb,
         veh=veh, topology=getattr(win, '_topology', None),
-        arb_geometry=arb_geometry_fn(win))
+        arb_geometry=arb_geometry_fn(win),
+        tire_model=(getattr(solver, '_tire_front', None) or getattr(win, '_tire_model', None)))
     # bp_f/bp_r carry the Seward caliper geometry (pad radius R_pad, bolt spacing
     # l5, pad offset l4); `solver` carries the tyre models for the aligning
     # moment Mz.  Returned so the load view uses the SAME objects (one model).
@@ -187,7 +314,15 @@ def _load_items(win, lat_g, lon_g, only_corner=None, speed_kph=None):
                  all AXIAL - and the only moment reaction, at the rocker PIVOT).
     """
     loads, veh, up, res, bp_f, bp_r, dyn = compute_case(win, lat_g, lon_g, speed_kph)
-    corners = [only_corner] if only_corner else ['FL', 'FR', 'RL', 'RR']
+    _all = ['FL', 'FR', 'RL', 'RR']
+    if only_corner in _all:
+        corners = [only_corner]
+    elif str(only_corner or '').lower() in ('front', 'f'):
+        corners = ['FL', 'FR']                 # View -> Isolate: one axle
+    elif str(only_corner or '').lower() in ('rear', 'r'):
+        corners = ['RL', 'RR']
+    else:
+        corners = _all
     items = []
     # The ARB drop-link force closes EACH rocker's own moment about its pivot
     # axis (core: rocker_arb_freebody).  compute_all_corners already split each
@@ -336,9 +471,7 @@ def _load_items(win, lat_g, lon_g, only_corner=None, speed_kph=None):
             pi = np.asarray(st.pushrod_inner, float); po = np.asarray(st.pushrod_outer, float)
             sp = np.asarray(st.rocker_spring_pt, float); sc = np.asarray(st.spring_chassis_pt, float)
             dt = win._arb_drop_top_world(lbl, st)
-            ae = np.asarray(arb['arb_arm_end'], float)
-            if lbl in ('FR', 'RR'):
-                ae = ae * np.array([-1.0, 1.0, 1.0])
+            ae = arb_arm_end_world(win, lbl, st, dt)   # lever tip AT the pose (as drawn)
             arb_piv = arb.get('arb_pivot')
             if arb_piv is not None:
                 arb_piv = np.asarray(arb_piv, float)
@@ -414,6 +547,42 @@ def _load_items(win, lat_g, lon_g, only_corner=None, speed_kph=None):
             items.append((kp_a, float(M_kp) * k, _C_MOM,
                           f'{lbl} STEERING · moment about kingpin axis · '
                           f'{abs(M_kp):,.0f} N·m'))
+        # STEERING ARM: the moment the TIE ROD puts about the kingpin (its force
+        # x its lever off the axis) and what that is at the driver's hands
+        # through the probed linkage gain and the config rack (user 2026-10-10:
+        # "Vahan doesn't show moment about the steering arm, just force").
+        if lbl in ('FL', 'FR'):
+            try:
+                tro = np.asarray(st.tr_outer, float); tri = np.asarray(st.tr_inner, float)
+                kp_a = np.asarray(st.lca_outer, float)
+                k = np.asarray(st.uca_outer, float) - kp_a
+                k = k / max(np.linalg.norm(k), 1e-9)
+                u_tr = (tri - tro) / max(np.linalg.norm(tri - tro), 1e-9)
+                lever_m = float(abs(np.cross(tro - kp_a, u_tr) @ k))     # m, the torque arm
+                F_tr = float(c.tierod_N)
+                M_arm = F_tr * lever_m
+                if abs(M_arm) > 0.5:
+                    gains = getattr(win, '_steer_gain_cache', None)
+                    if not gains:
+                        from vahan.steering import linkage_gains
+                        gains = linkage_gains(win._front_hp, win._topology.front.damper_mount.value)
+                        win._steer_gain_cache = gains
+                    gain = abs(gains[0] if lbl == 'FL' else gains[1])        # rad/m
+                    C_mm = float((getattr(win, '_steer', {}) or {}).get('rack_travel_per_rev_mm', 0.0) or 0.0)
+                    hand = abs(M_arm) * gain * (C_mm / 1000.0) / (2.0 * np.pi) if C_mm else float('nan')
+                    hand_txt = f' ≈ {hand:.1f} N·m at the wheel (this wheel alone)' if np.isfinite(hand) else ''
+                    # Rim force (user 2026-10-11): torque / (steering-wheel OD / 2) from
+                    # the project steer block; no OD in the project = not reported.
+                    if np.isfinite(hand):
+                        _od = (getattr(win, '_steer', {}) or {}).get('wheel_od_mm') or 0.0
+                        hand_txt += (f' = {hand / (float(_od) / 2000.0):.0f} N at the rim (wheel Ø{float(_od):.0f} mm)'
+                                     if float(_od) > 0 else ' (rim force: steering-wheel OD unknown)')
+                    items.append((tro, M_arm * k, _C_MOM,
+                                  f'{lbl} STEERING ARM · tie-rod moment about kingpin '
+                                  f'({abs(F_tr):,.0f} N × {lever_m * 1000:.1f} mm lever) · '
+                                  f'{abs(M_arm):,.0f} N·m{hand_txt}'))
+            except Exception:
+                pass
         # TYRE self-aligning torque Mz about the vertical.
         _mz = mom.get('mz_Nm')
         if _mz is not None and abs(_mz) > 1.0:
@@ -429,6 +598,31 @@ def _load_items(win, lat_g, lon_g, only_corner=None, speed_kph=None):
                           f'{lbl} ARB · bar TORSION about its own axis '
                           f'· {abs(T_arb):,.0f} N·m'))
     return items
+
+
+def axis_angles_deg(v):
+    """Angle (deg, 0..180) between a vector and each +axis of the chassis frame:
+    +lateral (X, car left), +fore-aft (Y, rearward), +vertical (Z, up).
+    0 = along the axis, 90 = perpendicular, 180 = along the negative axis.
+    For a moment this is the orientation of its axis (right-hand rule).
+    NaN triple for a zero vector."""
+    v = np.asarray(v, float).ravel()[:3]
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < 1e-12:
+        return (float('nan'),) * 3
+    c = np.clip(v / n, -1.0, 1.0)
+    return tuple(float(a) for a in np.degrees(np.arccos(c)))
+
+
+def angle_text(v):
+    """How to apply the vector (binder angle mode): the cardinal plane it most
+    nearly lies in, theta in that plane from its first axis, the tilt off the
+    plane — then the three axis angles.  Hover label and the Loads table."""
+    a = axis_angles_deg(v)
+    if any(not np.isfinite(x) for x in a):
+        return '—'
+    from gui.view3d import plane_angle_text
+    return f'{plane_angle_text(v)} · lat {a[0]:.0f}° / f-a {a[1]:.0f}° / vert {a[2]:.0f}°'
 
 
 def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None, speed_kph=None):
@@ -466,13 +660,17 @@ def load_arrows(win, lat_g, lon_g, mode='resultant', only_corner=None, speed_kph
             mag = float(np.linalg.norm(v))
             if mag < 1.0:
                 continue
-            arrows.append((p, p + (v / mag) * _len(mag, fmax), col, lab))
+            # angle of the force to the chassis axes on the hover label (user
+            # 2026-10-08) — same numbers as the Loads table's Angle column.
+            arrows.append((p, p + (v / mag) * _len(mag, fmax), col,
+                           f'{lab} · ∠ {angle_text(v)}'))
     # moments: one arrow along the moment axis (right-hand rule), both modes.
     for p, v, col, lab in moments:
         mag = float(np.linalg.norm(v))
         if mag < 1.0:
             continue
-        arrows.append((p, p + (v / mag) * _len(mag, mmax) * 0.9, col, lab))
+        arrows.append((p, p + (v / mag) * _len(mag, mmax) * 0.9, col,
+                       f'{lab} · ∠ axis {angle_text(v)}'))
     return arrows
 
 

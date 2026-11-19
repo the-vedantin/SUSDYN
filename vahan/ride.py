@@ -231,7 +231,8 @@ class RideModel:
 
     def contact_response(self, time_s, road_heights_m, *, initial_state=None,
                          travel_limits_m=None, max_step_s=None,
-                         rtol=1e-7, atol=1e-9):
+                         rtol=1e-7, atol=1e-9, damper_force_fn=None,
+                         integrator='solve_ivp'):
         """Time integration with compression-only elastic tyre contact.
 
         Uses this model's same mass, suspension stiffness and damping. Only
@@ -240,11 +241,21 @@ class RideModel:
         Coordinates are perturbations about loaded static equilibrium; zero
         initial state is at rest on zero-height road. Road is piecewise linear.
 
-        Suspension remains linearized (no changing MR, spring unseating,
-        asymmetric damping or aero). Optional four-corner travel bounds flag
+        Suspension remains linearized (no changing MR, spring unseating or
+        aero). Optional four-corner travel bounds flag
         invalid results; they do NOT invent a bump-stop force law. No final
         hardware selection may rely on a trace that violates those bounds.
         Contact fractions are sample statistics, not exact event durations.
+
+        damper_force_fn (optional): a NONLINEAR wheel-frame damper law,
+        F_wheel = fn(v_wheel) on (4,) arrays (FL FR RL RR), v_wheel = bump
+        velocity (wheel minus body, + = compression), F > 0 resists bump —
+        e.g. vahan.damper.WheelDampers (asymmetric, digressive dyno curves at
+        the static MR). It REPLACES this model's linear corner damping;
+        springs, ARB and tyre are unchanged.
+        integrator: 'solve_ivp' (DOP853, default) or 'rk4' — classic fixed-
+        step RK4 on the road samples, substepped so that h x (largest
+        undamped frequency, largest damping rate) <= 0.5; for long records.
         """
         from scipy.integrate import solve_ivp
 
@@ -273,26 +284,99 @@ class RideModel:
                 raise ValueError('travel limits must be finite (2,4), lower then upper')
         step = min(np.diff(t)) if max_step_s is None else _positive(max_step_s, 'max step')
         _positive(rtol, 'relative tolerance'); _positive(atol, 'absolute tolerance')
+        if integrator not in ('solve_ivp', 'rk4'):
+            raise ValueError("integrator must be 'solve_ivp' or 'rk4'")
         suspension_k = self.stiffness.copy()
         suspension_k[3:, 3:] -= np.diag(self.tire_rates)
         inv_mass = np.linalg.inv(self.mass)
+        smap = self.suspension_map
+
+        if damper_force_fn is None:
+            def damping_force(velocity):
+                return self.damping @ velocity
+        else:
+            def damping_force(velocity):
+                return smap.T @ np.asarray(damper_force_fn(smap @ velocity), dtype=float)
+
+        def accel(q, velocity, height):
+            load = np.maximum(0., self.baseline_loads + self.tire_rates*(height-q[3:]))
+            force = -suspension_k @ q - damping_force(velocity)
+            force[3:] += load-self.baseline_loads
+            return inv_mass @ force
 
         def rhs(now, state):
             q, velocity = state[:7], state[7:]
             height = np.array([np.interp(now, t, track) for track in tracks])
-            load = np.maximum(0., self.baseline_loads + self.tire_rates*(height-q[3:]))
-            force = -suspension_k @ q - self.damping @ velocity
-            force[3:] += load-self.baseline_loads
-            return np.concatenate((velocity, inv_mass @ force))
+            return np.concatenate((velocity, accel(q, velocity, height)))
 
-        solution = solve_ivp(rhs, (t[0], t[-1]), y0, t_eval=t,
-                             max_step=step, rtol=rtol, atol=atol, method='DOP853')
-        if not solution.success or solution.y.shape[1] != len(t):
-            raise RuntimeError(f'contact integration failed: {solution.message}')
-        q, velocity = solution.y[:7].T, solution.y[7:].T
+        if integrator == 'solve_ivp':
+            solution = solve_ivp(rhs, (t[0], t[-1]), y0, t_eval=t,
+                                 max_step=step, rtol=rtol, atol=atol, method='DOP853')
+            if not solution.success or solution.y.shape[1] != len(t):
+                raise RuntimeError(f'contact integration failed: {solution.message}')
+            states = solution.y
+        else:
+            # Same equations, pre-multiplied by M^-1 (fewer operations per
+            # stage): a = Aq q + Mt (Fz - Fz0) - Ms F_damper(S v)  [or + Ad v].
+            aq = -inv_mass @ suspension_k
+            mt = np.ascontiguousarray(inv_mass[:, 3:])
+            ms = inv_mass @ smap.T
+            ad = -inv_mass @ self.damping
+            base, kt = self.baseline_loads, self.tire_rates
+
+            if damper_force_fn is None:
+                def fast(q, v, height):
+                    return aq @ q + ad @ v + mt @ np.maximum(-base, kt*(height-q[3:]))
+            else:
+                def fast(q, v, height):
+                    return (aq @ q + mt @ np.maximum(-base, kt*(height-q[3:]))
+                            - ms @ damper_force_fn(smap @ v))
+            # Step bound: RK4 is stable to h*lambda ~2.8 on a real decay
+            # rate; use 1.5 on the largest damping rate (damper slope probed
+            # to 3 m/s) and 0.5 rad per step on the largest undamped frequency.
+            omega = float(np.sqrt(np.max(np.abs(np.linalg.eigvals(inv_mass @ self.stiffness)))))
+            if damper_force_fn is None:
+                c_eff = self.damping
+            else:
+                probe = np.linspace(-3., 3., 1201)
+                f = np.asarray(damper_force_fn(probe[:, None] * np.ones(4)), dtype=float)
+                slope = np.max(np.abs(np.diff(f, axis=0)) / np.diff(probe)[:, None], axis=0)
+                c_eff = smap.T @ np.diag(slope) @ smap
+            rate = float(np.max(np.abs(np.linalg.eigvals(inv_mass @ c_eff))))
+            h_max = min(0.5 / max(omega, 1e-9), 1.5 / max(rate, 1e-9), step)
+            states = np.empty((14, len(t)))
+            q, v = y0[:7].copy(), y0[7:].copy()
+            states[:, 0] = y0
+            for i in range(len(t) - 1):
+                span = t[i+1] - t[i]
+                m = int(np.ceil(span / h_max - 1e-9))
+                h = span / m
+                r0, dr = road[i], (road[i+1] - road[i]) / span
+                for k in range(m):
+                    s0 = k * h
+                    hm = r0 + dr*(s0 + 0.5*h)
+                    k1 = fast(q, v, r0 + dr*s0)
+                    v2 = v + 0.5*h*k1
+                    k2 = fast(q + 0.5*h*v, v2, hm)
+                    v3 = v + 0.5*h*k2
+                    k3 = fast(q + 0.5*h*v2, v3, hm)
+                    v4 = v + h*k3
+                    k4 = fast(q + h*v3, v4, r0 + dr*(s0 + h))
+                    q = q + h/6*(v + 2*v2 + 2*v3 + v4)
+                    v = v + h/6*(k1 + 2*k2 + 2*k3 + k4)
+                states[:7, i+1] = q
+                states[7:, i+1] = v
+            if not np.all(np.isfinite(states)):
+                raise RuntimeError('contact integration (rk4) diverged')
+        q, velocity = states[:7].T, states[7:].T
         load = np.maximum(0., self.baseline_loads + self.tire_rates*(road-q[:, 3:]))
         travel = q @ self.suspension_map.T
-        acceleration = np.array([rhs(now, state)[7:] for now, state in zip(t, solution.y.T)])
+        if integrator == 'solve_ivp':
+            acceleration = np.array([accel(s[:7], s[7:], h) for s, h in zip(states.T, road)])
+        else:      # vectorised over samples, same expression
+            damp = (velocity @ ad.T if damper_force_fn is None
+                    else -np.asarray(damper_force_fn(velocity @ smap.T), dtype=float) @ ms.T)
+            acceleration = q @ aq.T + damp + (load - base) @ mt.T
         result = dict(time_s=t, coordinates=q, velocity=velocity,
                       normal_load_N=load, dynamic_tire_load_N=load-self.baseline_loads,
                       suspension_displacement_m=travel,
@@ -300,8 +384,12 @@ class RideModel:
                       body_corner_acceleration_mps2=acceleration[:, :3] @ self.body_corner_map.T,
                       contact_loss_sample_fraction=np.mean(load == 0., axis=0),
                       minimum_load_N=load.min(axis=0),
-                      response_kind='transient unilateral tyre; linearized suspension; no stops',
+                      response_kind=('transient unilateral tyre; linearized suspension; no stops'
+                                     if damper_force_fn is None else
+                                     'transient unilateral tyre; linear springs, NONLINEAR dampers; no stops'),
                       travel_bounds_checked=bounds is not None)
+        if damper_force_fn is not None:
+            result['wheel_damper_force_N'] = np.asarray(damper_force_fn(velocity @ smap.T), dtype=float)
         if bounds is not None:
             invalid = (travel < bounds[0]) | (travel > bounds[1])
             result['within_travel_bounds'] = not bool(np.any(invalid))

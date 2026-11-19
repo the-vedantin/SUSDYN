@@ -1516,6 +1516,25 @@ def _full_state_audit(win, n_rack, near_mm, focus, fsae, _types, pair_gap_mm, ds
                     members.append({'name': label + ' LCA inner chassis member',
                                     'a': np.asarray(hp['lca_front']), 'b': np.asarray(hp['lca_rear']),
                                     'r': LCA_MEMBER_R_M})
+                    # 2026-10-10: the DRAWN bay tubes (what the 3-D view shows) are
+                    # checked too — the stand-in alone read the 31.75 mm rack as
+                    # 0.5 mm clear while the drawn diagonal had it 6 mm inside.
+                    try:
+                        from . import chassis as _CH
+                        _s = _CH.settings(win._car) or _CH.default_settings(True)
+                        _pts = dict(hp); _pts.update(_CH.node_pts(hp, _s))
+                        try:
+                            _diag = _CH.diagonal_for(win, label)
+                        except Exception:
+                            _diag = 'ucaf_lcar'
+                        for _i, _m in enumerate(_CH.bay_members(_pts, _s, diagonal=_diag,
+                                                                axle='front' if label.startswith('F') else 'rear')):
+                            _a, _b = np.asarray(_m['a'], float), np.asarray(_m['b'], float)
+                            if np.all(np.isfinite(_a)) and np.all(np.isfinite(_b)):
+                                members.append({'name': f'{label} bay tube {_i}', 'a': _a, 'b': _b,
+                                                'r': float(_m.get('r', 0.0127))})
+                    except Exception:
+                        pass
             from .interference import rack_members as _rack_members
             members.extend(_rack_members(win._car, by['FL']['pts']['tie_rod_inner'], by['FR']['pts']['tie_rod_inner']))
             for axle, arb in (('front', win._front_arb), ('rear', win._rear_arb)):

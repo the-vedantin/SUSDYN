@@ -584,6 +584,389 @@ class LapResult:
     peak_accel_g: float = 0.0
     peak_brake_g: float = 0.0
     notes: list = field(default_factory=list)
+    # TYRE TEMPERATURE (vahan/tyre_temperature.py; None when the mode is off)
+    tyre_temp_front_C: np.ndarray = None   # front tyre surface temperature per station
+    tyre_temp_rear_C: np.ndarray = None
+    tyre_grip_factor: tuple = None         # (front, rear) grip factor the lap ran on
+    tyre_temp_log: list = field(default_factory=list)
+    # CORNER ISOLATION (user 2026-10-11: a lap-sim feature): one dict per corner
+    # (see isolate_corners) + the pooled summary the Ackermann method reads.
+    corners: list = field(default_factory=list)
+    corner_summary: dict = field(default_factory=dict)
+    # STRAIGHTS (user 2026-11-10: "average velocity in straights and corners, to give something
+    # to aero"): one dict per straight (see isolate_straights) + the pooled summary with the
+    # whole-lap speed bands.
+    straights: list = field(default_factory=list)
+    straight_summary: dict = field(default_factory=dict)
+    avg_straight_speed_kph: float = 0.0   # straights only (corners excluded): distance / time
+    # METHOD (2026-10-21): 'pointmass' (original) or 'ggv' (the solved car's
+    # g-g-V map); ggv = that GGVMap; lon_tyre_g = the tyre longitudinal g the
+    # detail solve was handed (net g with drag/scrub taken out; 'ggv' only).
+    method: str = 'pointmass'
+    ggv: object = None
+    lon_tyre_g: np.ndarray = None
+    launch_rpm: float = 0.0
+
+
+def isolate_corners(res: 'LapResult', track: 'Track', lat_g_min: float = 0.30,
+                    min_time_s: float = 0.15, merge_gap_m: float = 4.0) -> tuple:
+    """CORNER ISOLATION — cut the lap into its corners (user 2026-10-11).
+
+    A corner = a run of stations with |lateral g| above ``lat_g_min`` (the same
+    0.30 g rule the time-cornering summary uses), runs separated by less than
+    ``merge_gap_m`` of straight are merged (a direction change is never
+    merged), and runs shorter than ``min_time_s`` are dropped.  Per corner:
+    direction, entry/exit distance, length, time, mean and peak lateral g,
+    mean radius (time-weighted) and HARMONIC mean radius (1 / mean curvature —
+    the one that matches the steer angle), minimum speed and the apex station
+    (minimum speed).  Returns (corners, summary); summary pools every corner
+    time-weighted (g, radius mean/median/harmonic, time share) — the condition
+    the Ackermann-from-laps method designs for."""
+    s = np.asarray(res.s_m, float); v = np.asarray(res.v_ms, float); lat = np.asarray(res.lat_g, float)
+    kap = np.asarray(track.kappa_1pm, float)
+    if len(kap) != len(s):
+        kap = np.interp(s, np.linspace(s[0], s[-1], len(kap)), kap)
+    n = len(s)
+    ds = np.diff(s); vm = 0.5 * (v[1:] + v[:-1]); dt = ds / np.maximum(vm, 0.1)
+    latm = 0.5 * (lat[1:] + lat[:-1]); kapm = 0.5 * (kap[1:] + kap[:-1])
+    on = latm > float(lat_g_min)
+    # runs of consecutive "on" intervals, split on a curvature sign change
+    runs = []
+    i = 0
+    while i < n - 1:
+        if not on[i]:
+            i += 1; continue
+        j = i
+        sgn = np.sign(kapm[i]) if kapm[i] != 0 else 0.0
+        while j + 1 < n - 1 and on[j + 1] and (sgn == 0 or np.sign(kapm[j + 1]) == sgn or kapm[j + 1] == 0):
+            j += 1
+        runs.append([i, j]); i = j + 1
+    # merge runs separated by a short straight of the same hand
+    merged = []
+    for r in runs:
+        if merged:
+            a, b = merged[-1]
+            gap = s[r[0]] - s[b + 1]
+            same = np.sign(np.sum(kapm[a:b + 1])) == np.sign(np.sum(kapm[r[0]:r[1] + 1]))
+            if gap < merge_gap_m and same:
+                merged[-1][1] = r[1]; continue
+        merged.append(list(r))
+    corners = []
+    for a, b in merged:
+        sl = slice(a, b + 1)
+        t_c = float(np.sum(dt[sl]))
+        if t_c < float(min_time_s):
+            continue
+        w = dt[sl]
+        r_mid = 1.0 / np.maximum(np.abs(kapm[sl]), 1e-6)
+        k_apex = a + int(np.argmin(v[a:b + 2]))
+        order = np.argsort(r_mid); cum = np.cumsum(w[order]); r_med = float(r_mid[order][np.searchsorted(cum, 0.5 * cum[-1])])
+        corners.append(dict(
+            index=len(corners) + 1,
+            direction=('left' if np.sum(kapm[sl]) > 0 else 'right'),
+            s_in_m=float(s[a]), s_out_m=float(s[b + 1]), length_m=float(s[b + 1] - s[a]), time_s=t_c,
+            g_mean=float(np.sum(latm[sl] * w) / t_c), g_peak=float(np.max(latm[sl])),
+            R_mean_m=float(np.sum(r_mid * w) / t_c), R_median_m=r_med,
+            R_harmonic_m=float(1.0 / (np.sum(np.abs(kapm[sl]) * w) / t_c)),
+            v_min_kph=float(np.min(v[a:b + 2]) * 3.6), v_mean_kph=float(np.sum(vm[sl] * w) / t_c * 3.6),
+            s_apex_m=float(s[k_apex]), x_apex_m=float(np.asarray(track.x_m)[min(k_apex, len(track.x_m) - 1)]) if hasattr(track, 'x_m') else float('nan'),
+            y_apex_m=float(np.asarray(track.y_m)[min(k_apex, len(track.y_m) - 1)]) if hasattr(track, 'y_m') else float('nan'),
+            i_in=int(a), i_out=int(b + 1)))
+    if corners:
+        T = sum(c['time_s'] for c in corners)
+        g_all = np.concatenate([latm[c['i_in']:c['i_out']] for c in corners]); dt_all = np.concatenate([dt[c['i_in']:c['i_out']] for c in corners])
+        k_all = np.concatenate([np.abs(kapm[c['i_in']:c['i_out']]) for c in corners]); r_all = 1.0 / np.maximum(k_all, 1e-6)
+        order = np.argsort(r_all); cum = np.cumsum(dt_all[order])
+        summary = dict(n_corners=len(corners), corner_time_s=T, lap_time_s=float(res.lap_time_s),
+                       time_cornering_pct=100.0 * T / float(res.lap_time_s),
+                       g_mean=float(np.sum(g_all * dt_all) / T), g_peak=float(np.max(g_all)),
+                       R_mean_m=float(np.sum(r_all * dt_all) / T), R_median_m=float(r_all[order][np.searchsorted(cum, 0.5 * cum[-1])]),
+                       R_harmonic_m=float(1.0 / (np.sum(k_all * dt_all) / T)),
+                       lat_g_min=float(lat_g_min))
+    else:
+        summary = dict(n_corners=0, corner_time_s=0.0, lap_time_s=float(res.lap_time_s), time_cornering_pct=0.0, lat_g_min=float(lat_g_min))
+    return corners, summary
+
+
+def isolate_straights(res: 'LapResult', track: 'Track', corners=None,
+                      bands_kph=(40.0, 60.0, 80.0, 100.0, 120.0)) -> tuple:
+    """STRAIGHTS (user 2026-11-10: "average velocity in straights and corners, to give
+    something to aero").  A straight is everything that is not a corner: each run of
+    stations between one corner's exit and the next corner's entry (isolate_corners
+    intervals), the launch run before the first corner and the run-out after the last one
+    included.  Per straight: entry/exit distance, length, time, entry / exit / mean / peak
+    speed; the mean speed is length / time (time-weighted, what the car actually averages
+    there).  Summary pools every straight the same way, gives the corners' pooled mean on the
+    SAME split (so straights + corners = the whole lap exactly) and the speed bands: the share
+    of the lap TIME spent above each speed — the numbers an aero package is sized on.
+    Returns (straights, summary)."""
+    s = np.asarray(res.s_m, float); v = np.asarray(res.v_ms, float)
+    n = len(s)
+    if corners is None:
+        corners = getattr(res, 'corners', None) or []
+    ds = np.diff(s); vm = 0.5 * (v[1:] + v[:-1]); dt = ds / np.maximum(vm, 0.1)
+    T_lap = float(np.sum(dt))
+    on = np.ones(n - 1, bool)          # interval i = between station i and i+1
+    for c in corners:
+        on[int(c['i_in']):int(c['i_out'])] = False
+    runs = []; i = 0
+    while i < n - 1:
+        if not on[i]:
+            i += 1; continue
+        j = i
+        while j + 1 < n - 1 and on[j + 1]:
+            j += 1
+        runs.append((i, j)); i = j + 1
+    straights = []
+    for a, b in runs:
+        sl = slice(a, b + 1)
+        t_s = float(np.sum(dt[sl])); L = float(s[b + 1] - s[a])
+        if t_s <= 0.0 or L <= 0.0:
+            continue
+        straights.append(dict(
+            index=len(straights) + 1, s_in_m=float(s[a]), s_out_m=float(s[b + 1]), length_m=L, time_s=t_s,
+            v_entry_kph=float(v[a] * 3.6), v_exit_kph=float(v[b + 1] * 3.6), v_mean_kph=L / t_s * 3.6,
+            v_max_kph=float(np.max(v[a:b + 2]) * 3.6), v_min_kph=float(np.min(v[a:b + 2]) * 3.6),
+            i_in=int(a), i_out=int(b + 1)))
+    bands = {float(k): (100.0 * float(np.sum(dt[vm * 3.6 > float(k)])) / T_lap if T_lap > 0 else 0.0)
+             for k in bands_kph}
+    L_lap = float(s[-1] - s[0])
+    summary = dict(n_straights=len(straights), lap_time_s=T_lap, length_lap_m=L_lap,
+                   v_mean_lap_kph=(L_lap / T_lap * 3.6 if T_lap > 0 else 0.0), speed_bands_pct=bands)
+    if straights:
+        T = sum(x['time_s'] for x in straights); L = sum(x['length_m'] for x in straights)
+        summary.update(straight_time_s=T, time_straight_pct=100.0 * T / T_lap if T_lap > 0 else 0.0,
+                       length_m=L, length_pct=100.0 * L / L_lap if L_lap > 0 else 0.0,
+                       v_mean_kph=L / T * 3.6, v_max_kph=max(x['v_max_kph'] for x in straights),
+                       v_exit_mean_kph=float(np.mean([x['v_exit_kph'] for x in straights])))
+    else:
+        summary.update(straight_time_s=0.0, time_straight_pct=0.0, length_m=0.0, length_pct=0.0,
+                       v_mean_kph=0.0, v_max_kph=0.0, v_exit_mean_kph=0.0)
+    Tc = sum(float(np.sum(dt[int(c['i_in']):int(c['i_out'])])) for c in corners)
+    Lc = sum(float(s[int(c['i_out'])] - s[int(c['i_in'])]) for c in corners)
+    summary.update(corner_time_s=Tc, time_corner_pct=100.0 * Tc / T_lap if T_lap > 0 else 0.0,
+                   v_mean_corner_kph=(Lc / Tc * 3.6 if Tc > 0 else 0.0))
+    return straights, summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  g-g-V map from the ONE solved car (2026-10-21)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY: the old lap sim (method='pointmass') judged corner speed by the PER-TYRE
+# maximum utilisation (stricter than every other limit in Vahan), then braked
+# and accelerated on a mu-circle built from that one lateral number (brake bias,
+# driven axle and load transfer absent).  Result: the lap's limits matched
+# nothing else in the model — lateral too low without aero, braking too high
+# with it, and the full solve along the lap asked the tyres for more than they
+# have on corner entry.  method='ggv' instead drives the lap on the G-G envelope
+# of the solved car (SteadyStateSolver.gg_envelope: axle_utilization <= 1 on the
+# full solve — the same criterion as the Dynamics G-G diagram, the Loads-page
+# G-G slice and the corner-speed limits), built at a grid of speeds with the
+# downforce at each speed (RCVD ch.9 pr. 350-354 g-g-V; Segal/MRA constant-
+# speed envelope; Honda/Bosch forward-backward passes on vehicle limits).
+#
+# The envelope's longitudinal axis is TYRE force (solver longitudinal_g = total
+# tyre Fx / m g); drag, scrub and the engine are applied by the lap itself.
+
+_GGV_CACHE: dict = {}
+_GGV_CACHE_MAX = 8
+
+
+class GGVMap:
+    """Tyre-force envelope of the solved car at a grid of speeds.
+
+    For speed node k: ay_k (0..ay_lim_k, g), acc_k (forward tyre g >= 0),
+    brk_k (braking tyre g >= 0, magnitude).  Between speeds the border is
+    interpolated in dynamic pressure (v^2, downforce is linear in it) on the
+    NORMALISED lateral coordinate u = ay / ay_lim(v), so the shape is carried
+    across speeds instead of being smeared."""
+
+    def __init__(self, v_nodes, envs, cla_m2=0.0, cop_rear=0.5, rho=1.225,
+                 meta=None):
+        self.v = np.asarray(v_nodes, float)
+        self.q = self.v ** 2
+        self.envs = envs
+        self.cla, self.cop_rear, self.rho = float(cla_m2), float(cop_rear), float(rho)
+        self.meta = dict(meta or {})
+        self.ay_lim = np.array([e['ay_lim'] for e in envs], float)
+        # resample every node on a common normalised grid u in [0, 1]
+        self.u = np.linspace(0.0, 1.0, 41)
+        self.acc_u = np.array([np.interp(self.u * e['ay_lim'], e['ay'], e['acc'])
+                               for e in envs])
+        self.brk_u = np.array([np.interp(self.u * e['ay_lim'], e['ay'], e['brk'])
+                               for e in envs])
+
+    # ── queries (all in g) ───────────────────────────────────────────────
+    def _w(self, v):
+        """(i0, i1, frac) bracket in v^2."""
+        q = float(v) ** 2
+        if len(self.q) == 1 or q <= self.q[0]:
+            return 0, 0, 0.0
+        if q >= self.q[-1]:
+            n = len(self.q) - 1
+            return n, n, 0.0
+        i1 = int(np.searchsorted(self.q, q))
+        i0 = i1 - 1
+        return i0, i1, (q - self.q[i0]) / (self.q[i1] - self.q[i0])
+
+    def lat_limit_g(self, v) -> float:
+        i0, i1, f = self._w(v)
+        return float(self.ay_lim[i0] * (1 - f) + self.ay_lim[i1] * f)
+
+    def _row(self, arr, v):
+        i0, i1, f = self._w(v)
+        return arr[i0] * (1 - f) + arr[i1] * f
+
+    def accel_g(self, v, ay_g) -> float:
+        """Forward TYRE g available at speed v while pulling |ay_g| sideways
+        (0 outside the lateral limit)."""
+        lim = self.lat_limit_g(v)
+        u = abs(float(ay_g)) / max(lim, 1e-9)
+        if u > 1.0:
+            return 0.0
+        return float(max(np.interp(u, self.u, self._row(self.acc_u, v)), 0.0))
+
+    def brake_g(self, v, ay_g) -> float:
+        """Braking TYRE g (magnitude) available at speed v and |ay_g|."""
+        lim = self.lat_limit_g(v)
+        u = abs(float(ay_g)) / max(lim, 1e-9)
+        if u > 1.0:
+            return 0.0
+        return float(max(np.interp(u, self.u, self._row(self.brk_u, v)), 0.0))
+
+    def lat_for_accel_g(self, v, acc_need_g) -> float:
+        """Largest |ay| (g) at which the forward tyre g still covers
+        ``acc_need_g`` (what holding speed against drag needs)."""
+        lim = self.lat_limit_g(v)
+        row = self._row(self.acc_u, v)
+        c = float(acc_need_g)
+        if c <= row[-1]:
+            return lim
+        if c > row[0]:
+            return 0.0
+        # row is (near-)monotone falling in u: last u with row >= c
+        ok = np.flatnonzero(row >= c)
+        j = int(ok[-1])
+        if j >= len(row) - 1:
+            return lim
+        r0, r1 = row[j], row[j + 1]
+        t = (r0 - c) / (r0 - r1) if r0 > r1 else 0.0
+        return float((self.u[j] + t * (self.u[j + 1] - self.u[j])) * lim)
+
+    def border(self, v, n=91):
+        """Closed G-G border at speed v: (ay_g[], ax_g[]) going brake -> right
+        -> accel -> left (for plotting)."""
+        lim = self.lat_limit_g(v)
+        acc, brk = self._row(self.acc_u, v), self._row(self.brk_u, v)
+        ay = self.u * lim
+        xs = np.concatenate([ay, ay[::-1], -ay, -ay[::-1]])
+        ys = np.concatenate([-brk, acc[::-1], acc, -brk[::-1]])
+        return xs, ys
+
+
+def _ggv_fingerprint(ss, extra) -> tuple:
+    """Cache key for a g-g-V map: probe solves of the live car (they carry the
+    hardpoints, springs, ARBs, tyre data, grip scale, brake bias...) plus the
+    vehicle parameters and the map settings.  Any change to the car changes
+    at least one probe number."""
+    vals = []
+    try:
+        vp = ss._veh
+        for k in sorted(vars(vp)):
+            x = getattr(vp, k)
+            if isinstance(x, (int, float, bool, str)):
+                vals.append((k, round(float(x), 9) if isinstance(x, (int, float)) and not isinstance(x, bool) else x))
+    except Exception:
+        pass
+    probes = []
+    warm = getattr(ss, '_warm', None)
+    try:
+        for ay, ax in ((1.1, 0.4), (-0.6, -0.9)):
+            ss._warm = {}
+            r = ss.solve(ay, ax)
+            for c in ('FL', 'FR', 'RL', 'RR'):
+                probes.append(round(float(r.Fz.get(c, 0.0)), 4))
+                probes.append(round(float(r.utilization.get(c, 0.0)), 6))
+                probes.append(round(float((r.inclination or {}).get(c, 0.0)), 6))
+    except Exception as e:
+        probes.append(repr(e))
+    finally:
+        ss._warm = warm if warm is not None else {}
+    return (tuple(vals), tuple(probes), tuple(extra))
+
+
+def build_ggv_map(ss, v_top_ms: float, cla_m2: float = 0.0,
+                  cop_rear: float = 0.5, rho: float = 1.225,
+                  mu_scale: float | None = None, n_ay: int = 11,
+                  iters: int = 8, n_speeds: int = 8, progress=None,
+                  use_cache: bool = True) -> GGVMap:
+    """Build (or fetch from the cache) the g-g-V map of the solved car.
+
+    No downforce: the envelope does not depend on speed (the engine is applied
+    by the lap, not here), so ONE envelope is solved.  With downforce: speed
+    nodes equally spaced in v^2 (equal downforce steps) from 0 to v_top.
+    ~6 s per speed on v191 at n_ay 11 / iters 8 (187 full solves)."""
+    prev = getattr(ss, '_mu_scale', 1.0)
+    if mu_scale is not None:
+        ss._mu_scale = float(mu_scale)
+    try:
+        aero_on = abs(float(cla_m2)) > 1e-6
+        if aero_on:
+            # evenly spaced in speed (checked 2026-10-21: spacing in v^2 left a
+            # 0-20 m/s gap where the drive-limit kink moves, 0.08 g error at
+            # 13 m/s; 8 even nodes keep the border within ~0.02 g)
+            v_top = max(float(v_top_ms), 10.0)
+            v_nodes = np.linspace(0.0, v_top, max(int(n_speeds), 2))
+        else:
+            v_nodes = np.array([0.0])
+        key = None
+        if use_cache:
+            key = _ggv_fingerprint(ss, (round(float(cla_m2), 6), round(float(cop_rear), 6),
+                                        round(float(rho), 6), int(n_ay), int(iters),
+                                        tuple(np.round(v_nodes, 4)),
+                                        round(float(ss._mu_scale), 6)))
+            hit = _GGV_CACHE.get(key)
+            if hit is not None:
+                if progress:
+                    progress('g-g-V map: reused (car unchanged)', 20)
+                return hit
+        W = float(ss._veh.total_mass_kg) * G
+        envs = []
+        for k, v in enumerate(v_nodes):
+            Fd = 0.5 * float(rho) * float(cla_m2) * float(v) ** 2
+            aero = None
+            if aero_on and abs(Fd) > 1e-9:
+                fa = Fd * (1.0 - cop_rear) / 2.0
+                ra = Fd * cop_rear / 2.0
+                aero = {'FL': fa, 'FR': fa, 'RL': ra, 'RR': ra}
+            hi = max(3.0, 2.2 * (1.0 + max(Fd, 0.0) / W))
+            if progress:
+                progress(f'g-g-V map: speed {k + 1}/{len(v_nodes)} '
+                         f'({v * 3.6:.0f} km/h)', 2 + int(18 * k / len(v_nodes)))
+            e = ss.gg_envelope(n_ay=n_ay, iters=iters, aero_Fz=aero,
+                               ay_hi=hi, ax_hi=hi)
+            m = len(e['ay_g']) // 2
+            ay = np.asarray(e['ay_g'][m:], float)
+            if not np.all(np.isfinite(ay)):
+                raise RuntimeError(f'G-G envelope failed at {v:.1f} m/s')
+            envs.append({'v': float(v), 'ay': ay, 'ay_lim': float(e['ay_limit_g']),
+                         'acc': np.asarray(e['ax_accel_g'][m:], float),
+                         'brk': -np.asarray(e['ax_brake_g'][m:], float),
+                         'n_solves': int(e['n_solves'])})
+        gmap = GGVMap(v_nodes, envs, cla_m2, cop_rear, rho,
+                      meta={'n_ay': n_ay, 'iters': iters,
+                            'criterion': 'axle_utilization <= 1 on the full solve',
+                            'mu_scale': float(ss._mu_scale),
+                            'n_solves': int(sum(e['n_solves'] for e in envs))})
+        if key is not None:
+            if len(_GGV_CACHE) >= _GGV_CACHE_MAX:
+                _GGV_CACHE.pop(next(iter(_GGV_CACHE)))
+            _GGV_CACHE[key] = gmap
+        return gmap
+    finally:
+        ss._mu_scale = prev
+        ss._warm = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -621,6 +1004,15 @@ class LapSimulator:
         if grip_scale is None:
             grip_scale = float(getattr(ss_solver, '_mu_scale', 1.0))
         self.grip_scale = float(np.clip(grip_scale, 0.1, 1.5))
+        # Tyre UTILIZATION CAP (driver/setup margin): no tyre is asked for
+        # more than util_cap of the grip it has (|F| <= cap*mu*Fz).  The
+        # limits (corner, brake, accel, g-g-V map) use grip_scale*util_cap;
+        # the reported utilization stays relative to the FULL grip_scale, so
+        # a capped lap shows tyres peaking at ~util_cap, not 1.0.
+        self.util_cap = 1.0
+        # Tyre temperature (vahan/tyre_temperature.TyreTempSettings); None or
+        # mode 'off' = the tyre model's own grip, the lap is untouched.
+        self.tyre_temp = None
         # Optional GEARBOX (set via set_gearbox).  None -> fall back to the
         # VehicleParams single-ratio drive_force model.
         self._gears = None          # list of gearbox ratios (1st..Nth)
@@ -665,8 +1057,24 @@ class LapSimulator:
         # ── per-station Ackermann (optional) ─────────────────────────────
         self._ack_model = None
         self._ack_pct = 0.0
+        # ── method: 'pointmass' (the original) or 'ggv' (set by simulate) ─
+        self._method = 'pointmass'
+        self._ggv = None            # GGVMap while method == 'ggv'
 
     # ── gearbox ──────────────────────────────────────────────────────────
+    @property
+    def limit_scale(self) -> float:
+        """Grip the LIMITS are built on: grip_scale x util_cap."""
+        return self.grip_scale * self.util_cap
+
+    def set_tyre_temperature(self, settings) -> None:
+        """TyreTempSettings (mode off / fixed / estimated) or None."""
+        self.tyre_temp = settings
+
+    def set_util_cap(self, cap: float) -> None:
+        """Cap every tyre's utilization at ``cap`` (0.3-1.0; 1.0 = off)."""
+        self.util_cap = float(np.clip(cap, 0.3, 1.0))
+
     def set_gearbox(self, gear_ratios, primary_ratio: float,
                     final_drive: float, redline_rpm: float):
         """Per-gear drive model.  total_ratio(gear) = primary × gear × final.
@@ -965,7 +1373,7 @@ class LapSimulator:
         Fz_r = Fz_tot * (1.0 - wf) / 2.0
         mu_f = float(self.tire.peak_mu(Fz_f, 0.0))         # front tire
         mu_r = float(self.tire_rear.peak_mu(Fz_r, 0.0))    # rear tire (split)
-        return min(mu_f, mu_r) * self.grip_scale   # conservative + derated
+        return min(mu_f, mu_r) * self.limit_scale  # conservative + derated + capped
 
     def _ay_max_pointmass(self, v: float) -> float:
         """Point-mass lateral ceiling (m/s²) — μ·(g + downforce/m).  Ignores
@@ -1023,17 +1431,29 @@ class LapSimulator:
         v_top = max(v_hint_ms * 1.1, 15.0)
         self._grip_v = np.linspace(2.0, v_top, 9)
         prev = getattr(self.ss, '_mu_scale', 1.0)
-        self.ss._mu_scale = self.grip_scale
+        self.ss._mu_scale = self.limit_scale
         self.ss._warm = {}
-        self._grip_ay = np.array([self._ay_at_util1(float(v))
-                                  for v in self._grip_v])
+        if abs(self.cla) <= 1e-6:
+            # No downforce: _ay_at_util1 depends on speed ONLY through the
+            # aero load (and the bracket, built from the same aero-free μ),
+            # so every grid speed returns the identical number.  Solve it
+            # once instead of nine times (about 6 s of a 7 s table).
+            ay0 = self._ay_at_util1(float(self._grip_v[0]))
+            self._grip_ay = np.full(len(self._grip_v), ay0)
+        else:
+            self._grip_ay = np.array([self._ay_at_util1(float(v))
+                                      for v in self._grip_v])
         self.ss._mu_scale = prev
         # monotone-ish guard: clamp to >0
         self._grip_ay = np.maximum(self._grip_ay, 0.2)
 
     def _ay_max(self, v: float) -> float:
         """Real lateral ceiling at speed v (m/s²) — interpolated from the
-        load-transfer-aware grip table when built, else the point mass."""
+        load-transfer-aware grip table when built, else the point mass.
+        method 'ggv': the solved car's lateral limit at this speed (G-G
+        envelope with the downforce at v)."""
+        if getattr(self, '_method', 'pointmass') == 'ggv' and self._ggv is not None:
+            return self._ggv.lat_limit_g(v) * G
         if getattr(self, '_grip_v', None) is not None:
             return float(np.interp(v, self._grip_v, self._grip_ay))
         return self._ay_max_pointmass(v)
@@ -1068,6 +1488,125 @@ class LapSimulator:
         scale = self._ack_model.ay_trim_scale(1.0 / ak, self._ack_pct)
         return base * float(scale)
 
+    def _ack_scale(self, kappa: float) -> float:
+        """The Ackermann multiplier _ay_max_local applies (1 without a model
+        or on a straight) — method 'ggv' scales the envelope's sideways axis
+        by it."""
+        if self._ack_model is None:
+            return 1.0
+        ak = abs(float(kappa))
+        if ak < 1e-5:
+            return 1.0
+        return float(self._ack_model.ay_trim_scale(1.0 / ak, self._ack_pct))
+
+    # ── method 'ggv': launch + tyre limits from the g-g-V map ───────────
+    def launch_rpm(self) -> float:
+        """Engine speed the driver holds while the clutch slips off the line:
+        the rpm of peak torque (same definition as AccelerationModel)."""
+        if getattr(self, '_launch_rpm_c', None) is None:
+            hi = self._redline_rpm if self._redline_rpm > 0 else 12000.0
+            if self._tq_rpm is not None:
+                rr = np.linspace(float(self._tq_rpm[0]), min(float(self._tq_rpm[-1]), hi), 400)
+            else:
+                rr = np.linspace(1000.0, hi, 400)
+            tq = np.array([self._engine_torque_Nm(x) for x in rr])
+            # top of the peak-torque plateau (a flat curve's argmax is its
+            # FIRST point — launching at 2000 rpm bogged a flat table)
+            self._launch_rpm_c = float(rr[np.nonzero(tq >= 0.995 * tq.max())[0][-1]])
+        return self._launch_rpm_c
+
+    def _clutch_slipping(self, v: float, gear: int) -> bool:
+        """True while the wheels are too slow for the engine at launch rpm in
+        1st: the clutch slips, the engine stays at launch rpm."""
+        if not self._gears or int(gear) > 1:
+            return False
+        return self._rpm_in_gear(max(v, 0.0), 1) < self.launch_rpm()
+
+    def _ax_drive_ggv(self, v: float, ay: float, gear: int = 0,
+                      torque_cut: bool = False, kappa: float = 0.0,
+                      launching: bool = False) -> float:
+        """Method 'ggv' version of _ax_drive (same Newton balance, see there).
+        Traction comes from the solved envelope at this speed and sideways g
+        (driven axle, load transfer, pitch, camber, aero) instead of a
+        mu-circle.  LAUNCH: while the clutch slips (1st gear, wheel-speed rpm
+        below the launch rpm) the engine is held at the launch rpm, so the
+        drive force is T(launch rpm)·eta·N/r and the ENGINE's inertia is not
+        being spun up (only the wheels); the clutch locks when the wheels
+        catch up and the normal torque branch takes over without a jump.
+        ``launching`` is True only from the standing start until that first
+        lock-up — a 1st-gear corner exit later in the lap runs on a locked
+        clutch."""
+        m = self.veh.total_mass_kg
+        D = self.drag_N(v) + self.scrub_drag_N(v, kappa)
+        m_f = self._free_wheel_mass_kg()
+        if torque_cut:
+            return float(-D / (m + self._wheels_only_mass_kg()))
+        ay_env = abs(ay) / G / max(self._ack_scale(kappa), 1e-6)
+        F_trac = self._ggv.accel_g(v, ay_env) * m * G
+        a_tyre = (F_trac - D) / (m + m_f)
+        if launching and self._gears and self._clutch_slipping(v, gear if gear else 1):
+            r = max(self.veh.tire_radius_m, 1e-3)
+            F_T = (self._engine_torque_Nm(self.launch_rpm())
+                   * float(self.veh.drivetrain_efficiency) * self._total_ratio(1) / r)
+            a_torque = (F_T - D) / (m + self._wheels_only_mass_kg())
+            return float(min(a_torque, a_tyre))
+        if gear and self._gears:
+            F_T = self._force_in_gear(v, gear)[0]
+        else:
+            F_T = self._drive_force(max(v, 0.5))
+        a_torque = (F_T - D) / (m * self._inertia_div(gear))
+        return float(min(a_torque, a_tyre))
+
+    def _ax_brake_ggv(self, v: float, ay: float, kappa: float = 0.0) -> float:
+        """Method 'ggv' braking decel (m/s², +): the envelope's braking tyre
+        force at this speed and sideways g (fixed brake balance, load transfer,
+        aero — all in the solve) plus drag and scrub."""
+        m = self.veh.total_mass_kg
+        ay_env = abs(ay) / G / max(self._ack_scale(kappa), 1e-6)
+        F = self._ggv.brake_g(v, ay_env) * m * G
+        D = self.drag_N(v) + self.scrub_drag_N(v, kappa)
+        return float((F + D) / m)
+
+    def _v_top_track_ms(self, track) -> float:
+        """Upper speed for the g-g-V grid on THIS track: full-power run (no
+        grip limit, drag on) from 15 m/s down the longest near-straight stretch
+        (|curvature| < 0.01 1/m), +15 %, rounded up to 2 m/s, never above the
+        car's own top speed.  Above the top node the map holds the top-node
+        limits (conservative: grip grows with speed)."""
+        v_car = self._v_top_ms()
+        try:
+            k = np.abs(np.asarray(track.kappa_1pm, float))
+            s = np.asarray(track.s_m, float)
+            straight = k < 0.01
+            best, i = 0.0, 0
+            while i < len(k):
+                if not straight[i]:
+                    i += 1; continue
+                j = i
+                while j + 1 < len(k) and straight[j + 1]:
+                    j += 1
+                best = max(best, float(s[j] - s[i])); i = j + 1
+            m = float(self.veh.total_mass_kg) * self._inertia_div(1)
+            v = 15.0
+            for _ in range(int(best)):
+                a = (self._drive_force(v) - self.drag_N(v)) / m
+                v = float(np.sqrt(max(v * v + 2.0 * a, 1.0)))
+            v_est = 1.15 * max(v, 20.0)
+            return float(min(v_car, 2.0 * np.ceil(v_est / 2.0)))
+        except Exception:
+            return v_car
+
+    def _v_top_ms(self) -> float:
+        """Steady top speed on the flat: where the best gear's force meets
+        drag (or the top-gear redline).  Sizes the g-g-V speed grid."""
+        v_hi = 80.0
+        if self._gears and self._redline_rpm > 0:
+            v_hi = (self._redline_rpm / self._total_ratio(len(self._gears)) / 60.0
+                    * 2 * np.pi * max(self.veh.tire_radius_m, 1e-3))
+        vs = np.linspace(5.0, max(v_hi, 6.0), 200)
+        ok = [v for v in vs if self._drive_force(v) > self.drag_N(v)]
+        return float(max(ok) if ok else v_hi)
+
     def scrub_drag_N(self, v: float, kappa: float) -> float:
         """Front-tyre scrub as a retarding force (N) at this station.  It is
         the part of the front tyre force that points along the car's path
@@ -1083,16 +1622,50 @@ class LapSimulator:
             return 0.0
         return float(self._ack_model.scrub_drag_N(R, ay_g, self._ack_pct))
 
-    def _corner_vmax(self, kappa: float) -> float:
-        """Speed ceiling for one curvature: v² κ = ay_max(v), iterated
-        because downforce grows with v (fixed point, bounded)."""
+    def _corner_vmax(self, kappa: float, trac_g0: float | None = None) -> float:
+        """Speed ceiling for one curvature: the steady speed the car can HOLD
+        on this radius.  Iterated because downforce grows with v.
+
+        Holding speed on a radius takes two things from the tyres at once:
+        the sideways force m·v²·κ AND the forward force that cancels aero drag
+        + front-tyre scrub.  So the ceiling sits where the driven tyres' share
+        of the friction ellipse left over by the sideways force just covers
+        that resistance (the zero of the traction branch of _ax_drive):
+            ay = ay_cap · sqrt(1 − c²),   c = D / F_trac(at zero sideways g).
+        FIXED 2026-10-21: the ceiling used to be ay = ay_cap (no resistance).
+        At exactly that speed the ellipse leaves NO forward force, so the
+        forward pass lost speed to drag on one station and regained it on the
+        next — a two-station limit cycle (±0.03 g of fake braking/accel in
+        every long corner, the saw-tooth in the forward-g, power and diff
+        traces).  The speed change is tiny (≈0.02 % on a 12 m/s corner); the
+        traces are now steady where the car is steady."""
         ak = abs(float(kappa))
         if ak < 1e-5:
             return 1e3                     # straight — no lateral cap
-        v = np.sqrt(self._ay_max_local(0.0, kappa) / ak)
-        for _ in range(8):
-            v_new = np.sqrt(self._ay_max_local(v, kappa) / ak)
-            if abs(v_new - v) < 1e-3:
+        m = self.veh.total_mass_kg
+        if trac_g0 is None:
+            trac_g0 = self._traction_g0()
+
+        def ay_hold(v):
+            if getattr(self, '_method', 'pointmass') == 'ggv' and self._ggv is not None:
+                # the solved envelope: the largest sideways g at which the
+                # forward TYRE force still cancels drag + scrub (the engine
+                # must cover it too — it always can below top speed)
+                D = self.drag_N(v) + self.scrub_drag_N(v, kappa)
+                ay_g = self._ggv.lat_for_accel_g(v, D / (m * G))
+                return max(ay_g * G * self._ack_scale(kappa), 1e-6)
+            ay = self._ay_max_local(v, kappa)
+            T = trac_g0 * G * m * max(1.0 + self.downforce_N(v) / (m * G), 0.0)
+            if T > 1e-6:
+                D = self.drag_N(v) + self.scrub_drag_N(v, kappa)
+                c = min(D / T, 1.0)
+                ay *= np.sqrt(max(1.0 - c * c, 0.0))
+            return max(ay, 1e-6)
+
+        v = np.sqrt(ay_hold(0.0) / ak)
+        for _ in range(80):
+            v_new = np.sqrt(ay_hold(v) / ak)
+            if abs(v_new - v) < 1e-7:
                 return float(v_new)
             v = 0.5 * (v + v_new)
         return float(v)
@@ -1103,7 +1676,7 @@ class LapSimulator:
         (mu scaled inside the fixed point — the old code scaled the answer,
         which ignored that a derated tyre also transfers less load)."""
         prev = getattr(self.ss, '_mu_scale', 1.0)
-        self.ss._mu_scale = self.grip_scale
+        self.ss._mu_scale = self.limit_scale
         try:
             a = float(self.ss._traction_g_dynamic(0.0))
         finally:
@@ -1221,33 +1794,135 @@ class LapSimulator:
         return float((F_max + D) / m)
 
     # ── the three passes ─────────────────────────────────────────────────
+    @staticmethod
+    def _detail_stations(signals, budget: int, tol: float) -> np.ndarray:
+        """Pick WHERE the full suspension solve runs (detail pass).
+
+        The solve's inputs along the lap (signed sideways g, forward g, aero
+        load) change on a 3–10 m scale and jump in one station where the
+        car goes from full throttle to full braking.  Evenly spaced samples
+        (80 on an 800 m lap = one per 10 m) land between those features, so
+        the detail traces (tyre grip used, roll, LLTD, travel) were drawn as
+        straight lines between samples that missed apexes and braking
+        points — the jagged saw-tooth, with input errors up to 1.1 g.
+
+        Greedy refinement instead: start from a coarse even spread, then
+        repeatedly add the station where joining the chosen samples with
+        straight lines misrepresents the INPUTS the most, until every input
+        is within ``tol`` (g) or ``budget`` solves are used.  The solve is a
+        smooth function of its inputs, so straight lines between these
+        stations are a faithful picture of the output too."""
+        sig = np.atleast_2d(np.asarray(signals, float))
+        n = sig.shape[1]
+        budget = int(max(min(budget, n), 2))
+        x = np.arange(n)
+        idx = set(np.unique(np.linspace(0, n - 1, max(budget // 4, 2))
+                            .astype(int)).tolist())
+        while len(idx) < budget:
+            I = np.array(sorted(idx))
+            err = np.zeros(n)
+            for row in sig:
+                err = np.maximum(err, np.abs(row - np.interp(x, I, row[I])))
+            if float(err.max()) <= tol:
+                break
+            # add the worst station of up to K different gaps per round
+            K = max(1, (budget - len(idx)) // 4)
+            order = np.argsort(err)[::-1]
+            gap = np.searchsorted(I, order)
+            used, add = set(), []
+            for c, g_ in zip(order, gap):
+                if err[c] <= tol or len(add) >= K:
+                    break
+                if g_ in used:
+                    continue
+                used.add(g_)
+                add.append(int(c))
+            if not add:
+                break
+            idx.update(add)
+        return np.array(sorted(idx), int)
+
     def simulate(self, track: Track, n_detail: int = 60,
-                 progress_cb=None) -> LapResult:
+                 progress_cb=None, detail_tol_g: float | None = None,
+                 method: str = 'pointmass', ggv_n_speeds: int = 8
+                 ) -> LapResult:
+        """Run the lap (see _simulate_once).  With tyre temperature on
+        (set_tyre_temperature), the tyres' grip per axle follows their
+        temperature: 'fixed' runs once at that temperature, 'estimated' runs
+        several laps, each on the previous lap's mean tyre temperature
+        (vahan/tyre_temperature.simulate_with_temperature)."""
+        st = self.tyre_temp
+        kw = dict(n_detail=n_detail, detail_tol_g=detail_tol_g,
+                  method=method, ggv_n_speeds=ggv_n_speeds)
+        if st is None or getattr(st, 'mode', 'off') == 'off':
+            return self._simulate_once(track, progress_cb=progress_cb, **kw)
+        from vahan.tyre_temperature import simulate_with_temperature
+        return simulate_with_temperature(
+            self, lambda cb: self._simulate_once(track, progress_cb=cb, **kw),
+            st, progress_cb)
+
+    def _simulate_once(self, track: Track, n_detail: int = 60,
+                       progress_cb=None, detail_tol_g: float | None = None,
+                       method: str = 'pointmass', ggv_n_speeds: int = 8
+                       ) -> LapResult:
+        """Run the lap.  ``n_detail`` = how many stations get the full
+        suspension solve.  ``detail_tol_g`` None (default) spreads them
+        evenly (unchanged behaviour for scripts that only want the lap time);
+        a number places them where the solve inputs change, see
+        _detail_stations — what the Laptime page uses for its plots.
+
+        ``method``:
+          'pointmass' (default, the original): lateral limit = per-tyre
+              utilisation 1 on the full solve, braking/drive on a mu-circle.
+          'ggv': the lap runs on the G-G envelope of the solved car at a grid
+              of speeds (build_ggv_map: axle_utilization <= 1, downforce at
+              each speed, brake balance, driven axle) — the same limit as the
+              Dynamics G-G diagram and the Loads-page G-G.  Launch with
+              clutch slip.  The detail pass feeds the solve the TYRE
+              longitudinal g (drag taken out), which is what the envelope is
+              built on."""
         s = track.s_m
         ds = np.diff(s)
         n = track.n
         kap = track.kappa_1pm
+        method = str(method or 'pointmass').lower()
+        if method not in ('pointmass', 'ggv'):
+            raise ValueError(f"method must be 'pointmass' or 'ggv', not {method!r}")
+        self._method = method
+        ggv = method == 'ggv'
 
         def _prog(msg, pct):
             if progress_cb:
                 progress_cb(msg, pct)
 
-        # pass 0 — build the load-transfer-aware lateral grip table from the
-        # full per-corner solver (so the corner cap respects what the tires
-        # can REALLY hold once the outer tire overloads — not the optimistic
-        # point-mass μ).  A rough top-speed hint sizes the speed grid.
-        _prog('Calibrating grip (load transfer)…', 2)
-        kmin = float(np.min(np.abs(kap)[np.abs(kap) > 1e-5])) \
-            if np.any(np.abs(kap) > 1e-5) else 1e-3
-        v_hint = float(np.sqrt(self._ay_max_pointmass(30.0) / max(kmin, 1e-4)))
-        try:
-            self._build_grip_table(min(v_hint, 60.0))
-        except Exception:
-            self._grip_v = None    # fall back to point mass
+        if ggv:
+            # pass 0 (ggv) — the solved car's g-g-V map (cached per car)
+            _prog('g-g-V map from the full solve…', 2)
+            self._launch_rpm_c = None
+            self._ggv = build_ggv_map(
+                self.ss, self._v_top_track_ms(track), cla_m2=self.cla,
+                cop_rear=self.cop_rear, rho=self.rho,
+                mu_scale=self.limit_scale, n_speeds=ggv_n_speeds,
+                progress=progress_cb)
+        else:
+            self._ggv = None
+            # pass 0 — build the load-transfer-aware lateral grip table from
+            # the full per-corner solver (so the corner cap respects what the
+            # tires can REALLY hold once the outer tire overloads — not the
+            # optimistic point-mass μ).  A rough top-speed hint sizes the grid.
+            _prog('Calibrating grip (load transfer)…', 2)
+            kmin = float(np.min(np.abs(kap)[np.abs(kap) > 1e-5])) \
+                if np.any(np.abs(kap) > 1e-5) else 1e-3
+            v_hint = float(np.sqrt(self._ay_max_pointmass(30.0) / max(kmin, 1e-4)))
+            try:
+                self._build_grip_table(min(v_hint, 60.0))
+            except Exception:
+                self._grip_v = None    # fall back to point mass
 
         # pass 1 — corner ceiling
         _prog('Corner-speed ceiling…', 8)
-        vcap = np.array([self._corner_vmax(k) for k in kap])
+        _g0 = self._traction_g0()          # speed-independent: solve it once
+        vcap = np.array([self._corner_vmax(k, trac_g0=_g0) for k in kap])
 
         # pass 2 — forward from standing start.  The loop now carries GEAR
         # STATE: which ratio the driver is in, how long since the last shift,
@@ -1256,20 +1931,42 @@ class LapSimulator:
         # only two gears) and every shift is free and instantaneous.
         _prog('Forward (accel) pass…', 25)
         v_f = np.zeros(n)
-        v_f[0] = 0.5                       # rolling out of the start box
-        gear = max(self._gear_force_rpm(v_f[0])[2], 1) if self._gears else 0
+        # 'pointmass': rolling out of the start box at 0.5 m/s.  'ggv': a
+        # standing start (clutch-slip launch, see _ax_drive_ggv).
+        v_f[0] = 0.0 if ggv else 0.5
+        gear = (1 if ggv else max(self._gear_force_rpm(v_f[0])[2], 1)) \
+            if self._gears else 0
         since, cut_left = 1e9, 0.0
+        launching = bool(ggv and self._gears)
         for i in range(n - 1):
+            if launching and not self._clutch_slipping(v_f[i], 1):
+                launching = False             # clutch locked: launch over
             if self._gears:
-                if cut_left <= 0.0:
-                    g_new = self._shift_decide(v_f[i], gear, since)
+                if cut_left <= 0.0 and not launching:
+                    g_new = self._shift_decide(max(v_f[i], 0.5), gear, since)
                     if g_new != gear:
                         gear, since, cut_left = g_new, 0.0, self._shift_time
             ay = v_f[i] ** 2 * abs(kap[i])
-            ax = self._ax_drive(v_f[i], ay, gear=gear, torque_cut=cut_left > 0,
-                                kappa=kap[i])
+            if ggv:
+                # both ends of the step must be inside the envelope: the
+                # sideways g at the far end (speed after the step, that
+                # station's curvature) can be the larger one
+                ax = self._ax_drive_ggv(v_f[i], ay, gear=gear,
+                                        torque_cut=cut_left > 0, kappa=kap[i],
+                                        launching=launching)
+                v_try = np.sqrt(max(v_f[i] ** 2 + 2.0 * ax * ds[i], 0.0))
+                ay2 = v_try ** 2 * abs(kap[i + 1])
+                if ay2 > ay:
+                    ax = min(ax, self._ax_drive_ggv(
+                        v_f[i], ay2, gear=gear, torque_cut=cut_left > 0,
+                        kappa=kap[i + 1], launching=launching))
+            else:
+                ax = self._ax_drive(v_f[i], ay, gear=gear,
+                                    torque_cut=cut_left > 0, kappa=kap[i])
             v_next = np.sqrt(max(v_f[i] ** 2 + 2.0 * ax * ds[i], 0.01))
             v_f[i + 1] = min(v_next, vcap[i + 1])
+            if launching and vcap[i + 1] < v_next:
+                launching = False             # first corner reached: clutch in
             dt_i = ds[i] / max(0.5 * (v_f[i] + v_f[i + 1]), 0.1)
             since += dt_i
             cut_left = max(cut_left - dt_i, 0.0)
@@ -1284,8 +1981,15 @@ class LapSimulator:
         v_b[-1] = vcap[-1]
         for i in range(n - 2, -1, -1):
             ay = v_b[i + 1] ** 2 * abs(kap[i + 1])
-            gb = self._gear_force_rpm(v_b[i + 1])[2] if self._gears else 0
-            ab = self._ax_brake(v_b[i + 1], ay, gear=gb, kappa=kap[i + 1])
+            if ggv:
+                ab = self._ax_brake_ggv(v_b[i + 1], ay, kappa=kap[i + 1])
+                v_try = np.sqrt(v_b[i + 1] ** 2 + 2.0 * ab * ds[i])
+                ay0 = min(v_try, vcap[i]) ** 2 * abs(kap[i])
+                if ay0 > ay:
+                    ab = min(ab, self._ax_brake_ggv(v_b[i + 1], ay0, kappa=kap[i]))
+            else:
+                gb = self._gear_force_rpm(v_b[i + 1])[2] if self._gears else 0
+                ab = self._ax_brake(v_b[i + 1], ay, gear=gb, kappa=kap[i + 1])
             v_prev = np.sqrt(v_b[i + 1] ** 2 + 2.0 * ab * ds[i])
             v_b[i] = min(vcap[i], v_prev)
 
@@ -1313,6 +2017,21 @@ class LapSimulator:
             avg_speed_kph=float(track.length_m / t[-1] * 3.6),
             max_speed_kph=float(v.max() * 3.6),
         )
+        res.method = method
+        if ggv:
+            res.ggv = self._ggv
+            res.launch_rpm = float(self.launch_rpm()) if self._gears else 0.0
+            _gm = self._ggv
+            res.notes.append(
+                f'method g-g-V: the lap runs on the G-G envelope of the solved car '
+                f'(axle grip use <= 1 on the full solve, brake balance, driven '
+                f'axle, downforce at each speed) — {len(_gm.v)} speed(s), '
+                f'{_gm.meta.get("n_solves", 0)} solves; sideways limit '
+                f'{_gm.lat_limit_g(0.0):.2f} g at rest'
+                + (f', {_gm.lat_limit_g(float(v.max())):.2f} g at '
+                   f'{float(v.max()) * 3.6:.0f} km/h' if abs(self.cla) > 1e-6 else '')
+                + (f'; standing start, clutch slips at {res.launch_rpm:.0f} rpm '
+                   f'until 1st gear catches up' if self._gears else ''))
         # ── corner / usage summary (time-weighted; binder-facing) ─────────
         _latm = 0.5 * (lat_g[1:] + lat_g[:-1])
         _lonm = 0.5 * (lon_g[1:] + lon_g[:-1])
@@ -1416,10 +2135,25 @@ class LapSimulator:
             self._gear_trace(v, ds)
         gear_arr = gear_i.astype(float)
         pwr_arr = np.zeros(n)
+        slip = np.zeros(n, bool)
+        if ggv and self._gears:
+            # launch: the clutch slips, the engine sits at the launch rpm
+            # only the standing start, until the clutch first locks
+            for i in range(n):
+                if (int(gear_i[i]) <= 1 and self._clutch_slipping(float(v[i]), 1)
+                        and (i == 0 or v[i] >= v[i - 1])):
+                    slip[i] = True
+                else:
+                    break
+            rpm_arr = np.where(slip, self.launch_rpm(), rpm_arr)
         for i in range(n):
             F_avail = (self._force_in_gear(float(v[i]), int(gear_i[i]))[0]
                        if self._gears else
                        self._gear_force_rpm(float(v[i]))[0])
+            if slip[i]:
+                F_avail = (self._engine_torque_Nm(self.launch_rpm())
+                           * float(self.veh.drivetrain_efficiency)
+                           * self._total_ratio(1) / max(self.veh.tire_radius_m, 1e-3))
             if cut_arr[i]:
                 F_avail = 0.0
             if lon_g[i] > 0:
@@ -1493,13 +2227,46 @@ class LapSimulator:
 
         # ── detailed pass: full steady-state solve at sampled stations ────
         _prog('Suspension detail pass…', 60)
-        idx = np.unique(np.linspace(0, n - 1, max(int(n_detail), 8)).astype(int))
+        # SIGN (FIXED 2026-10-21): the track's curvature is + for a LEFT-hand
+        # turn (heading increasing, counter-clockwise).  The steady-state
+        # solver's lateral g is + for a RIGHT-hand turn (it loads the LEFT
+        # tyres: solve(+1 g) -> FL 938 N / FR 355 N on v191).  The pass used
+        # to solve |lat g| for every corner, i.e. it drove every LEFT-hand
+        # turn as a right-hander: half the corners had FL/FR and RL/RR
+        # swapped in the per-tyre load, grip-used and travel traces.
+        lat_solver = -np.sign(kap) * lat_g
+        # What the solve is handed as longitudinal g.  The solver's
+        # longitudinal_g is TYRE force (total Fx / m g).  'pointmass' keeps
+        # its original input (the car's net g, drag included — overstates the
+        # braking tyre force by drag/m g, ~0.17 g at 100 km/h).  'ggv' hands
+        # it the tyre force: m·a + D (braking) or (m + m_free)·a + D (drive),
+        # the same quantity the envelope was built on.
+        if ggv:
+            _m = float(self.veh.total_mass_kg)
+            _D = np.array([self.drag_N(float(v[i])) + self.scrub_drag_N(float(v[i]), float(kap[i]))
+                           for i in range(n)])
+            _meff = np.where(lon_g > 0, _m + self._free_wheel_mass_kg(), _m)
+            lon_solve = (_meff * lon_g * G + _D) / (_m * G)
+            # torque cut / coasting: the tyres only carry the drag (≈ 0)
+            res.lon_tyre_g = lon_solve
+        else:
+            lon_solve = lon_g
+        if detail_tol_g is not None:
+            _sig = [lat_solver, lon_solve]
+            if abs(self.cla) > 1e-6:      # aero load enters the solve too
+                _sig.append(self.downforce_N(v) / (self.veh.total_mass_kg * G))
+            idx = self._detail_stations(_sig, max(int(n_detail), 8),
+                                        float(detail_tol_g))
+        else:
+            idx = np.unique(np.linspace(0, n - 1,
+                                        max(int(n_detail), 8)).astype(int))
         det = {k: [] for k in (
             'Fz_FL', 'Fz_FR', 'Fz_RL', 'Fz_RR',
             'util_FL', 'util_FR', 'util_RL', 'util_RR',
             'travel_FL', 'travel_FR', 'travel_RL', 'travel_RR',
             'shock_F_mm', 'shock_R_mm',
-            'roll_deg', 'pitch_deg', 'lltd_pct', 'understeer_deg')}
+            'roll_deg', 'pitch_deg', 'lltd_pct', 'understeer_deg',
+            'util_axle_F', 'util_axle_R')}
         mr_f = max(self.veh.motion_ratio_front, 1e-3)
         mr_r = max(self.veh.motion_ratio_rear, 1e-3)
         done = 0
@@ -1510,8 +2277,8 @@ class LapSimulator:
         _mu_scale_prev = getattr(self.ss, '_mu_scale', 1.0)
         self.ss._mu_scale = self.grip_scale
         for i in idx:
-            lg = float(np.sign(kap[i]) * lat_g[i])
-            xg = float(np.clip(lon_g[i], -3.0, 3.0))
+            lg = float(lat_solver[i])      # solver convention: + = right turn
+            xg = float(np.clip(lon_solve[i], -3.0, 3.0))
             # per-corner aero load at this station's speed
             aero = None
             if self.cla > 1e-6:
@@ -1520,7 +2287,7 @@ class LapSimulator:
                 ra = Fd * self.cop_rear / 2.0
                 aero = {'FL': fa, 'FR': fa, 'RL': ra, 'RR': ra}
             try:
-                r_ = self.ss.solve(abs(lg), xg, aero_Fz=aero)
+                r_ = self.ss.solve(lg, xg, aero_Fz=aero)
                 for c in ('FL', 'FR', 'RL', 'RR'):
                     det[f'Fz_{c}'].append(float(r_.Fz.get(c, np.nan)))
                     det[f'util_{c}'].append(float(r_.utilization.get(c, np.nan)))
@@ -1536,10 +2303,19 @@ class LapSimulator:
                 el_r = r_.elastic_lt_rear_N + r_.geometric_lt_rear_N \
                     + r_.unsprung_lt_rear_N
                 tot = el_f + el_r
+                # ratio is sign-free (both axles flip together in a
+                # left-hand turn); the old `tot > 1` test NaN'd them.
                 det['lltd_pct'].append(
-                    float(el_f / tot * 100.0) if tot > 1.0 else np.nan)
+                    float(el_f / tot * 100.0) if abs(tot) > 1.0 else np.nan)
                 det['understeer_deg'].append(
                     float(r_.understeer_gradient_deg))
+                # the canonical grip criterion (the one the G-G envelope uses)
+                try:
+                    _ua = self.ss.axle_utilization(r_)
+                except Exception:
+                    _ua = {}
+                det['util_axle_F'].append(float(_ua.get('F', np.nan)))
+                det['util_axle_R'].append(float(_ua.get('R', np.nan)))
             except Exception:
                 for k in det:
                     det[k].append(np.nan)
@@ -1564,7 +2340,7 @@ class LapSimulator:
             apex = np.abs(lon_d) < 0.2          # ~pure lateral
             apex_u = np.nanmax(um[apex]) if np.any(apex) else np.nan
             comb_u = np.nanmax(um[~apex]) if np.any(~apex) else np.nan
-            if np.isfinite(comb_u) and comb_u > 1.1:
+            if np.isfinite(comb_u) and comb_u > 1.1 * self.util_cap:
                 res.notes.append(
                     f'lateral grip is load-transfer-honest (apex util '
                     f'{apex_u:.2f}); combined brake/accel-in-corner util peaks '
@@ -1572,5 +2348,19 @@ class LapSimulator:
                     f'there (QSS limitation, lap slightly quick on entries/exits)')
         except Exception:
             pass
+        if self.util_cap < 0.999:
+            res.notes.append(f'tyre use capped at {self.util_cap:.2f} '
+                             f'(limits on {self.limit_scale:.3f} of TTC grip)')
         _prog('Done', 100)
+        # ── corner isolation (lap-sim feature, 2026-10-11) ────────────────
+        try:
+            res.corners, res.corner_summary = isolate_corners(res, track)
+        except Exception as _e:
+            res.corners, res.corner_summary = [], {'error': str(_e)}
+        # ── straights = the rest of the lap (user 2026-11-10, for aero) ───
+        try:
+            res.straights, res.straight_summary = isolate_straights(res, track, res.corners)
+            res.avg_straight_speed_kph = float(res.straight_summary.get('v_mean_kph', 0.0))
+        except Exception as _e:
+            res.straights, res.straight_summary = [], {'error': str(_e)}
         return res

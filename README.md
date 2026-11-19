@@ -530,7 +530,9 @@ allowance, with the slope per 10 mm.
   bearings and corner-speed tables, `capture_views.py` renders.
 - **MCP server:** with the `mcp` package the running app serves `status`, `load_config`,
   `get_hardpoints`, `set_hardpoint`, `axle_metrics`, `relocate`, `hoopline`, `screenshot` and
-  others on 127.0.0.1:8765 (`VAHAN_MCP=0` disables).
+  others on 127.0.0.1:8765 (`VAHAN_MCP=0` disables). To allow access from other devices on your
+  local network, start the app with `VAHAN_MCP_HOST=0.0.0.0`; connect to
+  `http://<this-PC's-LAN-IP>:8765/mcp`. The default remains local-only.
 
 ## Project files
 

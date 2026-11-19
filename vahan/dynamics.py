@@ -47,6 +47,13 @@ class VehicleParams:
     # Unsprung CG height (approximation: wheel center height)
     unsprung_cg_height_m: float = 0.203
 
+    # Front / rear axle CG heights (m).  0 = not set: both ends at the
+    # whole-vehicle CG.  Only their DIFFERENCE is used (front lower, rear
+    # higher); the level stays cg_height_m, so the axle-share-weighted mean is
+    # cg_height_m by construction.  See sprung_end_cg_heights_m.
+    cg_height_front_m: float = 0.0
+    cg_height_rear_m: float = 0.0
+
     # Springs (N/m at the spring, not at the wheel)
     spring_rate_front_Npm: float = 22000.0
     spring_rate_rear_Npm: float = 22000.0
@@ -160,6 +167,14 @@ class VehicleParams:
     camber_front_deg: float = 0.0
     camber_rear_deg: float = 0.0
 
+    # Chassis torsional compliance (hub to hub, N·m/rad).  Off (default) = rigid
+    # body, one roll angle.  On = the three-spring model of vahan.chassis_stiffness:
+    # front / rear sprung lumps roll by their own angles, each axle's corners take
+    # their own angle for travel, kinematic camber, ground camber and the elastic
+    # split.  Kinematics are untouched.  See SteadyStateSolver._axle_roll.
+    chassis_compliance: bool = False
+    chassis_torsion_Nm_rad: float = 0.0
+
     # Aerodynamic drag — bounds terminal speed during longitudinal
     # acceleration trajectories.  CdA is the lumped drag coefficient ×
     # frontal area (m²).  Without these, the steady-state power-limit
@@ -172,7 +187,7 @@ class VehicleParams:
     # Used by `vahan.steering.SteeringGeometry` to convert commanded
     # road-wheel angle ↔ steering-wheel angle, and to derive the physical
     # max road-wheel angle imposed by the rack travel limit.
-    rack_travel_per_rev_mm: float = 60.0    # rack translation per 360° of wheel
+    rack_travel_per_rev_mm: float = 129.54  # rack translation per 360° of wheel (5.1 in/rev, user 2026-10-11)
     total_rack_travel_mm:   float = 120.0   # full stroke bump-to-bump
 
     # Auto-inertia coefficients — used by the GUI when Ixx/Izz aren't
@@ -267,6 +282,21 @@ class VehicleParams:
     @property
     def cg_to_rear_axle_m(self):
         return self.wheelbase_m - self.cg_to_front_axle_m
+
+    @property
+    def sprung_end_cg_heights_m(self):
+        """(front, rear) sprung-lump CG heights (m) for the three-spring roll
+        model.  Lumps split at the CG station b (front share 1-b); each end is
+        offset from the sprung CG height by its axle CG height minus the
+        share-weighted mean of the two, so (1-b)*h_f + b*h_r = sprung_cg_height_m
+        and the rigid-chassis roll moment is unchanged."""
+        h_s = self.sprung_cg_height_m
+        h_f, h_r = float(self.cg_height_front_m), float(self.cg_height_rear_m)
+        if h_f <= 0.0 or h_r <= 0.0:
+            return h_s, h_s
+        b = self.cg_to_front_axle_m / self.wheelbase_m
+        mean = (1.0 - b) * h_f + b * h_r
+        return h_s + h_f - mean, h_s + h_r - mean
 
     @property
     def sprung_cg_height_m(self):
@@ -684,6 +714,9 @@ class VehicleParams:
             kw['wheelbase_m'] = car['wheelbase_mm'] / 1000
         if 'cg_z_mm' in car and 'cg_height_m' not in kw:
             kw['cg_height_m'] = car['cg_z_mm'] / 1000
+        if 'cg_z_front_mm' in car and 'cg_z_rear_mm' in car:
+            kw['cg_height_front_m'] = car['cg_z_front_mm'] / 1000
+            kw['cg_height_rear_m'] = car['cg_z_rear_mm'] / 1000
         return cls(**kw)
 
 
@@ -700,8 +733,12 @@ class SteadyStateResult:
     # Per-corner vertical loads (N, positive = compression)
     Fz: dict = field(default_factory=dict)  # {'FL': ..., 'FR': ..., 'RL': ..., 'RR': ...}
 
-    # Roll / pitch
+    # Roll / pitch.  roll_angle_deg is the CG-station roll; with chassis
+    # compliance the front / rear body sections roll by their own angles.
     roll_angle_deg: float = 0.0
+    roll_front_deg: float = 0.0
+    roll_rear_deg: float = 0.0
+    chassis_twist_deg: float = 0.0
     pitch_angle_deg: float = 0.0
 
     # Per-corner suspension travel (mm)
@@ -787,6 +824,24 @@ class SteadyStateResult:
     jacking_heave_applied_front_mm: float = 0.0
     jacking_heave_applied_rear_mm: float = 0.0
     jacking_feedback_passes: int = 0
+
+    # Per-corner chassis toe (deg, + = toe-in) from the solved corner states
+    # (steered front corners when the sweep steers).
+    toe: dict = field(default_factory=dict)
+    # ── FRONT STEER IN THE SOLVE (2026-11-14, SteadyStateSolver.steer_front) ──
+    # steer_on False = the front corners were solved at the solvers' own rack
+    # (normally 0), exactly as before.  When on: mean road-wheel steer the
+    # bicycle relation asks for (deg, magnitude INTO the turn), the rack travel
+    # used (mm, physical +X), each front wheel's rack-induced angle into the
+    # turn at its solved travel (deg), and the turn radius (m).
+    steer_on: bool = False
+    steer_mean_deg: float = 0.0
+    steer_rack_mm: float = 0.0
+    steer_inner_deg: float = 0.0
+    steer_outer_deg: float = 0.0
+    steer_wheel_deg: dict = field(default_factory=dict)
+    steer_turn_radius_m: float = 0.0
+    steer_iterations: int = 0
     # Suspension sink of each axle under the aero load (mm, + = body DOWN =
     # bump on both wheels), through the ONE heave curve (vahan.heave_curve:
     # progressive wheel rate).  Already INSIDE `travel` when
@@ -982,6 +1037,32 @@ class SteadyStateSolver:
         # turns it off.
         self.pitch_travel = True
         self._antis = None
+        # FRONT STEER (2026-11-14, user: "steady state sweep doesnt take in
+        # account for camber gain from caster").  OFF by default so every
+        # caller that does not opt in (lap sim, G-G map, loads, ...) is
+        # unchanged.  When steer_front is True AND a turn radius is known
+        # (solve(turn_radius_m=...) or steer_turn_radius_m) AND the app
+        # supplied front_solver_at_rack + steering_geometry, each front corner
+        # is solved by a SuspensionConstraints built at the rack travel the
+        # bicycle relation asks for: delta = L/R + (alpha_f - alpha_r).
+        #   front_solver_at_rack(rack_m, label) -> SuspensionConstraints, the
+        #       SAME construction the app's corner solvers use (ONE MODEL).
+        #   steering_geometry: vahan.steering.SteeringGeometry (rack <-> mean
+        #       road-wheel angle, + = left turn).
+        self.steer_front = False
+        self.steer_turn_radius_m = 0.0
+        # > 0: lat-g sweeps hold this SPEED instead of the radius, so the corner
+        # tightens as g rises (R = v^2 / a_y) and the steer GROWS from 0 at 0 g
+        # (user 2026-11-14: constant radius put L/R of steer, and its caster
+        # camber, on the car already at 0 g).  0 = hold steer_turn_radius_m.
+        self.steer_speed_mps = 0.0
+        self.front_solver_at_rack = None
+        self.steering_geometry = None
+        self.steer_max_iter = 5
+        self.steer_tol_m = 0.05e-3          # rack fixed point, 0.05 mm
+        self.steer_rack_bin_m = 1e-4        # solver cache bin, 0.1 mm
+        self._steer_rack_m = None           # rack in force during one solve
+        self._rack_solvers = {}             # (label, bin) -> solver
 
     def _tire_for(self, label: str):
         """Tire model for a corner — front tire for FL/FR, rear for RL/RR.
@@ -1027,11 +1108,121 @@ class SteadyStateSolver:
         mz = diff.yaw_moment_Nm(T_axle, track, r, on_power, max_bias_N=max_bias)
         return mz, on_power
 
+    def steer_active(self, turn_radius_m: float = None) -> bool:
+        """True when this solver will steer the front corners for a solve at
+        ``turn_radius_m`` (None = the solver's own steer_turn_radius_m)."""
+        R = self.steer_turn_radius_m if turn_radius_m is None else turn_radius_m
+        try:
+            R = float(R)
+        except (TypeError, ValueError):
+            return False
+        return bool(self.steer_front and self.front_solver_at_rack is not None
+                    and self.steering_geometry is not None
+                    and np.isfinite(R) and R > 1e-6)
+
+    def _rack_bin(self, rack_m: float) -> float:
+        b = float(self.steer_rack_bin_m)
+        return round(float(rack_m) / b) * b
+
     def solve(self, lateral_g: float,
               longitudinal_g: float = 0.0,
               max_iter: int = 15,
               tol_deg: float = 0.002,
-              aero_Fz: dict = None) -> SteadyStateResult:
+              aero_Fz: dict = None,
+              turn_radius_m: float = None) -> SteadyStateResult:
+        """Steady-state equilibrium, with the front wheels STEERED when
+        steer_active(turn_radius_m) (see __init__ 'FRONT STEER').
+
+        Steer fixed point (a few passes, steer changes camber -> slip):
+          delta = L/R + (alpha_f - alpha_r)            (rad, bicycle)
+        alpha_f - alpha_r = the solve's own understeer_gradient_deg (axle
+        reference slip angles from the pair analysis, + diff shift).  +lateral
+        g loads the LEFT wheels = a RIGHT turn, so the mean road-wheel angle is
+        -delta in SteeringGeometry's + = left-turn frame.  The rack comes from
+        steering_geometry.rack_from_road_wheel; the inner/outer split comes
+        from the linkage itself (each front corner solved at that rack)."""
+        if not self.steer_active(turn_radius_m):
+            return self._solve_unsteered(lateral_g, longitudinal_g, max_iter,
+                                         tol_deg, aero_Fz)
+        R = float(self.steer_turn_radius_m if turn_radius_m is None
+                  else turn_radius_m)
+        L = float(self._veh.wheelbase_m)
+        # +1 = right turn.  0 g on a circle (walking pace) still needs L/R of
+        # steer; it is taken as the right-hand turn the + g side of the sweep
+        # continues, so the curve has no jump at 0 g.
+        hand = -1.0 if lateral_g < 0 else 1.0
+        geo = self.steering_geometry
+
+        def rack_for(delta_rad):
+            mean_left = -hand * delta_rad            # + = left turn
+            mean_left = float(np.clip(mean_left, -geo.max_road_wheel_rad,
+                                      geo.max_road_wheel_rad))
+            r = float(geo.rack_from_road_wheel(mean_left))
+            r = float(np.clip(r, -geo.max_rack_half_m, geo.max_rack_half_m))
+            return self._rack_bin(r)
+
+        v_hold = float(getattr(self, 'steer_speed_mps', 0.0) or 0.0)
+        if v_hold > 0.0:      # held speed wins over any radius passed in (g-sweeps)
+            # constant speed: 1/R = a_y / v^2  ->  no steer at 0 g
+            inv_R = abs(float(lateral_g)) * G / (v_hold * v_hold)
+            R = (1.0 / inv_R) if inv_R > 1e-9 else float('inf')
+        else:
+            inv_R = 1.0 / R
+        delta = L * inv_R
+        rack = rack_for(delta)
+        res = None
+        it = 0
+        try:
+            for it in range(1, max(int(self.steer_max_iter), 1) + 1):
+                self._steer_rack_m = rack
+                res = self._solve_unsteered(lateral_g, longitudinal_g, max_iter,
+                                            tol_deg, aero_Fz)
+                delta = L * inv_R + np.radians(float(res.understeer_gradient_deg))
+                new_rack = rack_for(delta)
+                if abs(new_rack - rack) < float(self.steer_tol_m):
+                    break
+                rack = new_rack
+            self._fill_steer(res, rack, delta, R, hand)
+            res.steer_iterations = it
+        finally:
+            self._steer_rack_m = None
+        return res
+
+    def _fill_steer(self, res, rack_m: float, delta_rad: float, R: float,
+                    hand: float):
+        """Steer outputs on a steered result.  Per-wheel angle into the turn =
+        the toe change the RACK makes at that corner's solved travel (steered
+        toe minus the unsteered solver's toe at the same travel)."""
+        res.steer_on = True
+        res.steer_mean_deg = float(np.degrees(delta_rad))
+        res.steer_rack_mm = float(rack_m) * 1000.0
+        res.steer_turn_radius_m = float(R)
+        wheel = {}
+        for lbl in ('FL', 'FR'):
+            if lbl not in self._solvers or lbl not in res.toe:
+                continue
+            side = 'left' if lbl == 'FL' else 'right'
+            try:
+                t0 = float(KinematicMetrics(self._solvers[lbl].solve(
+                    res.travel.get(lbl, 0.0) / 1000.0), side).toe)
+            except Exception:
+                continue
+            d_toe = float(res.toe[lbl]) - t0          # + = toe-in change
+            # left-turn yaw: FL = -d_toe, FR = +d_toe; into the turn = -hand*yaw
+            yaw_left = -d_toe if lbl == 'FL' else d_toe
+            wheel[lbl] = -hand * yaw_left
+        res.steer_wheel_deg = wheel
+        if len(wheel) == 2:
+            outer = 'FL' if hand > 0 else 'FR'        # right turn: FL outer
+            inner = 'FR' if hand > 0 else 'FL'
+            res.steer_outer_deg = wheel[outer]
+            res.steer_inner_deg = wheel[inner]
+
+    def _solve_unsteered(self, lateral_g: float,
+                         longitudinal_g: float = 0.0,
+                         max_iter: int = 15,
+                         tol_deg: float = 0.002,
+                         aero_Fz: dict = None) -> SteadyStateResult:
         """Steady-state equilibrium INCLUDING the jacking heave.
 
         One pass = _solve_at_heave() (roll / load-transfer / tyre fixed
@@ -1188,7 +1379,8 @@ class SteadyStateSolver:
         rc_f = self._query_rc_height('FL', 0.0)
         rc_r = self._query_rc_height('RL', 0.0)
 
-        roll_rad = self._compute_roll(ay, v, rc_f, rc_r)
+        th_f, th_r = self._axle_roll(ay, v, rc_f, rc_r)
+        roll_rad = self._cg_roll(v, th_f, th_r)
         roll_prev = roll_rad
 
         # ── Step 3: Iterate ──────────────────────────────────────────────
@@ -1204,8 +1396,8 @@ class SteadyStateSolver:
             # Positive roll = left side compresses, right extends (the body's
             # +X / left side goes DOWN).  Convention: positive travel = bump.
             # Jacking heave (body up) is droop on both wheels of the axle.
-            roll_travel_front = np.sin(roll_rad) * v.front_track_m / 2
-            roll_travel_rear = np.sin(roll_rad) * v.rear_track_m / 2
+            roll_travel_front = np.sin(th_f) * v.front_track_m / 2
+            roll_travel_rear = np.sin(th_r) * v.rear_track_m / 2
 
             travels = {
                 'FL': +roll_travel_front - heave_f,
@@ -1217,6 +1409,7 @@ class SteadyStateSolver:
             # 3b. Solve kinematics at each corner
             rc_heights = {}
             cambers = {}
+            toes = {}
             for label, travel_m in travels.items():
                 side = 'left' if label.endswith('L') else 'right'
                 try:
@@ -1225,6 +1418,7 @@ class SteadyStateSolver:
                     m = KinematicMetrics(state, side)
                     rc_heights[label] = m.roll_center_height
                     cambers[label] = m.camber
+                    toes[label] = float(getattr(m, 'toe', float('nan')))
                 except Exception as exc:
                     if label in self._solvers:
                         raise RuntimeError(
@@ -1241,7 +1435,7 @@ class SteadyStateSolver:
             rc_r = (rc_heights['RL'] + rc_heights['RR']) / 2
 
             # 3d. Load transfer
-            lt = self._compute_load_transfer(ay, v, rc_f, rc_r)
+            lt = self._compute_load_transfer(ay, v, rc_f, rc_r, axle_roll=(th_f, th_r))
 
             # Per-corner Fz (positive = compression)
             # Positive lateral_g = turning right = body rolls left
@@ -1253,8 +1447,9 @@ class SteadyStateSolver:
                 'RR': Fz_static['RR'] - lt['total_rear'],
             }
 
-            # 3e. Update roll angle
-            roll_rad_new = self._compute_roll(ay, v, rc_f, rc_r)
+            # 3e. Update roll angle (per axle with chassis compliance)
+            th_f, th_r = self._axle_roll(ay, v, rc_f, rc_r)
+            roll_rad_new = self._cg_roll(v, th_f, th_r)
 
             # Check convergence
             if abs(np.degrees(roll_rad_new - roll_prev)) < tol_deg:
@@ -1300,6 +1495,9 @@ class SteadyStateSolver:
 
         # ── Step 4: Build result ─────────────────────────────────────────
         result.roll_angle_deg = np.degrees(roll_rad)
+        result.roll_front_deg = float(np.degrees(th_f))
+        result.roll_rear_deg = float(np.degrees(th_r))
+        result.chassis_twist_deg = float(np.degrees(th_f - th_r))
 
         # Pitch angle from longitudinal load transfer.  The pitch couple
         # the suspension reacts is m_s · ax · h_s where h_s is the
@@ -1315,6 +1513,7 @@ class SteadyStateSolver:
         result.Fz = Fz
         result.travel = {k: v * 1000 for k, v in travels.items()}  # mm
         result.camber = cambers
+        result.toe = toes
         # Ground camber must use the complete spin vector, not the XZ-only
         # camber projection plus angles (that overstates inclination at steer).
         # Match the renderer's existing global-Y alignment convention, followed
@@ -1330,7 +1529,8 @@ class SteadyStateSolver:
             _state = states.get(label)
             _spin = (np.asarray(_state.spin_axis, float) if _state is not None
                      else np.array([1., 0., 0.]))
-            _angle = np.radians(_side * _static + _roll_deg)
+            _angle = np.radians(_side * _static
+                                + (result.roll_front_deg if label[0] == 'F' else result.roll_rear_deg))
             _c, _s = np.cos(_angle), np.sin(_angle)
             _spin_ground = np.array([_c * _spin[0] + _s * _spin[2],
                                      _spin[1],
@@ -1674,6 +1874,32 @@ class SteadyStateSolver:
         result.jacking_heave_applied_front_mm = heave_f * 1000.0
         result.jacking_heave_applied_rear_mm = heave_r * 1000.0
 
+    @staticmethod
+    def _record_steer(out: dict, i: int, r, n: int):
+        """Per-point toe + (when the point was steered) steer outputs into a
+        sweep dict: toe_<c> (deg, from the solved corner states), and
+        steer_mean_deg / steer_inner_deg / steer_outer_deg / steer_rack_mm /
+        steer_FL_deg / steer_FR_deg (deg into the turn, rack mm)."""
+        for lbl in ('FL', 'FR', 'RL', 'RR'):
+            k = f'toe_{lbl}'
+            if k not in out:
+                out[k] = np.full(n, np.nan)
+            out[k][i] = float((getattr(r, 'toe', None) or {}).get(lbl, np.nan))
+        if not getattr(r, 'steer_on', False):
+            return
+        if 'steer_mean_deg' not in out:
+            for k in ('steer_mean_deg', 'steer_inner_deg', 'steer_outer_deg',
+                      'steer_rack_mm', 'steer_FL_deg', 'steer_FR_deg'):
+                out[k] = np.full(n, np.nan)
+            out['steer_front'] = True
+            out['steer_turn_radius_m'] = float(r.steer_turn_radius_m)
+        out['steer_mean_deg'][i] = r.steer_mean_deg
+        out['steer_inner_deg'][i] = r.steer_inner_deg
+        out['steer_outer_deg'][i] = r.steer_outer_deg
+        out['steer_rack_mm'][i] = r.steer_rack_mm
+        out['steer_FL_deg'][i] = r.steer_wheel_deg.get('FL', np.nan)
+        out['steer_FR_deg'][i] = r.steer_wheel_deg.get('FR', np.nan)
+
     def sweep_by_speed(self,
                        v_min_mph: float,
                        v_max_mph: float,
@@ -1734,7 +1960,9 @@ class SteadyStateSolver:
         for i, lat_g in enumerate(lat_arr):
             lat_c, lon_c, clamped = self._clamp_to_friction_circle(
                 float(lat_g), float(longitudinal_g), mu)
-            r = self.solve(lat_c, lon_c, aero_Fz=aero_Fz)
+            r = self.solve(lat_c, lon_c, aero_Fz=aero_Fz,
+                           turn_radius_m=turn_radius_m)
+            self._record_steer(out, i, r, n_points)
             out['lat_g_applied'][i]   = lat_c
             out['lon_g_applied'][i]   = lon_c
             out['friction_clamp'][i]  = clamped
@@ -2074,9 +2302,12 @@ class SteadyStateSolver:
                         g_range: tuple = (0.0, 2.0),
                         n_points: int = 41,
                         longitudinal_g: float = 0.0,
-                        aero_Fz: dict = None) -> dict:
+                        aero_Fz: dict = None,
+                        turn_radius_m: float = None) -> dict:
         """
         Sweep lateral acceleration and return arrays of all outputs.
+        turn_radius_m: radius the front wheels are steered for when
+        steer_front is on (None = steer_turn_radius_m; see solve()).
 
         Returns dict with numpy arrays keyed by output name.
         """
@@ -2100,7 +2331,9 @@ class SteadyStateSolver:
         self._warm = {}  # reset warm starts
 
         for i, lg in enumerate(g_arr):
-            r = self.solve(lg, longitudinal_g, aero_Fz=aero_Fz)
+            r = self.solve(lg, longitudinal_g, aero_Fz=aero_Fz,
+                           turn_radius_m=turn_radius_m)
+            self._record_steer(out, i, r, n_points)
             out['roll_angle_deg'][i] = r.roll_angle_deg
             out['pitch_angle_deg'][i] = r.pitch_angle_deg
             out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
@@ -2152,7 +2385,11 @@ class SteadyStateSolver:
                 'understeer_gradient_deg']
         corner_keys = ['Fz', 'travel', 'camber', 'camber_ground', 'inclination', 'utilization']
 
-        out = {'longitudinal_g': g_arr}
+        # front / rear ride-height change from pitch and aero (mm, + = bump =
+        # body DOWN at that axle) so the long-g sweep shows what pitch is made of
+        keys += ['pitch_travel_front_mm', 'pitch_travel_rear_mm',
+                 'aero_heave_front_mm', 'aero_heave_rear_mm']
+        out = {'longitudinal_g': g_arr, 'fixed_lateral_g': lateral_g}
         for k in keys:
             out[k] = np.zeros(n_points)
         for ck in corner_keys:
@@ -2163,8 +2400,13 @@ class SteadyStateSolver:
 
         for i, lg in enumerate(g_arr):
             r = self.solve(lateral_g, lg, aero_Fz=aero_Fz)
+            self._record_steer(out, i, r, n_points)
             out['roll_angle_deg'][i] = r.roll_angle_deg
             out['pitch_angle_deg'][i] = r.pitch_angle_deg
+            out['pitch_travel_front_mm'][i] = r.pitch_travel_front_mm
+            out['pitch_travel_rear_mm'][i] = r.pitch_travel_rear_mm
+            out['aero_heave_front_mm'][i] = r.aero_heave_front_mm
+            out['aero_heave_rear_mm'][i] = r.aero_heave_rear_mm
             out['rc_height_front_mm'][i] = r.rc_height_front_m * 1000
             out['rc_height_rear_mm'][i] = r.rc_height_rear_m * 1000
             out['elastic_lt_front_N'][i] = r.elastic_lt_front_N
@@ -2194,9 +2436,11 @@ class SteadyStateSolver:
                        lat_range: tuple = (0.0, 2.0),
                        lon_g: float = -0.5,
                        n_points: int = 41,
-                       aero_Fz: dict = None) -> dict:
+                       aero_Fz: dict = None,
+                       turn_radius_m: float = None) -> dict:
         """
         Sweep lateral g while simultaneously applying longitudinal g.
+        turn_radius_m: see sweep_lateral_g (front steer, opt-in).
 
         This is the combined cornering + braking/accel condition — the real
         peak dynamic load case. Sweeps lateral g as the x-axis while
@@ -2234,7 +2478,9 @@ class SteadyStateSolver:
 
         for i, lat_g in enumerate(g_arr):
             lat_c, lon_c, clamped = self._clamp_to_friction_circle(lat_g, lon_g, mu)
-            r = self.solve(lat_c, lon_c, aero_Fz=aero_Fz)
+            r = self.solve(lat_c, lon_c, aero_Fz=aero_Fz,
+                           turn_radius_m=turn_radius_m)
+            self._record_steer(out, i, r, n_points)
             out['lat_g_applied'][i]  = lat_c
             out['lon_g_applied'][i]  = lon_c
             out['friction_clamp'][i] = clamped
@@ -2473,6 +2719,117 @@ class SteadyStateSolver:
             self._mu_scale = prev
         return rows
 
+    def gg_envelope(self, n_ay: int = 15, iters: int = 9,
+                    aero_Fz_per_g: dict | None = None,
+                    turn_radius_m: float = 0.0,
+                    ay_hi: float = 3.0, ax_hi: float = 2.5,
+                    progress=None, aero_Fz: dict | None = None,
+                    speed_ms: float = 0.0) -> dict:
+        """G-G diagram: the (lateral g, longitudinal g) envelope the solved car
+        holds in steady state, judged by THE canonical grip criterion —
+        axle_utilization <= 1 on both axles (the pair budget the Design City /
+        corner-speed limits use) evaluated on the FULL solve(): load transfer,
+        jacking, pitch travel, camber-sensitive mu, brake bias and the driven
+        axle are all in it.  It is the solved car, not a mu circle.
+
+        The lateral limit at lon = 0 is bisected first (same bracket logic as
+        corner_speed.per_corner_limit_g: a solve that raises counts as over the
+        limit); n_ay stations from 0 to that limit then each bisect the forward
+        and the braking longitudinal g (iters steps on [0, ax_hi]).  Stations
+        are computed for ay >= 0 and mirrored: the solver is left/right
+        symmetric by construction (solve(-ay) is the mirror of solve(+ay); the
+        regression net checks this).
+
+        aero_Fz_per_g — per-corner N at 1 g (the V^2-at-constant-radius scaling
+            the Dynamics sweep uses); applied as per_g x |ay| at each station, so
+            the envelope sits on the same constant-radius road as the sweep.
+        turn_radius_m — > 0 adds the power cap on the forward branch: speed at a
+            station is v = sqrt(|ay| g R) and ax <= drive_force_at_v_N(v) / (m g);
+            power_limited marks the stations where that cap binds.
+        aero_Fz / speed_ms — the FIXED-SPEED slice instead (the Loads page's
+            G-G envelope at one speed): aero_Fz is the per-corner N at that
+            speed, applied unchanged at every station, and speed_ms > 0 caps
+            the forward branch with drive_force_at_v_N(speed_ms).  aero_Fz
+            overrides aero_Fz_per_g; speed_ms overrides turn_radius_m.
+
+        Returns ay_g (symmetric), ax_accel_g (>= 0), ax_brake_g (<= 0),
+        power_limited, ay_limit_g, accel_tip_g, brake_tip_g (the ay = 0 tips),
+        mu_ref (the friction-circle clamp radius, reference only), n_solves,
+        iters, criterion.
+        """
+        n_ay = max(int(n_ay), 2)
+        iters = max(int(iters), 1)
+        W = float(self._veh.total_mass_kg) * G
+        n_solves = [0]
+        self._warm = {}
+
+        def _aero(ay):
+            if aero_Fz:
+                return {k: float(v) for k, v in aero_Fz.items()}
+            if not aero_Fz_per_g:
+                return None
+            return {k: float(v) * abs(float(ay)) for k, v in aero_Fz_per_g.items()}
+
+        def _inside(ay, ax):
+            n_solves[0] += 1
+            try:
+                r = self.solve(float(ay), float(ax), aero_Fz=_aero(ay))
+            except Exception:                    # wheel-lift refusal etc. = over
+                return False
+            if r.grip_exceeded and any(bool(v) for v in r.grip_exceeded.values()):
+                return False
+            u = self.axle_utilization(r)
+            return bool(max(u.values()) <= 1.0)
+
+        def _bisect(fn, lo, hi, n):
+            # fn(lo) is True by construction; returns the largest tested x inside
+            for _ in range(n):
+                mid = 0.5 * (lo + hi)
+                if fn(mid):
+                    lo = mid
+                else:
+                    hi = mid
+            return lo
+
+        nan = float('nan')
+        out = {'criterion': 'axle_utilization <= 1 on the full solve',
+               'iters': iters, 'n_ay': n_ay,
+               'mu_ref': float(self._effective_mu()),
+               'aero': bool(aero_Fz_per_g or aero_Fz), 'turn_radius_m': float(turn_radius_m),
+               'speed_ms': float(speed_ms)}
+        if not _inside(0.0, 0.0):
+            out.update(ay_g=np.array([nan]), ax_accel_g=np.array([nan]),
+                       ax_brake_g=np.array([nan]), power_limited=np.array([False]),
+                       ay_limit_g=nan, accel_tip_g=nan, brake_tip_g=nan,
+                       n_solves=n_solves[0])
+            return out
+        if progress:
+            progress('G-G: lateral limit')
+        ay_lim = _bisect(lambda a: _inside(a, 0.0), 0.0, float(ay_hi), iters + 2)
+        ay_st = np.linspace(0.0, ay_lim, n_ay)
+        acc = np.zeros(n_ay); brk = np.zeros(n_ay); plim = np.zeros(n_ay, dtype=bool)
+        for i, ay in enumerate(ay_st):
+            if progress:
+                progress(f'G-G: station {i + 1}/{n_ay} (ay {ay:.2f} g)')
+            a = _bisect(lambda x, _ay=ay: _inside(_ay, x), 0.0, float(ax_hi), iters)
+            b = _bisect(lambda x, _ay=ay: _inside(_ay, -x), 0.0, float(ax_hi), iters)
+            if (speed_ms > 0.0 or turn_radius_m > 0.0) and self._veh.wheel_power_W > 0.0:
+                v = (float(speed_ms) if speed_ms > 0.0
+                     else float(np.sqrt(abs(ay) * G * float(turn_radius_m))))
+                if v >= 1.0:
+                    cap = float(self._veh.drive_force_at_v_N(v)) / W
+                    if cap < a:
+                        a, plim[i] = cap, True
+            acc[i], brk[i] = a, -b
+        out.update(ay_g=np.concatenate([-ay_st[:0:-1], ay_st]),
+                   ax_accel_g=np.concatenate([acc[:0:-1], acc]),
+                   ax_brake_g=np.concatenate([brk[:0:-1], brk]),
+                   power_limited=np.concatenate([plim[:0:-1], plim]),
+                   ay_limit_g=float(ay_lim), accel_tip_g=float(acc[0]),
+                   brake_tip_g=float(brk[0]), n_solves=n_solves[0])
+        return out
+
+
     # ── Internals ────────────────────────────────────────────────────────
 
     def axle_utilization(self, result: 'SteadyStateResult') -> dict:
@@ -2533,16 +2890,28 @@ class SteadyStateSolver:
         return {l: float(pos[i] * scale) for i, l in enumerate(labels)}
 
     def _solve_corner(self, label: str, travel_m: float):
-        """Solve kinematics for one corner with warm-start caching."""
+        """Solve kinematics for one corner with warm-start caching.  While a
+        steered solve is in force (self._steer_rack_m), a FRONT corner is
+        solved by the app's own construction at that rack (cached per 0.1 mm
+        rack bin, warm-started per bin)."""
+        key = label
         solver = self._solvers[label]
-        warm = self._warm.get(label)
+        if (self._steer_rack_m is not None and label[0] == 'F'
+                and self.front_solver_at_rack is not None):
+            rb = self._rack_bin(self._steer_rack_m)
+            key = (label, int(round(rb / float(self.steer_rack_bin_m))))
+            solver = self._rack_solvers.get(key)
+            if solver is None:
+                solver = self.front_solver_at_rack(rb, label)
+                self._rack_solvers[key] = solver
+        warm = self._warm.get(key)
         if warm is not None:
             state = solver.solve(travel_m, x0=warm['x0'],
                                  rocker_theta0=warm['theta'],
                                  rocker_spring_prev=warm['spring_len'])
         else:
             state = solver.solve(travel_m)
-        self._warm[label] = {
+        self._warm[key] = {
             'x0': state.x_vec(),
             'theta': state.rocker_angle,
             'spring_len': state.spring_length,
@@ -2609,12 +2978,48 @@ class SteadyStateSolver:
             return roll_moment / K_total
         return roll_moment / K_eff
 
+    def _axle_roll(self, ay: float, v: VehicleParams, rc_f: float, rc_r: float) -> tuple:
+        """(front, rear) body roll in rad.  Rigid (default): both = _compute_roll.
+        With v.chassis_compliance and a positive v.chassis_torsion_Nm_rad, the
+        three-spring model of vahan.chassis_stiffness with the SAME lumps and
+        gravity term as _compute_roll (sprung mass split by the CG station b,
+        lumps at sprung_end_cg_heights_m - equal unless front/rear axle CG
+        heights are set):
+            (k_f - W_sf d_f + k_c) th_f - k_c th_r = M_f
+            -k_c th_f + (k_r - W_sr d_r + k_c) th_r = M_r
+        so k_c -> infinity returns _compute_roll exactly."""
+        if not (getattr(v, 'chassis_compliance', False) and float(getattr(v, 'chassis_torsion_Nm_rad', 0.0)) > 0.0):
+            r = self._compute_roll(ay, v, rc_f, rc_r)
+            return r, r
+        b = v.cg_to_front_axle_m / v.wheelbase_m
+        m_f, m_r = v.sprung_mass_kg * (1.0 - b), v.sprung_mass_kg * b
+        h_sf, h_sr = v.sprung_end_cg_heights_m
+        d_f, d_r = h_sf - rc_f, h_sr - rc_r
+        k_c = float(v.chassis_torsion_Nm_rad)
+        k_f = v.roll_stiffness_front_Npm_rad - m_f * G * d_f
+        k_r = v.roll_stiffness_rear_Npm_rad - m_r * G * d_r
+        A = np.array([[k_f + k_c, -k_c], [-k_c, k_r + k_c]])
+        if np.linalg.det(A) <= 1.0 or k_f + k_r <= 1.0:
+            r = self._compute_roll(ay, v, rc_f, rc_r)
+            return r, r
+        th = np.linalg.solve(A, np.array([m_f * ay * d_f, m_r * ay * d_r]))
+        return float(th[0]), float(th[1])
+
+    @staticmethod
+    def _cg_roll(v: VehicleParams, th_f: float, th_r: float) -> float:
+        """Body roll at the CG station from the front / rear section angles."""
+        b = v.cg_to_front_axle_m / v.wheelbase_m
+        return (1.0 - b) * th_f + b * th_r
+
     def _compute_load_transfer(self, ay: float, v: VehicleParams,
-                               rc_f: float, rc_r: float) -> dict:
+                               rc_f: float, rc_r: float, axle_roll: tuple = None) -> dict:
         """
         Compute all load transfer components (N, one-side delta per axle).
 
         Positive = load added to the outside wheel in a right turn.
+        axle_roll = (front, rear) roll in rad from _axle_roll: with chassis
+        compliance the elastic split follows k_f·th_f : k_r·th_r (rigid:
+        th_f = th_r, the classic k_f : k_r split).
         """
         K_f = v.roll_stiffness_front_Npm_rad
         K_r = v.roll_stiffness_rear_Npm_rad
@@ -2651,9 +3056,15 @@ class SteadyStateSolver:
         h_arm = v.sprung_cg_height_m - h_roll_axis
         roll_moment = v.sprung_mass_kg * ay * h_arm
 
+        share_f = K_f / K_total if K_total > 0 else 0.0
+        if (axle_roll is not None and getattr(v, 'chassis_compliance', False)
+                and float(getattr(v, 'chassis_torsion_Nm_rad', 0.0)) > 0.0):
+            mf_, mr_ = K_f * float(axle_roll[0]), K_r * float(axle_roll[1])
+            if abs(mf_ + mr_) > 1e-12:
+                share_f = mf_ / (mf_ + mr_)
         if K_total > 0:
-            elastic_front = roll_moment * (K_f / K_total) / v.front_track_m
-            elastic_rear = roll_moment * (K_r / K_total) / v.rear_track_m
+            elastic_front = roll_moment * share_f / v.front_track_m
+            elastic_rear = roll_moment * (1.0 - share_f) / v.rear_track_m
         else:
             elastic_front = elastic_rear = 0.0
 

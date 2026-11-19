@@ -97,12 +97,95 @@ def ve_target_curve(rpm, ve_peak: float = VE_TARGET,
     return ve_peak + (ve_13k - ve_peak) * frac
 
 
+def apply_power_cap(rpm, torque_Nm, cap_hp):
+    """Crank torque limited so power <= cap_hp (T = min(T, P_cap/omega)).
+    Applied at USE time — a saved table is never rewritten.  The curve is
+    resampled (original points + a 100 rpm grid) so the knee where the cap
+    starts is not lost between table points.  cap_hp None/<=0 = no cap."""
+    import numpy as np
+    r = np.asarray(rpm, float); t = np.asarray(torque_Nm, float)
+    if cap_hp is None or not np.isfinite(float(cap_hp)) or float(cap_hp) <= 0 or r.size < 2:
+        return list(r), list(t)
+    P = float(cap_hp) * 745.7
+    if np.max(t * r * 2 * np.pi / 60.0) <= P:
+        return list(r), list(t)                     # cap never reached
+    g = np.unique(np.r_[r, np.arange(np.ceil(r[0] / 100) * 100, r[-1], 100.0)])
+    tg = np.interp(g, r, t)
+    tg = np.minimum(tg, P / np.maximum(g * 2 * np.pi / 60.0, 1e-6))
+    return list(g), list(tg)
+
+
+def engine_tables_from_car(car) -> dict:
+    """Named crank-torque tables the project carries:
+    car['engine_tables'] = {key: {'label', 'source', 'table': [[rpm, N·m]]}}.
+    The old single car['engine_table'] (+ engine_table_label) is kept as one
+    option ('engine_table') for backward compatibility."""
+    car = car or {}
+    out = {}
+    for k, v in (car.get('engine_tables') or {}).items():
+        if isinstance(v, dict) and v.get('table') and len(v['table']) >= 2:
+            out[str(k)] = v
+    if car.get('engine_table') and 'engine_table' not in out:
+        out['engine_table'] = {'label': car.get('engine_table_label') or 'project torque table',
+                               'source': 'car.engine_table (older single-table form)',
+                               'table': car['engine_table']}
+    return out
+
+
+def car_engine_curve(car):
+    """THE engine curve for a project car dict — the one source for the
+    Engine page, the Laptime page and the lap engine window:
+    engine_method (+ calibration knobs), engine_table_choice among
+    engine_tables, and engine_power_cap_hp (user input; 0/None = off)."""
+    car = car or {}
+    tabs = engine_tables_from_car(car)
+    choice = car.get('engine_table_choice')
+    if choice not in tabs:
+        choice = next(iter(tabs), None)
+    tab = tabs.get(choice) if choice else None
+    cap = car.get('engine_power_cap_hp')
+    return engine_curve(
+        car.get('engine_method', DEFAULT_METHOD),
+        ve_target=float(car.get('engine_ve_target', VE_TARGET)),
+        ve_fall_rpm=float(car.get('engine_ve_fall_rpm', VE_FALL_START_RPM)),
+        ve_13k=float(car.get('engine_ve_13k', VE_AT_13K)),
+        fmep_a=float(car.get('engine_fmep_a', FMEP_A_BAR)),
+        fmep_b=float(car.get('engine_fmep_b', FMEP_B_BAR)),
+        anchor_hp=float(car.get('engine_anchor_hp', ANCHOR_HP)),
+        table=tab['table'] if tab else None,
+        table_label=tab.get('label') if tab else None,
+        power_cap_hp=float(cap) if cap not in (None, '') else None)
+
+
 def engine_curve(method: str = DEFAULT_METHOD, ve_target: float = VE_TARGET,
                  fmep_a: float = FMEP_A_BAR, fmep_b: float = FMEP_B_BAR,
                  anchor_hp: float = ANCHOR_HP,
                  ve_fall_rpm: float = VE_FALL_START_RPM,
-                 ve_13k: float = VE_AT_13K):
+                 ve_13k: float = VE_AT_13K,
+                 table=None, table_label: str | None = None,
+                 power_cap_hp: float | None = None):
+    """_engine_curve_raw, then the power cap (if any) applied at use time."""
+    c = _engine_curve_raw(method, ve_target=ve_target, fmep_a=fmep_a, fmep_b=fmep_b,
+                          anchor_hp=anchor_hp, ve_fall_rpm=ve_fall_rpm, ve_13k=ve_13k,
+                          table=table, table_label=table_label)
+    if c is None or power_cap_hp is None or float(power_cap_hp) <= 0:
+        return c
+    r, t = apply_power_cap(c[0], c[1], power_cap_hp)
+    lbl = c[2] if len(r) == len(c[0]) and list(r) == list(c[0]) and list(t) == list(c[1])         else f"{c[2]}, capped at {float(power_cap_hp):g} hp"
+    return r, t, lbl
+
+
+def _engine_curve_raw(method: str = DEFAULT_METHOD, ve_target: float = VE_TARGET,
+                      fmep_a: float = FMEP_A_BAR, fmep_b: float = FMEP_B_BAR,
+                      anchor_hp: float = ANCHOR_HP,
+                      ve_fall_rpm: float = VE_FALL_START_RPM,
+                      ve_13k: float = VE_AT_13K,
+                      table=None, table_label: str | None = None):
     """(rpm[], crank torque N·m[], label) for the chosen calibration method.
+
+    'table'    : a named crank-torque table saved in the project (see
+                 engine_tables_from_car), e.g. the powertrain team's curve —
+                 used as given; falls back to DEFAULT_METHOD when no table.
 
     ALL SIX calibration knobs are explicit arguments (ve_target, ve_fall_rpm,
     ve_13k, fmep_a, fmep_b, anchor_hp) — no module globals are read at call
@@ -114,8 +197,14 @@ def engine_curve(method: str = DEFAULT_METHOD, ve_target: float = VE_TARGET,
     'raw'      : untouched solver output.
     Returns None if the data files are missing."""
     import numpy as np
-    sw = _load_sweep()
     method = str(method).lower()
+    if method == "table":
+        if table is not None and len(table) >= 2:
+            pts = sorted((float(a), float(b)) for a, b in table)
+            return ([p[0] for p in pts], [p[1] for p in pts],
+                    str(table_label or "project torque table"))
+        method = DEFAULT_METHOD
+    sw = _load_sweep()
     if sw and sw.get("curve") and method in ("corrected", "raw"):
         rpm = np.array([p["rpm"] for p in sw["curve"]], float)
         if method == "raw":

@@ -34,6 +34,7 @@ Construction modes
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
+import math
 import numpy as np
 
 
@@ -105,10 +106,46 @@ class SteeringGeometry:
     max_road_wheel_rad: float
     overall_ratio_deg_per_deg: float
     rack_direction: int = 1
+    # Per-WHEEL steer vs rack (rad, static toe removed, + = into a LEFT turn
+    # for both wheels).  Filled by from_probe; None on the linear fallback.
+    # This is THE Ackermann curve of the linkage: inner/outer split at any
+    # steer comes from here, never from one percentage times the spread.
+    wheel_fl_rad_grid: Optional[np.ndarray] = None
+    wheel_fr_rad_grid: Optional[np.ndarray] = None
 
     def __post_init__(self):
         if self.rack_direction not in (-1, 1):
             raise ValueError('rack_direction must be +1 or -1')
+
+    # ── The linkage's own Ackermann curve ────────────────────────────────
+
+    @property
+    def has_pair_curve(self) -> bool:
+        return (self.wheel_fl_rad_grid is not None
+                and self.wheel_fr_rad_grid is not None)
+
+    def pair_from_mean(self, mean_rad) -> tuple:
+        """(inner, outer) road-wheel angles (rad, magnitudes into the turn)
+        the SOLVED linkage gives at a mean steer ``mean_rad`` (+ = left
+        turn).  Left turn: FL is inner, FR outer; mirrored for a right turn.
+        Raises if the probe did not store the per-wheel grids."""
+        if not self.has_pair_curve:
+            raise ValueError('SteeringGeometry has no per-wheel curve '
+                             '(built from a linear ratio, not a probe)')
+        m = float(mean_rad)
+        rack = float(self.rack_from_road_wheel(abs(m)))
+        fl = float(np.interp(rack, self.rack_m_grid, self.wheel_fl_rad_grid))
+        fr = float(np.interp(rack, self.rack_m_grid, self.wheel_fr_rad_grid))
+        return (fl, fr)          # left turn: inner = FL, outer = FR
+
+    def ackermann_pct_from_mean(self, mean_rad, track_m: float,
+                                wheelbase_m: float) -> float:
+        """Ackermann % the linkage actually delivers at this mean steer
+        (canonical cot-difference definition, vahan.ackermann)."""
+        from .ackermann import ackermann_pct_from_pair
+        d_in, d_out = self.pair_from_mean(mean_rad)
+        return ackermann_pct_from_pair(math.degrees(d_in), math.degrees(d_out),
+                                       track_m, wheelbase_m)
 
     # ── Construction ────────────────────────────────────────────────────
 
@@ -155,6 +192,8 @@ class SteeringGeometry:
         if not np.all(np.isfinite([neutral_fl, neutral_fr])):
             raise ValueError('Steering probe needs valid neutral toe on both corners')
         rw = np.zeros_like(rack_grid)
+        w_fl = np.full_like(rack_grid, np.nan)   # per-wheel, + = left turn
+        w_fr = np.full_like(rack_grid, np.nan)
         for i, rm in enumerate(rack_grid):
             try:
                 a_fl = front_solver_factory(float(rm), 'FL')
@@ -163,6 +202,8 @@ class SteeringGeometry:
                     rw[i] = np.nan
                     continue
                 rw[i] = 0.5 * ((a_fr-neutral_fr) - (a_fl-neutral_fl))
+                w_fl[i] = -(a_fl - neutral_fl)    # FL toes OUT in a left turn
+                w_fr[i] = +(a_fr - neutral_fr)    # FR toes IN
             except Exception:
                 rw[i] = np.nan
 
@@ -179,6 +220,8 @@ class SteeringGeometry:
 
         mask = ~np.isnan(rw)
         rw = np.interp(rack_grid, rack_grid[mask], rw[mask])
+        w_fl = np.interp(rack_grid, rack_grid[mask], w_fl[mask])
+        w_fr = np.interp(rack_grid, rack_grid[mask], w_fr[mask])
 
         # Small-angle overall ratio from central finite difference
         dr = rack_grid[1] - rack_grid[0] if len(rack_grid) > 1 else 1e-3
@@ -201,6 +244,8 @@ class SteeringGeometry:
             max_road_wheel_rad=max_rw,
             overall_ratio_deg_per_deg=float(dsw_deg_drw_deg),
             rack_direction=rack_direction,
+            wheel_fl_rad_grid=w_fl,
+            wheel_fr_rad_grid=w_fr,
         )
 
     @classmethod
@@ -301,6 +346,8 @@ class SteeringGeometry:
 # ═════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_LAT_GRID = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.2, 2.3)
+# FSAE skidpad centre-line radius (rules: 15.25 m inner diameter + 3.0 m lane)
+FSAE_SKIDPAD_RADIUS_M = (15.25 + 3.0) / 2.0
 
 
 def linkage_gains(front_hp: dict, pushrod_body: str):
@@ -336,20 +383,52 @@ def linkage_gains(front_hp: dict, pushrod_body: str):
 def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
                             tire_model, steer_cfg: Optional[dict] = None,
                             lat_grid=DEFAULT_LAT_GRID,
-                            front_solver=None) -> dict:
+                            front_solver=None,
+                            aero_Fz_per_g: Optional[dict] = None,
+                            turn_radius_m: Optional[float] = None,
+                            steering_geometry=None) -> dict:
     """Steering-effort report from the solved model.
 
     ss_solver: SteadyStateSolver (per-wheel Fy/Fz/camber at each lat g).
     front_hp:  front hardpoint dict.  pushrod_body: topology damper mount.
     tire_model: front TTC tire (Mz + slip_angle_for_Fy).
-    steer_cfg: config 'steer' block {rack_travel_per_rev_mm, total_rack_travel_mm}.
+    steer_cfg: config 'steer' block {rack_travel_per_rev_mm, total_rack_travel_mm,
+        wheel_od_mm}.  ``wheel_od_mm`` (steering-wheel outer diameter, a
+        PROJECT input — user 2026-10-11) turns the hand torque into the
+        RIM FORCE the hands feel, F_rim = T / (OD/2); a project without it
+        reports ``wheel_od_mm=None`` and NO rim force (never a default).
     front_solver: solved FL corner solver, for trail/scrub + the physical arm.
+    aero_Fz_per_g: falsy, or the per-corner N-per-lateral-g package dict
+        (MainWindow._get_aero_Fz_per_g); each station's solve receives
+        dict x lat_g.  Added 2026-10-10 — before this the hand torque was
+        the no-aero car's.
+    turn_radius_m: constant corner radius the hand-wheel angle is reported
+        on (``handwheel_deg_vs_latg``); None = the FSAE skidpad centre-line
+        radius (FSAE_SKIDPAD_RADIUS_M).
+    steering_geometry: the probed SteeringGeometry of the car (the nonlinear
+        rack -> road-wheel curve with its stop).  When given, the hand-wheel
+        angle comes from it (``handwheel_source='probed SteeringGeometry'``);
+        else from the small-angle ratio arm/C (``'arm/C ratio'``).
+
+    Besides the rack force / hand torque the report carries, per station,
+    the MOMENT ABOUT THE KINGPIN each wheel makes (M_kp = TTC Mz + Fy x
+    mechanical trail, N·m — the moment the steering arm has to react) and the
+    tie-rod force that moment needs on the physical arm
+    (``M_kp_vs_latg``, ``tie_rod_force_vs_latg``).
     """
     from vahan.kinematics import KinematicMetrics
 
     steer_cfg = steer_cfg or {}
     C_mm = float(steer_cfg.get('rack_travel_per_rev_mm', 0.0) or 0.0)
     stroke_mm = float(steer_cfg.get('total_rack_travel_mm', 0.0) or 0.0)
+    # Steering-wheel outer diameter from the project steer block.  Missing /
+    # zero = UNKNOWN: the rim force is then not reported rather than invented.
+    try:
+        _od = steer_cfg.get('wheel_od_mm')
+        wheel_od_mm = float(_od) if _od is not None and float(_od) > 0 else None
+    except (TypeError, ValueError):
+        wheel_od_mm = None
+    wb = float(getattr(getattr(ss_solver, '_veh', None), 'wheelbase_m', 1.537))
 
     gL, gR = linkage_gains(front_hp, pushrod_body)
     arm_L = 1.0 / gL * 1000.0 if gL else float('nan')
@@ -383,7 +462,10 @@ def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
             return 6.0
 
     def F_rack_at(lat_g):
-        r = ss_solver.solve(float(lat_g), 0.0)
+        aero_row = ({k: float(aero_Fz_per_g.get(k, 0.0)) * float(lat_g)
+                     for k in ('FL', 'FR', 'RL', 'RR')}
+                    if aero_Fz_per_g else None)
+        r = ss_solver.solve(float(lat_g), 0.0, aero_Fz=aero_row)
         total = 0.0
         parts = {}
         for lbl, g in (('FL', gL), ('FR', gR)):
@@ -399,13 +481,15 @@ def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
             mk = mz + abs(Fy) * t_mech
             total += mk * abs(g)
             parts[lbl] = dict(Fy=Fy, Fz=Fz, alpha_deg=al, Mz=mz, M_kp=mk)
-        return total, parts
+        us = float(getattr(r, 'understeer_gradient_deg', 0.0) or 0.0)
+        return total, parts, (us if np.isfinite(us) else 0.0)
 
-    curve, parts_at = [], {}
+    curve, parts_at, us_at = [], {}, {}
     for lg in lat_grid:
-        F, parts = F_rack_at(lg)
+        F, parts, us = F_rack_at(lg)
         curve.append((float(lg), float(F)))
         parts_at[float(lg)] = parts
+        us_at[float(lg)] = us
     F_arr = [f for _, f in curve]
     F_max = max(F_arr)
     peak_g = curve[int(np.argmax(F_arr))][0]
@@ -423,9 +507,21 @@ def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
         if np.isfinite(mk_max) and arm_torq > 0:
             f_tr_max = float(mk_max / (arm_torq / 1000.0))
 
+    # Per-station kingpin moment per wheel (N·m) and the tie-rod force the
+    # physical arm needs to react it (N) — "the moment about the steering
+    # arm", not just a force (user, 2026-10-10).
+    M_kp_curve = [(float(g), round(parts_at[float(g)]['FL']['M_kp'], 2),
+                   round(parts_at[float(g)]['FR']['M_kp'], 2)) for g, _ in curve]
+    tr_curve = ([(float(g), round(parts_at[float(g)]['FL']['M_kp'] / (arm_torq / 1000.0), 1),
+                  round(parts_at[float(g)]['FR']['M_kp'] / (arm_torq / 1000.0), 1))
+                 for g, _ in curve]
+                if np.isfinite(arm_torq) and arm_torq > 0 else [])
     out = dict(
         arm_eff_mm_L=round(arm_L, 1), arm_eff_mm_R=round(arm_R, 1),
         arm_eff_mm=round(arm_eff, 1),
+        M_kp_vs_latg=M_kp_curve,
+        tie_rod_force_vs_latg=tr_curve,
+        aero=bool(aero_Fz_per_g),
         arm_physical_mm=(round(arm_phys, 1) if np.isfinite(arm_phys) else None),
         arm_torque_mm=(round(arm_torq, 1) if np.isfinite(arm_torq) else None),
         tie_rod_force_max_N=(round(f_tr_max, 0) if np.isfinite(f_tr_max) else None),
@@ -433,14 +529,49 @@ def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
         F_rack_vs_latg=[(g, round(f, 1)) for g, f in curve],
         F_max_N=round(F_max, 1), peak_latg=peak_g,
         C_mm_per_rev=(C_mm or None), stroke_total_mm=(stroke_mm or None),
+        wheel_od_mm=wheel_od_mm,
     )
     if C_mm:
         c = C_mm / (2.0 * np.pi * 1000.0)
         out['T_vs_latg'] = [(g, round(f * c, 2)) for g, f in curve]
         out['T_max_Nm'] = round(F_max * c, 2)
         out['ratio_to1'] = round((arm_eff / 1000.0) / (C_mm / 1000.0 / (2 * np.pi)), 2)
+        if wheel_od_mm:
+            # RIM FORCE — what the hands feel: torque / wheel radius (both
+            # hands together, tangential at the rim).  User 2026-10-11.
+            r_rim_m = wheel_od_mm / 2000.0
+            out['F_rim_vs_latg'] = [(g, round(f * c / r_rim_m, 1)) for g, f in curve]
+            out['F_rim_max_N'] = round(F_max * c / r_rim_m, 1)
+        if stroke_mm:
+            # Hand-wheel angle to the STEERING STOP (one way): half the total
+            # rack travel through the pinion's mm/rev.
+            out['handwheel_to_lock_deg'] = round(stroke_mm / 2.0 / C_mm * 360.0, 2)
+    # Hand-wheel angle the car needs at each lateral-g station on a constant
+    # corner radius: road-wheel angle = Ackermann atan(L/R) + the solve's
+    # understeer at that station (front - rear slip angle, deg), mapped to the
+    # hand wheel through the probed SteeringGeometry when given (nonlinear
+    # linkage curve, clamps at the rack stop) else the small-angle arm/C ratio.
+    R_m = float(turn_radius_m) if turn_radius_m else FSAE_SKIDPAD_RADIUS_M
+    if wb > 0 and R_m > 0 and (steering_geometry is not None or C_mm):
+        ack_deg = float(np.degrees(np.arctan(wb / R_m)))
+        road, hw = [], []
+        for g, _ in curve:
+            rw_deg = ack_deg + us_at[g]
+            if steering_geometry is not None:
+                sw = float(steering_geometry.steering_wheel_from_road_wheel(np.radians(rw_deg)))
+                hw_deg = abs(sw) * (1.0 if rw_deg >= 0 else -1.0)
+            else:
+                hw_deg = rw_deg * out['ratio_to1']
+            road.append((g, round(rw_deg, 2))); hw.append((g, round(hw_deg, 1)))
+        out['turn_radius_m'] = R_m
+        out['ackermann_road_wheel_deg'] = round(ack_deg, 2)
+        out['road_wheel_deg_vs_latg'] = road
+        out['handwheel_deg_vs_latg'] = hw
+        out['handwheel_source'] = ('probed SteeringGeometry' if steering_geometry is not None
+                                   else 'arm/C ratio')
+        if steering_geometry is not None:
+            out['ratio_probed_to1'] = round(float(steering_geometry.overall_ratio_deg_per_deg), 2)
     if stroke_mm and np.isfinite(arm_eff):
-        wb = float(getattr(getattr(ss_solver, '_veh', None), 'wheelbase_m', 1.537))
         delta_need = np.degrees(np.arctan(wb / 3.93)) + 3.0   # FSAE hairpin + slip margin
         need = (arm_eff / 1000.0) * np.radians(delta_need) * 1000.0
         out['delta_need_deg'] = round(delta_need, 1)
@@ -450,3 +581,84 @@ def compute_steering_effort(ss_solver, front_hp: dict, pushrod_body: str,
         if C_mm:
             out['lock_to_lock_deg'] = round(2.0 * need / C_mm * 360.0, 0)
     return out
+
+
+# ─── Caster jacking (2026-10-07) ─────────────────────────────────────────────
+#  Steering a wheel about its inclined kingpin (caster + KPI, with scrub and
+#  trail) moves the tyre's contact patch up or down RELATIVE TO THE CHASSIS.
+#  With the tyre on the ground that is a ride-height change at that corner.
+#  The corner solver pins the wheel-centre Z (its travel input), so at
+#  solve(0.) the jacking hides in arm/rocker/spring motion; the physical
+#  "rigid suspension" answer is the travel at which the steered corner's
+#  spring is back at its straight-ahead length (spring frozen -> rocker,
+#  pushrod and arms frozen -> the upright turns about the static kingpin).
+#  Ride-height change = -(contact-patch Z at that state - static contact-patch
+#  Z), + = chassis UP at that corner.  Weight lifted = lift x wheel rate: the
+#  vertical load that corner takes on if the body is held (the spring must be
+#  compressed by the jacking displacement), i.e. the diagonal / heave load the
+#  steering puts into the car.  Cradle-link corners (decoupled / T-bar) have
+#  no per-corner spring and read NaN.
+
+def frozen_spring_travel_m(solver, spring_length_ref_m: float, x0=None,
+                           t0: float = 0.0, tol_m: float = 1e-9,
+                           max_iter: int = 20):
+    """Wheel travel (m) at which this (steered) corner's spring length is back
+    at ``spring_length_ref_m``.  Secant iteration on SolvedState.spring_length
+    (smooth, near-linear in travel: slope = -motion ratio); NaN when the corner
+    has no spring (cradle_link corners) or the iteration does not converge."""
+    if not np.isfinite(spring_length_ref_m):
+        return float('nan')
+
+    def f(t):
+        st = solver.solve(float(t), x0=None if x0 is None else np.array(x0, float))
+        return float(st.spring_length) - float(spring_length_ref_m)
+    try:
+        ta, fa = float(t0), f(t0)
+        if not np.isfinite(fa):
+            return float('nan')
+        if abs(fa) < 1e-12:
+            return ta
+        tb = ta + 0.002
+        fb = f(tb)
+        for _ in range(max_iter):
+            if not np.isfinite(fb) or fb == fa:
+                return float('nan')
+            tc = tb - fb * (tb - ta) / (fb - fa)
+            if abs(tc) > 0.1:          # +-100 mm: no physical root
+                return float('nan')
+            ta, fa, tb = tb, fb, tc
+            fb = f(tb)
+            if abs(tb - ta) < tol_m and abs(fb) < 1e-9:
+                return float(tb)
+        return float('nan')
+    except Exception:
+        return float('nan')
+
+
+def caster_jacking_ref(solver, tire_radius_m: float) -> dict:
+    """Straight-ahead static reference for :func:`caster_jacking`: the spring
+    length and the contact-patch Z of this corner at zero steer, zero travel."""
+    from .loads import contact_patch_point
+    st = solver.solve(0.0)
+    return {'spring_length_m': float(st.spring_length),
+            'cp_z_m': float(contact_patch_point(st.wheel_center, st.spin_axis,
+                                                float(tire_radius_m))[2])}
+
+
+def caster_jacking(solver, ref: dict | None, tire_radius_m: float, x0=None) -> dict:
+    """Caster jacking of one STEERED corner solver against its straight-ahead
+    reference (:func:`caster_jacking_ref`).
+
+    Returns ``{'travel_m': t*, 'lift_m': h}`` where t* is the frozen-spring
+    travel and h = -(contact-patch Z at t* - reference contact-patch Z) is the
+    ride-height change at that corner, + = chassis UP.  NaN when undefined."""
+    from .loads import contact_patch_point
+    nan = float('nan')
+    if not ref or not np.isfinite(tire_radius_m):
+        return {'travel_m': nan, 'lift_m': nan}
+    t = frozen_spring_travel_m(solver, ref['spring_length_m'], x0=x0)
+    if not np.isfinite(t):
+        return {'travel_m': nan, 'lift_m': nan}
+    st = solver.solve(t, x0=None if x0 is None else np.array(x0, float))
+    cp_z = float(contact_patch_point(st.wheel_center, st.spin_axis, float(tire_radius_m))[2])
+    return {'travel_m': float(t), 'lift_m': -(cp_z - float(ref['cp_z_m']))}

@@ -214,6 +214,51 @@ class NavCube(QWidget):
 
 # ── geometry helpers ──────────────────────────────────────────────────────────
 
+_PLANES = (  # smallest component -> the force lies nearly IN this plane
+    (0, 1, 2, 'YZ', 'X', 'Y', 'Z'),   # (normal, a1, a2, plane, normal name, a1 name, a2 name)
+    (1, 0, 2, 'XZ', 'Y', 'X', 'Z'),
+    (2, 0, 1, 'XY', 'Z', 'X', 'Y'))
+_AX_WORD = {'X': 'lat', 'Y': 'f-a', 'Z': 'vert'}
+
+
+def plane_angles(v):
+    """How to APPLY a vector with two angles (binder angle mode): the cardinal
+    plane it most nearly lies in (the one whose normal is its smallest component),
+    the in-plane angle theta from that plane's first axis toward its second, and
+    the tilt phi off the plane toward the normal.  Returns a dict with plane,
+    a1/a2/normal names, theta_deg, tilt_deg, and the unit vectors a1, a2, nrm,
+    shadow (in-plane direction); None for a zero / non-finite vector."""
+    v = np.asarray(v, float).ravel()[:3]
+    n = float(np.linalg.norm(v))
+    if not np.isfinite(n) or n < 1e-12:
+        return None
+    d = v / n
+    ad = np.abs(d)
+    ni = int(np.argmin(ad))
+    norm_i, a1_i, a2_i, name, nn, n1, n2 = _PLANES[ni]
+    a1 = np.zeros(3); a1[a1_i] = 1.0
+    a2 = np.zeros(3); a2[a2_i] = 1.0
+    nrm = np.zeros(3); nrm[norm_i] = 1.0
+    theta = float(np.degrees(np.arctan2(d[a2_i], d[a1_i])))
+    tilt = float(np.degrees(np.arcsin(np.clip(d[norm_i], -1.0, 1.0))))
+    shadow = d[a1_i] * a1 + d[a2_i] * a2
+    sn = float(np.linalg.norm(shadow))
+    shadow = shadow / sn if sn > 1e-12 else a1
+    return {'plane': name, 'normal': nn, 'a1': n1, 'a2': n2, 'theta_deg': theta,
+            'tilt_deg': tilt, 'a1_v': a1, 'a2_v': a2, 'nrm_v': nrm, 'shadow_v': shadow,
+            'theta_rad': float(np.arctan2(d[a2_i], d[a1_i])),
+            'tilt_rad': float(np.arcsin(np.clip(d[norm_i], -1.0, 1.0)))}
+
+
+def plane_angle_text(v):
+    """'YZ plane: θ 32° from +Y(f-a), tilt +5° to +X(lat)'."""
+    a = plane_angles(v)
+    if a is None:
+        return '—'
+    return (f"{a['plane']} plane: θ {a['theta_deg']:.0f}° from +{a['a1']}({_AX_WORD[a['a1']]}), "
+            f"tilt {a['tilt_deg']:+.0f}° to +{a['normal']}({_AX_WORD[a['normal']]})")
+
+
 def _norm(v):
     n = np.linalg.norm(v)
     return v / n if n > 1e-12 else v
@@ -687,6 +732,10 @@ class View3D:
         self._member_r_thin = 0.0006    # ~1 mm wisps (thickness OFF → reads as lines)
         self._member_r = self._member_r_full
         self._thick_on  = True          # navcube "Thickness" toggle state
+        self._show_wheels = True        # navcube "Wheels" toggle (tyre + rim meshes)
+        self._angle_mode = False        # Load mode: draw the angle construction on hover / click
+        self._angle_sel = None          # pinned arrow index (click) or None
+        self._on_load_pick = None       # cb(label) on a click in Load mode
         self._rocker_half_t = 0.003     # bellcrank = 6 mm flat PLATE (extruded, not tubed)
         self._rocker_plate_style = 'legacy'
         self._front_rocker_plate_style = None
@@ -1012,16 +1061,21 @@ class View3D:
         self._thick_chk = QCheckBox('Thickness'); self._thick_chk.setChecked(True)
         self._thick_chk.setToolTip('Draw members / ARB / pushrods / driveshaft / '
                                    'springs as solid tubes (off = thin lines)')
+        self._wheels_chk = QCheckBox('Wheels'); self._wheels_chk.setChecked(True)
+        self._wheels_chk.setToolTip('Show the tyres and rims (off = see the upright, bearings and load arrows)')
         _vl.addWidget(self._mode_combo)
         _vl.addWidget(self._persp_chk)
         _vl.addWidget(self._floor_chk)
         _vl.addWidget(self._thick_chk)
+        _vl.addWidget(self._wheels_chk)
         self._viewctrl.adjustSize()
         self._on_view_controls = None
         self._mode_combo.currentTextChanged.connect(self._emit_view_controls)
         self._persp_chk.toggled.connect(self._emit_view_controls)
         self._floor_chk.toggled.connect(self._emit_view_controls)
         self._thick_chk.toggled.connect(self._emit_view_controls)
+        self._wheels_chk.toggled.connect(lambda on: self.set_wheels(bool(on)))
+        self._wheels_chk.toggled.connect(self._emit_view_controls)
 
         # ── Watermark (top-right credit) ──────────────────────────────────
         self._watermark = QLabel('Made by Yu @ Cougar Racing', parent=n)
@@ -1351,7 +1405,7 @@ class View3D:
                             else self._rear_rocker_pr_full_length_fork_jog)
 
             # corner isolation (wheel-package view): hide the other corners
-            if self._isolate and corner.get('label') != self._isolate:
+            if self._is_hidden(corner.get('label')):
                 _z = np.zeros((3, 3), np.float32); _t = np.array([[0, 1, 2]], np.uint32)
                 _pose_mesh(self._tire_meshes[ci], vertices=_z, faces=_t)
                 _pose_mesh(self._rim_meshes[ci], vertices=_z, faces=_t)
@@ -1739,7 +1793,9 @@ class View3D:
         # isolated in NORMAL mode, but KEPT in Load / Interference mode (the
         # loads view wants the ARB structure visible for its force arrows).
         self._arb_vis.set_data(pos=np.zeros((2, 3), np.float32))
-        _arb_show = bool(arb_segs) and (not self._isolate
+        # Axle isolation (2 corners) keeps that axle's bar: the host filters
+        # arb_segs down to the visible axle (_assemble_arb_segs(axles=...)).
+        _arb_show = bool(arb_segs) and (not self._isolate or len(self._isolate) >= 2
                                         or self._view_mode in ('load', 'interference'))
         # record the ARB linkage this frame draws (mesh → invisible to a Line capture)
         self._last_arb_segs = ([(np.asarray(s[0], float).copy(),
@@ -1784,7 +1840,7 @@ class View3D:
             if ci >= len(self._spring_meshes):
                 break
             pts = corner['pts']
-            if self._isolate and corner.get('label') != self._isolate:
+            if self._is_hidden(corner.get('label')):
                 _pose_mesh(self._spring_meshes[ci],
                     vertices=np.zeros((3, 3), np.float32),
                     faces=np.array([[0, 1, 2]], np.uint32))
@@ -2151,15 +2207,17 @@ class View3D:
                 'view_mode': self._mode_combo.currentText().lower(),
                 'perspective': self._persp_chk.isChecked(),
                 'floor': self._floor_chk.isChecked(),
-                'thickness': self._thick_chk.isChecked()})
+                'thickness': self._thick_chk.isChecked(),
+                'wheels': self._wheels_chk.isChecked()})
 
     def sync_view_controls(self, view_mode=None, perspective=None, floor=None,
-                           thickness=None):
+                           thickness=None, wheels=None):
         """Set the overlay controls to match external state without re-firing."""
         for w, v, setter in ((self._mode_combo, view_mode, 'combo'),
                              (self._persp_chk, perspective, 'chk'),
                              (self._floor_chk, floor, 'chk'),
-                             (self._thick_chk, thickness, 'chk')):
+                             (self._thick_chk, thickness, 'chk'),
+                             (self._wheels_chk, wheels, 'chk')):
             if v is None:
                 continue
             w.blockSignals(True)
@@ -2177,6 +2235,22 @@ class View3D:
         Caller must re-run update_scene / set_driveshaft_package to apply."""
         self._thick_on = bool(on)
         self._member_r = self._member_r_full if self._thick_on else self._member_r_thin
+
+    def set_wheels(self, show: bool) -> None:
+        """Show / hide the tyres and rims (the uprights, bearings and load arrows
+        stay).  View only — nothing in the model changes."""
+        self._show_wheels = bool(show)
+        for m in list(self._tire_meshes) + list(self._rim_meshes):
+            m.visible = self._show_wheels
+        try:
+            self._wheels_chk.blockSignals(True); self._wheels_chk.setChecked(self._show_wheels)
+            self._wheels_chk.blockSignals(False)
+        except Exception:
+            pass
+        self._canvas.update()
+
+    def wheels_visible(self) -> bool:
+        return bool(self._show_wheels)
 
     def set_brakes(self, show: bool) -> None:
         """Show/hide the brake rotors + calipers in the 3-D view."""
@@ -2216,26 +2290,56 @@ class View3D:
             except (TypeError, ValueError):
                 pass
 
-    def set_isolate_corner(self, lbl) -> None:
-        """Draw only corner ``lbl`` (e.g. 'RL'); None shows all four.  Used by
-        the wheel-package view to isolate one corner."""
-        self._isolate = lbl if lbl in ('FL', 'FR', 'RL', 'RR') else None
+    @staticmethod
+    def _isolate_set(sel):
+        """Normalise an isolate selection to a frozenset of corner labels
+        (None = draw everything).  Accepts a corner ('RL'), an axle ('front' /
+        'rear' / 'F' / 'R'), or any iterable of corner labels."""
+        if not sel:
+            return None
+        if isinstance(sel, str):
+            s = sel.strip().upper()
+            if s in ('FL', 'FR', 'RL', 'RR'):
+                return frozenset({s})
+            if s in ('F', 'FRONT', 'FRONT AXLE'):
+                return frozenset({'FL', 'FR'})
+            if s in ('R', 'REAR', 'REAR AXLE'):
+                return frozenset({'RL', 'RR'})
+            return None
+        out = frozenset(str(x).strip().upper() for x in sel
+                        if str(x).strip().upper() in ('FL', 'FR', 'RL', 'RR'))
+        return out or None
+
+    def set_isolate_corner(self, sel) -> None:
+        """Draw only the selected corner(s): a label ('RL'), an axle ('front' /
+        'rear'), or an iterable of labels; None / '' shows all four.  Used by
+        the wheel-package view and View -> Isolate.  VIEW ONLY: the solved
+        model behind the hidden corners is untouched."""
+        self._isolate = self._isolate_set(sel)
+
+    def isolate_selection(self):
+        """The corner labels currently drawn (frozenset) or None for all."""
+        return self._isolate
+
+    def _is_hidden(self, label) -> bool:
+        return bool(self._isolate) and str(label).strip().upper() not in self._isolate
 
     def set_load_vectors(self, arrows) -> None:
-        """Draw force-vector arrows in Load mode.
+        """Draw load arrows in Load mode.
 
-        arrows: list of (p, tip, rgba) world-point pairs + colour.  Each is a
-        shaft plus a 4-barb 3-D arrowhead so the direction reads from any angle.
+        arrows: list of (p, tip, rgba[, label]) world-point pairs + colour.  A
+        FORCE is a shaft plus a 4-barb 3-D arrowhead.  A MOMENT (label carries
+        N·m) is rotational, so it is drawn as the rotation itself: a ~250° arc
+        in the plane perpendicular to its axis, one arrowhead giving the sense
+        (right-hand rule about the axis), and a dotted tick along the axis.
         Empty / None clears them.
         """
         try:
             self._loadvec_count = len(arrows) if arrows else 0
-            self._loadvec_snap = []          # [(tip_world, label)] for hover
+            self._loadvec_snap = []          # [(tip, label, base, unit_dir, length, is_moment)]
+            self._angle_sel = None
+            self._clear_angle_construction()
             if not arrows:
-                # Reset the COLOUR buffer too.  Setting pos alone left the old
-                # per-vertex colour array in place, so clearing a populated load
-                # view raised "All attributes must have the same size" on the next
-                # draw (832-long colour against a 2-long position).
                 self._loadvec_vis.set_data(
                     pos=np.zeros((2, 3), np.float32),
                     color=np.zeros((2, 4), np.float32))
@@ -2244,29 +2348,279 @@ class View3D:
             for a in arrows:
                 p = np.asarray(a[0], float); tip = np.asarray(a[1], float); c = a[2]
                 lab = a[3] if len(a) > 3 else ''
-                self._loadvec_snap.append((tip.copy(), lab))
-                segs += [p, tip]; cols += [c, c]
                 d = tip - p; L = float(np.linalg.norm(d))
                 if L < 1e-6:
+                    self._loadvec_snap.append((tip.copy(), lab, p.copy(), np.zeros(3), 0.0, False))
                     continue
                 u = d / L
+                is_mom = ('N·m' in lab)
                 perp = _cross3(u, np.array([0., 0., 1.0]))
                 if np.linalg.norm(perp) < 1e-6:
                     perp = _cross3(u, np.array([0., 1.0, 0.]))
                 perp = perp / np.linalg.norm(perp)
                 perp2 = _cross3(u, perp)
+                if is_mom:
+                    R = 0.75 * L
+                    ts = np.linspace(-2.2, 2.2, 27)
+                    pts = [p + perp * R * np.cos(tt) + perp2 * R * np.sin(tt) for tt in ts]
+                    for k in range(len(pts) - 1):
+                        segs += [pts[k], pts[k + 1]]; cols += [c, c]
+                    # arrowhead at the arc end, along the arc tangent
+                    e, e2 = pts[-1], pts[-2]
+                    tg = e - e2; tg = tg / max(np.linalg.norm(tg), 1e-9)
+                    rad = e - p; rad = rad / max(np.linalg.norm(rad), 1e-9)
+                    hl = min(0.02, 0.5 * R)
+                    for pp in (rad, -rad, u, -u):
+                        barb = e - tg * hl + pp * hl * 0.55
+                        segs += [e, barb]; cols += [c, c]
+                    # dotted axis tick (the axis it turns about)
+                    for k in range(6):
+                        s0 = p + u * L * (k / 6.0); s1 = p + u * L * ((k + 0.5) / 6.0)
+                        segs += [s0, s1]; cols += [c, c]
+                    self._loadvec_snap.append((e.copy(), lab, p.copy(), u, L, True))
+                    continue
+                segs += [p, tip]; cols += [c, c]
+                self._loadvec_snap.append((tip.copy(), lab, p.copy(), u, L, False))
                 hl = min(0.02, 0.32 * L)
-                # a MOMENT vector (label carries N·m) gets a DOUBLE arrowhead so it
-                # reads as a torque, not a force.
-                _tips = [tip, tip - u * hl] if ('N·m' in lab) else [tip]
-                for _t in _tips:
-                    for pp in (perp, -perp, perp2, -perp2):
-                        barb = _t - u * hl + pp * hl * 0.55
-                        segs += [_t, barb]; cols += [c, c]
+                for pp in (perp, -perp, perp2, -perp2):
+                    barb = tip - u * hl + pp * hl * 0.55
+                    segs += [tip, barb]; cols += [c, c]
             self._loadvec_vis.set_data(pos=np.array(segs, np.float32),
                                        color=np.array(cols, np.float32))
         except Exception:
             pass
+
+    # ── Load mode: angle construction (binder "angle mode") ──────────────────
+    def set_angle_mode(self, on: bool) -> None:
+        """When on, hovering a FORCE arrow in Load mode draws how to apply it with
+        two angles: the cardinal plane it most nearly lies in (translucent quad),
+        theta in that plane from its first axis, and the tilt phi off the plane.
+        A click pins the construction on that arrow; another click releases."""
+        self._angle_mode = bool(on)
+        if not self._angle_mode:
+            self._angle_sel = None
+            self._clear_angle_construction()
+
+    def set_on_load_pick(self, cb) -> None:
+        """cb(label) when a load arrow is clicked in Load mode."""
+        self._on_load_pick = cb
+
+    def _clear_angle_construction(self):
+        for key in (('line', '_angle'), ('text', '_angle'), ('quad', '_angle')):
+            vis = self._overlay_store().get(key)
+            if vis is not None:
+                vis.visible = False
+        self._canvas.update()
+
+    def draw_angle_construction(self, base, direction, length, rgba=(1.0, 0.84, 0.0, 1.0)) -> dict | None:
+        """Draw the reference plane + the two angle arcs for one force at `base`
+        along `direction` (any length) with a drawn arrow length `length` (m).
+        Returns the plane_angles dict (None for a zero vector)."""
+        a = plane_angles(direction)
+        if a is None:
+            self._clear_angle_construction(); return None
+        p = np.asarray(base, float); L = float(length)
+        h = 0.9 * L; R = 0.62 * L
+        a1, a2, nrm, sh = a['a1_v'], a['a2_v'], a['nrm_v'], a['shadow_v']
+        d = np.asarray(direction, float); d = d / max(np.linalg.norm(d), 1e-12)
+        quad = [p + (a1 * sx + a2 * sy) * h for sx, sy in ((1, 1), (1, -1), (-1, -1), (-1, 1))]
+        self.set_overlay_quad('_angle', quad, (rgba[0], rgba[1], rgba[2], 0.16))
+        segs = [(p, p + a1 * h)]                                   # the plane's first axis
+        for k in range(8):                                          # dotted in-plane shadow
+            segs.append((p + sh * L * (k / 8.0), p + sh * L * ((k + 0.5) / 8.0)))
+        def arc(va, vb, ang):
+            n = max(8, int(abs(ang) / 0.1))
+            dirs = [va * np.cos(ang * k / n) + vb * np.sin(ang * k / n) for k in range(n + 1)]
+            pts = [p + u_ * R for u_ in dirs]
+            return [(pts[k], pts[k + 1]) for k in range(n)], dirs[len(dirs) // 2]
+        s1, u1 = arc(a1, a2, a['theta_rad'])                         # theta: a1 -> shadow
+        s2, u2 = arc(sh, nrm, a['tilt_rad'])                         # phi: shadow -> force
+        segs += s1 + s2
+        self.set_overlay_lines('_angle', segs, rgba, width=2.0, on_top=True)
+        # labels: theta just outside its arc, phi beyond the force tip so the two
+        # never sit on top of each other when phi is small
+        texts = [(p + u1 * R * 1.35, f"θ {a['theta_deg']:+.0f}° in {a['plane']} from +{a['a1']}", rgba),
+                 (p + d * L * 1.12, f"φ {a['tilt_deg']:+.0f}° off {a['plane']} to +{a['normal']}", rgba),
+                 (quad[2], f"{a['plane']} plane", (rgba[0], rgba[1], rgba[2], 0.8))]
+        self.set_overlay_text('_angle', texts, font_size=7.0)
+        return a
+
+    def set_overlay_quad(self, key, pts4, rgba) -> None:
+        """A translucent filled quad (4 world points) keyed by name."""
+        ov = self._overlay_store()
+        vis = ov.get(('quad', key))
+        if vis is None:
+            vis = scene.Mesh(vertices=np.zeros((3, 3), np.float32), faces=np.array([[0, 1, 2]], np.uint32),
+                             color=rgba, parent=self._view.scene)
+            try:
+                vis.set_gl_state(blend=True, depth_test=False)
+            except Exception:
+                pass
+            vis.order = 8
+            vis.visible = False; ov[('quad', key)] = vis
+        v = np.asarray(pts4, np.float32)
+        vis.set_data(vertices=v, faces=np.array([[0, 1, 2], [0, 2, 3]], np.uint32), color=rgba)
+        vis.visible = True
+        self._canvas.update()
+
+    def _pick_load(self, qpos, tol_px: float = 14.0):
+        """Index of the load arrow whose SHAFT (base..tip) is nearest the cursor
+        within tol_px, else None.  Projects through the camera like _hover_load."""
+        try:
+            tr = self._view.scene.node_transform(self._canvas.scene)
+            qx, qy = float(qpos.x()), float(qpos.y())
+            best, best_d2 = None, tol_px ** 2
+            for i, (tip, lab, base, u, L, is_mom) in enumerate(self._loadvec_snap):
+                pts = []
+                for w in (base, tip):
+                    m = tr.map([float(w[0]), float(w[1]), float(w[2]), 1.0])
+                    if m[3] <= 0:
+                        break
+                    pts.append((m[0] / m[3], m[1] / m[3]))
+                if len(pts) < 2:
+                    continue
+                (ax, ay), (bx, by) = pts
+                vx, vy = bx - ax, by - ay
+                ll = vx * vx + vy * vy
+                s = 0.0 if ll < 1e-9 else max(0.0, min(1.0, ((qx - ax) * vx + (qy - ay) * vy) / ll))
+                d2 = (qx - (ax + s * vx)) ** 2 + (qy - (ay + s * vy)) ** 2
+                if d2 < best_d2:
+                    best_d2, best = d2, i
+            return best
+        except Exception:
+            return None
+
+    def _angle_for_index(self, i):
+        """Draw (or clear) the angle construction for arrow i (forces only)."""
+        if i is None or i >= len(self._loadvec_snap):
+            self._clear_angle_construction(); return
+        tip, lab, base, u, L, is_mom = self._loadvec_snap[i]
+        if is_mom or L <= 0:
+            self._clear_angle_construction(); return
+        self.draw_angle_construction(base, u, L)
+
+    # ── generic keyed overlays (Chassis page: rolled bays, lumps, labels) ────
+    # Coloured geometry a page draws ON TOP of the one solved car.  Each key
+    # owns one visual that is reused on every redraw; empty data hides it.
+    def _overlay_store(self) -> dict:
+        if not hasattr(self, '_overlays'):
+            self._overlays = {}
+        return self._overlays
+
+    def set_overlay_tubes(self, key, members, rgba, n: int = 12) -> None:
+        """Solid tubes (dicts with 'a', 'b', 'r' in metres) in one colour."""
+        ov = self._overlay_store()
+        vis = ov.get(('tube', key))
+        if vis is None:
+            vis = self._new_mesh(rgba); vis.visible = False; ov[('tube', key)] = vis
+        VV, FF, off = [], [], 0
+        for m in (members or []):
+            a = np.asarray(m['a'], float); b = np.asarray(m['b'], float)
+            r = float(m.get('r', 0.0127))
+            if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))) or np.linalg.norm(b - a) < 1e-6:
+                continue
+            v, f = build_cylinder_between(a, b, r, n=n)
+            VV.append(np.asarray(v, np.float32)); FF.append(np.asarray(f) + off); off += len(v)
+        if not VV:
+            vis.visible = False; self._canvas.update(); return
+        vis.set_data(vertices=np.concatenate(VV).astype(np.float32),
+                     faces=np.concatenate(FF).astype(np.uint32), color=rgba)
+        vis.visible = True
+        self._canvas.update()
+
+    def set_overlay_spheres(self, key, items) -> None:
+        """Solid balls [(center, radius_m, rgba), ...] in one mesh."""
+        ov = self._overlay_store()
+        vis = ov.get(('sph', key))
+        if vis is None:
+            vis = scene.Mesh(vertices=np.zeros((3, 3), np.float32),
+                             faces=np.array([[0, 1, 2]], np.uint32),
+                             vertex_colors=np.ones((3, 4), np.float32),
+                             parent=self._view.scene)
+            vis.visible = False; ov[('sph', key)] = vis
+        VV, FF, CC, off = [], [], [], 0
+        for c, r, col in (items or []):
+            c = np.asarray(c, float)
+            if not np.all(np.isfinite(c)):
+                continue
+            v, f = build_sphere(c, float(r))
+            VV.append(np.asarray(v, np.float32)); FF.append(np.asarray(f) + off); off += len(v)
+            CC.append(np.tile(np.asarray(col, np.float32)[:4], (len(v), 1)))
+        if not VV:
+            vis.visible = False; self._canvas.update(); return
+        vis.set_data(vertices=np.concatenate(VV).astype(np.float32),
+                     faces=np.concatenate(FF).astype(np.uint32),
+                     vertex_colors=np.concatenate(CC).astype(np.float32))
+        vis.visible = True
+        self._canvas.update()
+
+    def set_overlay_lines(self, key, segs, rgba, width: float = 2.0, on_top: bool = False) -> None:
+        """Line segments [(p0, p1), ...] in one colour.  on_top = no depth test."""
+        ov = self._overlay_store()
+        vis = ov.get(('line', key))
+        if vis is None:
+            vis = scene.Line(pos=np.zeros((2, 3), np.float32), color=rgba, connect='segments',
+                             width=width, antialias=True, parent=self._view.scene)
+            if on_top:
+                vis.set_gl_state(depth_test=False, blend=True); vis.order = 9
+            vis.visible = False; ov[('line', key)] = vis
+        pts = [np.asarray(p, np.float32) for s in (segs or []) for p in s[:2]]
+        if not pts:
+            vis.visible = False; self._canvas.update(); return
+        vis.set_data(pos=np.array(pts, np.float32), color=rgba, width=width)
+        vis.visible = True
+        self._canvas.update()
+
+    def set_overlay_text(self, key, items, font_size: float = 10.0) -> None:
+        """3-D anchored labels [(xyz, text, rgba), ...] drawn over everything."""
+        ov = self._overlay_store()
+        vis = ov.get(('text', key))
+        if vis is None:
+            vis = scene.Text(text='', pos=(0.0, 0.0, 0.0), color='white', font_size=font_size,
+                             anchor_x='left', anchor_y='bottom', parent=self._view.scene)
+            try:
+                vis.set_gl_state(depth_test=False, blend=True); vis.order = 11
+            except Exception:
+                pass
+            vis.visible = False; ov[('text', key)] = vis
+        items = [(np.asarray(p, float), str(s), c) for p, s, c in (items or [])
+                 if np.all(np.isfinite(np.asarray(p, float))) and str(s)]
+        if not items:
+            vis.visible = False; self._canvas.update(); return
+        vis.text = [s for _, s, _ in items]
+        vis.pos = np.array([p for p, _, _ in items], np.float32)
+        try:
+            vis.color = [c for _, _, c in items]
+        except Exception:
+            vis.color = items[0][2]
+        vis.font_size = font_size
+        vis.visible = True
+        self._canvas.update()
+
+    def clear_overlays(self) -> None:
+        for vis in self._overlay_store().values():
+            vis.visible = False
+        self._canvas.update()
+
+    def overlay_visible(self, kind: str, key) -> bool:
+        vis = self._overlay_store().get((kind, key))
+        return bool(vis is not None and vis.visible)
+
+    def set_camera(self, azimuth=None, elevation=None, scale_factor=None, center=None) -> None:
+        """Pose the orbit camera (degrees / metres); None leaves a value alone."""
+        if azimuth is not None:
+            self._cam.azimuth = float(azimuth) % 360.0
+        if elevation is not None:
+            self._cam.elevation = float(np.clip(elevation, -89.9, 89.9))
+        if scale_factor is not None:
+            self._cam.scale_factor = float(scale_factor)
+        if center is not None:
+            self._cam.center = tuple(center)
+        try:
+            self._navcube.set_orientation(self._cam.azimuth, self._cam.elevation)
+        except Exception:
+            pass
+        self._canvas.update()
 
     def set_driveshaft_package(self, pkg, show: bool = True, only=None,
                                show_diff: bool = True) -> None:
@@ -2427,6 +2781,17 @@ class View3D:
             self._mouse_last = event.pos()
             self._mouse_btn  = event.button()
             if event.button() == Qt.MouseButton.LeftButton:
+                if self._view_mode == 'load' and self._loadvec_snap:
+                    i = self._pick_load(event.pos())
+                    if i is not None:
+                        if self._angle_mode:
+                            self._angle_sel = None if self._angle_sel == i else i
+                            self._angle_for_index(self._angle_sel if self._angle_sel is not None else i)
+                        if self._on_load_pick:
+                            try:
+                                self._on_load_pick(self._loadvec_snap[i][1])
+                            except Exception:
+                                pass
                 self._try_pick(event.pos())
         except Exception:
             pass
@@ -2441,14 +2806,11 @@ class View3D:
             # the scene node to the canvas scene walks through the camera projection.
             tr = self._view.scene.node_transform(self._canvas.scene)
             best_lab, best_d2 = None, 22 ** 2
-            for tip, lab in self._loadvec_snap:
-                m = tr.map([float(tip[0]), float(tip[1]), float(tip[2]), 1.0])
-                if m[3] <= 0:
-                    continue
-                sx, sy = m[0] / m[3], m[1] / m[3]
-                d2 = (qpos.x() - sx) ** 2 + (qpos.y() - sy) ** 2
-                if d2 < best_d2:
-                    best_d2, best_lab = d2, lab
+            best_i = self._pick_load(qpos, tol_px=22.0)
+            if best_i is not None:
+                best_lab = self._loadvec_snap[best_i][1]
+            if self._angle_mode and self._angle_sel is None:
+                self._angle_for_index(best_i)
             if best_lab:
                 self._load_tooltip.setText(best_lab); self._load_tooltip.adjustSize()
                 self._load_tooltip.move(qpos.x() + 14, qpos.y() + 10)

@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
-from vahan.engine import (engine_curve, DEFAULT_METHOD, VE_TARGET,
+from vahan.engine import (engine_curve, engine_tables_from_car, DEFAULT_METHOD, VE_TARGET,
                           VE_FALL_START_RPM, VE_AT_13K, FMEP_A_BAR,
                           FMEP_B_BAR, ANCHOR_HP, CREDIT_POWERTRAIN)
 
@@ -52,6 +52,8 @@ class EnginePage(QWidget):
         g.addWidget(QLabel('Method:'), 0, 0)
         self._method = QComboBox()
         self._method.addItems(['corrected', 'anchored', 'raw'])
+        if engine_tables_from_car(getattr(main, '_car', {})):
+            self._method.insertItem(0, 'table')   # a named project torque table
         self._method.setToolTip(
             'corrected = physics fix (breathing + friction), the default.\n'
             'anchored = raw shape scaled to the published peak.\n'
@@ -77,6 +79,20 @@ class EnginePage(QWidget):
         self._anchor = spin(2, 0, 'Anchor peak (hp crank):', 40, 130, ANCHOR_HP,
                             1, 1.0, 'Published restricted-CBR600RR crank peak '
                             '(75-85 typical) used by the anchored method.')
+        # named torque tables carried by the project (car['engine_tables']) +
+        # the power cap — both user inputs, saved by Apply, applied at use time
+        g.addWidget(QLabel('Table:'), 3, 0)
+        self._table = QComboBox()
+        for k, v in engine_tables_from_car(getattr(main, '_car', {})).items():
+            self._table.addItem(str(v.get('label', k)), k)
+        self._table.setToolTip('Which torque table the "table" method uses '
+                               '(every option is drawn; the chosen one bold).')
+        self._table.currentIndexChanged.connect(self._refresh)
+        g.addWidget(self._table, 3, 1, 1, 3)
+        self._cap = spin(4, 0, 'Power cap (hp crank, 0 = off):', 0.0, 200.0, 0.0, 1, 1.0,
+                         'Crank power is limited to this (torque = cap / engine '
+                         'speed above the knee) for EVERY method, at use time — '
+                         'the tables themselves are never changed.')
         apply_btn = QPushButton('Apply to lap sim')
         apply_btn.setToolTip('Save this method + inputs into the project; the '
                              'lap sim and every consumer use this curve.')
@@ -99,8 +115,17 @@ class EnginePage(QWidget):
     def _load_saved(self):
         car = getattr(self._main, '_car', {})
         m = car.get('engine_method')
-        if m in ('corrected', 'anchored', 'raw'):
+        if m in ('corrected', 'anchored', 'raw', 'table'):
             self._method.setCurrentText(m)
+        ch = car.get('engine_table_choice')
+        i = self._table.findData(ch) if ch is not None else -1
+        if i >= 0:
+            self._table.blockSignals(True); self._table.setCurrentIndex(i)
+            self._table.blockSignals(False)
+        cap = car.get('engine_power_cap_hp')
+        self._cap.blockSignals(True)
+        self._cap.setValue(float(cap) if cap not in (None, '') else 0.0)
+        self._cap.blockSignals(False)
         for key, sp in (('engine_ve_target', self._ve),
                         ('engine_ve_fall_rpm', self._vefall),
                         ('engine_ve_13k', self._ve13),
@@ -120,6 +145,9 @@ class EnginePage(QWidget):
         car['engine_fmep_a'] = float(self._fa.value())
         car['engine_fmep_b'] = float(self._fb.value())
         car['engine_anchor_hp'] = float(self._anchor.value())
+        if self._table.count():
+            car['engine_table_choice'] = self._table.currentData()
+        car['engine_power_cap_hp'] = float(self._cap.value())
         self._main.statusBar().showMessage(
             'Engine model saved to project — lap sim now uses: '
             + self._method.currentText(), 6000)
@@ -133,12 +161,20 @@ class EnginePage(QWidget):
         """Every calibration knob on the page, passed EXPLICITLY to
         engine_curve (the VE-taper boxes used to write module globals that
         ve_target_curve never read — dead controls, audit item 21)."""
-        return dict(ve_target=float(self._ve.value()),
+        return dict(**self._table_kw(self._table.currentData()),
+                    power_cap_hp=(float(self._cap.value()) or None),
+                    ve_target=float(self._ve.value()),
                     ve_fall_rpm=float(self._vefall.value()),
                     ve_13k=float(self._ve13.value()),
                     fmep_a=float(self._fa.value()),
                     fmep_b=float(self._fb.value()),
                     anchor_hp=float(self._anchor.value()))
+
+    def _table_kw(self, key) -> dict:
+        tabs = engine_tables_from_car(getattr(self._main, '_car', {}))
+        t = tabs.get(key) if key is not None else None
+        return dict(table=t['table'] if t else None,
+                    table_label=t.get('label') if t else None)
 
     # ── plotting ──────────────────────────────────────────────────────────
     def _refresh(self):
@@ -148,21 +184,30 @@ class EnginePage(QWidget):
         sel = self._method.currentText()
         styles = {'raw': (_GREY, 1.4, '--'), 'corrected': (_AMBER, 1.6, '-'),
                   'anchored': (_RED, 1.6, '-')}
+        # every named table is an option too (blue / white, dashed past two)
+        tab_styles = [('#42A5F5', 1.6, '-'), ('#FFFFFF', 1.6, '-'),
+                      ('#42A5F5', 1.6, '--'), ('#FFFFFF', 1.6, '--')]
         peak_note = ''
-        for m in ('raw', 'corrected', 'anchored'):
+        cur_key = self._table.currentData()
+        runs = [(m, m, styles[m], {}) for m in ('raw', 'corrected', 'anchored')]
+        for j, k in enumerate(engine_tables_from_car(getattr(self._main, '_car', {}))):
+            runs.append(('table', k, tab_styles[j % len(tab_styles)], self._table_kw(k)))
+        base = self._calib()
+        for m, key, (col, lw, ls), kw in runs:
             try:
-                c = engine_curve(m, **self._calib())
+                c = engine_curve(m, **dict(base, **kw))
             except Exception:
                 c = None
             if c is None:
                 continue
             r = np.asarray(c[0]); t = np.asarray(c[1])
             p = t * r * 2 * np.pi / 60 / 745.7
-            col, lw, ls = styles[m]
-            lw2 = lw + (1.4 if m == sel else 0.0)
-            ax1.plot(r, t, color=col, lw=lw2, ls=ls, label=m)
-            ax2.plot(r, p, color=col, lw=lw2, ls=ls, label=m)
-            if m == sel:
+            chosen = (m == sel) and (m != 'table' or key == cur_key)
+            lw2 = lw + (1.4 if chosen else 0.0)
+            lab = c[2] if m == 'table' else m
+            ax1.plot(r, t, color=col, lw=lw2, ls=ls, label=lab)
+            ax2.plot(r, p, color=col, lw=lw2, ls=ls, label=lab)
+            if chosen:
                 i = int(p.argmax())
                 peak_note = (f'SELECTED "{m}": peak {p[i]:.1f} hp @ '
                              f'{r[i]:.0f} rpm, torque peak {t.max():.1f} N·m '

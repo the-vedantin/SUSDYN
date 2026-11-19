@@ -1,7 +1,8 @@
 """MCP server embedded in Vahan — operate the RUNNING app from Claude directly.
 
 Starts a streamable-HTTP MCP server on 127.0.0.1:8765 in a daemon thread when
-the MainWindow constructs (set VAHAN_MCP=0 to disable; VAHAN_MCP_PORT to move).
+the MainWindow constructs (set VAHAN_MCP=0 to disable; VAHAN_MCP_PORT to move;
+set VAHAN_MCP_HOST=0.0.0.0 to allow connections from other network devices).
 Every tool call is marshalled onto the Qt GUI thread through a queue drained by
 a QTimer — the solvers and view are not thread-safe, so tools run exactly like
 user actions do.  Register once per machine:
@@ -172,6 +173,7 @@ def start_mcp(win, port: int = None):
         return None
     _WIN = win
     port = int(port or os.environ.get('VAHAN_MCP_PORT', 8765))
+    host = os.environ.get('VAHAN_MCP_HOST', '127.0.0.1')
 
     timer = QTimer(win)
     timer.timeout.connect(_drain)
@@ -180,7 +182,7 @@ def start_mcp(win, port: int = None):
 
     mcp = FastMCP('vahan')
     try:
-        mcp.settings.host = '127.0.0.1'
+        mcp.settings.host = host
         mcp.settings.port = port
     except Exception:
         pass

@@ -14,12 +14,14 @@ import numpy as np
 from PyQt6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLabel, QComboBox,
                              QRadioButton, QButtonGroup, QPushButton, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView, QSplitter,
-                             QDoubleSpinBox, QGridLayout, QCheckBox)
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+                             QDoubleSpinBox, QGridLayout, QCheckBox, QSlider, QDialog,
+                             QApplication, QScrollArea)
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF
+from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QPolygonF
 
 from gui.wheel_package import (CASES, _load_items, load_arrows, case_speed_kph, case_aero,
-                               case_aero_text)
+                               case_aero_text, angle_text, gg_envelope_at, gg_border_point,
+                               gg_worst_loads, GG_JOINTS)
 
 # Colourblind-safe category text (docs/DESIGN.md): NO yellow/amber, NO blue.
 # Distinguished by luminance + the Impeccable red on the tyre row; the category
@@ -30,6 +32,92 @@ _CAT_COLOR = {'CHASSIS': QColor(236, 236, 238), 'UPRIGHT': QColor(205, 200, 196)
 
 # corner selector entries ('All' -> no isolation)
 _CORNERS = ['All corners', 'FL', 'FR', 'RL', 'RR']
+
+# plain names for the G-G worst-loads table
+_GG_NAMES = {'uca_front_N': 'upper arm front leg', 'uca_rear_N': 'upper arm rear leg',
+             'lca_front_N': 'lower arm front leg', 'lca_rear_N': 'lower arm rear leg',
+             'tierod_N': 'tie rod / toe link', 'pushrod_N': 'pushrod',
+             'spring_damper_force_N': 'spring + damper', 'arb_link_N': 'anti-roll-bar drop link',
+             'bearing_axial_N': 'wheel bearing, sideways (axial)'}
+for _j, _nm in GG_JOINTS:
+    _GG_NAMES[f'{_j}_total'] = f'{_nm}, total'
+    for _ax in ('lateral', 'fore-aft', 'vertical'):
+        _GG_NAMES[f'{_j}_{_ax}'] = f'{_nm}, {_ax} part'
+
+
+def _gg_dir(corner, item, v):
+    """Which way a G-G worst-load row points, in words.  Members: tension / compression
+    along the member; joint parts: the force ON the upright, outboard / inboard,
+    forward / rearward, up / down (world +x = car left, +y = rearward, +z = up)."""
+    if not np.isfinite(v) or abs(v) < 0.5:
+        return ''
+    if item == 'spring_damper_force_N':
+        return 'compression' if v > 0 else 'tension'
+    if item == 'bearing_axial_N' or item.endswith('_total'):
+        return ''
+    if item.endswith('_lateral'):
+        return 'outboard' if (v > 0) == (str(corner)[1:2] == 'L') else 'inboard'
+    if item.endswith('_fore-aft'):
+        return 'rearward' if v > 0 else 'forward'
+    if item.endswith('_vertical'):
+        return 'up' if v > 0 else 'down'
+    return 'tension' if v > 0 else 'compression'
+
+
+class _GGWorker(QThread):
+    """Builds the G-G envelope off the UI thread (~250 full solves)."""
+    done = pyqtSignal(object)
+
+    def __init__(self, main, speed_kph, engine_limit=False):
+        super().__init__()
+        self._main, self._v, self._eng = main, float(speed_kph), bool(engine_limit)
+
+    def run(self):
+        try:
+            self.done.emit(gg_envelope_at(self._main, self._v, engine_limit=self._eng))
+        except Exception as e:                      # reported in the readout
+            self.done.emit(e)
+
+
+class _GGPlot(QWidget):
+    """Small G-G picture: the envelope border (white) and the chosen point
+    (yellow).  Lateral across, forward g up, braking down."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(190)
+        self._border, self._pt, self._lim = None, None, 2.5
+
+    def set_border(self, border):
+        self._border = None if border is None else np.asarray(border, float)
+        if self._border is not None and np.all(np.isfinite(self._border)):
+            self._lim = max(1.0, float(np.nanmax(np.abs(self._border))) * 1.12)
+        self.update()
+
+    def set_point(self, lat, lon):
+        self._pt = (float(lat), float(lon)); self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        p.fillRect(0, 0, W, H, QColor('#111114'))
+        s = (min(W, H) / 2.0 - 14.0) / self._lim
+        cx, cy = W / 2.0, H / 2.0
+        def xy(la, lo):
+            return QPointF(cx + la * s, cy - lo * s)
+        p.setPen(QPen(QColor('#3a3a42'), 1))
+        p.drawLine(QPointF(cx - self._lim * s, cy), QPointF(cx + self._lim * s, cy))
+        p.drawLine(QPointF(cx, cy - self._lim * s), QPointF(cx, cy + self._lim * s))
+        p.setPen(QColor('#9A9AA2'))
+        p.drawText(QPointF(cx + 4, 12), 'accelerate'); p.drawText(QPointF(cx + 4, H - 4), 'brake')
+        p.drawText(QPointF(W - 48, cy - 4), 'corner')
+        if self._border is not None and len(self._border) > 2:
+            poly = QPolygonF([xy(a, b) for a, b in self._border if np.isfinite(a) and np.isfinite(b)])
+            p.setPen(QPen(QColor('#f2f2f2'), 2)); p.setBrush(Qt.BrushStyle.NoBrush); p.drawPolygon(poly)
+        if self._pt is not None and all(np.isfinite(self._pt)):
+            p.setPen(QPen(QColor('#f2c94c'), 1.5))
+            p.drawLine(QPointF(cx, cy), xy(*self._pt))
+            p.setBrush(QBrush(QColor('#f2c94c'))); p.drawEllipse(xy(*self._pt), 5, 5)
+        p.end()
 
 
 class LoadsPage(QWidget):
@@ -82,20 +170,66 @@ class LoadsPage(QWidget):
         _pg = QGridLayout(); _pg.setContentsMargins(0, 2, 0, 0); _pg.setSpacing(3)
         for _i, (_nm, _la, _lo) in enumerate(
                 (('2.0g corner', 2.0, 0.0), ('1.6g brake', 0.0, -1.6),
-                 ('1.0g accel', 0.0, 1.0), ('corner+brake', 1.4, -1.0))):
+                 ('1.6g accel', 0.0, 1.6), ('corner+brake', 1.4, -1.0))):
             _b = QPushButton(_nm); _b.setStyleSheet('font-size:10px;padding:2px 3px;'
                 'background:#1e1e24;border:1px solid #444;border-radius:3px;')
             _b.clicked.connect(lambda _c=False, la=_la, lo=_lo:
                                (self._lat_g.setValue(la), self._lon_g.setValue(lo)))
             _pg.addWidget(_b, _i // 2, _i % 2)
         left.addLayout(_pg)
+
+        # ── G-G ENVELOPE (user 2026-10-21): slide the case around the border of
+        #    the car's own predicted G-G envelope (with aero at the speed above)
+        #    instead of typing g's — every point is a combination the tyres can
+        #    actually carry at that speed (engine cap optional).
+        left.addWidget(hdr('G-G ENVELOPE (with aero)'))
+        self._gg_on = QCheckBox('Pick the case on the G-G border')
+        self._gg_on.setToolTip("Solves the car's G-G envelope at the Speed above (aero at that speed,\n"
+                               'tyre-limited all round unless the engine box below is ticked) and puts\n'
+                               'the load case on its border.\n'
+                               '0° = straight braking, 90° = pure cornering, 180° = straight acceleration;\n'
+                               'negative angles = the turn the other way.')
+        left.addWidget(self._gg_on)
+        # Tyre-limited by default (user 2026-10-21): the load envelope is what the
+        # tyres can carry; tick to cap the forward side with the engine instead.
+        self._gg_engine = QCheckBox('Engine limit on the forward side')
+        self._gg_engine.setToolTip('Off (default): forward g is what the driven tyres can put down.\n'
+                                   'On: capped by the engine drive force at this speed.')
+        self._gg_engine.setChecked(False)
+        left.addWidget(self._gg_engine)
+        self._gg_slider = QSlider(Qt.Orientation.Horizontal)
+        self._gg_slider.setRange(-180, 180); self._gg_slider.setValue(90); self._gg_slider.setEnabled(False)
+        left.addWidget(self._gg_slider)
+        self._gg_plot = _GGPlot(); left.addWidget(self._gg_plot)
+        self._gg_lab = QLabel('Tick the box to solve the envelope.')
+        self._gg_lab.setWordWrap(True); self._gg_lab.setStyleSheet('color:#9A9AA2;font-size:11px')
+        left.addWidget(self._gg_lab)
+        self._gg_worst_btn = QPushButton('Worst loads around the border')
+        self._gg_worst_btn.setEnabled(False)
+        self._gg_worst_btn.setToolTip('Solves the loads at 36 points around the border (both turn directions)\n'
+                                      'and lists the largest value of every member and ball joint, and where.')
+        left.addWidget(self._gg_worst_btn)
+        self._gg_env, self._gg_worker, self._gg_pending = None, None, False
+        self._gg_timer = QTimer(self); self._gg_timer.setSingleShot(True); self._gg_timer.setInterval(120)
+        self._gg_timer.timeout.connect(self._gg_apply_point)
+        self._gg_on.toggled.connect(self._on_gg_toggle)
+        self._gg_engine.toggled.connect(lambda *_: self._gg_build() if self._gg_on.isChecked() else None)
+        self._gg_slider.valueChanged.connect(lambda *_: self._gg_timer.start())
+        self._gg_worst_btn.clicked.connect(self._on_gg_worst)
         left.addWidget(QLabel('Corner'))
         self._corner = QComboBox(); self._corner.addItems(_CORNERS); left.addWidget(self._corner)
         left.addWidget(QLabel('3D vectors'))
         self._res = QRadioButton('Resultant'); self._comp = QRadioButton('Components (X/Y/Z)')
+        self._ang = QRadioButton('Angles (hover / click a force)')
+        self._ang.setToolTip('Resultant arrows plus, for the force under the cursor, how to apply it with two\n'
+                             'angles: the cardinal plane it most nearly lies in (translucent), θ in that plane\n'
+                             'from its first axis, and the tilt φ off the plane.  Click pins it; click again releases.')
         self._res.setChecked(True)
-        bg = QButtonGroup(self); bg.addButton(self._res); bg.addButton(self._comp)
-        left.addWidget(self._res); left.addWidget(self._comp)
+        bg = QButtonGroup(self); bg.addButton(self._res); bg.addButton(self._comp); bg.addButton(self._ang)
+        left.addWidget(self._res); left.addWidget(self._comp); left.addWidget(self._ang)
+        self._wheels = QCheckBox('Show wheels'); self._wheels.setChecked(True)
+        self._wheels.setToolTip('Hide the tyres and rims to see the upright, bearings and arrows (also in the 3-D view box)')
+        left.addWidget(self._wheels)
 
         # ── UPRIGHT / BRAKE geometry — inputs live HERE on the Loads page (not
         #    the dynamics panel).  They write back to the same stores the model
@@ -145,7 +279,12 @@ class LoadsPage(QWidget):
                             '(axial) + the rocker pivot (the only moment).')
         self._note.setWordWrap(True); self._note.setStyleSheet('color:#999;font-size:11px')
         left.addWidget(self._note); left.addStretch(1)
-        lw = QWidget(); lw.setLayout(left); lw.setFixedWidth(270); root.addWidget(lw)
+        # was a FIXED 270 px column in a fixed 292 px box with the sideways
+        # bar off: wider rows were simply cut.  Resizable, never clipped now.
+        from gui.side_panel import SideScroll, side_split
+        lw = QWidget(); lw.setLayout(left)
+        _sc = SideScroll(lw, 292)
+        _sc.setStyleSheet('QScrollArea{border:0;}')
 
         # ── right: LIVE 3-D view (top) + outputs table (bottom) ──
         self._split = QSplitter(Qt.Orientation.Vertical)
@@ -158,11 +297,24 @@ class LoadsPage(QWidget):
         self._view_host_lay.addWidget(self._view_ph)
         self._split.addWidget(self._view_host)
 
-        self._tbl = QTableWidget(0, 5)
+        self._tbl = QTableWidget(0, 6)
         # Magnitude column mixes forces (N) and moments (N·m); the Type column
         # carries the unit per row, so the header names BOTH rather than lying (N).
+        # Angle column (user 2026-10-08): angle of the force — or of a moment's
+        # axis — to each +axis of the chassis frame, 0..180° (0 = along +axis,
+        # 90 = perpendicular, 180 = along the negative axis).  Same numbers as
+        # the hover label on the arrows above.
         self._tbl.setHorizontalHeaderLabels(['Category', 'Point / member', 'Magnitude (N / N·m)',
-                                             'Direction (lat / fore-aft / vert)', 'Type'])
+                                             'Direction (lat / fore-aft / vert)',
+                                             'Angle: plane θ / tilt φ · to +lat / +f-a / +vert (°)', 'Type'])
+        self._tbl.horizontalHeaderItem(4).setToolTip(
+            'How to apply the load with two angles: the cardinal plane it most nearly lies in,\n'
+            'θ in that plane from its first axis, and the tilt φ off the plane toward the normal\n'
+            '(the Angles option in the 3-D view draws this construction).  Then:\n'
+            'Angle between the vector and each positive chassis axis, 0–180°.\n'
+            '+lat = car left, +fore-aft = rearward, +vert = up.\n'
+            '0° = along the axis, 90° = perpendicular, 180° = along the negative axis.\n'
+            'For a moment row this is the orientation of the moment axis (right-hand rule).')
         self._tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -173,7 +325,8 @@ class LoadsPage(QWidget):
         self._split.addWidget(self._tbl)
         self._split.setStretchFactor(0, 3)
         self._split.setStretchFactor(1, 2)
-        root.addWidget(self._split, stretch=1)
+        self._side_split = side_split(_sc, self._split, 292, key='loads')
+        root.addWidget(self._side_split, stretch=1)
 
         self._corner.currentTextChanged.connect(self._on_input)
         for _s in (self._lat_g, self._lon_g):
@@ -181,6 +334,8 @@ class LoadsPage(QWidget):
         self._speed.valueChanged.connect(self._on_speed_edit)
         self._speed_auto.toggled.connect(self._on_input)
         self._res.toggled.connect(self._on_input)
+        self._ang.toggled.connect(self._on_input)
+        self._wheels.toggled.connect(lambda on: self._v3d.set_wheels(bool(on)) if self._v3d is not None else None)
         self.refresh()
 
     # ── corner selection -> isolation arg (None for 'All corners') ──
@@ -219,13 +374,152 @@ class LoadsPage(QWidget):
         if self._speed_auto.isChecked():
             self._speed_auto.blockSignals(True); self._speed_auto.setChecked(False)
             self._speed_auto.blockSignals(False)
+        if self._gg_on.isChecked():
+            self._gg_build()            # the envelope belongs to ONE speed
+            return
         self.refresh()
+
+    # ── G-G envelope mode ──
+    def _on_gg_toggle(self, on):
+        on = bool(on)
+        for wdg in (self._lat_g, self._lon_g, self._speed_auto):
+            wdg.setEnabled(not on)
+        self._gg_slider.setEnabled(on and self._gg_env is not None)
+        self._gg_worst_btn.setEnabled(on and self._gg_env is not None)
+        if not on:
+            self._gg_lab.setText('Tick the box to solve the envelope.')
+            return
+        if self._speed_auto.isChecked():
+            # default speed = the aero package reference speed
+            self._speed_auto.blockSignals(True); self._speed_auto.setChecked(False)
+            self._speed_auto.blockSignals(False)
+            try:
+                v = float(self._main._dynamics_panel.get_custom_aero_params()['V_ref_kph'])
+                self._speed.blockSignals(True); self._speed.setValue(v); self._speed.blockSignals(False)
+            except Exception:
+                pass
+        self._gg_build()
+
+    def _gg_build(self):
+        if self._gg_worker is not None and self._gg_worker.isRunning():
+            self._gg_pending = True
+            return
+        self._gg_pending = False
+        self._gg_slider.setEnabled(False); self._gg_worst_btn.setEnabled(False)
+        self._gg_lab.setText(f'Solving the G-G envelope at {self._speed.value():.1f} km/h … '
+                             '(about 15 s; the slider unlocks when it is done)')
+        self._gg_worker = _GGWorker(self._main, self._speed.value(), self._gg_engine.isChecked())
+        self._gg_worker.done.connect(self._on_gg_built)
+        self._gg_worker.start()
+
+    def _on_gg_built(self, env):
+        if self._gg_pending:
+            self._gg_build(); return
+        if isinstance(env, Exception) or not np.isfinite(env.get('ay_limit_g', float('nan'))):
+            self._gg_env = None
+            self._gg_lab.setText(f'G-G envelope failed: {env if isinstance(env, Exception) else "no solved state"}')
+            self._gg_plot.set_border(None)
+            return
+        self._gg_env = env
+        self._gg_plot.set_border(env['border'])
+        on = self._gg_on.isChecked()
+        self._gg_slider.setEnabled(on); self._gg_worst_btn.setEnabled(on)
+        self._gg_apply_point()
+
+    def _gg_apply_point(self):
+        env = self._gg_env
+        if env is None or not self._gg_on.isChecked():
+            return
+        th = float(self._gg_slider.value())
+        lat, lon = gg_border_point(env, th)
+        if not (np.isfinite(lat) and np.isfinite(lon)):
+            return
+        self._gg_plot.set_point(lat, lon)
+        for wdg, val in ((self._lat_g, lat), (self._lon_g, lon)):
+            wdg.blockSignals(True); wdg.setValue(round(val, 2)); wdg.blockSignals(False)
+        what = ('straight braking' if abs(th) < 1 else 'straight acceleration' if abs(th) > 179
+                else 'pure cornering' if abs(abs(th) - 90) < 1 else
+                'cornering + braking' if abs(th) < 90 else 'cornering + acceleration')
+        self._gg_lab.setText(
+            f'{th:+.0f}°  {what}: {lat:+.2f} g lateral, {abs(lon):.2f} g {"braking" if lon < 0 else "forward"}\n'
+            f'Envelope at {env["speed_kph"]:.1f} km/h, {env["aero_total_N"]:.0f} N downforce: '
+            f'cornering {env["ay_limit_g"]:.2f} g, braking {abs(env["brake_tip_g"]):.2f} g, '
+            f'forward {env["accel_tip_g"]:.2f} g'
+            + (' (engine-limited)' if bool(np.asarray(env['power_limited'])[len(env['power_limited']) // 2])
+               else '' if env.get('engine_limit') else ' (tyre-limited)'))
+        self.refresh()
+
+    def _on_gg_worst(self):
+        env = self._gg_env
+        if env is None:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            res = gg_worst_loads(self._main, env, n=36)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._gg_last_worst = res
+        corner = self._corner_arg()
+        rows = [r for r in res['rows'] if corner is None or r['corner'] == corner]
+        dlg = QDialog(self); dlg.setWindowTitle(
+            f'Worst loads around the G-G border — {res["speed_kph"]:.1f} km/h, 36 points, both turn directions')
+        dlg.resize(980, 640)
+        lay = QVBoxLayout(dlg)
+        note = QLabel('Largest value of each member / joint force over the whole border at this speed. '
+                      'Direction: members are pulled (tension) or pushed (compression) along their length; '
+                      'joint parts are the force ON the upright — outboard / inboard, forward / rearward, up / down. '
+                      'Signed column: + tension; joint parts +lateral = car left, +fore-aft = rearward, +vertical = up. '
+                      'Double-click a row to put the slider on that point.')
+        note.setWordWrap(True); lay.addWidget(note)
+        t = QTableWidget(len(rows), 7)
+        t.setHorizontalHeaderLabels(['Corner', 'Member / joint', 'Largest (N)', 'Direction', 'Signed (N)',
+                                     'Where: angle', 'Where: lateral / longitudinal g'])
+        for i, r in enumerate(rows):
+            vals = [r['corner'], _GG_NAMES.get(r['item'], r['item']), None,
+                    _gg_dir(r['corner'], r['item'], float(r['signed'])), f"{r['signed']:+,.0f}",
+                    f"{r['theta']:+.0f}°", f"{r['lat_g']:+.2f} / {r['lon_g']:+.2f}"]
+            for j, v in enumerate(vals):
+                it = QTableWidgetItem()
+                if j == 2:
+                    it.setData(Qt.ItemDataRole.DisplayRole, round(r['max_abs']))
+                else:
+                    it.setText(v)
+                if j == 5:
+                    it.setData(Qt.ItemDataRole.UserRole, r['theta'])
+                t.setItem(i, j, it)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setSortingEnabled(True); t.sortItems(2, Qt.SortOrder.DescendingOrder)
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        t.setStyleSheet('QTableWidget{background:#111;gridline-color:#333;}'
+                        'QHeaderView::section{background:#1e1e24;color:#e0a83a;padding:5px;border:0;}')
+        def _go(row, _col):
+            it = t.item(row, 5)
+            if it is not None:
+                self._gg_slider.setValue(int(round(float(it.data(Qt.ItemDataRole.UserRole)))))
+        t.cellDoubleClicked.connect(_go)
+        lay.addWidget(t)
+        dlg.show()
 
     def _refresh_aero_label(self):
         try:
             lat, lon = self._case_g()
             ca = case_aero(self._main, lat, lon, self._case_speed())
-            self._aero_lab.setText('Solved at ' + case_aero_text(ca))
+            if not self._speed_auto.isChecked():
+                ca['rule'] = 'typed'
+            txt = 'Solved at ' + case_aero_text(ca)
+            env = self._gg_env
+            if (env is not None and not self._gg_on.isChecked()
+                    and abs(float(env['speed_kph']) - float(ca['speed_kph'])) < 0.05
+                    and (abs(lat) + abs(lon)) > 1e-6):
+                # where this typed case sits against the G-G border at the SAME speed
+                th = float(np.degrees(np.arctan2(lat, -lon)))
+                blat, blon = gg_border_point(env, th)
+                r_b = float(np.hypot(blat, blon))
+                if np.isfinite(r_b) and r_b > 1e-6:
+                    pct = 100.0 * float(np.hypot(lat, lon)) / r_b
+                    txt += (f'\nG-G envelope at this speed: this case is {pct:.0f} % of the way to the border'
+                            + (' — OUTSIDE what the car can reach' if pct > 100.5 else ''))
+            self._aero_lab.setText(txt)
         except Exception as e:
             self._aero_lab.setText(f'Speed / aero: {e}')
 
@@ -240,6 +534,7 @@ class LoadsPage(QWidget):
             # wire the embedded view's navcube controls (perspective / floor /
             # thickness) — without this they did nothing on the Loads page.
             self._v3d.set_on_view_controls(self._on_v3d_controls)
+            self._v3d.set_wheels(self._wheels.isChecked())
             self._view_host_lay.removeWidget(self._view_ph)
             self._view_ph.hide()
             self._view_host_lay.addWidget(self._v3d.native)
@@ -256,6 +551,8 @@ class LoadsPage(QWidget):
                 v.set_perspective(bool(d['perspective']))
             if 'floor' in d and hasattr(v, '_ground'):
                 v._ground.visible = bool(d['floor'])
+            if 'wheels' in d:
+                self._wheels.blockSignals(True); self._wheels.setChecked(bool(d['wheels'])); self._wheels.blockSignals(False)
             if 'thickness' in d:
                 # route through _car so build_load_view keeps it on the next rebuild
                 self._main._car['show_shock_thickness'] = bool(d['thickness'])
@@ -364,7 +661,7 @@ class LoadsPage(QWidget):
             elif 'PIVOT' in lab or 'pivot' in lab:
                 typ = 'moment reaction'
             cells = [cat, point, f'{mag:,.0f}',
-                     f'{v[0]:+,.0f} / {v[1]:+,.0f} / {v[2]:+,.0f}', typ]
+                     f'{v[0]:+,.0f} / {v[1]:+,.0f} / {v[2]:+,.0f}', angle_text(v), typ]
             magitem = QTableWidgetItem()
             magitem.setData(Qt.ItemDataRole.DisplayRole, round(mag))   # numeric sort
             for cndx, txt in enumerate(cells):
@@ -383,7 +680,10 @@ class LoadsPage(QWidget):
         try:
             lat, lon = self._case_g()
             vec = 'components' if self._comp.isChecked() else 'resultant'
-            self._main.build_load_view(self._v3d, self._corner_arg(), lat, lon, vec)
+            self._v3d.set_angle_mode(self._ang.isChecked())
+            self._main.build_load_view(self._v3d, self._corner_arg(), lat, lon, vec,
+                                       speed_kph=self._speed_override())
+            self._v3d.set_wheels(self._wheels.isChecked())
             # build_load_view draws the arrows at the case-rule speed; a typed
             # speed re-draws them at that speed so picture == table.
             v = self._speed_override()

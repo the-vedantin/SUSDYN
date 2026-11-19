@@ -81,6 +81,12 @@ class TransientParams:
     # typical FSAE damper combo gives ~1500-2500 N·m·s/rad of body roll
     # damping; the default above is only a fallback for direct callers
     # who construct TransientParams without going through the GUI.
+    roll_damping_fn: Optional[Callable[[float], float]] = None
+    # NONLINEAR body roll damping moment M(phi_dot) (N·m, same sign as
+    # phi_dot).  When set it REPLACES roll_damping_Nms_rad·phi_dot — the app
+    # passes the project's dyno dampers in pure roll
+    # (vahan.damper.WheelDampers.roll_moment_fn: per axle the bump-side wheel
+    # at +t/2·phi_dot, the rebound side at -t/2·phi_dot, at the solved MR).
 
     # Steering kinematics
     ackermann_pct: float = 0.0             # 0 = parallel, 100 = perfect Ackermann,
@@ -105,6 +111,8 @@ class TransientParams:
     longitudinal_control_mode: str = 'speed_hold'
     # 'speed_hold' — PID on vx to track v_x_target
     # 'open_loop'  — use TransientInputs.longitudinal_profile directly (N)
+    # 'throttle'   — speed hold until TransientInputs.throttle_profile(t) > 0,
+    #                then blend to the engine's full force (see that field)
 
     # Speed-hold PI gains.  If None, TransientSolver derives them from
     # the VehicleParams.speed_hold_kp_per_kg × total_mass so heavier cars
@@ -127,6 +135,97 @@ class TransientParams:
     # the solver uses the SteeringGeometry's physical limit (preferred);
     # if no geometry is supplied, it falls back to VehicleParams.max_steer_angle_deg.
     max_steer_rad: Optional[float] = None
+
+    # ── CORNER-EXIT EXTENSIONS (2026-10-20).  ALL OFF BY DEFAULT: with every
+    # flag below at its default the solver is bit-for-bit the old model.
+    #
+    # combined_slip — each tyre's lateral force is reduced by its own
+    #   longitudinal force through a FRICTION ELLIPSE on the same TTC lateral
+    #   model:   Fy = Fy_pure · sqrt(1 - (Fx / Fx_max)²),
+    #            Fx_max = mu_x_ratio · peak_Fy(Fz, IA, branch) · grip_scale.
+    #   ASSUMPTION: the project's TTC files are all cornering runs (no drive/
+    #   brake slip-ratio sweeps), so the longitudinal grip is NOT measured —
+    #   mu_x = mu_x_ratio × the measured lateral peak mu at that load (1.0 =
+    #   circle).  A wheel can never deliver more Fx than Fx_max: extra drive
+    #   torque spins it up and it stays at Fx_max with zero lateral force
+    #   (the wheel's own spin speed is not a state — wheelspin is a cap).
+    combined_slip: bool = False
+    mu_x_ratio: float = 1.0
+    # diff_model — split the drive force across the driven (RWD) axle by
+    #   VehicleParams.diff_kind (open / spool / salisbury) instead of 50/50.
+    #   See TransientSolver._drive_split.  The locked (spool) split needs a
+    #   longitudinal slip stiffness: C_kappa = diff_kappa_per_N · Fz (N per unit
+    #   slip ratio).  ASSUMPTION (no TTC drive data): 25 /unit slip, a typical
+    #   FSAE-slick value; it only matters while the clutch is locked.
+    diff_model: bool = False
+    diff_kappa_per_N: float = 25.0
+    # pitch_dof — body pitch as a degree of freedom, so the rear load gained
+    #   under drive arrives through the springs and dampers, not instantly:
+    #     Iyy·θ'' = (1 - s)·m_s·h_s·ax - K_θ·θ - M_damp(θ')        (θ + = squat)
+    #     K_θ = 2·(k_wheel,f·a² + k_wheel,r·b²)   (VehicleParams wheel rates)
+    #   Axle load change (+ rear / - front, equal and opposite):
+    #     m_u·h_u·ax/L  +  s·m_s·h_s·ax/L  (instant: unsprung + through the links)
+    #     + K_θ·θ/L                         (through the springs, lags)
+    #   s = anti_squat (fraction, used while ax > 0; braking uses 0 — not a
+    #   braking model).  Steady state = m·h·ax/L exactly (m·h = m_s·h_s + m_u·h_u).
+    #   SIMPLIFICATION: no heave DOF, so the spring couple is shared as ±K_θ·θ/L.
+    #   Pitch also moves the wheels for the camber tables (front -a·θ, rear +b·θ).
+    #   pitch_inertia None -> 0.9 × yaw_inertia (ASSUMPTION, typical FSAE ratio).
+    #   pitch_damping_fn M(θ') from the project dampers (pitch_damping_from_
+    #   wheel_dampers); without one, pitch_damping_zeta × critical (ASSUMPTION).
+    pitch_dof: bool = False
+    anti_squat: float = 0.0
+    pitch_inertia: Optional[float] = None
+    pitch_damping_fn: Optional[Callable[[float], float]] = None
+    pitch_damping_zeta: float = 0.5
+    # static_toe — apply VehicleParams.toe_front_deg / toe_rear_deg (TOTAL
+    #   per axle, + = toe-out) as half per wheel on top of the steer.
+    static_toe: bool = False
+    # aero_Fz_per_v2 — downforce per corner (N per (m/s)²), {FL,FR,RL,RR};
+    #   Fz_aero = coeff · vx².  None = no aero (no drag either).
+    aero_Fz_per_v2: Optional[dict] = None
+
+
+def damper_moment_fns(wheel_dampers, track_front_m: float, track_rear_m: float,
+                      a_m: float, b_m: float, scales: Optional[dict] = None):
+    """(roll_fn, pitch_fn) body damping moments from the project's dyno
+    dampers (vahan.damper.WheelDampers, solved motion ratios).
+
+    roll : per axle the bump wheel at +t/2·φ', the rebound wheel at -t/2·φ',
+           M = t/2·(F_w(+v) - F_w(-v)) — identical to WheelDampers.roll_moment_fn
+           when every scale is 1.
+    pitch: θ' + = squat: front wheels REBOUND at a·θ', rear wheels BUMP at
+           b·θ';  M = 2·a·(-F_wf(-a·θ')) + 2·b·F_wr(+b·θ').
+    scales: optional {'F_comp','F_reb','R_comp','R_reb'} force multipliers
+           (lever studies: e.g. R_comp 1.3 = rear compression damping +30 %)."""
+    sc = {'F_comp': 1.0, 'F_reb': 1.0, 'R_comp': 1.0, 'R_reb': 1.0}
+    sc.update(scales or {})
+    curve = wheel_dampers.curve
+    mr_f, mr_r = float(wheel_dampers.mr[0]), float(wheel_dampers.mr[2])
+
+    def fw(v_wheel, axle):
+        mr = mr_f if axle == 'F' else mr_r
+        f = float(curve(float(v_wheel) * mr)) * mr
+        return f * (sc[axle + '_comp'] if v_wheel > 0 else sc[axle + '_reb'])
+
+    tf, tr = float(track_front_m), float(track_rear_m)
+
+    def roll_fn(phi_dot):
+        m = 0.0
+        for t, ax in ((tf, 'F'), (tr, 'R')):
+            s = 0.5 * t * float(phi_dot)
+            m += 0.5 * t * (fw(s, ax) - fw(-s, ax))
+        return m
+
+    a, b = float(a_m), float(b_m)
+
+    def pitch_fn(theta_dot):
+        td = float(theta_dot)
+        return 2.0 * a * (-fw(-a * td, 'F')) + 2.0 * b * fw(b * td, 'R')
+
+    roll_fn.equivalent_c = lambda rate: roll_fn(float(rate)) / float(rate)
+    pitch_fn.equivalent_c = lambda rate: pitch_fn(float(rate)) / float(rate)
+    return roll_fn, pitch_fn
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -582,6 +681,13 @@ class TransientInputs:
     # If mode='open_loop', this callable returns total Fx (N) at the driven axle.
     # If None or mode='speed_hold', vx is held to v_x_target by a PI controller.
 
+    throttle_profile: Optional[Callable[[float], float]] = None
+    # mode='throttle': u(t) in [0, 1].  Fx_total = (1-u)·Fx_hold + u·F_full(vx),
+    # F_full = VehicleParams.drive_force_at_v_N(vx) (the engine's full power
+    # at the ground), Fx_hold = the speed-hold PI output, which runs normally
+    # while u == 0 (the driver's maintenance throttle) and is FROZEN at its
+    # last value once u > 0.  The tyres decide how much of it is delivered.
+
     duration_s: float = 5.0
     dt_s: float = 0.002
 
@@ -638,6 +744,10 @@ class TransientResult:
     Fx: dict = field(default_factory=dict)          # long. force (N), body frame
     slip_angle: dict = field(default_factory=dict)  # slip angle (rad)
     camber: dict = field(default_factory=dict)      # dynamic camber (deg)
+    # Exit extensions (zeros unless the matching TransientParams flag is on)
+    utilization: dict = field(default_factory=dict) # friction-ellipse use, 1 = at the limit
+    pitch: np.ndarray = field(default_factory=lambda: np.zeros(0))       # rad, + = squat
+    Fx_demand: np.ndarray = field(default_factory=lambda: np.zeros(0))   # N, total asked
 
     # Scalar metrics
     yaw_rate_rise_time_s: float = 0.0        # 10-90% of steady-state r
@@ -757,6 +867,16 @@ class TransientSolver:
             self._kin_lo_mm = -float(half)
             self._kin_hi_mm = +float(half)
         self._build_kinematic_lut(corner_solvers)
+        # Exit extensions: any flag on -> the extended force path in _deriv.
+        self._ext = bool(p.combined_slip or p.diff_model or p.pitch_dof
+                         or p.static_toe or p.aero_Fz_per_v2)
+        a_, b_ = vehicle.cg_to_front_axle_m, vehicle.cg_to_rear_axle_m
+        self._K_pitch = 2.0 * (vehicle.wheel_rate_front_Npm * a_ ** 2
+                               + vehicle.wheel_rate_rear_Npm * b_ ** 2)
+        self._I_pitch = (float(p.pitch_inertia) if p.pitch_inertia is not None
+                         else 0.9 * float(p.yaw_inertia))
+        self._c_pitch = (2.0 * float(p.pitch_damping_zeta)
+                         * np.sqrt(max(self._K_pitch, 0.0) * self._I_pitch))
 
     # ── Kinematic lookup tables ──────────────────────────────────────────
 
@@ -800,7 +920,8 @@ class TransientSolver:
     # ── Per-corner Fz and travel from roll ───────────────────────────────
 
     def _per_corner_loads(self, v: VehicleParams,
-                          phi: float, ay: float, ax: float) -> dict:
+                          phi: float, ay: float, ax: float,
+                          extra_Fz: Optional[dict] = None) -> dict:
         """
         Per-corner Fz (N) and travel (m) at a given roll / ay / ax state.
 
@@ -872,6 +993,10 @@ class TransientSolver:
         Fz['RL'] -= (geo_r + uns_r + el_r)
         Fz['RR'] += (geo_r + uns_r + el_r)
 
+        if extra_Fz:            # exit extensions: aero + lagged pitch transfer
+            for k in Fz:
+                Fz[k] += float(extra_Fz.get(k, 0.0))
+
         # Clamp so a wheel never has negative normal load
         for k in Fz:
             Fz[k] = max(Fz[k], 0.0)
@@ -932,6 +1057,13 @@ class TransientSolver:
             d_FR = (1 - ackermann_frac) * steer_cmd + ackermann_frac * d_FR_ack
 
         steer_per = {'FL': d_FL, 'FR': d_FR, 'RL': 0.0, 'RR': 0.0}
+        if self._params.static_toe:
+            # TOTAL toe per axle, + = toe-out: the left wheel points left
+            # (+ steer in ISO), the right wheel points right, half each.
+            tf_ = np.radians(float(getattr(v, 'toe_front_deg', 0.0))) / 2.0
+            tr_ = np.radians(float(getattr(v, 'toe_rear_deg', 0.0))) / 2.0
+            steer_per = {'FL': d_FL + tf_, 'FR': d_FR - tf_,
+                         'RL': +tr_, 'RR': -tr_}
 
         alpha = {}
         for lbl in _CORNERS:
@@ -957,6 +1089,8 @@ class TransientSolver:
         Returns (dstate, diagnostics) where diagnostics holds the per-corner
         forces used so the caller can record them at the current step.
         """
+        if self._ext:
+            return self._deriv_ext(state, steer_cmd, Fx_total)
         v = self._veh
         p = self._params
 
@@ -1087,8 +1221,10 @@ class TransientSolver:
         # The sprung roll moment is m_s · ay · h_arm (positive ay → positive moment).
         M_roll = v.sprung_mass_kg * ay_est * h_arm
         K_total = v.roll_stiffness_total_Npm_rad
+        M_damp = (p.roll_damping_fn(phi_dot) if p.roll_damping_fn is not None
+                  else p.roll_damping_Nms_rad * phi_dot)
         phi_ddot = (M_roll
-                    - p.roll_damping_Nms_rad * phi_dot
+                    - M_damp
                     - K_total * phi) / max(p.sprung_roll_inertia, 1e-3)
 
         # --- Yaw dynamics ----------------------------------------------
@@ -1114,6 +1250,198 @@ class TransientSolver:
             'steer_per': steer_per,
             'travel': travel,
         }
+        return dstate, diag
+
+    # ── Exit extensions: diff split, friction ellipse, pitch DOF ─────────
+
+    def _drive_split(self, F: float, Fz: dict, cap: dict,
+                     r: float, vx: float) -> dict:
+        """Drive force F (N, >= 0, at the ground) split across RL/RR by the
+        differential.  cap = per-wheel Fx limit (friction ellipse; inf when
+        combined slip is off).
+
+          locked split (spool): both wheels turn at the same speed, the
+            outer one travels further, so the inner wheel runs at more slip:
+              κ_in = κ0 + δ/2, κ_out = κ0 - δ/2,  δ = |r|·track / vx
+              F_i = C_κ,i·κ_i,  C_κ = diff_kappa_per_N·Fz,  F_in + F_out = F
+          open:      torque bias B = 0 (both wheels get the same force)
+          spool:     B = inf
+          salisbury: B = 2·T_lock/r_tyre,  T_lock = preload + ½·lock%·T_axle
+                     (vahan.differential.Differential, power ramp for F > 0)
+          actual difference D = clip(F_in - F_out (locked), -B, +B).
+          wheelspin: a wheel past its cap stays AT its cap (spinning); the
+          other gets min(F - cap_spin, cap_spin + B, its own cap)."""
+        from vahan.differential import Differential
+        v = self._veh
+        diff = Differential.from_vehicle(v)
+        rt = max(float(v.tire_radius_m), 1e-3)
+        inner, outer = ('RL', 'RR') if r >= 0.0 else ('RR', 'RL')
+        if diff.kind == 'open':
+            B = 0.0
+        elif diff.kind == 'spool':
+            B = np.inf
+        else:
+            B = 2.0 * diff.locking_torque_Nm(F * rt, True) / rt
+        k_i = self._params.diff_kappa_per_N * max(Fz[inner], 1.0)
+        k_o = self._params.diff_kappa_per_N * max(Fz[outer], 1.0)
+        delta = abs(r) * float(v.rear_track_m) / max(vx, 1.0)
+        kappa0 = (F - (k_i - k_o) * delta / 2.0) / (k_i + k_o)
+        D = float(np.clip(k_i * (kappa0 + delta / 2.0)
+                          - k_o * (kappa0 - delta / 2.0), -B, B))
+        f = {inner: 0.5 * (F + D), outer: 0.5 * (F - D)}
+        c = {k: max(float(cap[k]), 0.0) for k in (inner, outer)}
+        for spin, other in ((inner, outer), (outer, inner)):
+            if f[spin] > c[spin]:
+                f[spin] = c[spin]
+                f[other] = min(F - c[spin], c[spin] + B, c[other])
+        for k in (inner, outer):           # a dragged wheel is capped too
+            f[k] = float(np.clip(f[k], -c[k], c[k]))
+        return {'FL': 0.0, 'FR': 0.0, 'RL': f['RL'], 'RR': f['RR']}
+
+    def _deriv_ext(self, state: np.ndarray, steer_cmd: float,
+                   Fx_total: float) -> tuple:
+        """_deriv with the exit extensions (see TransientParams).  State is
+        [vx, vy, r, phi, phi_dot, X, Y, psi, steer_actual, theta, theta_dot]."""
+        v = self._veh
+        p = self._params
+        vx, vy, r, phi, phi_dot, X, Y, psi, steer_actual = state[:9]
+        theta, theta_dot = float(state[9]), float(state[10])
+        m = v.total_mass_kg
+        L = v.wheelbase_m
+        a_cg, b_cg = v.cg_to_front_axle_m, v.cg_to_rear_axle_m
+
+        tau_eff = max(p.steering_tau_s, 1e-3)
+        steer_dot = (steer_cmd - steer_actual) / tau_eff
+        alpha, steer_per = self._slip_angles(v, vx, vy, r, steer_actual)
+        alpha_arr = np.array([alpha[c] for c in _CORNERS])
+        alpha_deg = np.degrees(alpha_arr)
+
+        aero = {c: (float(p.aero_Fz_per_v2.get(c, 0.0)) * vx * vx
+                    if p.aero_Fz_per_v2 else 0.0) for c in _CORNERS}
+        pos = {
+            'FL': ( a_cg, +v.front_track_m / 2),
+            'FR': ( a_cg, -v.front_track_m / 2),
+            'RL': (-b_cg, +v.rear_track_m / 2),
+            'RR': (-b_cg, -v.rear_track_m / 2),
+        }
+        dt_mode = v.drivetrain.upper()
+        ay_est = 0.0
+        ax_est = Fx_total / m
+        util = {c: 0.0 for c in _CORNERS}
+        for _pass in range(3):
+            if p.pitch_dof:
+                s = float(p.anti_squat) if ax_est > 0 else 0.0
+                h_u = v.unsprung_cg_height_m
+                m_u = m - v.sprung_mass_kg
+                d_long = ((m_u * h_u + s * v.sprung_mass_kg * v.sprung_cg_height_m)
+                          * ax_est / L + self._K_pitch * theta / L)
+                extra = {c: aero[c] + (d_long / 2 if c[0] == 'R' else -d_long / 2)
+                         for c in _CORNERS}
+                loads = self._per_corner_loads(v, phi, ay_est, 0.0, extra)
+                travel = dict(loads['travel'])
+                travel['FL'] -= a_cg * theta; travel['FR'] -= a_cg * theta
+                travel['RL'] += b_cg * theta; travel['RR'] += b_cg * theta
+            else:
+                loads = self._per_corner_loads(v, phi, ay_est, ax_est, aero)
+                travel = loads['travel']
+            Fz = loads['Fz']
+            fz_arr = np.array([max(Fz[c], 0.0) for c in _CORNERS])
+            _phi_deg = float(np.degrees(phi))
+            cam_arr = np.array([
+                wheel_inclination_deg(
+                    self._camber(c, travel[c])
+                    + float(getattr(v, 'camber_front_deg' if c[0] == 'F'
+                                    else 'camber_rear_deg', 0.0))
+                    + (_phi_deg if c.endswith('R') else -_phi_deg),
+                    side='right' if c.endswith('R') else 'left')
+                for c in _CORNERS])
+            fy_pure = -np.asarray(self._tire.Fy(alpha_deg, fz_arr, cam_arr),
+                                  dtype=float).reshape(-1) * self._grip_scale
+            if fy_pure.size == 1:
+                fy_pure = np.repeat(fy_pure, 4)
+            # Peak lateral force on the branch each wheel is on (+ the cap)
+            pk = np.zeros(4)
+            if p.combined_slip:
+                pk_pos = np.atleast_1d(self._tire.peak_Fy(fz_arr, cam_arr, slip_sign=1))
+                pk_neg = np.atleast_1d(self._tire.peak_Fy(fz_arr, cam_arr, slip_sign=-1))
+                pk = np.where(alpha_deg >= 0, pk_pos, pk_neg) * self._grip_scale
+                pk = np.where(fz_arr > 1.0, pk, 0.0)
+                cap = {c: float(p.mu_x_ratio * pk[i]) for i, c in enumerate(_CORNERS)}
+            else:
+                cap = {c: np.inf for c in _CORNERS}
+
+            # Per-wheel Fx
+            Fx_per = {k: 0.0 for k in _CORNERS}
+            if Fx_total >= 0:
+                if p.diff_model and dt_mode == 'RWD':
+                    Fx_per = self._drive_split(Fx_total, Fz, cap, r, vx)
+                else:
+                    driven = (('FL', 'FR') if dt_mode == 'FWD' else
+                              _CORNERS if dt_mode == 'AWD' else ('RL', 'RR'))
+                    for lbl in driven:
+                        Fx_per[lbl] = min(Fx_total / len(driven), cap[lbl])
+            else:
+                bb = v.front_brake_bias
+                for lbl in _CORNERS:
+                    share = bb / 2 if lbl[0] == 'F' else (1 - bb) / 2
+                    Fx_per[lbl] = max(Fx_total * share, -cap[lbl])
+
+            # Friction ellipse
+            Fy = {}
+            for i, c in enumerate(_CORNERS):
+                fy = float(fy_pure[i])
+                if p.combined_slip:
+                    capx = cap[c]
+                    rho = (min(abs(Fx_per[c]) / capx, 1.0) if capx > 0 else 1.0)
+                    fy *= np.sqrt(max(1.0 - rho * rho, 0.0))
+                    lat = abs(float(fy_pure[i])) / pk[i] if pk[i] > 0 else 1.0
+                    util[c] = float(np.hypot(rho, min(lat, 1.0) * np.sqrt(max(1.0 - rho * rho, 0.0))))
+                    # (= sqrt(rho² + (Fy/Fy_peak)²); 1 = on the ellipse)
+                Fy[c] = fy
+
+            Fx_body = Fy_body = Mz_body = 0.0
+            for lbl in _CORNERS:
+                d = steer_per[lbl]
+                fx_w, fy_w = Fx_per[lbl], Fy[lbl]
+                fx_b = fx_w * np.cos(d) - fy_w * np.sin(d)
+                fy_b = fx_w * np.sin(d) + fy_w * np.cos(d)
+                ax_pos, b_pos = pos[lbl]
+                Fx_body += fx_b
+                Fy_body += fy_b
+                Mz_body += ax_pos * fy_b - b_pos * fx_b
+            vx_dot = Fx_body / m + vy * r
+            vy_dot = Fy_body / m - vx * r
+            ay_est = vy_dot + vx * r
+            ax_est = vx_dot - vy * r
+
+        h_roll_axis = 0.5 * (loads['rc_f'] + loads['rc_r'])
+        h_arm = v.sprung_cg_height_m - h_roll_axis
+        M_roll = v.sprung_mass_kg * ay_est * h_arm
+        M_damp = (p.roll_damping_fn(phi_dot) if p.roll_damping_fn is not None
+                  else p.roll_damping_Nms_rad * phi_dot)
+        phi_ddot = (M_roll - M_damp - v.roll_stiffness_total_Npm_rad * phi) \
+            / max(p.sprung_roll_inertia, 1e-3)
+
+        if p.pitch_dof:
+            s = float(p.anti_squat) if ax_est > 0 else 0.0
+            M_pitch = (1.0 - s) * v.sprung_mass_kg * v.sprung_cg_height_m * ax_est
+            Mp_damp = (p.pitch_damping_fn(theta_dot) if p.pitch_damping_fn is not None
+                       else self._c_pitch * theta_dot)
+            theta_ddot = (M_pitch - Mp_damp - self._K_pitch * theta) / max(self._I_pitch, 1e-3)
+        else:
+            theta_ddot = 0.0
+            theta_dot = 0.0
+
+        r_dot = Mz_body / max(p.yaw_inertia, 1e-3)
+        dstate = np.array([vx_dot, vy_dot, r_dot, phi_dot, phi_ddot,
+                           vx * np.cos(psi) - vy * np.sin(psi),
+                           vx * np.sin(psi) + vy * np.cos(psi),
+                           r, steer_dot, theta_dot, theta_ddot])
+        diag = {'ay': ay_est, 'ax': ax_est, 'Fz': Fz, 'Fy': Fy, 'Fx': Fx_per,
+                'alpha': alpha, 'steer_per': steer_per, 'travel': travel,
+                'util': util,
+                'fy_pure': {c: float(fy_pure[i]) for i, c in enumerate(_CORNERS)},
+                'fx_cap': cap}
         return dstate, diag
 
     # ── Top-level integrator ─────────────────────────────────────────────
@@ -1147,6 +1475,8 @@ class TransientSolver:
         initial_steer = float(np.clip(initial_steer, -lim, +lim))
         state = state0_no_steer.copy()
         state[8] = initial_steer
+        if self._ext:                       # + pitch angle, pitch rate
+            state = np.concatenate([state, [0.0, 0.0]])
 
         # Storage
         res = TransientResult(t=t_arr)
@@ -1164,9 +1494,12 @@ class TransientSolver:
             res.Fx[c] = np.zeros(n)
             res.slip_angle[c] = np.zeros(n)
             res.camber[c] = np.zeros(n)
+            res.utilization[c] = np.zeros(n)
+        res.pitch = np.zeros(n); res.Fx_demand = np.zeros(n)
 
         # Speed-hold integrator state
         speed_err_int = 0.0
+        fx_hold = 0.0
 
         lim = self._max_steer_rad
         for i in range(n):
@@ -1183,8 +1516,16 @@ class TransientSolver:
             steer_cmd = float(np.clip(steer_cmd, -lim, +lim))
 
             # --- Longitudinal control (speed hold PI or open loop) ─────
+            u_thr = (float(np.clip(inp.throttle_profile(t), 0.0, 1.0))
+                     if (p.longitudinal_control_mode == 'throttle'
+                         and inp.throttle_profile is not None) else 0.0)
             if p.longitudinal_control_mode == 'open_loop' and inp.longitudinal_profile:
                 Fx_total = float(inp.longitudinal_profile(t))
+            elif u_thr > 0.0:
+                # driver on the throttle: blend the frozen maintenance force
+                # to the engine's full force at this speed
+                Fx_total = ((1.0 - u_thr) * fx_hold
+                            + u_thr * float(v.drive_force_at_v_N(state[0])))
             else:
                 err = inp.v_x_target_ms - state[0]
                 speed_err_int += err * dt
@@ -1192,6 +1533,8 @@ class TransientSolver:
                 # Clamp to a sane fraction of tire capacity
                 Fx_max = p.fx_limit_g * v.total_mass_kg * G
                 Fx_total = float(np.clip(Fx_total, -Fx_max, Fx_max))
+                fx_hold = Fx_total
+            res.Fx_demand[i] = Fx_total
 
             # --- Record current state ──────────────────────────────────
             res.v_x[i] = state[0]
@@ -1231,6 +1574,10 @@ class TransientSolver:
                 res.Fx[c][i] = diag['Fx'][c]
                 res.slip_angle[c][i] = diag['alpha'][c]
                 res.camber[c][i] = self._camber(c, diag['travel'][c])
+                if 'util' in diag:
+                    res.utilization[c][i] = diag['util'][c]
+            if self._ext:
+                res.pitch[i] = state[9]
 
             if i < n - 1:
                 state = state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)

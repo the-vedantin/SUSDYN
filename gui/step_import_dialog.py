@@ -115,6 +115,20 @@ class StepImportDialog(QDialog):
         pg.addWidget(show_all, 3, 2); pg.addWidget(hide_all, 3, 3)
         root.addWidget(pbox)
 
+        # ── chassis keep-out (Rule 18 red zone) — managed here, not a hidden path ──
+        # (user 2026-10-11: "doesn't show up in step manager, hardcoded step file")
+        kbox = QGroupBox("Chassis keep-out zone (Rule 18, drawn red; the net gates members against it)")
+        kg = QGridLayout(kbox)
+        self._ko_path = QLabel(""); self._ko_path.setWordWrap(True)
+        kg.addWidget(QLabel("Keep-out STEP:"), 0, 0); kg.addWidget(self._ko_path, 0, 1, 1, 3)
+        ko_browse = QPushButton("Choose..."); ko_browse.clicked.connect(self._ko_browse)
+        ko_clear = QPushButton("Clear"); ko_clear.clicked.connect(self._ko_clear)
+        self._ko_show = QCheckBox("Show in the 3-D view"); self._ko_show.toggled.connect(self._ko_toggle)
+        kg.addWidget(ko_browse, 1, 0); kg.addWidget(ko_clear, 1, 1); kg.addWidget(self._ko_show, 1, 2, 1, 2)
+        kbox.setToolTip("The keep-out solid is saved with the project as car['keepout_step'] (repo-relative when it "
+                        "sits under the repo). A planar-faced STEP from the chassis team; no member may sit inside it.")
+        root.addWidget(kbox)
+
         self._info = QLabel(""); self._info.setWordWrap(True)
         root.addWidget(self._info)
 
@@ -135,10 +149,72 @@ class StepImportDialog(QDialog):
         self.sync_from_state()
 
     # ── helpers ──────────────────────────────────────────────────────────
+    # ── keep-out (Rule 18) ─────────────────────────────────
+    def _ko_refresh(self):
+        car = getattr(self._main, '_car', {}) or {}
+        rel = car.get('keepout_step') or ''
+        self._ko_path.setText(rel if rel else "(none — the net's keep-out gate is skipped)")
+        v3d = getattr(self._main, 'view3d', None)
+        km = getattr(v3d, '_keepout_mesh', None) if v3d is not None else None
+        self._ko_show.blockSignals(True)
+        try:
+            self._ko_show.setEnabled(bool(rel)); self._ko_show.setChecked(bool(km.visible) if (km is not None and rel) else False)
+        finally:
+            self._ko_show.blockSignals(False)
+
+    def _ko_apply(self, rel):
+        """Write car['keepout_step'] and rebuild the red solid in the view (ONE path: vahan.keepout.keepout_for_window)."""
+        car = self._main._car
+        if rel:
+            car['keepout_step'] = rel
+        else:
+            car.pop('keepout_step', None)
+        try:
+            from vahan.keepout import keepout_for_window
+            ko = keepout_for_window(self._main)
+            self._main.view3d.set_keepout(ko.faces if ko is not None else None)
+            if ko is None:
+                self._main._set_keepout_visible(False)
+        except Exception as e:
+            QMessageBox.warning(self, "Keep-out", f"Could not load the keep-out STEP:\n{e}")
+            car.pop('keepout_step', None)
+        try:
+            self._main._rebuild_step_parts_menu()
+        except Exception:
+            pass
+        self._ko_refresh()
+
+    def _ko_browse(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Keep-out STEP (planar-faced solid)", "", "STEP (*.step *.stp *.STEP *.STP)")
+        if not p:
+            return
+        root = os.getcwd()
+        try:
+            rel = os.path.relpath(p, root)
+            if rel.startswith('..'):
+                rel = p
+        except ValueError:
+            rel = p
+        self._ko_apply(rel.replace('\\', '/'))
+
+    def _ko_clear(self):
+        self._ko_apply('')
+
+    def _ko_toggle(self, on):
+        try:
+            self._main._set_keepout_visible(bool(on))
+            self._main._rebuild_step_parts_menu()
+        except Exception:
+            pass
+
     def _parts(self):
         return getattr(self._main, "_imported_parts", [])
 
     def sync_from_state(self):
+        try:
+            self._ko_refresh()
+        except Exception:
+            pass
         """Rebuild the list widget from the window's part list (call after a
         project load, or when re-opening the dialog)."""
         if not HAVE_STEP:

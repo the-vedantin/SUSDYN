@@ -445,6 +445,7 @@ def compute_corner_loads(
     unsprung_mass_kg: float = 0.0,
     accel_world=(0.0, 0.0, 0.0),
     cond_limit: float = COND_LIMIT,
+    mz_Nm: float = 0.0,
 ) -> ComponentLoads:
     """Member forces at one suspension corner — see the FREE-BODY DECLARATION.
 
@@ -458,6 +459,13 @@ def compute_corner_loads(
     unsprung_mass_kg, accel_world : corner unsprung mass lumped at the wheel
                          centre and the car's world acceleration (m/s^2); the
                          body carries m_u*(g - a).  Defaults 0 = massless corner.
+    mz_Nm              : tyre self-aligning torque MAGNITUDE (N·m, TTC Mz at this
+                         corner's slip and load).  Applied about the world vertical
+                         in the SAME sense as the side force acting behind the
+                         steer axis (pneumatic trail), i.e. (0, 0, -sign(Fy)·|Mz|)
+                         — the term the steering chain (vahan.steering) always
+                         carried and the member solve omitted until 2026-10-11, so
+                         the tie rod / steering arm were under-read.  0 = omitted.
     """
     result = ComponentLoads(Fz_N=Fz, Fy_N=Fy, Fx_N=Fx, brake_torque_Nm=brake_torque,
                             pushrod_body=str(pushrod_body or 'upright'),
@@ -510,6 +518,12 @@ def compute_corner_loads(
     O = lca_o.copy()                       # moment reference point
     F_ext = F_patch + F_unspr
     M_ext = np.cross(cp - O, F_patch) + np.cross(wc - O, F_unspr) + T_shaft
+    # tyre self-aligning torque (pneumatic trail): a free moment on the body,
+    # same sense as Fy applied behind the steer axis -> about -Z for +Fy
+    _mz = float(mz_Nm or 0.0)
+    if np.isfinite(_mz) and _mz != 0.0:
+        M_ext = M_ext + np.array([0.0, 0.0, -np.sign(Fy) * abs(_mz) if Fy != 0.0 else 0.0])
+    result.mz_Nm = _mz
 
     # ── Unit vectors (inboard -> outboard) ─────────────────────────────────
     u_uf = _normalize(uca_o - uca_f); u_ur = _normalize(uca_o - uca_r)
@@ -1337,6 +1351,7 @@ def compute_all_corners(
     brakes_inboard_f: bool = False,
     brakes_inboard_r: bool = False,
     arb_geometry=None,
+    tire_model=None,
 ) -> dict:
     """
     Compute component loads for all 4 corners from a dynamics result.
@@ -1488,11 +1503,29 @@ def compute_all_corners(
         body = (getattr(solver, '_damper_body', 'upright') if act == 'direct'
                 else getattr(solver, '_pushrod_body', 'upright'))
         r_axis = getattr(solver, '_rocker_axis', None) if act in ('pushrod', 'pullrod') else None
+        # tyre self-aligning torque at this corner's solved slip and load (the
+        # steering chain's Mz, now in the member solve too — 2026-10-11)
+        mz = 0.0
+        if tire_model is not None and Fz > 1.0:
+            try:
+                sa = None
+                _sa = getattr(dyn_result, 'slip_angle', None)
+                if isinstance(_sa, dict) and label in _sa and np.isfinite(float(_sa[label])):
+                    sa = abs(float(_sa[label]))
+                if sa is None:
+                    sa = float(tire_model.slip_angle_for_Fy(abs(Fy), Fz, 0.0))
+                _cam = getattr(dyn_result, 'camber', None)
+                cam = float(_cam[label]) if isinstance(_cam, dict) and label in _cam else 0.0
+                mz = abs(float(tire_model.Mz(sa, Fz, cam)))
+                if not np.isfinite(mz):
+                    mz = 0.0
+            except Exception:
+                mz = 0.0
         results[label] = compute_corner_loads(
             state, Fz, Fy, Fx, bt, bp, up, wheel_radius_m,
             pushrod_body=body, rocker_axis=r_axis,
             brakes_inboard=(brakes_inboard_f if is_front else brakes_inboard_r),
-            unsprung_mass_kg=m_u, accel_world=a_world)
+            unsprung_mass_kg=m_u, accel_world=a_world, mz_Nm=mz)
         if _incomplete:
             results[label].spring_arb_note = _incomplete
 

@@ -360,6 +360,123 @@ def _fit_magic_formula(sa_deg, fz_N, fy_N):
     return params, r2, (curve, peak_slip)
 
 
+FIT_METHODS = ('lookup', 'mf52', 'spline')
+FIT_METHOD_LABELS = {
+    'lookup': 'Lookup (binned medians)',
+    'mf52': 'MF 5.2 curve fit',
+    'spline': 'Spline fit (cubic, per load)',
+}
+
+
+def _mf52_eval(a_rad, Fz, p, fz0):
+    """MF 5.2 pure lateral with load-dependent shifts.  Positive force for
+    positive slip (SAE sign handled by the caller)."""
+    pCy1, pDy1, pDy2, pKy1, pKy2, pEy1, pEy2, pHy1, pHy2, pVy1, pVy2 = p
+    dfz = (Fz - fz0) / fz0
+    C = pCy1
+    D = np.maximum((pDy1 + pDy2 * dfz) * Fz, 1.0)
+    K = pKy1 * fz0 * np.sin(2.0 * np.arctan(Fz / (pKy2 * fz0)))
+    B = K / (C * D)
+    E = np.minimum(pEy1 + pEy2 * dfz, 1.0)
+    x = a_rad + np.radians(pHy1 + pHy2 * dfz)
+    Bx = B * x
+    return D * np.sin(C * np.arctan(Bx - E * (Bx - np.arctan(Bx)))) + Fz * (pVy1 + pVy2 * dfz)
+
+
+MF52_KEYS = ('pCy1', 'pDy1', 'pDy2', 'pKy1', 'pKy2', 'pEy1', 'pEy2',
+             'pHy1', 'pHy2', 'pVy1', 'pVy2')
+
+
+def _mf52_grid(sa, fz, fy, ia_r, sa_axis, fz_axis, ia_levels, fallback):
+    """Fit MF 5.2 (11 coefficients) to ALL raw samples of each tested camber,
+    every load at once, then evaluate it on the grid nodes.  A camber level
+    whose fit fails keeps the lookup column (and says so)."""
+    from scipy.optimize import curve_fit
+    out = fallback.copy()
+    params, notes = {}, []
+    rng = np.random.default_rng(0)
+    for k, lev in enumerate(ia_levels):
+        m = (ia_r == int(lev)) & np.isfinite(sa) & np.isfinite(fy) & (fz > 20.0)
+        idx = np.where(m)[0]
+        if idx.size < 200:
+            notes.append(f'IA {lev:+.0f}: too few samples, lookup kept')
+            continue
+        if idx.size > 25000:
+            idx = rng.choice(idx, 25000, replace=False)
+        a, f, y = np.radians(sa[idx]), fz[idx], -fy[idx]
+        fz0 = float(np.median(f))
+        p0 = [1.5, 2.5, -0.2, 20.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        lo = [0.5, 0.5, -3.0, 1.0, 0.1, -5.0, -5.0, -3.0, -3.0, -0.5, -0.5]
+        hi = [3.0, 6.0, 3.0, 200.0, 20.0, 1.0, 5.0, 3.0, 3.0, 0.5, 0.5]
+        try:
+            p, _ = curve_fit(lambda X, *q: _mf52_eval(X[0], X[1], q, fz0),
+                             (a, f), y, p0=p0, bounds=(lo, hi), maxfev=40000)
+        except Exception as e:
+            notes.append(f'IA {lev:+.0f}: fit failed ({type(e).__name__}), lookup kept')
+            continue
+        params[float(lev)] = dict(zip(MF52_KEYS, [float(v) for v in p]), Fz0=fz0)
+        A = np.radians(sa_axis)
+        for j, fzj in enumerate(fz_axis):
+            out[:, j, k] = -_mf52_eval(A, np.full_like(A, float(fzj)), p, fz0)
+    note = ('MF 5.2 curve fit: 11 coefficients per tested camber, all loads '
+            'fitted together' + ('; ' + '; '.join(notes) if notes else ''))
+    return out, params, note
+
+
+def _spline_grid(sa, fz, fy, mz, ia_r, sa_axis, fz_axis, ia_levels, fz_hw,
+                 fy_fallback, mz_fallback):
+    """Least-squares cubic spline of Fy and Mz vs slip, one per (load,
+    camber) test point, knots every 2 deg.  Outside the measured slip range
+    the edge value is held (same as the lookup gap fill)."""
+    from scipy.interpolate import LSQUnivariateSpline
+    fy_out, mz_out = fy_fallback.copy(), mz_fallback.copy()
+    kept = 0
+    for k, lev in enumerate(ia_levels):
+        mk = ia_r == int(lev)
+        for j, fzj in enumerate(fz_axis):
+            m = mk & (np.abs(fz - fzj) < fz_hw[j]) & np.isfinite(sa) & np.isfinite(fy)
+            if m.sum() < 40:
+                continue
+            o = np.argsort(sa[m], kind='stable')
+            x = sa[m][o]
+            lo_x, hi_x = float(x[0]), float(x[-1])
+            t = np.arange(np.ceil(lo_x) + 1.0, hi_x - 1.0, 2.0)
+            inside = (sa_axis >= lo_x) & (sa_axis <= hi_x)
+            try:
+                sf = LSQUnivariateSpline(x, fy[m][o], t, k=3)
+                sm = LSQUnivariateSpline(x, mz[m][o], t, k=3)
+            except Exception:
+                continue
+            xs = np.clip(sa_axis, lo_x, hi_x)
+            fy_out[:, j, k] = sf(xs)
+            mz_out[:, j, k] = sm(xs)
+            kept += 1
+    total = len(fz_axis) * len(ia_levels)
+    note = (f'spline fit: least-squares cubic spline per load and camber, knots '
+            f'every 2 deg ({kept}/{total} test points fitted, rest lookup)')
+    return fy_out, mz_out, note
+
+
+def _grid_fit_quality(sa, fz, fy, ia_r, sa_axis, fz_axis, ia_levels, fz_hw, grid):
+    """R^2 and RMS of the grid against the raw samples it was built from."""
+    res, tot = [], []
+    for k, lev in enumerate(ia_levels):
+        mk = ia_r == int(lev)
+        for j, fzj in enumerate(fz_axis):
+            m = mk & (np.abs(fz - fzj) < fz_hw[j]) & np.isfinite(fy)
+            if m.sum() < 5:
+                continue
+            pred = np.interp(sa[m], sa_axis, grid[:, j, k])
+            res.append(fy[m] - pred)
+            tot.append(fy[m])
+    if not res:
+        return {'r2': float('nan'), 'rms_N': float('nan'), 'n': 0}
+    r = np.concatenate(res)
+    y = np.concatenate(tot)
+    return {'r2': float(1.0 - np.sum(r ** 2) / max(np.sum((y - y.mean()) ** 2), 1e-9)),
+            'rms_N': float(np.sqrt(np.mean(r ** 2))), 'n': int(r.size)}
+
+
 class TireModel:
     """
     Processed tire model from TTC data.
@@ -378,7 +495,8 @@ class TireModel:
                  fz_n_bins: int = 8,
                  warmup_pts: int = 1500,
                  pressure_psi: float = None,
-                 speed_window_kph=None):
+                 speed_window_kph=None,
+                 fit_method: str = 'lookup'):
         """
         Process raw TTC data into interpolation grids.
 
@@ -614,11 +732,37 @@ class TireModel:
                     fy_grid[:, j, k] = 0.0
                     mz_grid[:, j, k] = 0.0
 
-        # Smooth lightly along SA to reduce test noise
+        # ── TTC DATA METHOD (user 2026-11-16): lookup / MF 5.2 fit / spline ──
+        # All three fill the SAME (slip, load, camber) grid, so every consumer
+        # below (offset removal, peak clamp, peak_mu, lap sim, loads, MMD)
+        # switches together — one model, three ways to read the data.
+        fit_method = str(fit_method or 'lookup').lower()
+        if fit_method not in FIT_METHODS:
+            raise ValueError(f'tyre fit_method must be one of {FIT_METHODS}, got {fit_method!r}')
+        self.fit_method = fit_method
+        self.fit_note = 'lookup: median of 0.5 deg slip bins at each test load and camber'
+        if fit_method == 'mf52':
+            fy_grid, self.mf52_params, self.fit_note = _mf52_grid(
+                sa, fz, fy, ia_rounded, self._sa_axis, self._fz_axis,
+                self._camber_levels, fy_grid)
+        elif fit_method == 'spline':
+            fy_grid, mz_grid, self.fit_note = _spline_grid(
+                sa, fz, fy, mz, ia_rounded, self._sa_axis, self._fz_axis,
+                self._camber_levels, fz_half_width, fy_grid, mz_grid)
+        # Fit quality on the RAW samples, same measure for every method:
+        # each sample vs its (load, camber) column at its own slip angle.
+        self.fit_quality = _grid_fit_quality(
+            sa, fz, fy, ia_rounded, self._sa_axis, self._fz_axis,
+            self._camber_levels, fz_half_width, fy_grid)
+
+        # Smooth lightly along SA to reduce test noise (lookup only — the
+        # fits are already smooth and must stay exactly the fitted curve)
         for k in range(n_ia):
             for j in range(n_fz):
-                fy_grid[:, j, k] = uniform_filter1d(fy_grid[:, j, k], size=3)
-                mz_grid[:, j, k] = uniform_filter1d(mz_grid[:, j, k], size=3)
+                if fit_method == 'lookup':
+                    fy_grid[:, j, k] = uniform_filter1d(fy_grid[:, j, k], size=3)
+                if fit_method != 'spline':
+                    mz_grid[:, j, k] = uniform_filter1d(mz_grid[:, j, k], size=3)
 
         # ── Remove the zero-slip force offset ────────────────────────────
         # The binned data does not pass through the origin: at zero slip and
